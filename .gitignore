@@ -1,0 +1,6 @@
+Agents-docs/
+.claude/
+.codex/
+__pycache__/
+.codex
+.in_use/

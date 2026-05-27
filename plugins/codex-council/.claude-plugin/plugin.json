@@ -1,0 +1,7 @@
+{
+  "name": "codex-council",
+  "version": "0.2.0",
+  "description": "Multi-perspective parallel Codex review — N sub-agents in parallel, each framed with a role you decide per call.",
+  "author": {"name": "ehzawad"},
+  "license": "MIT"
+}

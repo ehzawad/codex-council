@@ -1,0 +1,16 @@
+{
+  "name": "codex-council",
+  "owner": {
+    "name": "ehzawad"
+  },
+  "metadata": {
+    "description": "Multi-perspective parallel Codex review inside Claude Code — N sub-agents in parallel, each framed with a role you decide per call."
+  },
+  "plugins": [
+    {
+      "name": "codex-council",
+      "source": "./plugins/codex-council",
+      "description": "Multi-perspective parallel Codex review with N sub-agents, each framed with a role you decide per call."
+    }
+  ]
+}
