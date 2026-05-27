@@ -69,6 +69,45 @@ force a council — say so.
 The JSON role spec, retries, and panel-proposal flow are documented in
 [`plugins/codex-council/skills/codex-council/SKILL.md`](plugins/codex-council/skills/codex-council/SKILL.md).
 
+## Architecture
+
+```mermaid
+flowchart LR
+    User["User"] --> Claude["Claude Code"]
+    Claude --> Skill["codex-council skill<br/>SKILL.md"]
+    Skill --> Panel["Compose task-specific role panel<br/>Confirm with AskUserQuestion"]
+    Panel --> Script["codex_council.py<br/>stdin context + --roles-json"]
+
+    subgraph Plugin["codex-council plugin"]
+        Manifest[".claude-plugin/plugin.json"] -.-> Skill
+        Script --> Validate["Validate stdin size<br/>Parse and validate roles"]
+        Validate --> Prompt["Bookend context with<br/>each role instruction"]
+        Prompt --> Fanout["asyncio.gather<br/>parallel fan-out"]
+
+        Fanout --> RoleA["Role runner A"]
+        Fanout --> RoleB["Role runner B"]
+        Fanout --> RoleN["Role runner N"]
+
+        RoleA <--> State["Per-project, per-role state<br/>$XDG_STATE_HOME/codex-council"]
+        RoleB <--> State
+        RoleN <--> State
+    end
+
+    subgraph Codex["Codex CLI subprocesses"]
+        RoleA --> ExecA["codex exec resume or fresh"]
+        RoleB --> ExecB["codex exec resume or fresh"]
+        RoleN --> ExecN["codex exec resume or fresh"]
+    end
+
+    ExecA --> JSONL["JSONL events"]
+    ExecB --> JSONL
+    ExecN --> JSONL
+    JSONL --> Parse["Extract thread.started<br/>Extract final agent_message"]
+    Parse --> Report["Aggregated markdown report"]
+    Report --> Claude
+    Claude --> Reconcile["Claude reconciles results<br/>for the user"]
+```
+
 ## State
 
 Council state lives at
