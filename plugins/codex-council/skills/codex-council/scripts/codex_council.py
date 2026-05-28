@@ -13,14 +13,12 @@ This script is a pure orchestrator — there is no built-in role
 catalog and no default council. Callers (Claude as orchestrator)
 ultrathink about the user's task, compose the role panel JSON
 on-the-fly per invocation, confirm with the user via
-AskUserQuestion, then invoke this script. `--roles-json` is the
-sole role-input channel.
+AskUserQuestion, then invoke this script. Roles arrive via
+`--roles-file` (a path to a JSON file holding the panel), which keeps
+a large role array out of the shell entirely.
 
 Usage:
-    echo "<context>" | python3 codex_council.py \
-        --roles-json '[{"id":"<task-specific-lens>",
-                        "label":"<Human Label>",
-                        "instruction":"<task-specific framing>"}]'
+    echo "<context>" | python3 codex_council.py --roles-file roles.json
 
 Env vars:
     CODEX_COUNCIL_SESSION_KEY     scope council threads (e.g. per branch)
@@ -91,7 +89,18 @@ SESSION_KEY_ENV = "CODEX_COUNCIL_SESSION_KEY"
 MAX_PARALLEL = 6  # matches codex's own DEFAULT_AGENT_MAX_THREADS
 MAX_RETRY_ATTEMPTS = 2
 INITIAL_BACKOFF_SECS = 5
-MAX_STDIN_BYTES = 1 << 20  # 1 MiB
+MAX_STDIN_BYTES = 10 << 20  # 10 MiB (a sanity guard, not a model-context
+# limit — Codex's own context window is the real ceiling; compress anyway).
+
+# No timeout, by design. Neither this script nor `codex exec` enforces a
+# wall-clock or run-level timeout, so a role may think for hours or days.
+# codex's only default that could end a long-QUIET run is the
+# per-PROVIDER stream-idle timeout (`model_providers.<id>.stream_idle_timeout_ms`,
+# 5 min, then bounded retries), which an actively-streaming role never
+# trips. Widening that for long stalls is left to the user's
+# ~/.codex/config.toml rather than overridden here: it is provider-scoped
+# and the active provider id varies, so the council cannot target it
+# portably. (Verified against codex-cli 0.135.0.)
 
 
 @dataclass(frozen=True)
@@ -443,9 +452,9 @@ async def _run_role_once(role, prompt, attempt):
     if msg:
         # Persist only when both halves of session continuity are
         # present; an agent_message without a thread.started is still a
-        # valid reply but cannot be resumed, so skip the save (matches
-        # ask_codex.py's contract — don't persist a thread that
-        # produced no agent_message, but don't drop a reply either).
+        # valid reply but cannot be resumed, so skip the save — don't
+        # persist a thread that produced no agent_message, but don't
+        # drop a reply either.
         if new_id:
             save_session(role.id, new_id)
         return RoleResult(
@@ -491,7 +500,7 @@ async def run_council(roles, body):
     """Fan out N roles in parallel and wait for all to finish.
 
     `roles` is a list of Role objects supplied by the caller via
-    --roles-json. There is no built-in role registry.
+    --roles-file. There is no built-in role registry.
 
     `return_exceptions=True` ensures one role's crash does not cancel
     its siblings — every role gets its turn and its result in the report.
@@ -569,18 +578,20 @@ def _parse_args(argv):
     parser = argparse.ArgumentParser(
         description=(
             "Fan out a prompt to a council of Codex agents in parallel. "
-            "Roles are caller-supplied per invocation via --roles-json; "
+            "Roles are caller-supplied per invocation via --roles-file; "
             "there is no built-in catalog."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "--roles-json", default=None, metavar="JSON",
+        "--roles-file", default=None, metavar="PATH",
         help=(
-            "JSON list of role objects "
-            "([{\"id\":..,\"label\":..,\"instruction\":..}, ...]). "
-            "Required — Claude (the orchestrator) composes this per "
-            "invocation; see SKILL.md."
+            "Path to a JSON file holding the role panel: a list of "
+            "[{\"id\":..,\"label\":..,\"instruction\":..}] objects. Keeping "
+            "the panel in a file (not an inline argument) means a large "
+            "role array never has to survive shell quoting, where a stray "
+            "quote or brace would break the call. Claude (the orchestrator) "
+            "composes this per invocation; see SKILL.md."
         ),
     )
     return parser.parse_args(argv)
@@ -592,22 +603,40 @@ def _usage_exit(msg):
     raise SystemExit(2)
 
 
+def _read_roles_file(path):
+    """Read the raw roles JSON from a file.
+
+    Passing the panel as a path lets the caller write the JSON with a real
+    editor/tool instead of escaping a large blob through the shell, where a
+    stray quote or unbalanced brace would break the call. Read and decode
+    errors exit 2 like other usage errors; JSON validity is left to
+    _parse_roles_json.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except OSError as e:
+        _usage_exit(f"--roles-file: cannot read {path!r} ({e}).")
+    except UnicodeDecodeError as e:
+        _usage_exit(f"--roles-file: {path!r} is not valid UTF-8 ({e}).")
+
+
 def _validate_role_id(rid, ctx):
     """Reject malformed/oversize role IDs with a SystemExit citing context."""
     if not isinstance(rid, str) or not rid:
-        _usage_exit(f"--roles-json {ctx}: 'id' must be a non-empty string.")
+        _usage_exit(f"--roles-file {ctx}: 'id' must be a non-empty string.")
     if len(rid) > ROLE_ID_MAX_LEN:
         _usage_exit(
-            f"--roles-json {ctx}: id {rid!r} exceeds {ROLE_ID_MAX_LEN} chars."
+            f"--roles-file {ctx}: id {rid!r} exceeds {ROLE_ID_MAX_LEN} chars."
         )
     if not ROLE_ID_PATTERN.match(rid):
         _usage_exit(
-            f"--roles-json {ctx}: id {rid!r} must match {ROLE_ID_PATTERN.pattern}."
+            f"--roles-file {ctx}: id {rid!r} must match {ROLE_ID_PATTERN.pattern}."
         )
 
 
 def _parse_roles_json(raw):
-    """Parse the --roles-json blob into a list of Role objects.
+    """Parse the --roles-file blob into a list of Role objects.
 
     Validates each entry has non-empty id/label/instruction strings, id
     is well-formed, and ids are unique within the JSON.
@@ -615,28 +644,28 @@ def _parse_roles_json(raw):
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as e:
-        _usage_exit(f"--roles-json: invalid JSON ({e}).")
+        _usage_exit(f"--roles-file: invalid JSON ({e}).")
     if not isinstance(data, list):
-        _usage_exit("--roles-json: top-level value must be a JSON list.")
+        _usage_exit("--roles-file: top-level value must be a JSON list.")
     roles = []
     seen = set()
     for idx, entry in enumerate(data):
         ctx = f"entry {idx}"
         if not isinstance(entry, dict):
-            _usage_exit(f"--roles-json {ctx}: each entry must be an object.")
+            _usage_exit(f"--roles-file {ctx}: each entry must be an object.")
         for field in ("id", "label", "instruction"):
             if field not in entry:
-                _usage_exit(f"--roles-json {ctx}: missing field {field!r}.")
+                _usage_exit(f"--roles-file {ctx}: missing field {field!r}.")
             value = entry[field]
             if not isinstance(value, str) or not value.strip():
                 _usage_exit(
-                    f"--roles-json {ctx}: field {field!r} must be a non-empty string."
+                    f"--roles-file {ctx}: field {field!r} must be a non-empty string."
                 )
         rid = entry["id"]
         _validate_role_id(rid, ctx)
         if rid in seen:
             _usage_exit(
-                f"--roles-json {ctx}: duplicate id {rid!r} within JSON payload."
+                f"--roles-file {ctx}: duplicate id {rid!r} within JSON payload."
             )
         seen.add(rid)
         roles.append(Role(rid, entry["label"], entry["instruction"]))
@@ -652,7 +681,7 @@ def _resolve_roles(custom_roles):
     """
     if not custom_roles:
         _usage_exit(
-            "No roles requested. Pass --roles-json with the role panel "
+            "No roles requested. Pass --roles-file with the role panel "
             "(Claude composes this per invocation; see SKILL.md)."
         )
 
@@ -671,6 +700,36 @@ def _resolve_roles(custom_roles):
     return ordered
 
 
+def _read_stdin_body(stream):
+    """Read the prompt body from a binary stream, enforcing the byte cap.
+
+    Counts BYTES, not characters: stdin is read raw and the cap is checked
+    against the byte length, because the prompt is later UTF-8 encoded for
+    codex and a multibyte-heavy body would otherwise slip past a
+    character-count check (the cap claims bytes). Exits 1 if over the cap
+    or empty; input is never truncated. Decodes strictly as UTF-8 — a
+    prompt should be text, so invalid bytes are a clear error rather than
+    silently replaced.
+    """
+    raw = stream.read(MAX_STDIN_BYTES + 1)
+    if len(raw) > MAX_STDIN_BYTES:
+        print(
+            f"Input exceeds {MAX_STDIN_BYTES} bytes "
+            f"({MAX_STDIN_BYTES >> 20} MiB) — trim before piping.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    try:
+        body = raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        print(f"Input is not valid UTF-8 ({e}) — pipe text.", file=sys.stderr)
+        sys.exit(1)
+    if not body.strip():
+        print("Empty input — pipe a complete prompt instead.", file=sys.stderr)
+        sys.exit(1)
+    return body
+
+
 def main():
     args = _parse_args(sys.argv[1:])
 
@@ -684,23 +743,20 @@ def main():
     if sys.stdin.isatty():
         print(
             "No input piped. Usage: echo 'context' | "
-            "python3 codex_council.py --roles-json '[...]'",
+            "python3 codex_council.py --roles-file roles.json",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    body = sys.stdin.read(MAX_STDIN_BYTES + 1)
-    if len(body) > MAX_STDIN_BYTES:
-        print(
-            f"Input exceeds {MAX_STDIN_BYTES} bytes — trim before piping.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    if not body.strip():
-        print("Empty input — pipe a complete prompt instead.", file=sys.stderr)
-        sys.exit(1)
+    body = _read_stdin_body(sys.stdin.buffer)
 
-    custom_roles = _parse_roles_json(args.roles_json) if args.roles_json else []
+    # Parse unconditionally when a file path was supplied: an empty file
+    # then yields the clear "invalid JSON" usage error rather than the
+    # generic "no roles requested" message (which is for bare invocation).
+    if args.roles_file:
+        custom_roles = _parse_roles_json(_read_roles_file(args.roles_file))
+    else:
+        custom_roles = []
     roles = _resolve_roles(custom_roles)
 
     print(

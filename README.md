@@ -57,9 +57,10 @@ disambiguation gate.
 There is **no built-in role catalog**. Claude composes the panel
 on-the-fly per invocation — ultrathinking about the task, drafting
 role ids, labels, and instructions tailored to what the user is
-actually doing, then passing them as `--roles-json` to the script.
-The script is a pure orchestrator: it accepts JSON, fans out parallel
-`codex exec` subprocesses, and aggregates the replies.
+actually doing, then passing them to the script via `--roles-file`
+(a path to the panel JSON). The script is a pure orchestrator: it
+reads that JSON, fans out parallel `codex exec` subprocesses, and
+aggregates the replies.
 
 **Note on fit.** Codex is strongest where the task has technical,
 structured, or evidence-checking surfaces. For tasks where a single
@@ -76,7 +77,7 @@ flowchart LR
     User["User"] --> Claude["Claude Code"]
     Claude --> Skill["codex-council skill<br/>SKILL.md"]
     Skill --> Panel["Compose task-specific role panel<br/>Confirm with AskUserQuestion"]
-    Panel --> Script["codex_council.py<br/>stdin context + --roles-json"]
+    Panel --> Script["codex_council.py<br/>stdin context + --roles-file"]
 
     subgraph Plugin["codex-council plugin"]
         Manifest[".claude-plugin/plugin.json"] -.-> Skill
@@ -138,8 +139,15 @@ other settings come from `~/.codex/config.toml`. No model is hardcoded.
 Sandbox and approval settings are overridden by the plugin (see
 Security above).
 
-No subprocess timeout is enforced. Each role runs as long as Codex
-takes; Ctrl+C tears down every codex process group.
+No wall-clock timeout is enforced — neither the council nor `codex
+exec` imposes a run-level deadline, so a role runs as long as Codex
+takes, hours or days. An actively-working role streams continuously,
+so codex's per-request stream-idle guard never applies to it; that
+guard only covers a stalled connection (and is retried). To widen it
+for very long quiet stretches, raise
+`model_providers.<id>.stream_idle_timeout_ms` and the retry counts in
+your own `~/.codex/config.toml`. Ctrl+C tears down every codex process
+group.
 
 ## For development
 

@@ -156,19 +156,33 @@ turn. Do not fan out without confirmation.
 
 ## Step 4 — Launch the council
 
-Once confirmed, pipe the gathered context on stdin and pass roles
-via `--roles-json`. A council call takes as long as the slowest role
-and has no wall-clock cap; use Bash `run_in_background: true` and
-wait for Claude Code's completion notification instead of
-sleep-polling.
+Once confirmed, **write the panel JSON to a file with the Write tool
+and pass its path with `--roles-file`**, piping the gathered context
+on stdin. Roles are supplied only this way — by design. A multi-role
+JSON array embedded in a shell argument is the single most common
+launch failure (one stray quote or unbalanced brace breaks the call);
+keeping the panel in a file written with the Write tool means there is
+no shell escaping to get wrong. A council call takes as long as the
+slowest role and has **no wall-clock cap** — a role may think for
+hours or days; use Bash `run_in_background: true` and wait for Claude
+Code's completion notification instead of sleep-polling.
 
 ```bash
+# 1. Write the panel to a file with the Write tool (not a heredoc) so
+#    there is zero shell escaping. Shape:
+#    [{"id":"<lens>","label":"<Title>","instruction":"<single paragraph;
+#      name the specific failure modes; include: if nothing material,
+#      say so clearly; end with: Thoroughness beats speed.>"}, ...]
+#
+# 2. Cheap pre-flight: confirm the JSON parses before fanning out.
+python3 -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8"))' /tmp/council_roles.json
+
+# 3. Launch, context on stdin.
 echo "<gathered context>" | python3 ${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py \
-  --roles-json '[{"id":"<role-you-composed>","label":"<Human Title>","instruction":"<single paragraph. specific failure modes. include: if nothing material, say so clearly. end with: Thoroughness beats speed.>"}, ...]'
+  --roles-file /tmp/council_roles.json
 ```
 
-The role objects above are placeholders — replace with the panel you
-composed in Step 2. Bare invocation (no `--roles-json`) exits 2 — a
+Bare invocation (no `--roles-file`, with context piped) exits 2 — a
 safety net for accidental fan-out.
 
 Constraints:
@@ -190,14 +204,20 @@ from one of two sources:
   the question. Compress, don't dump.
 
 Choose the smallest sufficient slice. The script hard-rejects input
-over 1 MiB; it does not truncate.
+over 10 MiB (by byte count); it does not truncate. That ceiling is a
+sanity guard, not a budget — Codex's own context window is the real
+limit, so compress regardless.
+
+In the examples below, `--roles-file roles.json` stands in for your
+panel — write it to a file with the Write tool first (see Step 4); the
+examples vary only in how the stdin context is built.
 
 ### Shell-extracted
 
 **Uncommitted diff:**
 
 ```bash
-git diff HEAD | python3 ${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py --roles-json '[...]'
+git diff HEAD | python3 ${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py --roles-file roles.json
 ```
 
 **Diff plus untracked files that matter** (with binary / size /
@@ -212,7 +232,7 @@ symlink guards):
       printf '\n=== %s ===\n' "$f"
       cat <"$f"
   done
-} | python3 ${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py --roles-json '[...]'
+} | python3 ${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py --roles-file roles.json
 ```
 
 **An artifact plus a question** — pipe the relevant file or excerpt
@@ -221,12 +241,12 @@ plus the question the council should answer:
 ```bash
 { printf 'Question: %s\n\n' '<what you want the council to check>'
   cat <"$file"      # or: head -50 data.csv, or: pbpaste, etc.
-} | python3 ${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py --roles-json '[...]'
+} | python3 ${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py --roles-file roles.json
 ```
 
 **Bounded diagnostic transcript** — for a test / CI failure or any
 command output the council should diagnose. Bound the noise so the
-question survives the 1 MiB cap:
+question survives the 10 MiB cap:
 
 ```bash
 { printf 'Question: %s\n\n' '<what should the council diagnose?>'
@@ -234,7 +254,7 @@ question survives the 1 MiB cap:
   printf 'Exit status: %s\n\n' "$exit_status"
   echo 'Output (last 128 KiB):'
   tail -c 131072 <"$log_file"
-} | python3 ${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py --roles-json '[...]'
+} | python3 ${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py --roles-file roles.json
 ```
 
 If the diagnosis needs source context too, append bounded source
@@ -250,7 +270,7 @@ fragile with multiline content and unsafe if the content contains
 `$VAR`, `$(...)`, backticks, or backslashes:
 
 ```bash
-python3 ${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py --roles-json '[...]' <<'EOF'
+python3 ${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py --roles-file roles.json <<'EOF'
 <Claude-composed digest goes here>
 EOF
 ```
@@ -292,7 +312,10 @@ per branch or task ID). The state-file name becomes
 - Auth errors never clear state and never retry — fix the auth then
   re-run.
 - No wall-clock timeout is enforced — each role runs as long as Codex
-  takes. Ctrl+C still tears down every in-flight codex process group.
+  takes (hours or days is fine). `codex exec` has no run-level timeout
+  either; its per-provider stream-idle guard only covers a stalled
+  connection and is retried. Ctrl+C still tears down every in-flight
+  codex process group.
 
 ## After Codex Council responds
 

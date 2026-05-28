@@ -61,7 +61,7 @@ def _make_role(rid="test-role", label="Test Role",
 # ---------- role resolution (custom-only; no built-in catalog) ----------
 
 class ResolveRolesTests(unittest.TestCase):
-    """The script accepts roles only via --roles-json; no positional path."""
+    """The script accepts roles only via --roles-file; no positional path."""
 
     def test_no_roles_raises_systemexit(self):
         _assert_usage_exit(
@@ -725,7 +725,7 @@ class RunTeamAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(results[0].ok)
 
 
-# ---------- --roles-json JSON parsing ----------
+# ---------- roles JSON parsing (--roles-file contents) ----------
 
 class ParseRolesJsonTests(unittest.TestCase):
     def test_single_custom_role_happy_path(self):
@@ -890,6 +890,158 @@ class ProjectRootCacheTests(unittest.TestCase):
             for _ in range(5):
                 codex_council._project_root()
         self.assertEqual(calls["count"], 1)
+
+
+# ---------- --roles-file (the sole role-input channel) ----------
+
+class ReadRolesFileTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_reads_file_contents_verbatim(self):
+        path = os.path.join(self.tmp.name, "roles.json")
+        payload = json.dumps([{"id": "a", "label": "A", "instruction": "x."}])
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(payload)
+        self.assertEqual(codex_council._read_roles_file(path), payload)
+
+    def test_missing_file_usage_exits(self):
+        missing = os.path.join(self.tmp.name, "nope.json")
+        _assert_usage_exit(
+            self, lambda: codex_council._read_roles_file(missing),
+            expect_in_stderr="cannot read",
+        )
+
+    def test_invalid_utf8_file_usage_exits(self):
+        path = os.path.join(self.tmp.name, "bad.json")
+        with open(path, "wb") as f:
+            f.write(b"\xff\xfe not utf-8")
+        _assert_usage_exit(
+            self, lambda: codex_council._read_roles_file(path),
+            expect_in_stderr="not valid UTF-8",
+        )
+
+    def test_non_ascii_role_file_roundtrips(self):
+        path = os.path.join(self.tmp.name, "roles.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump([{"id": "a", "label": "Café",
+                        "instruction": "réview €. Thoroughness beats speed."}], f)
+        roles = codex_council._parse_roles_json(codex_council._read_roles_file(path))
+        self.assertEqual(roles[0].label, "Café")
+
+    def test_empty_file_parses_to_invalid_json(self):
+        """An explicitly-supplied empty file should surface a clear JSON
+        error (main() parses unconditionally), not 'no roles requested'."""
+        path = os.path.join(self.tmp.name, "empty.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("")
+        _assert_usage_exit(
+            self,
+            lambda: codex_council._parse_roles_json(codex_council._read_roles_file(path)),
+            expect_in_stderr="invalid JSON",
+        )
+
+    def test_file_roundtrips_through_parse(self):
+        """The whole point: a file the shell never had to quote parses cleanly."""
+        path = os.path.join(self.tmp.name, "roles.json")
+        with open(path, "w") as f:
+            json.dump([
+                {"id": "alpha", "label": "A",
+                 "instruction": "do a. Thoroughness beats speed."},
+                {"id": "beta", "label": "B",
+                 "instruction": "do b. Thoroughness beats speed."},
+            ], f)
+        roles = codex_council._parse_roles_json(codex_council._read_roles_file(path))
+        self.assertEqual([r.id for r in roles], ["alpha", "beta"])
+
+
+class ReadStdinBodyTests(unittest.TestCase):
+    """The cap is a BYTE cap (the prompt is UTF-8 encoded for codex), so the
+    reader counts bytes, not characters."""
+
+    def test_returns_decoded_body_under_cap(self):
+        self.assertEqual(codex_council._read_stdin_body(io.BytesIO(b"hello")), "hello")
+
+    def test_rejects_over_byte_cap(self):
+        oversize = b"a" * (codex_council.MAX_STDIN_BYTES + 1)
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            with self.assertRaises(SystemExit) as ctx:
+                codex_council._read_stdin_body(io.BytesIO(oversize))
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("exceeds", buf.getvalue())
+
+    def test_counts_bytes_not_characters(self):
+        """Regression: 3 multibyte chars (9 bytes) must be rejected at an
+        8-byte cap. A character-count check would have let it through."""
+        with patch.object(codex_council, "MAX_STDIN_BYTES", 8):
+            payload = "€€€".encode("utf-8")  # 3 chars, 9 bytes
+            self.assertEqual(len(payload), 9)
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as ctx:
+                    codex_council._read_stdin_body(io.BytesIO(payload))
+            self.assertEqual(ctx.exception.code, 1)
+
+    def test_multibyte_under_cap_ok(self):
+        with patch.object(codex_council, "MAX_STDIN_BYTES", 16):
+            self.assertEqual(
+                codex_council._read_stdin_body(io.BytesIO("€€".encode("utf-8"))),
+                "€€",
+            )
+
+    def test_accepts_exactly_cap_bytes(self):
+        with patch.object(codex_council, "MAX_STDIN_BYTES", 8):
+            self.assertEqual(
+                codex_council._read_stdin_body(io.BytesIO(b"abcdefgh")),  # exactly 8
+                "abcdefgh",
+            )
+
+    def test_rejects_invalid_utf8(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            with self.assertRaises(SystemExit) as ctx:
+                codex_council._read_stdin_body(io.BytesIO(b"\xff\xfe bad bytes"))
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("not valid UTF-8", buf.getvalue())
+
+    def test_empty_rejected(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            with self.assertRaises(SystemExit) as ctx:
+                codex_council._read_stdin_body(io.BytesIO(b"   \n  "))
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("Empty input", buf.getvalue())
+
+
+class ArgParseTests(unittest.TestCase):
+    def test_roles_file_parses_to_namespace(self):
+        args = codex_council._parse_args(["--roles-file", "x.json"])
+        self.assertEqual(args.roles_file, "x.json")
+
+    def test_bare_invocation_leaves_roles_file_none(self):
+        args = codex_council._parse_args([])
+        self.assertIsNone(args.roles_file)
+
+    def test_roles_json_flag_is_removed(self):
+        """--roles-json no longer exists; argparse rejects it (exit 2)."""
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            with self.assertRaises(SystemExit) as ctx:
+                codex_council._parse_args(["--roles-json", "[]"])
+        self.assertEqual(ctx.exception.code, 2)
+
+
+class NoTimeoutTests(unittest.TestCase):
+    """No timeout, by design: the codex commands carry no timeout/retry
+    config overrides (those live in the user's provider-scoped codex
+    config), and the script enforces no wall-clock deadline."""
+
+    def test_commands_have_no_config_overrides(self):
+        for cmd in (codex_council._fresh_cmd("/r"),
+                    codex_council._resume_cmd("/r", "sid")):
+            self.assertNotIn("-c", cmd)
+            self.assertFalse(any("timeout" in a or "retries" in a for a in cmd))
 
 
 if __name__ == "__main__":

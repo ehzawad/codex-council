@@ -5,11 +5,13 @@ Implementation details for contributors. User-facing docs live in
 
 ## No catalog, no defaults
 
-The script accepts roles **only** via `--roles-json` (a list of
-`{id, label, instruction}` objects). There is no built-in role
-catalog, no positional shortcuts, and no `--list-roles` flag — they
-were removed in v0.2.0. Bare invocation exits 2 — the script's way
-of telling Claude to go compose a panel.
+The script accepts roles **only** via `--roles-file` (a path to a JSON
+file holding the list of `{id, label, instruction}` objects). Keeping
+the panel in a file keeps a large role array out of the shell, where a
+stray quote or brace would otherwise break the call. There is no
+built-in role catalog, no positional shortcuts, and no `--list-roles`
+flag. Bare invocation (no `--roles-file`, with context piped) exits
+2 — the script's way of telling Claude to go compose a panel.
 
 The reasoning: every hardcoded catalog is a bias. The original 6
 coding roles biased Claude toward coding panels. A later expansion to
@@ -44,7 +46,7 @@ sequenceDiagram
     participant B as codex exec (role B)
     participant N as codex exec (role N)
 
-    C->>T: Pipe context via stdin + --roles-json
+    C->>T: Pipe context via stdin + --roles-file
     par
         T->>A: bookended prompt (role A framing)
         T->>B: bookended prompt (role B framing)
@@ -81,8 +83,15 @@ Per-role errors are tagged before they hit the report:
 | (untagged stale) | Detected via `STALE_RESUME_MARKERS`; that role's state is cleared and a fresh thread is started for it only |
 
 No wall-clock cap is applied to roles or to the council as a whole —
-each role runs as long as Codex takes. `start_new_session=True` on
-each `codex exec` puts it in its own process group, so a Ctrl+C (or
-any other cancellation) sends SIGTERM (then SIGKILL) to the group and
-any shell commands codex itself spawned for tool calls are also
-reaped. POSIX-only.
+each role runs as long as Codex takes (hours or days is fine).
+`codex exec` itself has no run-level timeout. Its only default that
+could end a long-*quiet* run is the per-provider stream-idle timeout
+(`model_providers.<id>.stream_idle_timeout_ms`, 5 min, then a bounded
+retry count), which an actively-streaming role never trips. Widening
+it is left to the user's `~/.codex/config.toml` rather than overridden
+here: it is provider-scoped and the active provider id varies, so the
+council cannot target it portably. `start_new_session=True` on each
+`codex exec` puts it in its own process group, so a Ctrl+C (or any
+other cancellation) sends SIGTERM (then SIGKILL) to the group and any
+shell commands codex itself spawned for tool calls are also reaped.
+POSIX-only.
