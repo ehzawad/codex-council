@@ -960,6 +960,10 @@ class ReadStdinBodyTests(unittest.TestCase):
     """The cap is a BYTE cap (the prompt is UTF-8 encoded for codex), so the
     reader counts bytes, not characters."""
 
+    def test_max_stdin_bytes_is_exactly_10_mib(self):
+        self.assertEqual(codex_council.MAX_STDIN_BYTES, 10 << 20)
+        self.assertEqual(codex_council.MAX_STDIN_BYTES, 10 * 1024 * 1024)
+
     def test_returns_decoded_body_under_cap(self):
         self.assertEqual(codex_council._read_stdin_body(io.BytesIO(b"hello")), "hello")
 
@@ -1042,6 +1046,48 @@ class NoTimeoutTests(unittest.TestCase):
                     codex_council._resume_cmd("/r", "sid")):
             self.assertNotIn("-c", cmd)
             self.assertFalse(any("timeout" in a or "retries" in a for a in cmd))
+
+    def test_source_uses_no_run_level_timeout_primitive(self):
+        """No run-level/wall-clock timeout, by design: pin the absence of any
+        named timeout primitive so adding one is a conscious choice (this test
+        fails) rather than a silent regression. Scans executable code only —
+        comment and string/docstring spans are masked out, since this file is
+        deliberately comment-heavy about NOT having a timeout. This catches the
+        named-API timeouts below; it cannot catch a hand-rolled deadline (an
+        asyncio.sleep watchdog or a time.monotonic cancel-loop), which has no
+        fixed spelling to pin — that boundary is held by code review plus
+        test_commands_have_no_config_overrides above."""
+        import io as _io
+        import re as _re
+        import tokenize as _tokenize
+        with open(codex_council.__file__, encoding="utf-8") as f:
+            src = f.read()
+        # Mask COMMENT and STRING token spans (preserving byte offsets) so the
+        # scan sees executable code only, not prose that names these APIs.
+        masked = list(src)
+        offsets = [0]
+        for line in src.splitlines(keepends=True):
+            offsets.append(offsets[-1] + len(line))
+        for tok in _tokenize.generate_tokens(_io.StringIO(src).readline):
+            if tok.type in (_tokenize.COMMENT, _tokenize.STRING):
+                start = offsets[tok.start[0] - 1] + tok.start[1]
+                end = offsets[tok.end[0] - 1] + tok.end[1]
+                for i in range(start, end):
+                    if masked[i] != "\n":
+                        masked[i] = " "
+        code = "".join(masked)
+        # (label, regex). Identifier boundaries avoid matching benign names
+        # like `idle_timeout = N`; \s* tolerates spaced kwargs / calls.
+        forbidden = (
+            ("asyncio.wait_for", r"\basyncio\s*\.\s*wait_for\b"),
+            ("asyncio.timeout", r"\basyncio\s*\.\s*timeout(?:_at)?\b"),
+            ("signal.alarm", r"\bsignal\s*\.\s*alarm\b"),
+            ("signal.setitimer", r"\bsignal\s*\.\s*setitimer\b"),
+            (".settimeout(", r"\.\s*settimeout\s*\("),
+            ("timeout=", r"\btimeout\s*="),
+        )
+        found = [name for name, pat in forbidden if _re.search(pat, code)]
+        self.assertEqual(found, [], f"unexpected timeout primitive(s): {found}")
 
 
 if __name__ == "__main__":
