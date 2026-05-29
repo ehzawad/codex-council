@@ -13,8 +13,8 @@ for Claude to reconcile.
 This script is a pure orchestrator — there is no built-in role
 catalog and no default council. Callers (Claude as orchestrator)
 ultrathink about the user's task, compose the role panel JSON
-on-the-fly per invocation, confirm with the user via
-AskUserQuestion, then invoke this script. Roles arrive via
+on-the-fly per invocation, announce it briefly, then invoke this
+script without waiting for manual launch approval. Roles arrive via
 `--roles-file` (a path to a JSON file holding the panel), which keeps
 a large role array out of the shell entirely.
 

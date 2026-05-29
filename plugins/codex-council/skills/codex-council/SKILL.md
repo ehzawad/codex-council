@@ -14,7 +14,8 @@ description: >-
   Code's built-in `Agent` tool. Direct invocation
   `/codex-council:codex-council`. On invocation, ultrathink about
   what the user is actually doing, compose a tailored panel
-  ground-up, confirm via AskUserQuestion, then launch.
+  ground-up, announce it briefly, then launch without a manual approval
+  gate.
 ---
 
 # Codex Council
@@ -32,8 +33,9 @@ current task, not from a label on it.
 load-bearing: **ultrathink** there. Read the user's actual work,
 figure out what judgment they need, design role ids / labels /
 instructions ground-up from that specific work. There is no catalog,
-no checklist of domains, no template panel to reach for. Then confirm
-via `AskUserQuestion` and only after that trigger `codex exec`.
+no checklist of domains, no template panel to reach for. Treat your
+composed task-specific panel as granted by default: announce it
+briefly, then trigger `codex exec` without asking for launch approval.
 
 ## Disambiguation gate — only if "codex council" / "codex team" is missing
 
@@ -67,7 +69,7 @@ Look at what the user is actually doing in the conversation: what
 they've been editing, what they've been asking, what files / objects
 / drafts / queries are in flight. Then ask one question:
 
-> *What are 2–4 distinct kinds of judgment that would catch the
+> *What are 2–6 distinct kinds of judgment that would catch the
 > failure modes specific to this work?*
 
 That question — answered from the actual material in front of you —
@@ -84,7 +86,7 @@ Cheap probes if you need them (otherwise skip):
   user is working with if it isn't already in your context
 
 Compose, don't pattern-match. For the material in front of you,
-name 2–4 independent ways it could fail or mislead — wrong on the
+name 2–6 independent ways it could fail or mislead — wrong on the
 substance, wrong for the audience, wrong against prior art, wrong
 in some specific operational dimension, etc. Each is a candidate
 lens. The lens names are local to this invocation; they should not
@@ -100,7 +102,7 @@ the work shifts in one turn.
 
 ## Step 2 — Compose the panel JSON
 
-Design 2–4 roles (default 3, max 6). Each role is
+Design 2–6 roles (default 3, max 6). Each role is
 `{id, label, instruction}`:
 
 - `id` — kebab-case, `^[a-z0-9_-]+$`, ≤32 chars. Derive from the
@@ -126,36 +128,26 @@ to review something outside its lens returns "nothing material"
 instead of overlapping with its siblings. Overlap = wasted Codex
 calls.
 
-## Step 3 — Confirm with the user (interactive Q/A)
+## Step 3 — Announce the panel and proceed
 
 Write one short user-facing paragraph that names what you inferred
 the work to be (one sentence on why) and the roles you composed
 (id + one-line summary each).
 
-Then call `AskUserQuestion` to gate the launch:
+Do **not** call `AskUserQuestion` to confirm the panel, and do **not**
+wait for a launch approval response. That manual gate breaks automatic
+long-running agentic flows. The composed task-specific role panel is
+accepted by default unless the user explicitly asked to review or
+adjust the panel before launch.
 
-- Question: "Run this <N>-agent council, or adjust the panel?"
-- Header: "Panel"
-- `multiSelect: false`
-- Option 1: "Run as proposed (Recommended)" — description names the
-  roles
-- Option 2: "Adjust the panel" — description: "I'll ask one
-  follow-up"
-
-Branches:
-
-- **"Run as proposed"** → proceed to Step 4.
-- **"Adjust the panel"** → ask one short text follow-up ("What to
-  change — different count, swap a role, retune an instruction?")
-  and recompose before proceeding.
-
-**Fallback if `AskUserQuestion` is unavailable**: ask the same
-confirmation as one plain-text question and wait for the user's next
-turn. Do not fan out without confirmation.
+If the user explicitly requested panel review or adjustment, ask one
+short text follow-up ("What to change — different count, swap a role,
+retune an instruction?") and recompose before proceeding. Otherwise,
+go directly to Step 4.
 
 ## Step 4 — Launch the council
 
-Once confirmed, **write the panel JSON to a file with the Write tool
+After composing and announcing the panel, **write the panel JSON to a file with the Write tool
 and pass its path with `--roles-file`**, and write the gathered context
 to `context.md` in the same staging directory and pass it with
 `--context-file`. Roles are supplied only by file — by design. A

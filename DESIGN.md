@@ -23,7 +23,7 @@ helped non-coding work but still biased Claude toward
 "pick-from-this-shelf" rather than "compose-from-context." Pulling
 the catalog out entirely forces Claude (the orchestrator) to
 ultrathink about the user's task, design role ids/labels/instructions
-on-the-fly, confirm via AskUserQuestion, and only then fan out. The
+on-the-fly, announce the composed panel, and then fan out. The
 script's job is fan-out, retry, and reconciliation — not role
 opinions.
 

@@ -32,11 +32,10 @@ Persists across sessions — no flags needed.
 
 Claude looks at the current task, the relevant files or artifacts in
 flight, and the judgment the user actually needs, composes a tailored
-2–4 agent panel, and asks you to confirm via Claude Code's
-`AskUserQuestion` tool. One click runs the panel as proposed;
-alternatively you can adjust the count or roles. Each role keeps its
-own Codex thread per project and host session, so framings accumulate
-across calls in the same terminal/session if you reuse role IDs.
+2–6 agent panel, announces it briefly, and launches without a manual
+launch approval gate. Each role keeps its own Codex thread per
+project and host session, so framings accumulate across calls in the
+same terminal/session if you reuse role IDs.
 
 Auto-trigger phrases (natural language) are restricted to:
 
@@ -78,7 +77,7 @@ The JSON role spec, retries, and panel-proposal flow are documented in
 flowchart LR
     User["User"] --> Claude["Claude Code"]
     Claude --> Skill["codex-council skill<br/>SKILL.md"]
-    Skill --> Panel["Compose task-specific role panel<br/>Confirm with AskUserQuestion"]
+    Skill --> Panel["Compose task-specific role panel<br/>Announce and launch"]
     Panel --> Script["codex_council.py<br/>--roles-file + --context-file"]
 
     subgraph Plugin["codex-council plugin"]
@@ -123,8 +122,7 @@ sequenceDiagram
 
     U->>C: Invoke codex-council
     C->>C: Compose task-specific role panel
-    C->>U: Confirm panel
-    U-->>C: Run as proposed
+    C->>U: Announce panel
     C->>F: mktemp -d once
     C->>F: Write roles.json and context.md
     C->>S: --check-staging-dir F
