@@ -184,7 +184,7 @@ After the one-time restart, edits to `plugins/codex-council/**` are live on the 
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c '/absolute/path/to/codex-council/scripts/dev-link.sh >/dev/null 2>&1 || true'"
+            "command": "bash -lc 'mkdir -p \"$HOME/.claude/logs\"; log=\"$HOME/.claude/logs/codex-council-dev-link.log\"; \"/absolute/path/to/codex-council/scripts/dev-link.sh\" >>\"$log\" 2>&1; rc=$?; if [ \"$rc\" -ne 0 ]; then printf \"%s dev-link failed exit=%s\\n\" \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" \"$rc\" >>\"$log\"; fi; exit 0'"
           }
         ]
       }
@@ -193,7 +193,12 @@ After the one-time restart, edits to `plugins/codex-council/**` are live on the 
 }
 ```
 
-Failures are swallowed (`|| true`) so a missing repo or broken script never blocks session startup. Merge into your existing `hooks.SessionStart` array if you already have one (don't replace it).
+Failures remain fail-open (`exit 0`) so a missing repo or broken dev-link script
+never blocks session startup, but diagnostics are logged to
+`~/.claude/logs/codex-council-dev-link.log`. Keep this fail-open behavior limited
+to the development startup hook; council launch/context pipelines in `SKILL.md`
+should fail closed with `set -euo pipefail`. Merge into your existing
+`hooks.SessionStart` array if you already have one (don't replace it).
 
 ## License
 

@@ -51,11 +51,26 @@ def _assert_usage_exit(test, callable_, *, expect_in_stderr):
     test.assertIn(expect_in_stderr, buf.getvalue())
 
 
+def _valid_instruction(prefix="x"):
+    return (
+        f"{prefix}; if nothing material, say so clearly. "
+        "Thoroughness beats speed."
+    )
+
+
 def _make_role(rid="test-role", label="Test Role",
-               instruction="x. Thoroughness beats speed."):
+               instruction=None):
     """Construct a Role for tests. The script has no built-in catalog,
     so tests build Role instances directly."""
+    if instruction is None:
+        instruction = _valid_instruction("x")
     return codex_council.Role(rid, label, instruction)
+
+
+def _role_json(rid="alpha", label="A", instruction=None):
+    if instruction is None:
+        instruction = _valid_instruction("review")
+    return {"id": rid, "label": label, "instruction": instruction}
 
 
 # ---------- role resolution (custom-only; no built-in catalog) ----------
@@ -70,24 +85,24 @@ class ResolveRolesTests(unittest.TestCase):
         )
 
     def test_resolve_returns_roles_in_input_order(self):
-        a = _make_role("alpha", "Alpha", "do alpha. Thoroughness beats speed.")
-        b = _make_role("beta", "Beta", "do beta. Thoroughness beats speed.")
-        c = _make_role("gamma", "Gamma", "do gamma. Thoroughness beats speed.")
+        a = _make_role("alpha", "Alpha", _valid_instruction("do alpha"))
+        b = _make_role("beta", "Beta", _valid_instruction("do beta"))
+        c = _make_role("gamma", "Gamma", _valid_instruction("do gamma"))
         roles = codex_council._resolve_roles([a, b, c])
         self.assertEqual([r.id for r in roles], ["alpha", "beta", "gamma"])
 
     def test_resolve_deduplicates_by_id_keeping_first(self):
         """Defense in depth — _parse_roles_json already rejects dupes,
         but _resolve_roles should also be safe if called with dupes."""
-        a1 = _make_role("alpha", "A1", "first. Thoroughness beats speed.")
-        a2 = _make_role("alpha", "A2", "second. Thoroughness beats speed.")
+        a1 = _make_role("alpha", "A1", _valid_instruction("first"))
+        a2 = _make_role("alpha", "A2", _valid_instruction("second"))
         roles = codex_council._resolve_roles([a1, a2])
         self.assertEqual([r.id for r in roles], ["alpha"])
         self.assertEqual(roles[0].label, "A1")  # first wins
 
     def test_resolve_at_cap_is_allowed(self):
         roles_in = [
-            _make_role(f"r{i}", f"R{i}", "x. Thoroughness beats speed.")
+            _make_role(f"r{i}", f"R{i}", _valid_instruction("x"))
             for i in range(codex_council.MAX_PARALLEL)
         ]
         roles = codex_council._resolve_roles(roles_in)
@@ -95,7 +110,7 @@ class ResolveRolesTests(unittest.TestCase):
 
     def test_resolve_over_cap_raises(self):
         roles_in = [
-            _make_role(f"r{i}", f"R{i}", "x. Thoroughness beats speed.")
+            _make_role(f"r{i}", f"R{i}", _valid_instruction("x"))
             for i in range(codex_council.MAX_PARALLEL + 1)
         ]
         _assert_usage_exit(
@@ -282,6 +297,16 @@ class ExtractSessionIDTests(unittest.TestCase):
         jsonl = "junk\n\n{malformed\n" '{"type":"thread.started","thread_id":"x"}'
         self.assertEqual(codex_council.extract_session_id(jsonl), "x")
 
+    def test_skips_non_object_json_and_invalid_thread_ids(self):
+        jsonl = "\n".join([
+            "[]",
+            "null",
+            '{"type":"thread.started","thread_id":123}',
+            '{"type":"thread.started","thread_id":""}',
+            '{"type":"thread.started","thread_id":"valid"}',
+        ])
+        self.assertEqual(codex_council.extract_session_id(jsonl), "valid")
+
 
 class ExtractFinalMessageTests(unittest.TestCase):
     def test_returns_last_agent_message(self):
@@ -294,6 +319,44 @@ class ExtractFinalMessageTests(unittest.TestCase):
     def test_returns_none_with_no_agent_message(self):
         jsonl = '{"type":"item.completed","item":{"type":"command_execution"}}'
         self.assertIsNone(codex_council.extract_final_message(jsonl))
+
+    def test_skips_non_object_events_items_and_text(self):
+        jsonl = "\n".join([
+            "[]",
+            '{"type":"item.completed","item":null}',
+            '{"type":"item.completed","item":[]}',
+            '{"type":"item.completed","item":{"type":"agent_message","text":123}}',
+            '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}',
+        ])
+        self.assertEqual(codex_council.extract_final_message(jsonl), "ok")
+
+
+class ExtractErrorMessagesTests(unittest.TestCase):
+    def test_extracts_error_message(self):
+        jsonl = '{"type":"error","message":"401 unauthorized"}'
+        self.assertEqual(codex_council.extract_error_messages(jsonl), ["401 unauthorized"])
+
+    def test_extracts_turn_failed_error_message(self):
+        jsonl = '{"type":"turn.failed","error":{"message":"HTTP 429 Too Many Requests"}}'
+        self.assertEqual(
+            codex_council.extract_error_messages(jsonl),
+            ["HTTP 429 Too Many Requests"],
+        )
+
+    def test_extracts_nested_codex_error_message_and_dedupes(self):
+        inner = json.dumps({
+            "type": "error",
+            "status": 400,
+            "error": {"message": "The model is unsupported."},
+        })
+        jsonl = "\n".join([
+            json.dumps({"type": "error", "message": inner}),
+            json.dumps({"type": "turn.failed", "error": {"message": inner}}),
+        ])
+        self.assertEqual(
+            codex_council.extract_error_messages(jsonl),
+            [inner, "The model is unsupported."],
+        )
 
 
 # ---------- error classifiers ----------
@@ -334,7 +397,7 @@ class ClassifierTests(unittest.TestCase):
 class ComposePromptTests(unittest.TestCase):
     def test_bookends_with_role_instruction(self):
         role = _make_role("architect", "Architect",
-                          "Review as architect. Thoroughness beats speed.")
+                          _valid_instruction("Review as architect"))
         out = codex_council._compose_prompt(role, "BODY")
         self.assertTrue(out.startswith(role.instruction + "\n\n"))
         self.assertTrue(out.endswith("\n\n" + role.instruction))
@@ -342,11 +405,11 @@ class ComposePromptTests(unittest.TestCase):
 
     def test_different_roles_produce_different_prompts(self):
         a = codex_council._compose_prompt(
-            _make_role("architect", "Architect", "review arch. Thoroughness beats speed."),
+            _make_role("architect", "Architect", _valid_instruction("review arch")),
             "x",
         )
         s = codex_council._compose_prompt(
-            _make_role("security", "Security", "review sec. Thoroughness beats speed."),
+            _make_role("security", "Security", _valid_instruction("review sec")),
             "x",
         )
         self.assertNotEqual(a, s)
@@ -492,6 +555,44 @@ class RunRoleAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.ok)
         self.assertTrue(result.error.startswith("[retriable:5xx]"))
 
+    async def test_stdout_error_jsonl_classifies_auth(self):
+        role = _make_role("architect", "Architect")
+        stdout = json.dumps({"type": "error", "message": "401 unauthorized"})
+        async def fake_subproc(cmd, prompt):
+            return 1, stdout, ""
+        with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
+            result = await codex_council._run_role_once(role, "prompt", attempt=1)
+        self.assertFalse(result.ok)
+        self.assertTrue(result.error.startswith("[auth]"))
+
+    async def test_stdout_turn_failed_jsonl_classifies_rate_limit(self):
+        role = _make_role("architect", "Architect")
+        stdout = json.dumps({
+            "type": "turn.failed",
+            "error": {"message": "HTTP 429 Too Many Requests"},
+        })
+        async def fake_subproc(cmd, prompt):
+            return 1, stdout, ""
+        with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
+            result = await codex_council._run_role_once(role, "prompt", attempt=1)
+        self.assertFalse(result.ok)
+        self.assertTrue(result.error.startswith("[retriable:rate-limit]"))
+
+    async def test_stdout_nested_json_error_is_reported(self):
+        role = _make_role("architect", "Architect")
+        inner = json.dumps({
+            "type": "error",
+            "status": 400,
+            "error": {"message": "The model is unsupported."},
+        })
+        stdout = json.dumps({"type": "turn.failed", "error": {"message": inner}})
+        async def fake_subproc(cmd, prompt):
+            return 1, stdout, ""
+        with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
+            result = await codex_council._run_role_once(role, "prompt", attempt=1)
+        self.assertFalse(result.ok)
+        self.assertIn("The model is unsupported.", result.error)
+
     async def test_no_agent_message_returns_failure_without_saving(self):
         role = _make_role("architect", "Architect")
         async def fake_subproc(cmd, prompt):
@@ -519,6 +620,43 @@ class RunRoleAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(calls), 2, "expected resume → fresh fallthrough")
         sid, _ = codex_council.load_session("architect")
         self.assertEqual(sid, "brand-new-sid")
+
+    async def test_stale_resume_with_429_in_thread_id_still_restarts_fresh(self):
+        role = _make_role("architect", "Architect")
+        codex_council.save_session("architect", "stale-429-sid")
+        calls = []
+        async def fake_subproc(cmd, prompt):
+            calls.append(cmd)
+            if "resume" in cmd:
+                return (
+                    1, "",
+                    "Error: no rollout found for thread id stale-429-sid",
+                )
+            return 0, _fresh_jsonl("brand-new-sid", "fresh ok"), ""
+        with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
+            result = await codex_council._run_role_once(role, "prompt", attempt=1)
+        self.assertTrue(result.ok)
+        self.assertEqual(len(calls), 2)
+        sid, _ = codex_council.load_session("architect")
+        self.assertEqual(sid, "brand-new-sid")
+
+    async def test_stale_resume_detected_from_stdout_jsonl(self):
+        role = _make_role("architect", "Architect")
+        codex_council.save_session("architect", "stale-sid")
+        calls = []
+        stdout = json.dumps({
+            "type": "turn.failed",
+            "error": {"message": "no rollout found for thread id stale-sid"},
+        })
+        async def fake_subproc(cmd, prompt):
+            calls.append(cmd)
+            if "resume" in cmd:
+                return 1, stdout, ""
+            return 0, _fresh_jsonl("brand-new-sid", "fresh ok"), ""
+        with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
+            result = await codex_council._run_role_once(role, "prompt", attempt=1)
+        self.assertTrue(result.ok)
+        self.assertEqual(len(calls), 2)
 
     async def test_resume_thread_id_mismatch_adopts_new_id_without_rerun(self):
         """Codex resume-with-bogus-id silently spawns a new thread.
@@ -572,6 +710,22 @@ class RunRoleAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(sid)
 
 
+class TerminateProcessGroupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sigkill_sent_even_if_grace_sleep_is_cancelled(self):
+        class Proc:
+            returncode = 0
+
+        async def cancelled_sleep(_):
+            raise asyncio.CancelledError()
+
+        with patch.object(codex_council.os, "killpg") as killpg:
+            with patch.object(codex_council.asyncio, "sleep", side_effect=cancelled_sleep):
+                with self.assertRaises(asyncio.CancelledError):
+                    await codex_council._terminate_process_group(Proc(), pgid=12345)
+        killpg.assert_any_call(12345, codex_council.signal.SIGTERM)
+        killpg.assert_any_call(12345, codex_council.signal.SIGKILL)
+
+
 class FormatReportWarningTests(unittest.TestCase):
     def test_warning_field_renders_in_role_section(self):
         role = _make_role("architect", "Architect")
@@ -582,6 +736,17 @@ class FormatReportWarningTests(unittest.TestCase):
         out = codex_council._format_report([result], 0.1)
         self.assertIn("_Warning: thread continuity lost_", out)
         self.assertIn("WARNING", out)  # in summary line too
+
+    def test_report_metadata_newlines_are_escaped(self):
+        role = _make_role("architect", "Good\n## Forged")
+        result = codex_council.RoleResult(
+            role=role, ok=False, error="boom\n## Injected", elapsed_seconds=0.1,
+        )
+        out = codex_council._format_report([result], 0.1)
+        self.assertNotIn("\n## Forged", out)
+        self.assertNotIn("\n## Injected", out)
+        self.assertIn("Good\\n## Forged", out)
+        self.assertIn("boom\\n## Injected", out)
 
 
 class RunRoleWithRetryTests(unittest.IsolatedAsyncioTestCase):
@@ -724,6 +889,66 @@ class RunTeamAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results[0].role.id, "ml-fairness")
         self.assertTrue(results[0].ok)
 
+    async def test_same_role_runs_are_serialized_by_state_lock(self):
+        role = _make_role("architect", "Architect")
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        calls = []
+        active = {"count": 0, "max": 0}
+
+        async def fake_subproc(cmd, prompt):
+            calls.append(cmd)
+            active["count"] += 1
+            active["max"] = max(active["max"], active["count"])
+            try:
+                if len(calls) == 1:
+                    first_started.set()
+                    await release_first.wait()
+                if "resume" in cmd:
+                    return 0, _resume_jsonl_no_thread_event("resumed"), ""
+                return 0, _fresh_jsonl("sid-first", "fresh"), ""
+            finally:
+                active["count"] -= 1
+
+        with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
+            t1 = asyncio.create_task(codex_council._run_role(role, "prompt-1"))
+            await first_started.wait()
+            t2 = asyncio.create_task(codex_council._run_role(role, "prompt-2"))
+            await asyncio.sleep(0.05)
+            self.assertEqual(active["max"], 1)
+            release_first.set()
+            results = await asyncio.gather(t1, t2)
+
+        self.assertTrue(all(r.ok for r in results))
+        self.assertEqual(sum(1 for cmd in calls if "resume" in cmd), 1)
+        self.assertEqual(sum(1 for cmd in calls if "resume" not in cmd), 1)
+
+    async def test_different_roles_still_run_concurrently(self):
+        roles = self._roles("architect", "security")
+        both_started = asyncio.Event()
+        release = asyncio.Event()
+        active = {"count": 0, "max": 0}
+
+        async def fake_subproc(cmd, prompt):
+            active["count"] += 1
+            active["max"] = max(active["max"], active["count"])
+            if active["count"] == 2:
+                both_started.set()
+            try:
+                await release.wait()
+                return 0, _fresh_jsonl(f"sid-{len(prompt)}", "ok"), ""
+            finally:
+                active["count"] -= 1
+
+        with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
+            tasks = [asyncio.create_task(codex_council._run_role(r, "prompt")) for r in roles]
+            await both_started.wait()
+            self.assertEqual(active["max"], 2)
+            release.set()
+            results = await asyncio.gather(*tasks)
+
+        self.assertTrue(all(r.ok for r in results))
+
 
 class RunCouncilProgressTests(unittest.IsolatedAsyncioTestCase):
     """run_council emits a per-role completion line to stderr as each role
@@ -801,30 +1026,25 @@ class RunCouncilProgressTests(unittest.IsolatedAsyncioTestCase):
 
 class ParseRolesJsonTests(unittest.TestCase):
     def test_single_custom_role_happy_path(self):
-        raw = json.dumps([{
-            "id": "ml-fairness",
-            "label": "ML Fairness",
-            "instruction": "Audit for bias.",
-        }])
+        instruction = _valid_instruction("Audit for bias")
+        raw = json.dumps([_role_json("ml-fairness", "ML Fairness", instruction)])
         roles = codex_council._parse_roles_json(raw)
         self.assertEqual(len(roles), 1)
         self.assertEqual(roles[0].id, "ml-fairness")
         self.assertEqual(roles[0].label, "ML Fairness")
-        self.assertEqual(roles[0].instruction, "Audit for bias.")
+        self.assertEqual(roles[0].instruction, instruction)
 
     def test_multiple_custom_roles_preserve_order(self):
         raw = json.dumps([
-            {"id": "alpha", "label": "A", "instruction": "do a."},
-            {"id": "beta", "label": "B", "instruction": "do b."},
-            {"id": "gamma", "label": "G", "instruction": "do g."},
+            _role_json("alpha", "A", _valid_instruction("do a")),
+            _role_json("beta", "B", _valid_instruction("do b")),
+            _role_json("gamma", "G", _valid_instruction("do g")),
         ])
         roles = codex_council._parse_roles_json(raw)
         self.assertEqual([r.id for r in roles], ["alpha", "beta", "gamma"])
 
     def test_longer_id_allowed_up_to_32(self):
-        raw = json.dumps([{
-            "id": "a" * 32, "label": "L", "instruction": "x.",
-        }])
+        raw = json.dumps([_role_json("a" * 32, "L")])
         roles = codex_council._parse_roles_json(raw)
         self.assertEqual(roles[0].id, "a" * 32)
 
@@ -849,14 +1069,14 @@ class ParseRolesJsonTests(unittest.TestCase):
         )
 
     def test_missing_id_field_raises(self):
-        raw = json.dumps([{"label": "L", "instruction": "x."}])
+        raw = json.dumps([{"label": "L", "instruction": _valid_instruction("x")}])
         _assert_usage_exit(
             self, lambda: codex_council._parse_roles_json(raw),
             expect_in_stderr="missing field 'id'",
         )
 
     def test_missing_label_field_raises(self):
-        raw = json.dumps([{"id": "x", "instruction": "x."}])
+        raw = json.dumps([{"id": "x", "instruction": _valid_instruction("x")}])
         _assert_usage_exit(
             self, lambda: codex_council._parse_roles_json(raw),
             expect_in_stderr="missing field 'label'",
@@ -870,7 +1090,7 @@ class ParseRolesJsonTests(unittest.TestCase):
         )
 
     def test_empty_string_field_raises(self):
-        raw = json.dumps([{"id": "x", "label": "", "instruction": "x."}])
+        raw = json.dumps([{"id": "x", "label": "", "instruction": _valid_instruction("x")}])
         _assert_usage_exit(
             self, lambda: codex_council._parse_roles_json(raw),
             expect_in_stderr="non-empty string",
@@ -883,24 +1103,85 @@ class ParseRolesJsonTests(unittest.TestCase):
             expect_in_stderr="non-empty string",
         )
 
+    def test_label_newline_raises(self):
+        raw = json.dumps([_role_json("x", "Good\nForged")])
+        _assert_usage_exit(
+            self, lambda: codex_council._parse_roles_json(raw),
+            expect_in_stderr="label must not contain newlines",
+        )
+
+    def test_instruction_newline_raises(self):
+        raw = json.dumps([_role_json("x", "L", "one\ntwo")])
+        _assert_usage_exit(
+            self, lambda: codex_council._parse_roles_json(raw),
+            expect_in_stderr="single paragraph",
+        )
+
+    def test_instruction_unicode_line_separator_raises(self):
+        raw = json.dumps([_role_json("x", "L", "one\u2028two")])
+        _assert_usage_exit(
+            self, lambda: codex_council._parse_roles_json(raw),
+            expect_in_stderr="single paragraph",
+        )
+
+    def test_label_at_byte_cap_allowed(self):
+        raw = json.dumps([_role_json("x", "a" * codex_council.ROLE_LABEL_MAX_BYTES)])
+        roles = codex_council._parse_roles_json(raw)
+        self.assertEqual(roles[0].label, "a" * codex_council.ROLE_LABEL_MAX_BYTES)
+
+    def test_label_over_byte_cap_raises(self):
+        raw = json.dumps([_role_json("x", "a" * (codex_council.ROLE_LABEL_MAX_BYTES + 1))])
+        _assert_usage_exit(
+            self, lambda: codex_council._parse_roles_json(raw),
+            expect_in_stderr="label exceeds",
+        )
+
+    def test_instruction_over_byte_cap_raises(self):
+        oversized = "a" * (codex_council.ROLE_INSTRUCTION_MAX_BYTES + 1)
+        raw = json.dumps([_role_json("x", "L", oversized)])
+        _assert_usage_exit(
+            self, lambda: codex_council._parse_roles_json(raw),
+            expect_in_stderr="instruction exceeds",
+        )
+
+    def test_instruction_size_counts_utf8_bytes(self):
+        with patch.object(codex_council, "ROLE_INSTRUCTION_MAX_BYTES", 4):
+            raw = json.dumps([_role_json("x", "L", "€€")])
+            _assert_usage_exit(
+                self, lambda: codex_council._parse_roles_json(raw),
+                expect_in_stderr="instruction exceeds",
+            )
+
+    def test_instruction_requires_scope_phrase(self):
+        raw = json.dumps([_role_json("x", "L", "Review only. Thoroughness beats speed.")])
+        _assert_usage_exit(
+            self, lambda: codex_council._parse_roles_json(raw),
+            expect_in_stderr="nothing material",
+        )
+
+    def test_instruction_requires_cadence_sentence(self):
+        raw = json.dumps([_role_json("x", "L", "Review; if nothing material, say so clearly.")])
+        _assert_usage_exit(
+            self, lambda: codex_council._parse_roles_json(raw),
+            expect_in_stderr="Thoroughness beats speed.",
+        )
+
     def test_bad_id_regex_uppercase_raises(self):
-        raw = json.dumps([{"id": "BadID", "label": "L", "instruction": "x."}])
+        raw = json.dumps([_role_json("BadID", "L")])
         _assert_usage_exit(
             self, lambda: codex_council._parse_roles_json(raw),
             expect_in_stderr="must match",
         )
 
     def test_bad_id_regex_with_dot_raises(self):
-        raw = json.dumps([{"id": "ml.fairness", "label": "L", "instruction": "x."}])
+        raw = json.dumps([_role_json("ml.fairness", "L")])
         _assert_usage_exit(
             self, lambda: codex_council._parse_roles_json(raw),
             expect_in_stderr="must match",
         )
 
     def test_id_over_32_chars_raises(self):
-        raw = json.dumps([{
-            "id": "a" * 33, "label": "L", "instruction": "x.",
-        }])
+        raw = json.dumps([_role_json("a" * 33, "L")])
         _assert_usage_exit(
             self, lambda: codex_council._parse_roles_json(raw),
             expect_in_stderr="exceeds 32",
@@ -908,8 +1189,8 @@ class ParseRolesJsonTests(unittest.TestCase):
 
     def test_duplicate_id_in_payload_raises(self):
         raw = json.dumps([
-            {"id": "alpha", "label": "A", "instruction": "do a."},
-            {"id": "alpha", "label": "A2", "instruction": "again."},
+            _role_json("alpha", "A", _valid_instruction("do a")),
+            _role_json("alpha", "A2", _valid_instruction("again")),
         ])
         _assert_usage_exit(
             self, lambda: codex_council._parse_roles_json(raw),
@@ -923,9 +1204,9 @@ class ResolveRolesJsonIntegrationTests(unittest.TestCase):
     def test_json_invocation_resolves(self):
         raw = json.dumps([
             {"id": "data-pipeline", "label": "Data",
-             "instruction": "review pipeline. Thoroughness beats speed."},
+             "instruction": _valid_instruction("review pipeline")},
             {"id": "ml-fairness", "label": "Fair",
-             "instruction": "audit bias. Thoroughness beats speed."},
+             "instruction": _valid_instruction("audit bias")},
         ])
         custom = codex_council._parse_roles_json(raw)
         roles = codex_council._resolve_roles(custom)
@@ -935,7 +1216,7 @@ class ResolveRolesJsonIntegrationTests(unittest.TestCase):
         """MAX_PARALLEL + 1 custom roles must reject."""
         entries = [
             {"id": f"role-{i}", "label": f"R{i}",
-             "instruction": "x. Thoroughness beats speed."}
+             "instruction": _valid_instruction("x")}
             for i in range(codex_council.MAX_PARALLEL + 1)
         ]
         custom = codex_council._parse_roles_json(json.dumps(entries))
@@ -973,7 +1254,7 @@ class ReadRolesFileTests(unittest.TestCase):
 
     def test_reads_file_contents_verbatim(self):
         path = os.path.join(self.tmp.name, "roles.json")
-        payload = json.dumps([{"id": "a", "label": "A", "instruction": "x."}])
+        payload = json.dumps([_role_json("a", "A")])
         with open(path, "w", encoding="utf-8") as f:
             f.write(payload)
         self.assertEqual(codex_council._read_roles_file(path), payload)
@@ -983,6 +1264,12 @@ class ReadRolesFileTests(unittest.TestCase):
         _assert_usage_exit(
             self, lambda: codex_council._read_roles_file(missing),
             expect_in_stderr="cannot read",
+        )
+
+    def test_empty_path_usage_exits(self):
+        _assert_usage_exit(
+            self, lambda: codex_council._read_roles_file(""),
+            expect_in_stderr="non-empty",
         )
 
     def test_invalid_utf8_file_usage_exits(self):
@@ -998,7 +1285,7 @@ class ReadRolesFileTests(unittest.TestCase):
         path = os.path.join(self.tmp.name, "roles.json")
         with open(path, "w", encoding="utf-8") as f:
             json.dump([{"id": "a", "label": "Café",
-                        "instruction": "réview €. Thoroughness beats speed."}], f)
+                        "instruction": _valid_instruction("réview €")}], f)
         roles = codex_council._parse_roles_json(codex_council._read_roles_file(path))
         self.assertEqual(roles[0].label, "Café")
 
@@ -1020,9 +1307,9 @@ class ReadRolesFileTests(unittest.TestCase):
         with open(path, "w") as f:
             json.dump([
                 {"id": "alpha", "label": "A",
-                 "instruction": "do a. Thoroughness beats speed."},
+                 "instruction": _valid_instruction("do a")},
                 {"id": "beta", "label": "B",
-                 "instruction": "do b. Thoroughness beats speed."},
+                 "instruction": _valid_instruction("do b")},
             ], f)
         roles = codex_council._parse_roles_json(codex_council._read_roles_file(path))
         self.assertEqual([r.id for r in roles], ["alpha", "beta"])
@@ -1090,10 +1377,35 @@ class ReadStdinBodyTests(unittest.TestCase):
         self.assertIn("Empty input", buf.getvalue())
 
 
+class PromptSizeTests(unittest.TestCase):
+    def test_composed_prompt_at_cap_allowed(self):
+        role = codex_council.Role("architect", "Architect", "i")
+        with patch.object(codex_council, "MAX_PROMPT_BYTES", len("i\n\nb\n\ni")):
+            codex_council._validate_prompt_size(role, "b")
+
+    def test_composed_prompt_over_cap_exits_1(self):
+        role = codex_council.Role("architect", "Architect", "i")
+        buf = io.StringIO()
+        with patch.object(codex_council, "MAX_PROMPT_BYTES", len("i\n\nb\n\ni") - 1):
+            with contextlib.redirect_stderr(buf):
+                with self.assertRaises(SystemExit) as ctx:
+                    codex_council._validate_prompt_size(role, "b")
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("architect", buf.getvalue())
+
+
 class ArgParseTests(unittest.TestCase):
     def test_roles_file_parses_to_namespace(self):
         args = codex_council._parse_args(["--roles-file", "x.json"])
         self.assertEqual(args.roles_file, "x.json")
+
+    def test_empty_roles_file_rejected(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            with self.assertRaises(SystemExit) as ctx:
+                codex_council._parse_args(["--roles-file", ""])
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertIn("must be non-empty", buf.getvalue())
 
     def test_bare_invocation_leaves_roles_file_none(self):
         args = codex_council._parse_args([])
@@ -1160,6 +1472,30 @@ class NoTimeoutTests(unittest.TestCase):
         )
         found = [name for name, pat in forbidden if _re.search(pat, code)]
         self.assertEqual(found, [], f"unexpected timeout primitive(s): {found}")
+
+
+class DocsContractTests(unittest.TestCase):
+    def _repo_file(self, *parts):
+        return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", *parts))
+
+    def test_skill_context_pipelines_are_fail_closed_and_filename_safe(self):
+        path = self._repo_file(
+            "plugins", "codex-council", "skills", "codex-council", "SKILL.md"
+        )
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn("set -euo pipefail", text)
+        self.assertIn("git ls-files -z", text)
+        self.assertIn("read -r -d ''", text)
+        self.assertIn("file --brief --mime --", text)
+        self.assertIn("git diff --cached", text)
+
+    def test_readme_dev_hook_keeps_diagnostics(self):
+        path = self._repo_file("README.md")
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn("codex-council-dev-link.log", text)
+        self.assertNotIn(">/dev/null 2>&1 || true", text)
 
 
 if __name__ == "__main__":

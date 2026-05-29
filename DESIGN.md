@@ -71,6 +71,13 @@ the requested ID, it adopts the new ID and warns. It does **not**
 re-run — the turn has already completed on the new thread; re-running
 burns tokens for no benefit.
 
+Per-role state is protected by a POSIX advisory lock keyed by
+`(project, session key, role)`. The lock is held across the whole
+load/resume-or-fresh/save retry loop, not just individual file reads
+or writes, so two council processes cannot concurrently resume the
+same role thread and then last-writer-wins the state file. Different
+roles still run in parallel.
+
 ## Failure-class tagging
 
 Per-role errors are tagged before they hit the report:
@@ -82,6 +89,11 @@ Per-role errors are tagged before they hit the report:
 | `[orchestrator-exception]` | A role's coroutine raised — siblings still complete via `gather(..., return_exceptions=True)` |
 | (untagged stale) | Detected via `STALE_RESUME_MARKERS`; that role's state is cleared and a fresh thread is started for it only |
 
+Classification uses stderr plus structured Codex JSONL stdout error
+events (`type:error`, `turn.failed`). JSONL parsing intentionally
+skips malformed and non-object events while preserving later valid
+agent messages.
+
 No wall-clock cap is applied to roles or to the council as a whole —
 each role runs as long as Codex takes (hours or days is fine).
 `codex exec` itself has no run-level timeout. Its only default that
@@ -92,6 +104,9 @@ it is left to the user's `~/.codex/config.toml` rather than overridden
 here: it is provider-scoped and the active provider id varies, so the
 council cannot target it portably. `start_new_session=True` on each
 `codex exec` puts it in its own process group, so a Ctrl+C (or any
-other cancellation) sends SIGTERM (then SIGKILL) to the group and any
-shell commands codex itself spawned for tool calls are also reaped.
+other cancellation) sends SIGTERM, waits briefly, then sends SIGKILL
+to the group; any shell commands codex itself spawned for tool calls
+are also reaped. SIGINT/SIGTERM/SIGHUP to the council process cancel
+the fan-out first, then exit without emitting the final
+`CODEX_COUNCIL_DONE` sentinel.
 POSIX-only.

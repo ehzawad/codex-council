@@ -115,9 +115,8 @@ Design 2–4 roles (default 3, max 6). Each role is
     instruction reads like a checklist a human expert would run; a
     useless one reads like "review for quality and clarity."
   - **Honest about scope.** Include the literal clause
-    **"if nothing material, say so clearly"** (or a close
-    paraphrase) so the role can return silence rather than bluffing
-    when out of its lens.
+    **"if nothing material, say so clearly"** so the role can return
+    silence rather than bluffing when out of its lens.
   - **Conventionally paced.** End with the literal sentence
     **"Thoroughness beats speed."** This shapes Codex's cadence and
     is checked by tests.
@@ -221,6 +220,12 @@ it arrives, read `RUNDIR/out.md` for the report; read `RUNDIR/err.log`
 for per-role progress and the final `[codex-council] CODEX_COUNCIL_DONE ...` line
 (its presence means the report is fully written; it carries the exit code).
 
+The process exit code is deliberately council-level and partial-failure
+tolerant: it is `0` when at least one role responds and `1` only when every
+role fails. Treat shell status as transport status. Always inspect the report
+Summary and the sentinel's `ok=N total=M exit=X` fields before deciding the
+council succeeded.
+
 If a run is ever lost or orphaned, recover entirely from disk:
 
 ```bash
@@ -240,8 +245,9 @@ Constraints:
 
 - Max 6 roles per call (matches Codex's concurrent-thread default).
 - `id`: `^[a-z0-9_-]+$`, ≤32 chars.
-- `label`: non-empty.
-- `instruction`: non-empty single paragraph.
+- `label`: non-empty single line, ≤80 UTF-8 bytes.
+- `instruction`: non-empty single paragraph, ≤8192 UTF-8 bytes; must include
+  "nothing material" and must end with "Thoroughness beats speed."
 
 ## Building the context
 
@@ -264,42 +270,86 @@ sanity guard, not a budget — Codex's own context window is the real
 limit, so compress regardless.
 
 In the examples below, `RUNDIR` is the private per-run dir from Step 4 and
-`RUNDIR/roles.json` stands in for your panel (write it with the Write tool
-first). The trailing `> RUNDIR/out.md 2> RUNDIR/err.log` is Step 4's mandatory
-redirection — these are complete launches, so each must still run under Bash
-`run_in_background: true` with nothing appended. The examples vary only in how
-the stdin context is built.
+`RUNDIR/roles.json` stands in for your panel. Every pipeline block starts with
+`set -euo pipefail`. Put that line in the same Bash invocation as the pipeline;
+shell options do not persist across Claude Code Bash calls. This makes context
+extraction fail closed: if an upstream extractor (`git diff`, `git ls-files`,
+`tail`, etc.) fails, the council is not launched on partial context. Do not add
+`|| true` to council launch or context pipelines.
+
+Staging context: `git diff HEAD` means tracked worktree vs `HEAD`, so it
+includes both staged and unstaged tracked changes. Use `git diff --cached` for
+staged-only reviews and `git diff` for unstaged-only reviews. Untracked files
+are never included by those diff commands; add them explicitly with the
+NUL-delimited snippet below when they matter.
 
 ### Shell-extracted
 
 **Uncommitted diff:**
 
 ```bash
-git diff HEAD | python3 ${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py --roles-file RUNDIR/roles.json > RUNDIR/out.md 2> RUNDIR/err.log
+set -euo pipefail
+git diff HEAD |
+  python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
+    --roles-file "RUNDIR/roles.json" \
+    > "RUNDIR/out.md" \
+    2> "RUNDIR/err.log"
+```
+
+**Staged-only diff:**
+
+```bash
+set -euo pipefail
+git diff --cached |
+  python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
+    --roles-file "RUNDIR/roles.json" \
+    > "RUNDIR/out.md" \
+    2> "RUNDIR/err.log"
 ```
 
 **Diff plus untracked files that matter** (with binary / size /
 symlink guards):
 
 ```bash
-{ git diff HEAD
-  git ls-files --others --exclude-standard | while IFS= read -r f; do
+set -euo pipefail
+{
+  git diff HEAD
+  git ls-files -z --others --exclude-standard -- |
+    while IFS= read -r -d '' f; do
       [ -f "$f" ] && [ ! -L "$f" ] || continue
-      file --mime "$f" | grep -q 'charset=binary' && continue
-      [ "$(wc -c <"$f")" -gt 32768 ] && continue
-      printf '\n=== %s ===\n' "$f"
+      mime=$(file --brief --mime -- "$f")
+      case "$mime" in
+        *charset=binary*) continue ;;
+        *charset=utf-8*|*charset=us-ascii*) ;;
+        *) continue ;;
+      esac
+      size=$(wc -c <"$f")
+      size=${size//[[:space:]]/}
+      [[ "$size" =~ ^[0-9]+$ ]]
+      (( size <= 32768 )) || continue
+      printf '\n=== untracked file: %q ===\n' "$f"
       cat <"$f"
-  done
-} | python3 ${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py --roles-file RUNDIR/roles.json > RUNDIR/out.md 2> RUNDIR/err.log
+    done
+} |
+  python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
+    --roles-file "RUNDIR/roles.json" \
+    > "RUNDIR/out.md" \
+    2> "RUNDIR/err.log"
 ```
 
 **An artifact plus a question** — pipe the relevant file or excerpt
 plus the question the council should answer:
 
 ```bash
-{ printf 'Question: %s\n\n' '<what you want the council to check>'
+set -euo pipefail
+{
+  printf 'Question: %s\n\n' '<what you want the council to check>'
   cat <"$file"      # or: head -50 data.csv, or: pbpaste, etc.
-} | python3 ${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py --roles-file RUNDIR/roles.json > RUNDIR/out.md 2> RUNDIR/err.log
+} |
+  python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
+    --roles-file "RUNDIR/roles.json" \
+    > "RUNDIR/out.md" \
+    2> "RUNDIR/err.log"
 ```
 
 **Bounded diagnostic transcript** — for a test / CI failure or any
@@ -307,12 +357,18 @@ command output the council should diagnose. Bound the noise so the
 question survives the 10 MiB cap:
 
 ```bash
-{ printf 'Question: %s\n\n' '<what should the council diagnose?>'
+set -euo pipefail
+{
+  printf 'Question: %s\n\n' '<what should the council diagnose?>'
   printf 'Command: %s\n' '<the failing command>'
   printf 'Exit status: %s\n\n' "$exit_status"
   echo 'Output (last 128 KiB):'
   tail -c 131072 <"$log_file"
-} | python3 ${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py --roles-file RUNDIR/roles.json > RUNDIR/out.md 2> RUNDIR/err.log
+} |
+  python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
+    --roles-file "RUNDIR/roles.json" \
+    > "RUNDIR/out.md" \
+    2> "RUNDIR/err.log"
 ```
 
 If the diagnosis needs source context too, append bounded source
@@ -328,7 +384,11 @@ fragile with multiline content and unsafe if the content contains
 `$VAR`, `$(...)`, backticks, or backslashes:
 
 ```bash
-python3 ${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py --roles-file RUNDIR/roles.json > RUNDIR/out.md 2> RUNDIR/err.log <<'EOF'
+set -euo pipefail
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
+  --roles-file "RUNDIR/roles.json" \
+  > "RUNDIR/out.md" \
+  2> "RUNDIR/err.log" <<'EOF'
 <Claude-composed digest goes here>
 EOF
 ```

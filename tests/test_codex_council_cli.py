@@ -33,11 +33,11 @@ SCRIPT = os.path.abspath(os.path.join(
 # Roles whose instruction contains this token make the fake codex exit
 # non-zero with no agent_message, so that role is reported FAILED.
 FAIL_SENTINEL = "PLEASE_FAIL"
+STDOUT_ERROR_SENTINEL = "PLEASE_STDOUT_ERROR"
 
-# A fake `codex` executable. It reads its whole stdin (the bookended prompt),
-# and if the FAIL_SENTINEL appears it exits non-zero with a stderr message and
-# NO agent_message; otherwise it emits a thread.started + agent_message JSONL
-# pair on stdout, exactly what the parser expects.
+# A fake `codex` executable. It reads its whole stdin (the bookended prompt).
+# Sentinels exercise stderr failures and stdout JSONL failures; otherwise it
+# emits a thread.started + agent_message JSONL pair.
 FAKE_CODEX = textwrap.dedent(
     f"""\
     #!/usr/bin/env python3
@@ -47,6 +47,11 @@ FAKE_CODEX = textwrap.dedent(
 
     if {FAIL_SENTINEL!r} in prompt:
         sys.stderr.write("fake codex: simulated role failure\\n")
+        sys.exit(3)
+
+    if {STDOUT_ERROR_SENTINEL!r} in prompt:
+        sys.stdout.write(json.dumps({{"type": "error", "message": "HTTP 429 Too Many Requests"}}) + "\\n")
+        sys.stdout.write(json.dumps({{"type": "turn.failed", "error": {{"message": "HTTP 429 Too Many Requests"}}}}) + "\\n")
         sys.exit(3)
 
     tid = "thread-" + uuid.uuid4().hex[:12]
@@ -62,6 +67,13 @@ FAKE_CODEX = textwrap.dedent(
 
 def _role(rid, label, instruction):
     return {"id": rid, "label": label, "instruction": instruction}
+
+
+def _instruction(text):
+    return (
+        f"{text}; if nothing material, say so clearly. "
+        "Thoroughness beats speed."
+    )
 
 
 class CouncilCLITestCase(unittest.TestCase):
@@ -128,14 +140,20 @@ class BareInvocationTests(CouncilCLITestCase):
         # Not just the code — the safety-net message must survive too.
         self.assertIn("No roles requested", proc.stderr)
 
+    def test_empty_roles_file_arg_exits_2(self):
+        proc = self._run(input="some context here\n", args=("--roles-file", ""))
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn("must be non-empty", proc.stderr)
+        self.assertNotIn("No roles requested", proc.stderr)
+
 
 class HappyPathTests(CouncilCLITestCase):
     def test_happy_path_report_and_progress(self):
         roles_path = self._write_roles([
             _role("architect", "Architect",
-                  "Review architecture. Thoroughness beats speed."),
+                  _instruction("Review architecture")),
             _role("security", "Security",
-                  "Review security. Thoroughness beats speed."),
+                  _instruction("Review security")),
         ])
         proc = self._run(
             input="please review this change\n",
@@ -167,9 +185,9 @@ class HappyPathTests(CouncilCLITestCase):
         # relative byte order of report vs sentinel is observable, then assert it.
         roles_path = self._write_roles([
             _role("architect", "Architect",
-                  "Review architecture. Thoroughness beats speed."),
+                  _instruction("Review architecture")),
             _role("security", "Security",
-                  "Review security. Thoroughness beats speed."),
+                  _instruction("Review security")),
         ])
         proc = self._run_merged(
             input="please review this change\n",
@@ -197,7 +215,7 @@ class StdinGuardTests(CouncilCLITestCase):
     def test_over_cap_stdin_exits_1(self):
         roles_path = self._write_roles([
             _role("architect", "Architect",
-                  "Review. Thoroughness beats speed."),
+                  _instruction("Review")),
         ])
         oversize = "a" * (10 * 1024 * 1024 + 1)
         proc = self._run(input=oversize, args=("--roles-file", roles_path))
@@ -210,20 +228,32 @@ class StdinGuardTests(CouncilCLITestCase):
     def test_empty_stdin_exits_1(self):
         roles_path = self._write_roles([
             _role("architect", "Architect",
-                  "Review. Thoroughness beats speed."),
+                  _instruction("Review")),
         ])
         proc = self._run(input="   \n ", args=("--roles-file", roles_path))
         self.assertEqual(proc.returncode, 1, proc.stderr)
         self.assertIn("Empty input", proc.stderr)
+
+    def test_prompt_over_cap_exits_before_codex(self):
+        roles_path = self._write_roles([
+            _role("architect", "Architect",
+                  _instruction("Review")),
+        ])
+        body = "a" * (10 * 1024 * 1024)
+        proc = self._run(input=body, args=("--roles-file", roles_path))
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("Composed prompt", proc.stderr)
+        self.assertNotIn("CODEX_COUNCIL_DONE", proc.stderr)
+        self.assertNotIn("# Codex Council", proc.stdout)
 
 
 class FailureReportingTests(CouncilCLITestCase):
     def test_mixed_failure_reports_and_exits_0(self):
         roles_path = self._write_roles([
             _role("architect", "Architect",
-                  "Review architecture. Thoroughness beats speed."),
+                  _instruction("Review architecture")),
             _role("security", "Security",
-                  f"Review security {FAIL_SENTINEL}. Thoroughness beats speed."),
+                  _instruction(f"Review security {FAIL_SENTINEL}")),
         ])
         proc = self._run(
             input="please review this change\n",
@@ -243,9 +273,9 @@ class FailureReportingTests(CouncilCLITestCase):
     def test_all_roles_fail_exits_1(self):
         roles_path = self._write_roles([
             _role("architect", "Architect",
-                  f"Review {FAIL_SENTINEL}. Thoroughness beats speed."),
+                  _instruction(f"Review {FAIL_SENTINEL}")),
             _role("security", "Security",
-                  f"Review {FAIL_SENTINEL}. Thoroughness beats speed."),
+                  _instruction(f"Review {FAIL_SENTINEL}")),
         ])
         proc = self._run(
             input="please review this change\n",
@@ -257,6 +287,19 @@ class FailureReportingTests(CouncilCLITestCase):
             r"\[codex-council\] CODEX_COUNCIL_DONE ok=0 total=2 "
             r"elapsed=[\d.]+s exit=1$",
         )
+
+    def test_stdout_jsonl_failure_is_reported(self):
+        roles_path = self._write_roles([
+            _role("architect", "Architect",
+                  _instruction(f"Review {STDOUT_ERROR_SENTINEL}")),
+        ])
+        proc = self._run(
+            input="please review this change\n",
+            args=("--roles-file", roles_path),
+        )
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("[retriable:rate-limit]", proc.stdout)
+        self.assertIn("HTTP 429 Too Many Requests", proc.stdout)
 
 
 if __name__ == "__main__":

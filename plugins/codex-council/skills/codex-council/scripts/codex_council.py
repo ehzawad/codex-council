@@ -31,6 +31,8 @@ POSIX-only: uses start_new_session and process-group signals.
 
 import argparse
 import asyncio
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -89,8 +91,15 @@ SESSION_KEY_ENV = "CODEX_COUNCIL_SESSION_KEY"
 MAX_PARALLEL = 6  # matches codex's own DEFAULT_AGENT_MAX_THREADS
 MAX_RETRY_ATTEMPTS = 2
 INITIAL_BACKOFF_SECS = 5
+TERMINATION_GRACE_SECS = 0.2
 MAX_STDIN_BYTES = 10 << 20  # 10 MiB (a sanity guard, not a model-context
 # limit — Codex's own context window is the real ceiling; compress anyway).
+MAX_PROMPT_BYTES = MAX_STDIN_BYTES
+ROLE_LABEL_MAX_BYTES = 80
+ROLE_INSTRUCTION_MAX_BYTES = 8192
+REQUIRED_SCOPE_PHRASE = "nothing material"
+REQUIRED_CADENCE_SENTENCE = "Thoroughness beats speed."
+LINEBREAK_CHARS = ("\r", "\n", "\u2028", "\u2029")
 
 # No timeout, by design. Neither this script nor `codex exec` enforces a
 # wall-clock or run-level timeout, so a role may think for hours or days.
@@ -165,13 +174,43 @@ def _state_path(role_id):
     return os.path.join(STATE_DIR, f"{_project_key(role_id)}.json")
 
 
+def _state_lock_path(role_id):
+    """Per-state-file lock path used across council processes."""
+    return _state_path(role_id) + ".lock"
+
+
+async def _acquire_role_state_lock(role_id):
+    """Acquire an exclusive cross-process lock for one role's state."""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    lock_path = _state_lock_path(role_id)
+    lock_file = open(lock_path, "a+")
+    try:
+        while True:
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return lock_file
+            except BlockingIOError:
+                await asyncio.sleep(0.1)
+    except BaseException:
+        lock_file.close()
+        raise
+
+
+def _release_role_state_lock(lock_file):
+    """Release a lock returned by _acquire_role_state_lock."""
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+    finally:
+        lock_file.close()
+
+
 def load_session(role_id):
     """Return (session_id, meta) for this role's stored thread, or (None, None)."""
     try:
         with open(_state_path(role_id)) as f:
             meta = json.load(f)
             sid = meta.get("session_id")
-            if sid:
+            if isinstance(sid, str) and sid:
                 return sid, meta
     except (OSError, json.JSONDecodeError):
         pass
@@ -214,37 +253,103 @@ def clear_session(role_id):
 
 # ---------- JSONL parsing ----------
 
-def extract_session_id(jsonl_output):
-    """Pull thread_id from the first thread.started event in the stream."""
+def _iter_json_objects(jsonl_output):
+    """Yield JSON object lines from a JSONL stream, skipping malformed lines."""
     for line in jsonl_output.splitlines():
         line = line.strip()
         if not line:
             continue
         try:
             event = json.loads(line)
-            if event.get("type") == "thread.started" and "thread_id" in event:
-                return event["thread_id"]
-        except (json.JSONDecodeError, KeyError):
+        except json.JSONDecodeError:
             continue
+        if isinstance(event, dict):
+            yield event
+
+
+def extract_session_id(jsonl_output):
+    """Pull thread_id from the first thread.started event in the stream."""
+    for event in _iter_json_objects(jsonl_output):
+        if event.get("type") == "thread.started":
+            thread_id = event.get("thread_id")
+            if isinstance(thread_id, str) and thread_id:
+                return thread_id
     return None
 
 
 def extract_final_message(jsonl_output):
     """Pull the last agent_message text from item.completed events."""
     last_message = None
-    for line in jsonl_output.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            event = json.loads(line)
-            if event.get("type") == "item.completed":
-                item = event.get("item", {})
-                if item.get("type") == "agent_message" and "text" in item:
-                    last_message = item["text"]
-        except (json.JSONDecodeError, KeyError):
-            continue
+    for event in _iter_json_objects(jsonl_output):
+        if event.get("type") == "item.completed":
+            item = event.get("item", {})
+            if isinstance(item, dict) and item.get("type") == "agent_message":
+                text = item.get("text")
+                if isinstance(text, str):
+                    last_message = text
     return last_message
+
+
+def extract_error_messages(jsonl_output):
+    """Pull structured error messages from Codex JSONL stdout."""
+    messages = []
+    for event in _iter_json_objects(jsonl_output):
+        event_type = event.get("type")
+        if event_type == "error":
+            message = event.get("message")
+            if not isinstance(message, str):
+                error = event.get("error")
+                if isinstance(error, dict):
+                    message = error.get("message")
+            if isinstance(message, str) and message.strip():
+                messages.extend(_expand_error_message(message))
+        elif event_type == "turn.failed":
+            error = event.get("error")
+            if isinstance(error, dict):
+                message = error.get("message")
+            else:
+                message = error
+            if isinstance(message, str) and message.strip():
+                messages.extend(_expand_error_message(message))
+    return _dedupe_preserve_order(messages)
+
+
+def _expand_error_message(message):
+    """Return the message plus any nested JSON error.message it contains."""
+    stripped = message.strip()
+    messages = [stripped]
+    try:
+        decoded = json.loads(stripped)
+    except json.JSONDecodeError:
+        return messages
+    if isinstance(decoded, dict):
+        error = decoded.get("error")
+        if isinstance(error, dict):
+            inner = error.get("message")
+            if isinstance(inner, str) and inner.strip():
+                messages.append(inner.strip())
+    return messages
+
+
+def _dedupe_preserve_order(items):
+    seen = set()
+    out = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def _failure_text(stdout, stderr):
+    """Combine stderr and structured stdout error events for classification."""
+    parts = []
+    stderr_stripped = stderr.strip()
+    if stderr_stripped:
+        parts.append(stderr_stripped)
+    parts.extend(extract_error_messages(stdout))
+    return "\n".join(parts)
 
 
 # ---------- error classifiers ----------
@@ -279,6 +384,17 @@ def _is_stale_resume_error(stderr_text):
 def _compose_prompt(role, body):
     """Bookend the body with the role's framing instruction (both ends)."""
     return f"{role.instruction}\n\n{body}\n\n{role.instruction}"
+
+
+def _validate_prompt_size(role, body):
+    prompt_bytes = len(_compose_prompt(role, body).encode("utf-8"))
+    if prompt_bytes > MAX_PROMPT_BYTES:
+        print(
+            f"Composed prompt for role {role.id!r} is {prompt_bytes} bytes; "
+            f"limit is {MAX_PROMPT_BYTES}. Trim stdin or role instructions.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 # ---------- async codex invocation ----------
@@ -316,9 +432,14 @@ async def _run_codex_subprocess(cmd, prompt):
         start_new_session=True,
     )
     try:
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        # start_new_session=True makes the child process leader's pid the pgid.
+        pgid = proc.pid
+    try:
         stdout_b, stderr_b = await proc.communicate(prompt.encode("utf-8"))
     except asyncio.CancelledError:
-        _terminate_process_group(proc)
+        await _terminate_process_group(proc, pgid)
         raise
     return (
         proc.returncode,
@@ -327,26 +448,32 @@ async def _run_codex_subprocess(cmd, prompt):
     )
 
 
-def _terminate_process_group(proc):
+async def _terminate_process_group(proc, pgid=None):
     """Best-effort SIGTERM then SIGKILL to the codex process group."""
-    if proc.returncode is not None:
-        return
-    pid = proc.pid
-    try:
-        os.killpg(os.getpgid(pid), signal.SIGTERM)
-    except (ProcessLookupError, PermissionError, OSError):
-        try:
-            proc.terminate()
-        except (ProcessLookupError, OSError):
-            pass
-    try:
+    def _signal_group(sig):
+        if pgid is not None:
+            try:
+                os.killpg(pgid, sig)
+                return
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
         if proc.returncode is None:
-            os.killpg(os.getpgid(pid), signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
-        try:
-            proc.kill()
-        except (ProcessLookupError, OSError):
-            pass
+            try:
+                if sig == signal.SIGTERM:
+                    proc.terminate()
+                else:
+                    proc.kill()
+            except (ProcessLookupError, OSError):
+                pass
+
+    _signal_group(signal.SIGTERM)
+    try:
+        await asyncio.sleep(TERMINATION_GRACE_SECS)
+    finally:
+        _signal_group(signal.SIGKILL)
+    if proc.returncode is None:
+        with contextlib.suppress(ProcessLookupError, OSError):
+            await proc.wait()
 
 
 def _format_clean_exit_no_message(stderr_stripped):
@@ -376,7 +503,7 @@ async def _run_role_once(role, prompt, attempt):
         rc, stdout, stderr = await _run_codex_subprocess(
             _resume_cmd(root, session_id), prompt
         )
-        stderr_stripped = stderr.strip()
+        failure_text = _failure_text(stdout, stderr)
 
         if rc == 0:
             # Resume-footgun mitigation: codex `resume <bogus_id>` silently
@@ -406,19 +533,20 @@ async def _run_role_once(role, prompt, attempt):
                 )
             return RoleResult(
                 role=role, ok=False,
-                error=_format_clean_exit_no_message(stderr_stripped),
+                error=_format_clean_exit_no_message(failure_text),
                 thread_id=session_id, elapsed_seconds=elapsed, attempts=attempt,
                 warning=warning,
             )
 
         # rc != 0 on resume. Classify, then decide retry vs stale vs fail.
-        err = _classify_failure(stderr_stripped, rc, "resume")
-        if err.startswith("[auth]") or err.startswith("[retriable:"):
+        if _is_auth_error(failure_text):
+            err = _classify_failure(failure_text, rc, "resume")
             return RoleResult(
                 role=role, ok=False, error=err,
                 elapsed_seconds=time.monotonic() - started, attempts=attempt,
             )
-        if not _is_stale_resume_error(stderr_stripped):
+        if not _is_stale_resume_error(failure_text):
+            err = _classify_failure(failure_text, rc, "resume")
             return RoleResult(
                 role=role, ok=False, error=err,
                 elapsed_seconds=time.monotonic() - started, attempts=attempt,
@@ -428,7 +556,7 @@ async def _run_role_once(role, prompt, attempt):
         updated = (meta or {}).get("updated_at", "unknown")
         print(
             f"[codex-council:{role.id}] session {session_id} (last used {updated}) "
-            f"is stale ({stderr_stripped}) — starting fresh.",
+            f"is stale ({failure_text}) — starting fresh.",
             file=sys.stderr,
         )
         current_id, _ = load_session(role.id)
@@ -437,12 +565,12 @@ async def _run_role_once(role, prompt, attempt):
 
     # Fresh path.
     rc, stdout, stderr = await _run_codex_subprocess(_fresh_cmd(root), prompt)
-    stderr_stripped = stderr.strip()
+    failure_text = _failure_text(stdout, stderr)
 
     if rc != 0:
         return RoleResult(
             role=role, ok=False,
-            error=_classify_failure(stderr_stripped, rc, "exec"),
+            error=_classify_failure(failure_text, rc, "exec"),
             elapsed_seconds=time.monotonic() - started, attempts=attempt,
         )
 
@@ -463,7 +591,7 @@ async def _run_role_once(role, prompt, attempt):
         )
     return RoleResult(
         role=role, ok=False,
-        error=_format_clean_exit_no_message(stderr_stripped),
+        error=_format_clean_exit_no_message(failure_text),
         thread_id=new_id, elapsed_seconds=elapsed, attempts=attempt,
     )
 
@@ -475,25 +603,29 @@ async def _run_role(role, prompt):
     Ctrl+C propagates as asyncio.CancelledError, which tears down the
     codex process group via _run_codex_subprocess's cancellation path.
     """
-    last_result = None
-    backoff = INITIAL_BACKOFF_SECS
+    lock_file = await _acquire_role_state_lock(role.id)
+    try:
+        last_result = None
+        backoff = INITIAL_BACKOFF_SECS
 
-    for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
-        result = await _run_role_once(role, prompt, attempt)
-        last_result = result
-        if result.ok or not (result.error or "").startswith("[retriable:"):
-            return result
-        if attempt >= MAX_RETRY_ATTEMPTS:
-            return result
-        print(
-            f"[codex-council:{role.id}] retriable error on attempt "
-            f"{attempt}/{MAX_RETRY_ATTEMPTS}; sleeping {backoff}s.",
-            file=sys.stderr,
-        )
-        await asyncio.sleep(backoff)
-        backoff *= 2
+        for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
+            result = await _run_role_once(role, prompt, attempt)
+            last_result = result
+            if result.ok or not (result.error or "").startswith("[retriable:"):
+                return result
+            if attempt >= MAX_RETRY_ATTEMPTS:
+                return result
+            print(
+                f"[codex-council:{role.id}] retriable error on attempt "
+                f"{attempt}/{MAX_RETRY_ATTEMPTS}; sleeping {backoff}s.",
+                file=sys.stderr,
+            )
+            await asyncio.sleep(backoff)
+            backoff *= 2
 
-    return last_result  # type: ignore[return-value]
+        return last_result  # type: ignore[return-value]
+    finally:
+        _release_role_state_lock(lock_file)
 
 
 async def run_council(roles, body):
@@ -543,11 +675,18 @@ async def run_council(roles, body):
 
     tasks = []
     for role in roles:
+        _validate_prompt_size(role, body)
         t = asyncio.create_task(_run_role(role, _compose_prompt(role, body)))
         t.add_done_callback(lambda task, role=role: _on_role_done(role, task))
         tasks.append(t)
     started = time.monotonic()
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    try:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+    except asyncio.CancelledError:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
     elapsed = time.monotonic() - started
 
     out = []
@@ -587,25 +726,32 @@ def _format_report(results, total_elapsed):
         status = "ok" if r.ok else "FAILED"
         attempts = f" (attempts: {r.attempts})" if r.attempts > 1 else ""
         warn_note = " — WARNING" if r.warning else ""
+        label = _report_inline(r.role.label)
         lines.append(
-            f"- **{r.role.label}** [{r.role.id}]: {status}{attempts}{warn_note} — "
+            f"- **{label}** [{r.role.id}]: {status}{attempts}{warn_note} — "
             f"{r.elapsed_seconds:.1f}s"
         )
     lines.append("")
 
     for r in results:
-        lines.append(f"## {r.role.label} ({r.role.id})")
+        label = _report_inline(r.role.label)
+        lines.append(f"## {label} ({r.role.id})")
         lines.append("")
         if r.warning:
-            lines.append(f"_Warning: {r.warning}_")
+            lines.append(f"_Warning: {_report_inline(r.warning)}_")
             lines.append("")
         if r.ok:
             lines.append((r.text or "").rstrip())
         else:
-            lines.append(f"_Failed: {r.error}_")
+            lines.append(f"_Failed: {_report_inline(r.error)}_")
         lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _report_inline(value):
+    """Keep report metadata on one Markdown line."""
+    return str(value).replace("\r", "\\r").replace("\n", "\\n")
 
 
 # ---------- CLI / entry point ----------
@@ -630,7 +776,10 @@ def _parse_args(argv):
             "composes this per invocation; see SKILL.md."
         ),
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.roles_file == "":
+        parser.error("--roles-file must be non-empty")
+    return args
 
 
 def _usage_exit(msg):
@@ -648,6 +797,8 @@ def _read_roles_file(path):
     errors exit 2 like other usage errors; JSON validity is left to
     _parse_roles_json.
     """
+    if path == "":
+        _usage_exit("--roles-file must be non-empty.")
     try:
         with open(path, encoding="utf-8") as f:
             return f.read()
@@ -671,11 +822,49 @@ def _validate_role_id(rid, ctx):
         )
 
 
+def _validate_role_label(label, ctx):
+    """Reject labels that can break report structure or become unreadable."""
+    if any(ch in label for ch in LINEBREAK_CHARS):
+        _usage_exit(f"--roles-file {ctx}: label must not contain newlines.")
+    encoded_len = len(label.encode("utf-8"))
+    if encoded_len > ROLE_LABEL_MAX_BYTES:
+        _usage_exit(
+            f"--roles-file {ctx}: label exceeds {ROLE_LABEL_MAX_BYTES} UTF-8 bytes."
+        )
+
+
+def _validate_role_instruction(instruction, ctx):
+    """Reject instructions that violate the documented role contract."""
+    if any(ch in instruction for ch in LINEBREAK_CHARS):
+        _usage_exit(
+            f"--roles-file {ctx}: instruction must be a single paragraph "
+            "with no newlines."
+        )
+    encoded_len = len(instruction.encode("utf-8"))
+    if encoded_len > ROLE_INSTRUCTION_MAX_BYTES:
+        _usage_exit(
+            f"--roles-file {ctx}: instruction exceeds "
+            f"{ROLE_INSTRUCTION_MAX_BYTES} bytes."
+        )
+    lowered = instruction.lower()
+    if REQUIRED_SCOPE_PHRASE not in lowered:
+        _usage_exit(
+            f"--roles-file {ctx}: instruction must include "
+            f"{REQUIRED_SCOPE_PHRASE!r}."
+        )
+    if not instruction.rstrip().endswith(REQUIRED_CADENCE_SENTENCE):
+        _usage_exit(
+            f"--roles-file {ctx}: instruction must end with "
+            f"{REQUIRED_CADENCE_SENTENCE!r}."
+        )
+
+
 def _parse_roles_json(raw):
     """Parse the --roles-file blob into a list of Role objects.
 
     Validates each entry has non-empty id/label/instruction strings, id
-    is well-formed, and ids are unique within the JSON.
+    is well-formed, instructions follow the documented contract, and ids
+    are unique within the JSON.
     """
     try:
         data = json.loads(raw)
@@ -698,13 +887,17 @@ def _parse_roles_json(raw):
                     f"--roles-file {ctx}: field {field!r} must be a non-empty string."
                 )
         rid = entry["id"]
+        label = entry["label"]
+        instruction = entry["instruction"]
         _validate_role_id(rid, ctx)
+        _validate_role_label(label, ctx)
+        _validate_role_instruction(instruction, ctx)
         if rid in seen:
             _usage_exit(
                 f"--roles-file {ctx}: duplicate id {rid!r} within JSON payload."
             )
         seen.add(rid)
-        roles.append(Role(rid, entry["label"], entry["instruction"]))
+        roles.append(Role(rid, label, instruction))
     return roles
 
 
@@ -766,6 +959,35 @@ def _read_stdin_body(stream):
     return body
 
 
+async def _run_council_with_signals(roles, body):
+    """Run the council and translate POSIX termination signals into cleanup."""
+    loop = asyncio.get_running_loop()
+    council_task = asyncio.create_task(run_council(roles, body))
+    interrupted = {"signum": None}
+    registered = []
+
+    def _cancel_for_signal(signum):
+        if interrupted["signum"] is None:
+            interrupted["signum"] = signum
+        council_task.cancel()
+
+    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        try:
+            loop.add_signal_handler(signum, _cancel_for_signal, signum)
+            registered.append(signum)
+        except (NotImplementedError, RuntimeError, ValueError):
+            pass
+
+    try:
+        return await council_task, None
+    except asyncio.CancelledError:
+        return None, interrupted["signum"] or signal.SIGINT
+    finally:
+        for signum in registered:
+            with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
+                loop.remove_signal_handler(signum)
+
+
 def main():
     args = _parse_args(sys.argv[1:])
 
@@ -789,7 +1011,7 @@ def main():
     # Parse unconditionally when a file path was supplied: an empty file
     # then yields the clear "invalid JSON" usage error rather than the
     # generic "no roles requested" message (which is for bare invocation).
-    if args.roles_file:
+    if args.roles_file is not None:
         custom_roles = _parse_roles_json(_read_roles_file(args.roles_file))
     else:
         custom_roles = []
@@ -803,10 +1025,14 @@ def main():
 
     started = time.monotonic()
     try:
-        results = asyncio.run(run_council(roles, body))
+        results, signum = asyncio.run(_run_council_with_signals(roles, body))
     except KeyboardInterrupt:
         print("\n[codex-council] interrupted by user", file=sys.stderr)
         sys.exit(130)
+    if signum is not None:
+        signame = signal.Signals(signum).name
+        print(f"\n[codex-council] interrupted by {signame}", file=sys.stderr)
+        sys.exit(128 + int(signum))
 
     elapsed = time.monotonic() - started
     print(_format_report(results, elapsed), end="")
