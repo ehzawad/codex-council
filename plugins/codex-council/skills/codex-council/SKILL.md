@@ -163,24 +163,75 @@ JSON array embedded in a shell argument is the single most common
 launch failure (one stray quote or unbalanced brace breaks the call);
 keeping the panel in a file written with the Write tool means there is
 no shell escaping to get wrong. A council call takes as long as the
-slowest role and has **no wall-clock cap** — a role may think for
-hours or days; use Bash `run_in_background: true` and wait for Claude
-Code's completion notification instead of sleep-polling.
+slowest role and has **no wall-clock cap** — a role may think for hours
+or days. Launch it with **exactly one backgrounding
+layer**: the Bash tool parameter `run_in_background: true`. The shell command
+itself must stay foreground, and **stdout and stderr must be redirected to
+files** so the run is observable while it works and recoverable from disk if the
+completion notification is ever lost.
+
+**Do not add a second backgrounding/detach layer.** `run_in_background: true`
+already wraps the command in a shell that Claude Code tracks and notifies you
+about when it exits. Any inner detach makes that wrapper exit immediately: you
+get a **false "completed" in ~0s with empty output**, and `codex_council.py` is
+reparented to `launchd`/PID 1 — orphaned, untracked, and it will **never** send
+the real completion notification. Forbidden in the launch command: a trailing
+`&`; zsh `&!` or `&|`; `nohup`; `setsid`; `disown` (before or after launch, incl.
+`cmd & disown`); `bg`; `coproc`; `( ... ) &`; `{ ...; } &`; `sh -c '... &'` /
+`zsh -c '... &'`; any wrapper function/script that forks and exits; a bare
+`>/dev/null` (redirect to files instead); and piping/wrapping into a supervisor
+such as `launchctl`, `tmux new -d`, `screen -dm`, `at`, `batch`, or `daemonize`.
+
+**Stage everything in a private per-run directory**, not fixed world-readable
+`/tmp` names. The report and the piped context can hold sensitive reviewed
+content, and predictable `/tmp/council_*` files are world-readable under a
+typical umask and can be pre-created or symlinked by another local user (who
+could then read the report or forge the `CODEX_COUNCIL_DONE` line). Make one
+private dir per run with `mktemp -d` (mode `0700`) and keep roles, context, and
+the output files inside it. Shell variables do **not** persist across Claude
+Code Bash calls, so capture the printed path and substitute it literally for
+`RUNDIR` in the Write calls and the launch command.
 
 ```bash
-# 1. Write the panel to a file with the Write tool (not a heredoc) so
-#    there is zero shell escaping. Shape:
-#    [{"id":"<lens>","label":"<Title>","instruction":"<single paragraph;
-#      name the specific failure modes; include: if nothing material,
-#      say so clearly; end with: Thoroughness beats speed.>"}, ...]
-#
-# 2. Cheap pre-flight: confirm the JSON parses before fanning out.
-python3 -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8"))' /tmp/council_roles.json
+# 0. Private per-run staging dir (mode 0700). Note the printed path and use it
+#    literally as RUNDIR in every step below.
+mktemp -d "${TMPDIR:-/tmp}/codex-council.XXXXXX"
 
-# 3. Launch, context on stdin.
-echo "<gathered context>" | python3 ${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py \
-  --roles-file /tmp/council_roles.json
+# 1. With the Write tool (not a heredoc, so there is zero shell escaping) write
+#    the panel to RUNDIR/roles.json and the gathered context to RUNDIR/context.md.
+#    Panel shape:
+#    [{"id":"<lens>","label":"<Title>","instruction":"<single paragraph; name
+#      the specific failure modes; include: if nothing material, say so clearly;
+#      end with: Thoroughness beats speed.>"}, ...]
+
+# 2. Cheap pre-flight: confirm the JSON parses before fanning out.
+python3 -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8"))' RUNDIR/roles.json
+
+# 3. Launch with Bash run_in_background: true and NOTHING appended. One layer,
+#    foreground command, stdout+stderr redirected into the private dir:
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
+  --roles-file RUNDIR/roles.json \
+  < RUNDIR/context.md \
+  > RUNDIR/out.md \
+  2> RUNDIR/err.log
 ```
+
+Then **wait for Claude Code's completion notification — do not sleep-poll.** When
+it arrives, read `RUNDIR/out.md` for the report; read `RUNDIR/err.log`
+for per-role progress and the final `[codex-council] CODEX_COUNCIL_DONE ...` line
+(its presence means the report is fully written; it carries the exit code).
+
+If a run is ever lost or orphaned, recover entirely from disk:
+
+```bash
+pgrep -fl 'codex_council[.]py'      # any council alive?
+pgrep -fl -- 'RUNDIR/roles.json'    # THIS run specifically (disambiguates when several run)
+tail -n 40 RUNDIR/err.log           # last line CODEX_COUNCIL_DONE -> finished
+```
+
+Last err line is `CODEX_COUNCIL_DONE` → done, read `out.md`. No such line but
+`pgrep` finds it → still running. No line and no process → it crashed; inspect
+`err.log` and any partial `out.md`.
 
 Bare invocation (no `--roles-file`, with context piped) exits 2 — a
 safety net for accidental fan-out.
@@ -193,6 +244,10 @@ Constraints:
 - `instruction`: non-empty single paragraph.
 
 ## Building the context
+
+The snippets below show only how to compose the stdin context; the actual launch
+must always use Step 4's form — `run_in_background: true`, stdout+stderr
+redirected to files, nothing appended.
 
 The stdin contents are whatever the roles need to see. Context comes
 from one of two sources:
@@ -208,16 +263,19 @@ over 10 MiB (by byte count); it does not truncate. That ceiling is a
 sanity guard, not a budget — Codex's own context window is the real
 limit, so compress regardless.
 
-In the examples below, `--roles-file roles.json` stands in for your
-panel — write it to a file with the Write tool first (see Step 4); the
-examples vary only in how the stdin context is built.
+In the examples below, `RUNDIR` is the private per-run dir from Step 4 and
+`RUNDIR/roles.json` stands in for your panel (write it with the Write tool
+first). The trailing `> RUNDIR/out.md 2> RUNDIR/err.log` is Step 4's mandatory
+redirection — these are complete launches, so each must still run under Bash
+`run_in_background: true` with nothing appended. The examples vary only in how
+the stdin context is built.
 
 ### Shell-extracted
 
 **Uncommitted diff:**
 
 ```bash
-git diff HEAD | python3 ${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py --roles-file roles.json
+git diff HEAD | python3 ${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py --roles-file RUNDIR/roles.json > RUNDIR/out.md 2> RUNDIR/err.log
 ```
 
 **Diff plus untracked files that matter** (with binary / size /
@@ -232,7 +290,7 @@ symlink guards):
       printf '\n=== %s ===\n' "$f"
       cat <"$f"
   done
-} | python3 ${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py --roles-file roles.json
+} | python3 ${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py --roles-file RUNDIR/roles.json > RUNDIR/out.md 2> RUNDIR/err.log
 ```
 
 **An artifact plus a question** — pipe the relevant file or excerpt
@@ -241,7 +299,7 @@ plus the question the council should answer:
 ```bash
 { printf 'Question: %s\n\n' '<what you want the council to check>'
   cat <"$file"      # or: head -50 data.csv, or: pbpaste, etc.
-} | python3 ${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py --roles-file roles.json
+} | python3 ${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py --roles-file RUNDIR/roles.json > RUNDIR/out.md 2> RUNDIR/err.log
 ```
 
 **Bounded diagnostic transcript** — for a test / CI failure or any
@@ -254,7 +312,7 @@ question survives the 10 MiB cap:
   printf 'Exit status: %s\n\n' "$exit_status"
   echo 'Output (last 128 KiB):'
   tail -c 131072 <"$log_file"
-} | python3 ${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py --roles-file roles.json
+} | python3 ${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py --roles-file RUNDIR/roles.json > RUNDIR/out.md 2> RUNDIR/err.log
 ```
 
 If the diagnosis needs source context too, append bounded source
@@ -270,7 +328,7 @@ fragile with multiline content and unsafe if the content contains
 `$VAR`, `$(...)`, backticks, or backslashes:
 
 ```bash
-python3 ${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py --roles-file roles.json <<'EOF'
+python3 ${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py --roles-file RUNDIR/roles.json > RUNDIR/out.md 2> RUNDIR/err.log <<'EOF'
 <Claude-composed digest goes here>
 EOF
 ```

@@ -505,11 +505,47 @@ async def run_council(roles, body):
     `return_exceptions=True` ensures one role's crash does not cancel
     its siblings — every role gets its turn and its result in the report.
     No wall-clock timeout: Codex decides when each role is done.
+
+    Per-role completion progress is emitted to stderr (in completion
+    order) as each role settles; stdout stays the report.
     """
-    tasks = [
-        asyncio.create_task(_run_role(role, _compose_prompt(role, body)))
-        for role in roles
-    ]
+    total = len(roles)
+    counter = {"done": 0}
+
+    def _on_role_done(role, task):
+        # Fires on the single event loop thread as each role settles, in
+        # COMPLETION order. No await between increment and print, so the
+        # counter is race-free. stdout stays the report; progress is stderr.
+        counter["done"] += 1
+        n = counter["done"]
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            print(
+                f"[codex-council] {n}/{total} {role.id}: crashed ({type(exc).__name__})",
+                file=sys.stderr, flush=True,
+            )
+            return
+        res = task.result()
+        if isinstance(res, RoleResult):
+            status = "ok" if res.ok else "FAILED"
+            print(
+                f"[codex-council] {n}/{total} {role.id}: {status} "
+                f"({res.elapsed_seconds:.1f}s)",
+                file=sys.stderr, flush=True,
+            )
+        else:
+            print(
+                f"[codex-council] {n}/{total} {role.id}: done",
+                file=sys.stderr, flush=True,
+            )
+
+    tasks = []
+    for role in roles:
+        t = asyncio.create_task(_run_role(role, _compose_prompt(role, body)))
+        t.add_done_callback(lambda task, role=role: _on_role_done(role, task))
+        tasks.append(t)
     started = time.monotonic()
     results = await asyncio.gather(*tasks, return_exceptions=True)
     elapsed = time.monotonic() - started
@@ -774,9 +810,22 @@ def main():
 
     elapsed = time.monotonic() - started
     print(_format_report(results, elapsed), end="")
+    sys.stdout.flush()
 
     successes = sum(1 for r in results if r.ok)
-    if successes == 0:
+    total = len(results)
+    exit_code = 0 if successes else 1
+
+    # Final, uniquely-shaped, LAST stderr line. Its presence means the stdout
+    # report is fully written; it carries the exit status so a lost/orphaned but
+    # redirected run is fully recoverable from `err.log` (tail until this line).
+    print(
+        f"[codex-council] CODEX_COUNCIL_DONE ok={successes} total={total} "
+        f"elapsed={elapsed:.1f}s exit={exit_code}",
+        file=sys.stderr, flush=True,
+    )
+
+    if exit_code:
         sys.exit(1)
 
 

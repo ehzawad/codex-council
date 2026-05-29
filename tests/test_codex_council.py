@@ -725,6 +725,78 @@ class RunTeamAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(results[0].ok)
 
 
+class RunCouncilProgressTests(unittest.IsolatedAsyncioTestCase):
+    """run_council emits a per-role completion line to stderr as each role
+    settles (in completion order), while stdout stays the report. The final
+    CODEX_COUNCIL_DONE line is NOT emitted here — main() owns it (covered by
+    the E2E happy-path test)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.project_patcher = patch.object(
+            codex_council, "_project_root", return_value=FIXED_PROJECT_ROOT
+        )
+        self.project_patcher.start()
+        self.addCleanup(self.project_patcher.stop)
+        self.state_patcher = patch.object(codex_council, "STATE_DIR", self.tmp.name)
+        self.state_patcher.start()
+        self.addCleanup(self.state_patcher.stop)
+        self.env_patcher = patch.dict(os.environ, _env_without_session_key(), clear=True)
+        self.env_patcher.start()
+        self.addCleanup(self.env_patcher.stop)
+
+    _LABELS = {
+        "architect": "Architect",
+        "security": "Security",
+        "tester": "Test engineer",
+    }
+
+    def _roles(self, *ids):
+        return [_make_role(i, self._LABELS.get(i, i)) for i in ids]
+
+    async def test_per_role_stderr_progress_and_order(self):
+        async def fake_role(role, prompt):
+            ok = role.id != "security"  # one not-ok to exercise FAILED line
+            return codex_council.RoleResult(
+                role=role, ok=ok,
+                text="reply" if ok else None,
+                error=None if ok else "boom",
+                elapsed_seconds=0.1, attempts=1,
+            )
+        buf = io.StringIO()
+        with patch.object(codex_council, "_run_role", side_effect=fake_role):
+            with contextlib.redirect_stderr(buf):
+                results = await codex_council.run_council(
+                    self._roles("architect", "security", "tester"), "body",
+                )
+
+        # Returned list preserves ROLE order (not completion order).
+        self.assertEqual(
+            [r.role.id for r in results], ["architect", "security", "tester"]
+        )
+
+        err = buf.getvalue()
+        # A per-role line for each role, ok or FAILED, with an elapsed paren.
+        self.assertRegex(err, r"\[codex-council\] \d+/3 architect: ok \(")
+        self.assertRegex(err, r"\[codex-council\] \d+/3 security: FAILED \(")
+        self.assertRegex(err, r"\[codex-council\] \d+/3 tester: ok \(")
+        # Exactly one progress line per role (3 total).
+        progress_lines = [
+            ln for ln in err.splitlines()
+            if re.match(r"\[codex-council\] \d+/3 \S+: (ok|FAILED) \(", ln)
+        ]
+        self.assertEqual(len(progress_lines), 3)
+        # Counters are exactly 1..N, each once — catches an "always 1/3" bug.
+        counters = sorted(
+            int(re.match(r"\[codex-council\] (\d+)/3", ln).group(1))
+            for ln in progress_lines
+        )
+        self.assertEqual(counters, [1, 2, 3])
+        # The final sentinel is main()'s job, never run_council's.
+        self.assertNotIn("CODEX_COUNCIL_DONE", err)
+
+
 # ---------- roles JSON parsing (--roles-file contents) ----------
 
 class ParseRolesJsonTests(unittest.TestCase):
