@@ -35,8 +35,8 @@ flight, and the judgment the user actually needs, composes a tailored
 2–4 agent panel, and asks you to confirm via Claude Code's
 `AskUserQuestion` tool. One click runs the panel as proposed;
 alternatively you can adjust the count or roles. Each role keeps its
-own Codex thread per project, so framings accumulate across calls if
-you reuse role IDs.
+own Codex thread per project and host session, so framings accumulate
+across calls in the same terminal/session if you reuse role IDs.
 
 Auto-trigger phrases (natural language) are restricted to:
 
@@ -91,7 +91,7 @@ flowchart LR
         Fanout --> RoleB["Role runner B"]
         Fanout --> RoleN["Role runner N"]
 
-        RoleA <--> State["Per-project, per-role state<br/>$XDG_STATE_HOME/codex-council"]
+        RoleA <--> State["Per-project/session/role state<br/>$XDG_STATE_HOME/codex-council"]
         RoleB <--> State
         RoleN <--> State
     end
@@ -109,6 +109,62 @@ flowchart LR
     Parse --> Report["Aggregated markdown report"]
     Report --> Claude
     Claude --> Reconcile["Claude reconciles results<br/>for the user"]
+```
+
+## Launch Flow
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant C as Claude Code
+    participant F as Private run dir
+    participant S as codex_council.py
+    participant X as Codex CLI
+
+    U->>C: Invoke codex-council
+    C->>C: Compose task-specific role panel
+    C->>U: Confirm panel
+    U-->>C: Run as proposed
+    C->>F: mktemp -d once
+    C->>F: Write roles.json and context.md
+    C->>S: --check-staging-dir F
+    S-->>C: staging OK or precise staging error
+    C->>S: --roles-file F/roles.json --context-file F/context.md
+    par role fan-out
+        S->>X: codex exec role A
+        S->>X: codex exec role B
+        S->>X: codex exec role N
+    end
+    X-->>S: JSONL events
+    S->>F: out.md report
+    S->>F: err.log progress + CODEX_COUNCIL_DONE
+    C->>F: Read out.md and err.log
+    C->>U: Reconciled answer
+```
+
+## State Scope
+
+```mermaid
+flowchart TD
+    Project["Git repo root or cwd"] --> ProjectHash["project hash"]
+    Role["Role id"] --> RoleKey["role key"]
+
+    Explicit["CODEX_COUNCIL_SESSION_KEY"] --> Scope{"explicit key set?"}
+    Auto["Auto-detected host session<br/>Claude session, CODEX_THREAD_ID,<br/>TERM_SESSION_ID, TMUX_PANE, STY, VSCODE_PID"] --> Scope
+    Disable["CODEX_COUNCIL_DISABLE_AUTO_SESSION_KEY=1"] --> Scope
+
+    Scope -->|"explicit"| SessionHash["session hash"]
+    Scope -->|"auto"| SessionHash
+    Scope -->|"disabled or unavailable"| ProjectOnly["project-wide scope"]
+
+    ProjectHash --> StatePath["state path"]
+    SessionHash --> StatePath
+    ProjectOnly --> StatePath
+    RoleKey --> StatePath
+
+    StatePath --> Lock["POSIX lock per state file"]
+    Lock --> Resume["resume stored Codex thread"]
+    Lock --> Fresh["or start fresh thread"]
 ```
 
 ## State

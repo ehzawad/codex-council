@@ -41,6 +41,8 @@ plus prose discouragement. External fan-out gives us failure
 isolation, distinct thread_ids on disk, and ~20% the dependency
 surface.
 
+## End-to-end fan-out
+
 ```mermaid
 sequenceDiagram
     participant C as Claude Code
@@ -61,6 +63,53 @@ sequenceDiagram
     T->>T: per-role extract_final_message
     T-->>C: aggregated markdown report
     C-->>C: reconcile across roles
+```
+
+## Staging validation
+
+```mermaid
+flowchart TD
+    Mktemp["Claude runs mktemp -d once"] --> Rundir["Private run dir"]
+    Rundir --> Roles["roles.json"]
+    Rundir --> Context["context.md"]
+    Rundir --> Out["out.md"]
+    Rundir --> Err["err.log"]
+
+    Roles --> Preflight["--check-staging-dir"]
+    Context --> Preflight
+    Preflight --> Exists{"both files exist?"}
+    Exists -->|no| StageError["exit 2 with staging hint"]
+    Exists -->|yes| SameDir{"same mktemp dir?"}
+    SameDir -->|no| StageError
+    SameDir -->|yes| Parse["parse roles + validate context"]
+    Parse -->|bad JSON/empty context| StageError
+    Parse -->|ok| Launch["launch fan-out"]
+
+    Launch --> Out
+    Launch --> Err
+    Err --> Sentinel["CODEX_COUNCIL_DONE"]
+```
+
+## State key and locking
+
+```mermaid
+flowchart LR
+    Root["project root"] --> RootHash["sha256 root prefix"]
+    Env["explicit or auto session key"] --> SessionHash["optional sha256 session prefix"]
+    Role["role id"] --> Filename["state filename"]
+
+    RootHash --> Filename
+    SessionHash --> Filename
+    Filename --> State["$XDG_STATE_HOME/codex-council/key__role.json"]
+    State --> Lock["state-file lock"]
+    Lock --> Load["load stored thread id"]
+    Load --> Resume["codex exec resume"]
+    Resume --> Match{"thread id matches?"}
+    Match -->|yes| Save["save session metadata"]
+    Match -->|no| Adopt["adopt new thread id + warn"]
+    Adopt --> Save
+    Resume -->|stale| Fresh["clear state + fresh codex exec"]
+    Fresh --> Save
 ```
 
 ## Resume footgun mitigation
