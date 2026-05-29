@@ -1266,6 +1266,13 @@ class ReadRolesFileTests(unittest.TestCase):
             expect_in_stderr="cannot read",
         )
 
+    def test_missing_parent_mentions_staging_hint(self):
+        missing = os.path.join(self.tmp.name, "missing", "roles.json")
+        _assert_usage_exit(
+            self, lambda: codex_council._read_roles_file(missing),
+            expect_in_stderr="Staging hint",
+        )
+
     def test_empty_path_usage_exits(self):
         _assert_usage_exit(
             self, lambda: codex_council._read_roles_file(""),
@@ -1313,6 +1320,112 @@ class ReadRolesFileTests(unittest.TestCase):
             ], f)
         roles = codex_council._parse_roles_json(codex_council._read_roles_file(path))
         self.assertEqual([r.id for r in roles], ["alpha", "beta"])
+
+
+class CheckStagingDirTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        os.chmod(self.tmp.name, 0o700)
+
+    def _write_valid_roles(self):
+        with open(os.path.join(self.tmp.name, "roles.json"), "w", encoding="utf-8") as f:
+            json.dump([_role_json("a", "A")], f)
+
+    def _write_context(self, text="context"):
+        with open(os.path.join(self.tmp.name, "context.md"), "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def test_valid_staging_dir_prints_ok(self):
+        self._write_valid_roles()
+        self._write_context()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            codex_council._check_staging_dir(self.tmp.name)
+        self.assertIn("staging OK", buf.getvalue())
+        self.assertIn("(1 roles)", buf.getvalue())
+
+    def test_missing_context_mentions_staging_hint(self):
+        self._write_valid_roles()
+        _assert_usage_exit(
+            self,
+            lambda: codex_council._check_staging_dir(self.tmp.name),
+            expect_in_stderr="Staging hint",
+        )
+
+    def test_empty_context_is_rejected(self):
+        self._write_valid_roles()
+        self._write_context("   \n")
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            with self.assertRaises(SystemExit) as ctx:
+                codex_council._check_staging_dir(self.tmp.name)
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("Empty Context file", buf.getvalue())
+
+    def test_public_staging_dir_is_rejected(self):
+        os.chmod(self.tmp.name, 0o755)
+        self.addCleanup(lambda: os.chmod(self.tmp.name, 0o700))
+        _assert_usage_exit(
+            self,
+            lambda: codex_council._check_staging_dir(self.tmp.name),
+            expect_in_stderr="not private 0700",
+        )
+
+
+class ReadContextFileTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _path(self, name="context.md"):
+        return os.path.join(self.tmp.name, name)
+
+    def test_reads_context_file(self):
+        path = self._path()
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("context\n")
+        self.assertEqual(codex_council._read_context_file(path), "context\n")
+
+    def test_missing_context_file_usage_exits(self):
+        path = self._path("missing.md")
+        _assert_usage_exit(
+            self,
+            lambda: codex_council._read_context_file(path),
+            expect_in_stderr="Staging hint",
+        )
+
+    def test_empty_context_file_exits_1(self):
+        path = self._path()
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("   \n")
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            with self.assertRaises(SystemExit) as ctx:
+                codex_council._read_context_file(path)
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("Empty Context file", buf.getvalue())
+
+    def test_context_file_reuses_utf8_and_byte_cap_guards(self):
+        path = self._path()
+        with open(path, "wb") as f:
+            f.write(b"\xff\xfe bad")
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            with self.assertRaises(SystemExit) as ctx:
+                codex_council._read_context_file(path)
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("not valid UTF-8", buf.getvalue())
+
+        with patch.object(codex_council, "MAX_STDIN_BYTES", 4):
+            with open(path, "wb") as f:
+                f.write(b"abcde")
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                with self.assertRaises(SystemExit) as ctx:
+                    codex_council._read_context_file(path)
+            self.assertEqual(ctx.exception.code, 1)
+            self.assertIn("exceeds", buf.getvalue())
 
 
 class ReadStdinBodyTests(unittest.TestCase):
@@ -1399,11 +1512,26 @@ class ArgParseTests(unittest.TestCase):
         args = codex_council._parse_args(["--roles-file", "x.json"])
         self.assertEqual(args.roles_file, "x.json")
 
+    def test_context_file_parses_to_namespace(self):
+        args = codex_council._parse_args([
+            "--roles-file", "x.json",
+            "--context-file", "context.md",
+        ])
+        self.assertEqual(args.context_file, "context.md")
+
     def test_empty_roles_file_rejected(self):
         buf = io.StringIO()
         with contextlib.redirect_stderr(buf):
             with self.assertRaises(SystemExit) as ctx:
                 codex_council._parse_args(["--roles-file", ""])
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertIn("must be non-empty", buf.getvalue())
+
+    def test_empty_context_file_rejected(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            with self.assertRaises(SystemExit) as ctx:
+                codex_council._parse_args(["--context-file", ""])
         self.assertEqual(ctx.exception.code, 2)
         self.assertIn("must be non-empty", buf.getvalue())
 

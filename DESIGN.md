@@ -6,12 +6,15 @@ Implementation details for contributors. User-facing docs live in
 ## No catalog, no defaults
 
 The script accepts roles **only** via `--roles-file` (a path to a JSON
-file holding the list of `{id, label, instruction}` objects). Keeping
-the panel in a file keeps a large role array out of the shell, where a
-stray quote or brace would otherwise break the call. There is no
+file holding the list of `{id, label, instruction}` objects), and the
+preferred launch path supplies context via `--context-file` in the same
+private staging directory. Keeping the panel and context in files keeps
+a large role array and multiline context out of the shell, where a
+stray quote, brace, or missing redirection target would otherwise break
+the call before the runner can diagnose it. There is no
 built-in role catalog, no positional shortcuts, and no `--list-roles`
-flag. Bare invocation (no `--roles-file`, with context piped) exits
-2 — the script's way of telling Claude to go compose a panel.
+flag. Bare invocation (no `--roles-file`, with context piped or staged)
+exits 2 — the script's way of telling Claude to go compose a panel.
 
 The reasoning: every hardcoded catalog is a bias. The original 6
 coding roles biased Claude toward coding panels. A later expansion to
@@ -46,7 +49,7 @@ sequenceDiagram
     participant B as codex exec (role B)
     participant N as codex exec (role N)
 
-    C->>T: Pipe context via stdin + --roles-file
+    C->>T: Staged context via --context-file + --roles-file
     par
         T->>A: bookended prompt (role A framing)
         T->>B: bookended prompt (role B framing)

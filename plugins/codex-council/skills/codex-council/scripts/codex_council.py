@@ -18,7 +18,7 @@ AskUserQuestion, then invoke this script. Roles arrive via
 a large role array out of the shell entirely.
 
 Usage:
-    echo "<context>" | python3 codex_council.py --roles-file roles.json
+    python3 codex_council.py --roles-file roles.json --context-file context.md
 
 Env vars:
     CODEX_COUNCIL_SESSION_KEY     scope council threads (e.g. per branch)
@@ -39,6 +39,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -100,6 +101,12 @@ ROLE_INSTRUCTION_MAX_BYTES = 8192
 REQUIRED_SCOPE_PHRASE = "nothing material"
 REQUIRED_CADENCE_SENTENCE = "Thoroughness beats speed."
 LINEBREAK_CHARS = ("\r", "\n", "\u2028", "\u2029")
+STAGING_PATH_HINT = (
+    "Staging hint: use the exact directory printed by `mktemp -d` for "
+    "both roles.json and context.md in this invocation; keep roles, context, "
+    "out.md, and err.log under the same mktemp directory. Shell variables do "
+    "not persist across Claude Code Bash calls."
+)
 
 # No timeout, by design. Neither this script nor `codex exec` enforces a
 # wall-clock or run-level timeout, so a role may think for hours or days.
@@ -776,9 +783,33 @@ def _parse_args(argv):
             "composes this per invocation; see SKILL.md."
         ),
     )
+    parser.add_argument(
+        "--check-staging-dir", default=None, metavar="DIR",
+        help=(
+            "Validate DIR/roles.json and DIR/context.md, then exit without "
+            "launching Codex. Use this after writing the per-run staging "
+            "files and before the background council launch."
+        ),
+    )
+    parser.add_argument(
+        "--context-file", default=None, metavar="PATH",
+        help=(
+            "Path to a UTF-8 context file to send to every role instead of "
+            "reading stdin. This lets the script validate both staged inputs "
+            "before launching any Codex subprocess."
+        ),
+    )
     args = parser.parse_args(argv)
     if args.roles_file == "":
         parser.error("--roles-file must be non-empty")
+    if args.check_staging_dir == "":
+        parser.error("--check-staging-dir must be non-empty")
+    if args.context_file == "":
+        parser.error("--context-file must be non-empty")
+    if args.check_staging_dir is not None and args.roles_file is not None:
+        parser.error("--check-staging-dir cannot be combined with --roles-file")
+    if args.check_staging_dir is not None and args.context_file is not None:
+        parser.error("--check-staging-dir cannot be combined with --context-file")
     return args
 
 
@@ -786,6 +817,63 @@ def _usage_exit(msg):
     """Exit 2 with msg on stderr (argparse-compatible usage-error code)."""
     print(msg, file=sys.stderr)
     raise SystemExit(2)
+
+
+def _file_arg_problem(arg_name, path):
+    """Return a staging diagnostic for an unreadable file arg, or None."""
+    if path == "":
+        return f"{arg_name} must be non-empty"
+    abs_path = os.path.abspath(path)
+    cwd = os.getcwd()
+    parent = os.path.dirname(abs_path) or "."
+    details = f"cwd={cwd!r}; absolute={abs_path!r}"
+    if not os.path.isdir(parent):
+        return (
+            f"{arg_name}: cannot read {path!r}; parent directory does not "
+            f"exist: {parent!r} ({details})"
+        )
+    if os.path.isdir(path):
+        return f"{arg_name}: cannot read {path!r}; path is a directory ({details})"
+    if not os.path.exists(path):
+        return f"{arg_name}: cannot read {path!r}; file does not exist ({details})"
+    if not os.path.isfile(path):
+        return f"{arg_name}: cannot read {path!r}; not a regular file ({details})"
+    if not os.access(path, os.R_OK):
+        return f"{arg_name}: cannot read {path!r}; permission denied ({details})"
+    return None
+
+
+def _usage_exit_if_file_arg_problems(*arg_pairs):
+    """Aggregate missing staged-input errors before attempting reads."""
+    problems = [
+        problem
+        for arg_name, path in arg_pairs
+        if path is not None
+        for problem in [_file_arg_problem(arg_name, path)]
+        if problem is not None
+    ]
+    if problems:
+        _usage_exit(
+            "codex-council input staging error:\n"
+            + "\n".join(f"- {p}" for p in problems)
+            + f"\n{STAGING_PATH_HINT}"
+        )
+
+
+def _usage_exit_if_staging_dirs_differ(roles_file, context_file):
+    """Require staged launch inputs to live in the same per-run directory."""
+    if roles_file is None or context_file is None:
+        return
+    roles_dir = os.path.realpath(os.path.dirname(os.path.abspath(roles_file)))
+    context_dir = os.path.realpath(os.path.dirname(os.path.abspath(context_file)))
+    if roles_dir != context_dir:
+        _usage_exit(
+            "codex-council input staging error:\n"
+            f"- --roles-file and --context-file must be in the same mktemp "
+            f"directory; got roles dir {roles_dir!r} and context dir "
+            f"{context_dir!r}.\n"
+            f"{STAGING_PATH_HINT}"
+        )
 
 
 def _read_roles_file(path):
@@ -797,13 +885,14 @@ def _read_roles_file(path):
     errors exit 2 like other usage errors; JSON validity is left to
     _parse_roles_json.
     """
-    if path == "":
-        _usage_exit("--roles-file must be non-empty.")
+    problem = _file_arg_problem("--roles-file", path)
+    if problem:
+        _usage_exit(f"{problem}. {STAGING_PATH_HINT}")
     try:
         with open(path, encoding="utf-8") as f:
             return f.read()
     except OSError as e:
-        _usage_exit(f"--roles-file: cannot read {path!r} ({e}).")
+        _usage_exit(f"--roles-file: cannot read {path!r} ({e}). {STAGING_PATH_HINT}")
     except UnicodeDecodeError as e:
         _usage_exit(f"--roles-file: {path!r} is not valid UTF-8 ({e}).")
 
@@ -929,8 +1018,8 @@ def _resolve_roles(custom_roles):
     return ordered
 
 
-def _read_stdin_body(stream):
-    """Read the prompt body from a binary stream, enforcing the byte cap.
+def _read_prompt_body(stream, source_label):
+    """Read a prompt body from a binary stream, enforcing the byte cap.
 
     Counts BYTES, not characters: stdin is read raw and the cap is checked
     against the byte length, because the prompt is later UTF-8 encoded for
@@ -943,7 +1032,7 @@ def _read_stdin_body(stream):
     raw = stream.read(MAX_STDIN_BYTES + 1)
     if len(raw) > MAX_STDIN_BYTES:
         print(
-            f"Input exceeds {MAX_STDIN_BYTES} bytes "
+            f"{source_label} exceeds {MAX_STDIN_BYTES} bytes "
             f"({MAX_STDIN_BYTES >> 20} MiB) — trim before piping.",
             file=sys.stderr,
         )
@@ -951,12 +1040,67 @@ def _read_stdin_body(stream):
     try:
         body = raw.decode("utf-8")
     except UnicodeDecodeError as e:
-        print(f"Input is not valid UTF-8 ({e}) — pipe text.", file=sys.stderr)
+        print(f"{source_label} is not valid UTF-8 ({e}) — pipe text.", file=sys.stderr)
         sys.exit(1)
     if not body.strip():
-        print("Empty input — pipe a complete prompt instead.", file=sys.stderr)
+        if source_label == "Input":
+            msg = "Empty input — pipe a complete prompt instead."
+        else:
+            msg = f"Empty {source_label} — write complete context first."
+        print(msg, file=sys.stderr)
         sys.exit(1)
     return body
+
+
+def _read_stdin_body(stream):
+    """Read the prompt body from stdin."""
+    return _read_prompt_body(stream, "Input")
+
+
+def _read_context_file(path):
+    """Read a staged context file, preserving stdin body validation."""
+    problem = _file_arg_problem("--context-file", path)
+    if problem:
+        _usage_exit(f"{problem}. {STAGING_PATH_HINT}")
+    try:
+        with open(path, "rb") as f:
+            return _read_prompt_body(f, f"Context file {path!r}")
+    except OSError as e:
+        _usage_exit(f"--context-file: cannot read {path!r} ({e}). {STAGING_PATH_HINT}")
+
+
+def _check_private_dir(path):
+    """Usage-error if a staging dir is missing or not private."""
+    if not os.path.isdir(path):
+        _usage_exit(
+            f"--check-staging-dir: {path!r} is not a directory. "
+            f"{STAGING_PATH_HINT}"
+        )
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    if mode & 0o077:
+        _usage_exit(
+            f"--check-staging-dir: {path!r} is mode {mode:04o}, not private "
+            f"0700. Create it with mktemp -d. {STAGING_PATH_HINT}"
+        )
+
+
+def _check_staging_dir(path):
+    """Validate the per-run staging dir before launching Codex."""
+    if path == "":
+        _usage_exit("--check-staging-dir must be non-empty.")
+    _check_private_dir(path)
+    roles_path = os.path.join(path, "roles.json")
+    context_path = os.path.join(path, "context.md")
+    _usage_exit_if_file_arg_problems(
+        ("--roles-file", roles_path),
+        ("--context-file", context_path),
+    )
+    roles = _resolve_roles(_parse_roles_json(_read_roles_file(roles_path)))
+    _read_context_file(context_path)
+    print(
+        f"[codex-council] staging OK: {os.path.abspath(path)} "
+        f"({len(roles)} roles)"
+    )
 
 
 async def _run_council_with_signals(roles, body):
@@ -991,31 +1135,42 @@ async def _run_council_with_signals(roles, body):
 def main():
     args = _parse_args(sys.argv[1:])
 
+    if args.check_staging_dir is not None:
+        _check_staging_dir(args.check_staging_dir)
+        return
+
+    _usage_exit_if_file_arg_problems(
+        ("--roles-file", args.roles_file),
+        ("--context-file", args.context_file),
+    )
+    _usage_exit_if_staging_dirs_differ(args.roles_file, args.context_file)
+
+    # Parse and validate staged inputs before requiring Codex. This catches
+    # temp-path mismatches without launching or depending on any Codex state.
+    if args.roles_file is not None:
+        custom_roles = _parse_roles_json(_read_roles_file(args.roles_file))
+    else:
+        custom_roles = []
+    roles = _resolve_roles(custom_roles)
+
+    if args.context_file is not None:
+        body = _read_context_file(args.context_file)
+    else:
+        if sys.stdin.isatty():
+            print(
+                "No input piped. Usage: echo 'context' | "
+                "python3 codex_council.py --roles-file roles.json",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        body = _read_stdin_body(sys.stdin.buffer)
+
     if not shutil.which("codex"):
         print(
             "Codex CLI not found — install with: npm i -g @openai/codex",
             file=sys.stderr,
         )
         sys.exit(1)
-
-    if sys.stdin.isatty():
-        print(
-            "No input piped. Usage: echo 'context' | "
-            "python3 codex_council.py --roles-file roles.json",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    body = _read_stdin_body(sys.stdin.buffer)
-
-    # Parse unconditionally when a file path was supplied: an empty file
-    # then yields the clear "invalid JSON" usage error rather than the
-    # generic "no roles requested" message (which is for bare invocation).
-    if args.roles_file is not None:
-        custom_roles = _parse_roles_json(_read_roles_file(args.roles_file))
-    else:
-        custom_roles = []
-    roles = _resolve_roles(custom_roles)
 
     print(
         f"[codex-council] dispatching {len(roles)} roles "

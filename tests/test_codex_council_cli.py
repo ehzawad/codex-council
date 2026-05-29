@@ -104,6 +104,12 @@ class CouncilCLITestCase(unittest.TestCase):
             json.dump(roles, f)
         return path
 
+    def _write_context(self, text):
+        path = os.path.join(self.workdir.name, "context.md")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        return path
+
     def _run(self, *, input, args=()):
         return subprocess.run(
             [sys.executable, SCRIPT, *args],
@@ -146,6 +152,77 @@ class BareInvocationTests(CouncilCLITestCase):
         self.assertIn("must be non-empty", proc.stderr)
         self.assertNotIn("No roles requested", proc.stderr)
 
+    def test_missing_roles_file_exits_before_reading_stdin(self):
+        missing = os.path.join(self.workdir.name, "missing", "roles.json")
+        oversize = "a" * (10 * 1024 * 1024 + 1)
+        proc = self._run(input=oversize, args=("--roles-file", missing))
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn("--roles-file", proc.stderr)
+        self.assertIn("cannot read", proc.stderr)
+        self.assertIn("Staging hint", proc.stderr)
+        self.assertNotIn("Input exceeds", proc.stderr)
+        self.assertNotIn("[codex-council] dispatching", proc.stderr)
+        self.assertEqual(proc.stdout, "")
+
+    def test_mismatched_staging_paths_report_both_inputs(self):
+        actual = tempfile.TemporaryDirectory()
+        requested = tempfile.TemporaryDirectory()
+        self.addCleanup(actual.cleanup)
+        self.addCleanup(requested.cleanup)
+        with open(os.path.join(actual.name, "roles.json"), "w", encoding="utf-8") as f:
+            json.dump([
+                _role("architect", "Architect",
+                      _instruction("Review architecture")),
+            ], f)
+        with open(os.path.join(actual.name, "context.md"), "w", encoding="utf-8") as f:
+            f.write("real context\n")
+        roles_path = os.path.join(requested.name, "roles.json")
+        context_path = os.path.join(requested.name, "context.md")
+
+        proc = self._run(
+            input="",
+            args=(
+                "--roles-file", roles_path,
+                "--context-file", context_path,
+            ),
+        )
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn(roles_path, proc.stderr)
+        self.assertIn(context_path, proc.stderr)
+        self.assertIn("same mktemp directory", proc.stderr)
+        self.assertNotIn("[codex-council] dispatching", proc.stderr)
+        self.assertNotIn("CODEX_COUNCIL_DONE", proc.stderr)
+        self.assertEqual(proc.stdout, "")
+
+    def test_existing_roles_and_context_in_different_dirs_exits_2(self):
+        roles_dir = tempfile.TemporaryDirectory()
+        context_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(roles_dir.cleanup)
+        self.addCleanup(context_dir.cleanup)
+        roles_path = os.path.join(roles_dir.name, "roles.json")
+        context_path = os.path.join(context_dir.name, "context.md")
+        with open(roles_path, "w", encoding="utf-8") as f:
+            json.dump([
+                _role("architect", "Architect",
+                      _instruction("Review architecture")),
+            ], f)
+        with open(context_path, "w", encoding="utf-8") as f:
+            f.write("real context\n")
+
+        proc = self._run(
+            input="",
+            args=(
+                "--roles-file", roles_path,
+                "--context-file", context_path,
+            ),
+        )
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn("same mktemp directory", proc.stderr)
+        self.assertIn(roles_dir.name, proc.stderr)
+        self.assertIn(context_dir.name, proc.stderr)
+        self.assertNotIn("[codex-council] dispatching", proc.stderr)
+        self.assertEqual(proc.stdout, "")
+
 
 class HappyPathTests(CouncilCLITestCase):
     def test_happy_path_report_and_progress(self):
@@ -177,6 +254,44 @@ class HappyPathTests(CouncilCLITestCase):
             r"\[codex-council\] CODEX_COUNCIL_DONE ok=2 total=2 "
             r"elapsed=[\d.]+s exit=0$",
         )
+
+    def test_context_file_happy_path_without_stdin(self):
+        roles_path = self._write_roles([
+            _role("architect", "Architect",
+                  _instruction("Review architecture")),
+        ])
+        context_path = self._write_context("please review this change\n")
+        proc = self._run(
+            input="",
+            args=(
+                "--roles-file", roles_path,
+                "--context-file", context_path,
+            ),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("# Codex Council", proc.stdout)
+        self.assertIn("Architect", proc.stdout)
+        self.assertRegex(
+            self._last_nonempty_stderr_line(proc.stderr),
+            r"\[codex-council\] CODEX_COUNCIL_DONE ok=1 total=1 "
+            r"elapsed=[\d.]+s exit=0$",
+        )
+
+    def test_check_staging_dir_cli(self):
+        roles_path = self._write_roles([
+            _role("architect", "Architect",
+                  _instruction("Review architecture")),
+        ])
+        self.assertEqual(os.path.basename(roles_path), "roles.json")
+        self._write_context("please review this change\n")
+        proc = self._run(
+            input="",
+            args=("--check-staging-dir", self.workdir.name),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("staging OK", proc.stdout)
+        self.assertIn("(1 roles)", proc.stdout)
+        self.assertNotIn("[codex-council] dispatching", proc.stderr)
 
     def test_report_precedes_sentinel_in_combined_stream(self):
         # Recovery contract (R2): CODEX_COUNCIL_DONE must appear only AFTER the
@@ -245,6 +360,27 @@ class StdinGuardTests(CouncilCLITestCase):
         self.assertIn("Composed prompt", proc.stderr)
         self.assertNotIn("CODEX_COUNCIL_DONE", proc.stderr)
         self.assertNotIn("# Codex Council", proc.stdout)
+
+    def test_context_file_missing_exits_2_before_codex(self):
+        roles_path = self._write_roles([
+            _role("architect", "Architect",
+                  _instruction("Review")),
+        ])
+        missing = os.path.join(self.workdir.name, "missing-context.md")
+        proc = self._run(
+            input="",
+            args=(
+                "--roles-file", roles_path,
+                "--context-file", missing,
+            ),
+        )
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn("--context-file", proc.stderr)
+        self.assertIn("cannot read", proc.stderr)
+        self.assertIn("Staging hint", proc.stderr)
+        self.assertNotIn("[codex-council] dispatching", proc.stderr)
+        self.assertNotIn("CODEX_COUNCIL_DONE", proc.stderr)
+        self.assertEqual(proc.stdout, "")
 
 
 class FailureReportingTests(CouncilCLITestCase):

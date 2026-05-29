@@ -156,12 +156,13 @@ turn. Do not fan out without confirmation.
 ## Step 4 — Launch the council
 
 Once confirmed, **write the panel JSON to a file with the Write tool
-and pass its path with `--roles-file`**, piping the gathered context
-on stdin. Roles are supplied only this way — by design. A multi-role
-JSON array embedded in a shell argument is the single most common
-launch failure (one stray quote or unbalanced brace breaks the call);
-keeping the panel in a file written with the Write tool means there is
-no shell escaping to get wrong. A council call takes as long as the
+and pass its path with `--roles-file`**, and write the gathered context
+to `context.md` in the same staging directory and pass it with
+`--context-file`. Roles are supplied only by file — by design. A
+multi-role JSON array embedded in a shell argument is the single most
+common launch failure (one stray quote or unbalanced brace breaks the
+call); keeping the panel in a file written with the Write tool means
+there is no shell escaping to get wrong. A council call takes as long as the
 slowest role and has **no wall-clock cap** — a role may think for hours
 or days. Launch it with **exactly one backgrounding
 layer**: the Bash tool parameter `run_in_background: true`. The shell command
@@ -181,42 +182,51 @@ the real completion notification. Forbidden in the launch command: a trailing
 `>/dev/null` (redirect to files instead); and piping/wrapping into a supervisor
 such as `launchctl`, `tmux new -d`, `screen -dm`, `at`, `batch`, or `daemonize`.
 
-**Stage everything in a private per-run directory**, not fixed world-readable
-`/tmp` names. The report and the piped context can hold sensitive reviewed
-content, and predictable `/tmp/council_*` files are world-readable under a
-typical umask and can be pre-created or symlinked by another local user (who
-could then read the report or forge the `CODEX_COUNCIL_DONE` line). Make one
-private dir per run with `mktemp -d` (mode `0700`) and keep roles, context, and
-the output files inside it. Shell variables do **not** persist across Claude
-Code Bash calls, so capture the printed path and substitute it literally for
-`RUNDIR` in the Write calls and the launch command.
+**Stage everything in one private per-run directory**, not fixed world-readable
+`/tmp` names. The report and context can hold sensitive reviewed content, and
+predictable `/tmp/council_*` files are world-readable under a typical umask and
+can be pre-created or symlinked by another local user (who could then read the
+report or forge the `CODEX_COUNCIL_DONE` line). Run `mktemp -d` exactly once.
+The exact path printed by `mktemp` is the only valid run directory for this
+invocation. Do not recompute it from `$TMPDIR`, `${TMPDIR:-/tmp}`, `/tmp`,
+`/var/folders`, `pwd`, or another `mktemp` call; do not normalize it or switch
+temp roots between tool calls. Shell variables do **not** persist across Claude
+Code Bash and Write calls, so paste the printed absolute path literally into
+every Write path and every later Bash command. If `mktemp` prints
+`/tmp/claude-501/codex-council.diJhSz`, then roles, context, stdout, and stderr
+must all be under that exact directory. A different parent path is a launch
+bug; stop and fix the paths before running.
 
 ```bash
-# 0. Private per-run staging dir (mode 0700). Note the printed path and use it
-#    literally as RUNDIR in every step below.
+# 0. Create exactly one private staging dir (mode 0700). Copy the exact stdout
+#    path; that printed path is ABS_RUNDIR for every later Write and Bash call.
 mktemp -d "${TMPDIR:-/tmp}/codex-council.XXXXXX"
 
-# 1. With the Write tool (not a heredoc, so there is zero shell escaping) write
-#    the panel to RUNDIR/roles.json and the gathered context to RUNDIR/context.md.
+# 1. With the Write tool, write these exact files under the printed ABS_RUNDIR:
+#      ABS_RUNDIR/roles.json
+#      ABS_RUNDIR/context.md
+#    Do not run mktemp again, do not use $TMPDIR again, and do not substitute a
+#    different temp root such as /var/folders.
 #    Panel shape:
 #    [{"id":"<lens>","label":"<Title>","instruction":"<single paragraph; name
 #      the specific failure modes; include: if nothing material, say so clearly;
 #      end with: Thoroughness beats speed.>"}, ...]
 
-# 2. Cheap pre-flight: confirm the JSON parses before fanning out.
-python3 -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8"))' RUNDIR/roles.json
+# 2. Cheap pre-flight: confirm both launch inputs are in the same printed dir.
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
+  --check-staging-dir 'ABS_RUNDIR'
 
 # 3. Launch with Bash run_in_background: true and NOTHING appended. One layer,
-#    foreground command, stdout+stderr redirected into the private dir:
+#    foreground command, stdout+stderr redirected into the same printed dir:
 python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
-  --roles-file RUNDIR/roles.json \
-  < RUNDIR/context.md \
-  > RUNDIR/out.md \
-  2> RUNDIR/err.log
+  --roles-file 'ABS_RUNDIR/roles.json' \
+  --context-file 'ABS_RUNDIR/context.md' \
+  > 'ABS_RUNDIR/out.md' \
+  2> 'ABS_RUNDIR/err.log'
 ```
 
 Then **wait for Claude Code's completion notification — do not sleep-poll.** When
-it arrives, read `RUNDIR/out.md` for the report; read `RUNDIR/err.log`
+it arrives, read `ABS_RUNDIR/out.md` for the report; read `ABS_RUNDIR/err.log`
 for per-role progress and the final `[codex-council] CODEX_COUNCIL_DONE ...` line
 (its presence means the report is fully written; it carries the exit code).
 
@@ -230,15 +240,15 @@ If a run is ever lost or orphaned, recover entirely from disk:
 
 ```bash
 pgrep -fl 'codex_council[.]py'      # any council alive?
-pgrep -fl -- 'RUNDIR/roles.json'    # THIS run specifically (disambiguates when several run)
-tail -n 40 RUNDIR/err.log           # last line CODEX_COUNCIL_DONE -> finished
+pgrep -fl -- 'ABS_RUNDIR/roles.json' # THIS run specifically (disambiguates when several run)
+tail -n 40 ABS_RUNDIR/err.log        # last line CODEX_COUNCIL_DONE -> finished
 ```
 
 Last err line is `CODEX_COUNCIL_DONE` → done, read `out.md`. No such line but
 `pgrep` finds it → still running. No line and no process → it crashed; inspect
 `err.log` and any partial `out.md`.
 
-Bare invocation (no `--roles-file`, with context piped) exits 2 — a
+Bare invocation (no `--roles-file`, with context piped or staged) exits 2 — a
 safety net for accidental fan-out.
 
 Constraints:
@@ -251,11 +261,11 @@ Constraints:
 
 ## Building the context
 
-The snippets below show only how to compose the stdin context; the actual launch
-must always use Step 4's form — `run_in_background: true`, stdout+stderr
-redirected to files, nothing appended.
+The snippets below show only how to compose `ABS_RUNDIR/context.md`; the actual
+launch must always use Step 4's `--context-file` form — `run_in_background:
+true`, stdout+stderr redirected to files, nothing appended.
 
-The stdin contents are whatever the roles need to see. Context comes
+The context contents are whatever the roles need to see. Context comes
 from one of two sources:
 
 - **Shell-extracted from disk** — raw artifacts the user is looking
@@ -269,13 +279,13 @@ over 10 MiB (by byte count); it does not truncate. That ceiling is a
 sanity guard, not a budget — Codex's own context window is the real
 limit, so compress regardless.
 
-In the examples below, `RUNDIR` is the private per-run dir from Step 4 and
-`RUNDIR/roles.json` stands in for your panel. Every pipeline block starts with
+In the examples below, `ABS_RUNDIR` is the exact private per-run dir printed by
+`mktemp` in Step 4. Every pipeline block starts with
 `set -euo pipefail`. Put that line in the same Bash invocation as the pipeline;
 shell options do not persist across Claude Code Bash calls. This makes context
 extraction fail closed: if an upstream extractor (`git diff`, `git ls-files`,
-`tail`, etc.) fails, the council is not launched on partial context. Do not add
-`|| true` to council launch or context pipelines.
+`tail`, etc.) fails, stale or partial context is not written. Do not add
+`|| true` to context pipelines.
 
 Staging context: `git diff HEAD` means tracked worktree vs `HEAD`, so it
 includes both staged and unstaged tracked changes. Use `git diff --cached` for
@@ -289,22 +299,14 @@ NUL-delimited snippet below when they matter.
 
 ```bash
 set -euo pipefail
-git diff HEAD |
-  python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
-    --roles-file "RUNDIR/roles.json" \
-    > "RUNDIR/out.md" \
-    2> "RUNDIR/err.log"
+git diff HEAD > 'ABS_RUNDIR/context.md'
 ```
 
 **Staged-only diff:**
 
 ```bash
 set -euo pipefail
-git diff --cached |
-  python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
-    --roles-file "RUNDIR/roles.json" \
-    > "RUNDIR/out.md" \
-    2> "RUNDIR/err.log"
+git diff --cached > 'ABS_RUNDIR/context.md'
 ```
 
 **Diff plus untracked files that matter** (with binary / size /
@@ -330,14 +332,10 @@ set -euo pipefail
       printf '\n=== untracked file: %q ===\n' "$f"
       cat <"$f"
     done
-} |
-  python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
-    --roles-file "RUNDIR/roles.json" \
-    > "RUNDIR/out.md" \
-    2> "RUNDIR/err.log"
+} > 'ABS_RUNDIR/context.md'
 ```
 
-**An artifact plus a question** — pipe the relevant file or excerpt
+**An artifact plus a question** — write the relevant file or excerpt
 plus the question the council should answer:
 
 ```bash
@@ -345,11 +343,7 @@ set -euo pipefail
 {
   printf 'Question: %s\n\n' '<what you want the council to check>'
   cat <"$file"      # or: head -50 data.csv, or: pbpaste, etc.
-} |
-  python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
-    --roles-file "RUNDIR/roles.json" \
-    > "RUNDIR/out.md" \
-    2> "RUNDIR/err.log"
+} > 'ABS_RUNDIR/context.md'
 ```
 
 **Bounded diagnostic transcript** — for a test / CI failure or any
@@ -364,11 +358,7 @@ set -euo pipefail
   printf 'Exit status: %s\n\n' "$exit_status"
   echo 'Output (last 128 KiB):'
   tail -c 131072 <"$log_file"
-} |
-  python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
-    --roles-file "RUNDIR/roles.json" \
-    > "RUNDIR/out.md" \
-    2> "RUNDIR/err.log"
+} > 'ABS_RUNDIR/context.md'
 ```
 
 If the diagnosis needs source context too, append bounded source
@@ -379,19 +369,8 @@ guards as the diff+untracked snippet above.
 
 When Claude already understands the situation, compress the
 understanding into prose rather than making Codex re-discover it
-from raw source. Pipe via a quoted heredoc — not `echo`, which is
-fragile with multiline content and unsafe if the content contains
-`$VAR`, `$(...)`, backticks, or backslashes:
-
-```bash
-set -euo pipefail
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
-  --roles-file "RUNDIR/roles.json" \
-  > "RUNDIR/out.md" \
-  2> "RUNDIR/err.log" <<'EOF'
-<Claude-composed digest goes here>
-EOF
-```
+from raw source. Write the digest with the Write tool directly to
+`ABS_RUNDIR/context.md`, using the exact path printed by `mktemp`.
 
 Two common digest scopes:
 
@@ -406,9 +385,9 @@ Two common digest scopes:
 Mark uncertainty explicitly. When state matters, verify live (e.g.
 `git status --short --branch`) rather than recalling it from memory.
 
-**Never pipe an empty string.** If a shell extractor would yield
-nothing and there's nothing to digest, write a self-contained
-question and pipe it via heredoc instead.
+**Never write an empty context file.** If a shell extractor would yield
+nothing and there's nothing to digest, write a self-contained question to
+`ABS_RUNDIR/context.md` instead.
 
 ## Session continuity
 

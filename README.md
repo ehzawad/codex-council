@@ -58,9 +58,11 @@ There is **no built-in role catalog**. Claude composes the panel
 on-the-fly per invocation — ultrathinking about the task, drafting
 role ids, labels, and instructions tailored to what the user is
 actually doing, then passing them to the script via `--roles-file`
-(a path to the panel JSON). The script is a pure orchestrator: it
-reads that JSON, fans out parallel `codex exec` subprocesses, and
-aggregates the replies.
+(a path to the panel JSON) and `--context-file` (a staged context file
+in the same private per-run directory). The script is a pure
+orchestrator: it reads those staged inputs, validates them before
+launch, fans out parallel `codex exec` subprocesses, and aggregates
+the replies.
 
 **Note on fit.** Codex is strongest where the task has technical,
 structured, or evidence-checking surfaces. For tasks where a single
@@ -77,11 +79,11 @@ flowchart LR
     User["User"] --> Claude["Claude Code"]
     Claude --> Skill["codex-council skill<br/>SKILL.md"]
     Skill --> Panel["Compose task-specific role panel<br/>Confirm with AskUserQuestion"]
-    Panel --> Script["codex_council.py<br/>stdin context + --roles-file"]
+    Panel --> Script["codex_council.py<br/>--roles-file + --context-file"]
 
     subgraph Plugin["codex-council plugin"]
         Manifest[".claude-plugin/plugin.json"] -.-> Skill
-        Script --> Validate["Validate stdin size<br/>Parse and validate roles"]
+        Script --> Validate["Validate staged inputs<br/>Parse and validate roles"]
         Validate --> Prompt["Bookend context with<br/>each role instruction"]
         Prompt --> Fanout["asyncio.gather<br/>parallel fan-out"]
 
