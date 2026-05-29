@@ -391,17 +391,21 @@ nothing and there's nothing to digest, write a self-contained question to
 
 ## Session continuity
 
-One Codex thread per (project, role) pair, stored at
-`$XDG_STATE_HOME/codex-council/{project-hash}__{role-id}.json`.
-Follow-up calls resume the per-role thread so each role accumulates
-its own framing across Claude Code sessions. Stale resumes restart
-only the affected role — siblings are unaffected. Role IDs reused
-across calls continue their own thread; new IDs start fresh.
+One Codex thread per (project, host session, role) tuple, stored at
+`$XDG_STATE_HOME/codex-council/{project-hash}-{session-hash}__{role-id}.json`
+when a stable host-session id is available. The runner auto-detects common
+session identifiers such as Claude session ids, `CODEX_THREAD_ID`,
+`TERM_SESSION_ID`, `TMUX_PANE`, `STY`, and `VSCODE_PID`, so separate terminal
+tabs/panes in the same repo do not normally share role threads. Follow-up calls
+from the same host session resume the per-role thread so each role accumulates
+its framing. Stale resumes restart only the affected role — siblings are
+unaffected. Role IDs reused across calls continue their own thread; new IDs
+start fresh.
 
-Set `CODEX_COUNCIL_SESSION_KEY` before launching Claude Code to
-scope a session away from the project-wide council threads (e.g.,
-per branch or task ID). The state-file name becomes
-`{project-hash}-{session-hash}__{role-id}.json`.
+`CODEX_COUNCIL_SESSION_KEY` remains an explicit override for custom scoping
+(e.g. per branch or task ID). Set `CODEX_COUNCIL_DISABLE_AUTO_SESSION_KEY=1`
+only if you intentionally want the older project-wide state file shape:
+`{project-hash}__{role-id}.json`.
 
 ## Retries
 

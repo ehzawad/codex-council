@@ -37,8 +37,13 @@ FIXED_PROJECT_HASH = hashlib.sha256(FIXED_PROJECT_ROOT.encode()).hexdigest()[:16
 
 
 def _env_without_session_key():
-    """Current env minus CODEX_COUNCIL_SESSION_KEY."""
-    return {k: v for k, v in os.environ.items() if k != codex_council.SESSION_KEY_ENV}
+    """Current env minus explicit and auto council session-scope keys."""
+    excluded = {
+        codex_council.SESSION_KEY_ENV,
+        codex_council.DISABLE_AUTO_SESSION_KEY_ENV,
+        *codex_council.AUTO_SESSION_ENV_VARS,
+    }
+    return {k: v for k, v in os.environ.items() if k not in excluded}
 
 
 def _assert_usage_exit(test, callable_, *, expect_in_stderr):
@@ -122,20 +127,46 @@ class ResolveRolesTests(unittest.TestCase):
 # ---------- env vars / session key ----------
 
 class SessionKeyTests(unittest.TestCase):
-    def test_unset_returns_empty(self):
+    def test_unset_without_auto_returns_empty(self):
         with patch.dict(os.environ, _env_without_session_key(), clear=True):
             self.assertEqual(codex_council._session_key(), "")
 
-    def test_value_returned(self):
-        with patch.dict(os.environ, {codex_council.SESSION_KEY_ENV: "branch-x"}, clear=False):
+    def test_explicit_value_returned(self):
+        env = _env_without_session_key()
+        env[codex_council.SESSION_KEY_ENV] = "branch-x"
+        with patch.dict(os.environ, env, clear=True):
             self.assertEqual(codex_council._session_key(), "branch-x")
 
     def test_whitespace_stripped(self):
-        with patch.dict(os.environ, {codex_council.SESSION_KEY_ENV: "  spaced  "}, clear=False):
+        env = _env_without_session_key()
+        env[codex_council.SESSION_KEY_ENV] = "  spaced  "
+        with patch.dict(os.environ, env, clear=True):
             self.assertEqual(codex_council._session_key(), "spaced")
 
     def test_whitespace_only_is_empty(self):
-        with patch.dict(os.environ, {codex_council.SESSION_KEY_ENV: "   "}, clear=False):
+        env = _env_without_session_key()
+        env[codex_council.SESSION_KEY_ENV] = "   "
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(codex_council._session_key(), "")
+
+    def test_auto_session_key_uses_terminal_session_when_no_explicit_key(self):
+        env = _env_without_session_key()
+        env["TERM_SESSION_ID"] = "term-123"
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(codex_council._session_key(), "TERM_SESSION_ID=term-123")
+
+    def test_explicit_session_key_overrides_auto_session_key(self):
+        env = _env_without_session_key()
+        env[codex_council.SESSION_KEY_ENV] = "manual"
+        env["TERM_SESSION_ID"] = "term-123"
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(codex_council._session_key(), "manual")
+
+    def test_disable_auto_session_key_restores_project_wide_scope(self):
+        env = _env_without_session_key()
+        env[codex_council.DISABLE_AUTO_SESSION_KEY_ENV] = "1"
+        env["TERM_SESSION_ID"] = "term-123"
+        with patch.dict(os.environ, env, clear=True):
             self.assertEqual(codex_council._session_key(), "")
 
 
@@ -164,6 +195,14 @@ class ProjectKeyTests(unittest.TestCase):
         with patch.dict(os.environ, {codex_council.SESSION_KEY_ENV: "task-1"}, clear=False):
             key = codex_council._project_key("architect")
         suffix = hashlib.sha256(b"task-1").hexdigest()[:16]
+        self.assertEqual(key, f"{FIXED_PROJECT_HASH}-{suffix}__architect")
+
+    def test_auto_session_key_appends_suffix_before_role(self):
+        env = _env_without_session_key()
+        env["TERM_SESSION_ID"] = "term-123"
+        with patch.dict(os.environ, env, clear=True):
+            key = codex_council._project_key("architect")
+        suffix = hashlib.sha256(b"TERM_SESSION_ID=term-123").hexdigest()[:16]
         self.assertEqual(key, f"{FIXED_PROJECT_HASH}-{suffix}__architect")
 
     def test_no_session_key_returns_project_plus_role(self):
@@ -238,6 +277,14 @@ class StateIOTests(unittest.TestCase):
             codex_council.save_session("architect", "s-alpha")
             _, meta = codex_council.load_session("architect")
         self.assertEqual(meta["session_key"], "alpha")
+
+    def test_save_includes_auto_session_key_when_detected(self):
+        env = _env_without_session_key()
+        env["TERM_SESSION_ID"] = "term-123"
+        with patch.dict(os.environ, env, clear=True):
+            codex_council.save_session("architect", "s-auto")
+            _, meta = codex_council.load_session("architect")
+        self.assertEqual(meta["session_key"], "TERM_SESSION_ID=term-123")
 
     def test_load_missing_returns_none_pair(self):
         with patch.dict(os.environ, _env_without_session_key(), clear=True):

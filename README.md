@@ -114,10 +114,17 @@ flowchart LR
 ## State
 
 Council state lives at
-`$XDG_STATE_HOME/codex-council/{project-hash}__{role-id}.json` (or
-`{project-hash}-{session-hash}__{role-id}.json` when
-`CODEX_COUNCIL_SESSION_KEY` is set). Set `CODEX_COUNCIL_SESSION_KEY`
-before launching Claude Code to scope state per branch or task.
+`$XDG_STATE_HOME/codex-council/{project-hash}-{session-hash}__{role-id}.json`
+when the runner can detect a stable host-session id. It auto-detects common
+values such as Claude session ids, `CODEX_THREAD_ID`, `TERM_SESSION_ID`,
+`TMUX_PANE`, `STY`, and `VSCODE_PID`, so separate terminal tabs/panes in the
+same repo do not normally share role threads. Follow-up calls from the same
+host session still resume the same per-role thread.
+
+`CODEX_COUNCIL_SESSION_KEY` remains an explicit override for custom scoping
+per branch or task. Set `CODEX_COUNCIL_DISABLE_AUTO_SESSION_KEY=1` only if you
+want the older project-wide state file shape:
+`{project-hash}__{role-id}.json`.
 
 ## Security
 

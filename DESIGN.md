@@ -75,11 +75,16 @@ re-run — the turn has already completed on the new thread; re-running
 burns tokens for no benefit.
 
 Per-role state is protected by a POSIX advisory lock keyed by
-`(project, session key, role)`. The lock is held across the whole
-load/resume-or-fresh/save retry loop, not just individual file reads
-or writes, so two council processes cannot concurrently resume the
-same role thread and then last-writer-wins the state file. Different
-roles still run in parallel.
+`(project, session key, role)`. The session key is explicit when
+`CODEX_COUNCIL_SESSION_KEY` is set; otherwise the runner auto-detects common
+host-session identifiers such as Claude session ids, `CODEX_THREAD_ID`,
+`TERM_SESSION_ID`, `TMUX_PANE`, `STY`, and `VSCODE_PID`. That gives normal
+multi-terminal isolation without requiring the user to export anything, while
+calls from the same terminal/session keep continuity. The lock is held across
+the whole load/resume-or-fresh/save retry loop, not just individual file reads
+or writes, so two council processes cannot concurrently resume the same role
+thread and then last-writer-wins the state file. Different roles still run in
+parallel.
 
 ## Failure-class tagging
 

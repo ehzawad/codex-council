@@ -2,9 +2,10 @@
 """Fan out a prompt to a council of Codex sub-agents in parallel.
 
 Each role runs in its own `codex exec` subprocess with a distinct
-framing instruction. Sessions are isolated per (project, role) and
-persist across calls so each role accumulates its own thread of
-project knowledge.
+framing instruction. Sessions are isolated per (project, host session,
+role) when a terminal/session identifier is available, and persist
+across calls from that host session so each role accumulates its own
+thread of project knowledge.
 
 Results are aggregated into one structured markdown report on stdout
 for Claude to reconcile.
@@ -21,7 +22,9 @@ Usage:
     python3 codex_council.py --roles-file roles.json --context-file context.md
 
 Env vars:
-    CODEX_COUNCIL_SESSION_KEY     scope council threads (e.g. per branch)
+    CODEX_COUNCIL_SESSION_KEY     explicit council thread scope override
+    CODEX_COUNCIL_DISABLE_AUTO_SESSION_KEY=1
+                                   fall back to project-wide role state
 
 No wall-clock timeouts are enforced — each role runs as long as Codex
 takes. Ctrl+C still tears down every in-flight codex process group.
@@ -88,6 +91,16 @@ STALE_RESUME_MARKERS = (
 )
 
 SESSION_KEY_ENV = "CODEX_COUNCIL_SESSION_KEY"
+DISABLE_AUTO_SESSION_KEY_ENV = "CODEX_COUNCIL_DISABLE_AUTO_SESSION_KEY"
+AUTO_SESSION_ENV_VARS = (
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_SESSION_ID",
+    "CODEX_THREAD_ID",
+    "TERM_SESSION_ID",
+    "TMUX_PANE",
+    "STY",
+    "VSCODE_PID",
+)
 
 MAX_PARALLEL = 6  # matches codex's own DEFAULT_AGENT_MAX_THREADS
 MAX_RETRY_ATTEMPTS = 2
@@ -161,9 +174,27 @@ def _project_root():
     return root or os.getcwd()
 
 
+def _auto_session_key():
+    """Best-effort stable host-session key for terminal/tab/pane isolation."""
+    for name in AUTO_SESSION_ENV_VARS:
+        value = os.environ.get(name, "").strip()
+        if value:
+            return f"{name}={value}"
+    return ""
+
+
+def _truthy_env(name):
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _session_key():
-    """Optional caller-provided key for scoping council threads."""
-    return os.environ.get(SESSION_KEY_ENV, "").strip()
+    """Return explicit or auto-detected key for scoping council threads."""
+    explicit = os.environ.get(SESSION_KEY_ENV, "").strip()
+    if explicit:
+        return explicit
+    if _truthy_env(DISABLE_AUTO_SESSION_KEY_ENV):
+        return ""
+    return _auto_session_key()
 
 
 def _project_key(role_id):
