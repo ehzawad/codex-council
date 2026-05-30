@@ -172,7 +172,9 @@ Council state lives at
 when the runner can detect a stable host-session id. It auto-detects common
 values such as Claude session ids, `CODEX_THREAD_ID`, `TERM_SESSION_ID`,
 `TMUX_PANE`, `STY`, and `VSCODE_PID`, so separate terminal tabs/panes in the
-same repo do not normally share role threads. Follow-up calls from the same
+same repo do not normally share role threads (except multiple integrated
+terminals in the **same VS Code window**, which share `VSCODE_PID`; set
+`CODEX_COUNCIL_SESSION_KEY` to isolate those). Follow-up calls from the same
 host session still resume the same per-role thread.
 
 `CODEX_COUNCIL_SESSION_KEY` remains an explicit override for custom scoping
