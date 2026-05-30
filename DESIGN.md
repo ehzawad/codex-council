@@ -114,14 +114,20 @@ flowchart LR
 
 ## Resume footgun mitigation
 
-Per Codex source, `codex exec resume <bogus_or_invalid_uuid>` silently
-falls through to creating a **new** thread instead of erroring. Without
-a check, we'd persist an unrelated thread ID under the role's state
-key. After every resume the council script extracts
-`thread.started.thread_id` from the JSONL stream; if it doesn't equal
-the requested ID, it adopts the new ID and warns. It does **not**
-re-run — the turn has already completed on the new thread; re-running
-burns tokens for no benefit.
+`codex exec resume <id>` parses `<id>` as a UUID first (UUIDs take
+precedence if it parses). Verified against codex-cli 0.135.0: a
+valid-but-unknown UUID **errors** (`no rollout found for thread id ...
+(code -32600)`, exit 1) and is handled by the stale-resume path (clear
+state + restart fresh); only a value that is **not** a valid UUID is
+treated as a thread *name* and silently starts a **new** thread (rc==0,
+fresh `thread.started`). The council only ever stores real UUIDs emitted
+by `thread.started`, so the silent-spawn case is unreachable via normal
+state — the mismatch check is **defense-in-depth** against a
+corrupt/hand-edited state file or future CLI drift. After every resume
+the script extracts `thread.started.thread_id`; if it doesn't equal the
+requested ID, it adopts the new ID and warns. It does **not** re-run —
+the turn has already completed on the new thread; re-running burns
+tokens for no benefit.
 
 Per-role state is protected by a POSIX advisory lock keyed by
 `(project, session key, role)`. The session key is explicit when
@@ -129,7 +135,11 @@ Per-role state is protected by a POSIX advisory lock keyed by
 host-session identifiers such as Claude session ids, `CODEX_THREAD_ID`,
 `TERM_SESSION_ID`, `TMUX_PANE`, `STY`, and `VSCODE_PID`. That gives normal
 multi-terminal isolation without requiring the user to export anything, while
-calls from the same terminal/session keep continuity. The lock is held across
+calls from the same terminal/session keep continuity. `VSCODE_PID` is the
+lowest-priority fallback and is **window-scoped**, not tab-scoped: multiple
+integrated terminals in one VS Code window share it and therefore share role
+threads — set `CODEX_COUNCIL_SESSION_KEY` (or rely on a finer identifier such as
+`TERM_SESSION_ID`) to isolate those. The lock is held across
 the whole load/resume-or-fresh/save retry loop, not just individual file reads
 or writes, so two council processes cannot concurrently resume the same role
 thread and then last-writer-wins the state file. Different roles still run in
@@ -147,9 +157,27 @@ Per-role errors are tagged before they hit the report:
 | (untagged stale) | Detected via `STALE_RESUME_MARKERS`; that role's state is cleared and a fresh thread is started for it only |
 
 Classification uses stderr plus structured Codex JSONL stdout error
-events (`type:error`, `turn.failed`). JSONL parsing intentionally
-skips malformed and non-object events while preserving later valid
-agent messages.
+events (`type:error`, `turn.failed`). The **primary** retriable signal
+is the numeric HTTP status parsed out of the JSONL error body
+(`_extract_statuses`), recognized in any *anchored* form — the JSON
+`"status"` key, a `HTTP NNN` / `status NNN` keyword, or a canonical
+reason phrase like `NNN Too Many Requests` — but never a bare digit run
+(so a `429` inside a thread id is ignored): status `429` → rate-limit,
+`500–599` → 5xx (so a `529` "overloaded" is retried even though it is
+not in the literal marker list). An anchored retriable status is trusted
+ahead of the stale-resume check, so a transient `HTTP 429 … thread not
+found` on resume backs off and retries instead of discarding the thread. A structured status is authoritative — when a
+non-retriable status (e.g. `400`) is present, the looser substring
+markers are **suppressed**, so a bare `429` or `service unavailable`
+echoed inside a 400 body no longer forces a wrong retry. The substring
+markers (`RATE_LIMIT_MARKERS` / `TRANSIENT_5XX_MARKERS`) are a
+**fallback** for failures that carry no parseable status — including the
+version-coupled phrases codex uses when it rewrites a 500/overload to
+code-less prose (`experiencing high demand`, `backend overloaded`). Usage/quota
+limits are **not** retriable: a plan cap does not clear within a 5s
+backoff, so it is surfaced terminal rather than retried. JSONL parsing
+intentionally skips malformed and non-object events while preserving
+later valid agent messages.
 
 No wall-clock cap is applied to roles or to the council as a whole —
 each role runs as long as Codex takes (hours or days is fine).

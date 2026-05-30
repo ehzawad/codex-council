@@ -388,7 +388,9 @@ One Codex thread per (project, host session, role) tuple, stored at
 when a stable host-session id is available. The runner auto-detects common
 session identifiers such as Claude session ids, `CODEX_THREAD_ID`,
 `TERM_SESSION_ID`, `TMUX_PANE`, `STY`, and `VSCODE_PID`, so separate terminal
-tabs/panes in the same repo do not normally share role threads. Follow-up calls
+tabs/panes in the same repo do not normally share role threads (except multiple
+integrated terminals in the **same VS Code window**, which share `VSCODE_PID`;
+set `CODEX_COUNCIL_SESSION_KEY` to isolate those). Follow-up calls
 from the same host session resume the per-role thread so each role accumulates
 its framing. Stale resumes restart only the affected role — siblings are
 unaffected. Role IDs reused across calls continue their own thread; new IDs
@@ -402,6 +404,12 @@ only if you intentionally want the older project-wide state file shape:
 ## Retries
 
 - Rate-limit (429) and 5xx errors retry once with exponential backoff.
+  Retriability is decided primarily from the numeric HTTP status in the
+  JSONL error body (429 → rate-limit, 500–599 → 5xx), with substring
+  markers as a fallback; a non-retriable status (e.g. 400) suppresses the
+  fallback so a stray "429" inside a 400 error body is not mistaken for a
+  rate limit. **Usage/quota-limit** errors are *not* retried — a plan cap
+  does not clear within a 5s backoff, so it is surfaced terminal.
 - Auth errors never clear state and never retry — fix the auth then
   re-run.
 - No wall-clock timeout is enforced — each role runs as long as Codex

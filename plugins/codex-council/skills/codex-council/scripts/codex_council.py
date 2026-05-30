@@ -56,9 +56,15 @@ STATE_DIR = os.path.join(
     "codex-council",
 )
 
-# Stderr substring markers (matched case-insensitively) classifying
-# failure modes. Order of check matters: auth first (never clear state),
-# then retriable (rate-limit / 5xx), then stale-resume (clear and restart).
+# Substring markers (matched case-insensitively) classifying failure modes.
+# These are the FALLBACK signal; the primary signal is the numeric HTTP status
+# parsed out of the JSONL error body (see _extract_statuses). Order of check on
+# the resume path: auth first (never clear state), then ANCHORED-status retriable
+# (a real API 429/5xx — by JSON status, `HTTP NNN`, or a reason phrase — beats a
+# stale-looking message), then stale-resume (clear and restart), then the
+# SUBSTRING retriable fallback — kept last so a stale error that merely contains
+# a bare digit run (e.g. "...stale-429-sid") still restarts fresh instead of
+# being mistaken for a rate limit.
 AUTH_ERROR_MARKERS = (
     "401 unauthorized",
     "incorrect api key",
@@ -68,11 +74,17 @@ AUTH_ERROR_MARKERS = (
     "please run codex login",
 )
 RATE_LIMIT_MARKERS = (
-    "429",
+    # NB: bare "429" is intentionally NOT here — the anchored status parser
+    # (_extract_statuses) covers every real 429 form ("status":429, HTTP 429,
+    # status 429, last status: 429, 429 Too Many Requests), so a bare digit run
+    # like "4291" or "stale-429-sid" is never mistaken for a rate limit.
     "rate limit",
     "rate_limit",
     "too many requests",
-    "quota exceeded",
+    # NB: "quota exceeded" / usage caps are deliberately NOT retriable markers —
+    # a plan/usage cap does not clear within a 5s backoff, so it is surfaced
+    # terminal (see the Retries note in SKILL.md / DESIGN.md). Genuine transient
+    # 429s are caught by the anchored parser or the rate-limit phrases above.
 )
 TRANSIENT_5XX_MARKERS = (
     "500 internal",
@@ -81,6 +93,15 @@ TRANSIENT_5XX_MARKERS = (
     "504 gateway timeout",
     "internal server error",
     "service unavailable",
+    # codex-cli 0.135.0 friendly-rewrites some upstream 5xx/overload errors to
+    # prose that carries no status code (HTTP 500 -> "...experiencing high
+    # demand..."; serverOverloaded -> "...backend overloaded..."). These two
+    # phrases are version-coupled fallbacks for that code-less case; the numeric
+    # range in _structured_retriable_class handles every 5xx that DOES carry a
+    # status. "backend overloaded" is intentionally specific (not bare
+    # "overloaded") so unrelated text like "operator overloaded" is not matched.
+    "backend overloaded",
+    "experiencing high demand",
 )
 STALE_RESUME_MARKERS = (
     "no rollout found",
@@ -417,6 +438,92 @@ def _is_stale_resume_error(stderr_text):
     return _stderr_contains(stderr_text, STALE_RESUME_MARKERS)
 
 
+# Numeric HTTP status as codex surfaces it. codex-cli 0.135.0 does NOT put a
+# status on the top-level JSONL event, so we scan the combined failure text for
+# an ANCHORED status — one in a recognizable status context, so a bare digit run
+# (e.g. "429" inside a thread id like "stale-429-sid") is never mistaken for one.
+# Two anchors are accepted:
+#   * keyword-prefixed: `"status": 429`, `status 529`, `status code 429`,
+#     `HTTP 429`, `last status: 429` (the JSON key and the prose forms);
+#   * reason-phrase-suffixed: `429 Too Many Requests`, `503 Service Unavailable`,
+#     `502 Bad Gateway`, `504 Gateway Timeout`, `500 Internal Server Error`,
+#     `529 <unknown status code>` (codex's "unexpected status N" form).
+# Anchored detection is the PRIMARY retriable signal and (unlike a bare
+# substring) is trusted ahead of the stale check on the resume path.
+# The separator class excludes "/" so a URL like `http://127.0.0.1:8080/...`
+# is NOT read as "http" + status 127; only real `HTTP 429` / `status: 429`
+# forms match.
+_STATUS_KEYWORD_RE = re.compile(
+    r"(?:^|[^0-9a-z_])(?:http|status)(?:\s+code)?[\s:=\"']*([0-9]{3})(?![0-9])",
+    re.IGNORECASE,
+)
+_STATUS_REASON_RE = re.compile(
+    r"(?<![0-9])([0-9]{3})\s+(?:too many requests|bad gateway|service unavailable"
+    r"|gateway timeout|internal server error|<unknown status code>)",
+    re.IGNORECASE,
+)
+
+
+def _extract_statuses(text):
+    """Return the anchored HTTP status codes named in failure text (deduped).
+
+    "Anchored" = appearing in a status context (a `status`/`HTTP` keyword, or a
+    canonical HTTP reason phrase), never a bare digit run. This is what lets a
+    real `HTTP 429 Too Many Requests` be treated as authoritative — and beat the
+    stale-resume check — while `...thread id stale-429-sid` names no status.
+    """
+    found = _STATUS_KEYWORD_RE.findall(text) + _STATUS_REASON_RE.findall(text)
+    out = []
+    for m in found:
+        s = int(m)
+        if s not in out:
+            out.append(s)
+    return out
+
+
+def _structured_retriable_class(text):
+    """Retriable class from an ANCHORED HTTP status only (never a bare substring).
+
+    "Anchored" = a status in keyword (`HTTP 429`, `status 529`) or reason-phrase
+    (`429 Too Many Requests`) context, per _extract_statuses. Returns
+    "rate-limit" (429), "5xx" (500-599), or None. Used ahead of the stale check
+    on the resume path so a genuine anchored 429/5xx (e.g.
+    "HTTP 429 Too Many Requests; thread not found") is retried, while a stale
+    message whose only digits are a thread id (e.g. "stale-429-sid") names no
+    status and so does not fire here.
+    """
+    statuses = _extract_statuses(text)
+    if any(s == 429 for s in statuses):
+        return "rate-limit"
+    if any(500 <= s <= 599 for s in statuses):
+        return "5xx"
+    return None
+
+
+def _retriable_class(text):
+    """Full retriable classification: structured status first, then substrings.
+
+    A structured status is authoritative when present: a non-retriable status
+    (e.g. 400/403) returns None and SUPPRESSES the substring fallback, so a bare
+    "429" or "service unavailable" echoed inside a 400 body no longer forces a
+    wrong retry. Substring markers apply only when codex emitted no parseable
+    status (e.g. stderr-only transport errors, or the version-coupled overload
+    phrases above).
+    """
+    statuses = _extract_statuses(text)
+    if statuses:
+        if any(s == 429 for s in statuses):
+            return "rate-limit"
+        if any(500 <= s <= 599 for s in statuses):
+            return "5xx"
+        return None
+    if _is_rate_limit_error(text):
+        return "rate-limit"
+    if _is_transient_5xx_error(text):
+        return "5xx"
+    return None
+
+
 # ---------- prompt composition ----------
 
 def _compose_prompt(role, body):
@@ -523,9 +630,10 @@ def _classify_failure(stderr_stripped, rc, phase):
     """Return a tagged error string for a non-zero codex exit."""
     if _is_auth_error(stderr_stripped):
         return f"[auth] {stderr_stripped or f'codex {phase} exited {rc}'}"
-    if _is_rate_limit_error(stderr_stripped):
+    cls = _retriable_class(stderr_stripped)
+    if cls == "rate-limit":
         return f"[retriable:rate-limit] {stderr_stripped or f'codex {phase} exited {rc}'}"
-    if _is_transient_5xx_error(stderr_stripped):
+    if cls == "5xx":
         return f"[retriable:5xx] {stderr_stripped or f'codex {phase} exited {rc}'}"
     return stderr_stripped or f"codex {phase} exited {rc}"
 
@@ -544,12 +652,18 @@ async def _run_role_once(role, prompt, attempt):
         failure_text = _failure_text(stdout, stderr)
 
         if rc == 0:
-            # Resume-footgun mitigation: codex `resume <bogus_id>` silently
-            # starts a NEW thread instead of failing. Detect by comparing the
-            # emitted thread.started.thread_id to what we asked to resume.
-            # If mismatched, adopt the new id (no benefit re-running an
-            # already-completed turn) and warn — the role lost its prior
-            # accumulated framing so the next call starts cold-ish.
+            # Resume-footgun mitigation. `codex exec resume <id>` parses <id>
+            # as a UUID first (UUIDs take precedence if it parses). On codex-cli
+            # 0.135.0 a valid-but-unknown UUID ERRORS ("no rollout found ...
+            # -32600", exit 1) and is handled by the stale-resume branch below;
+            # only a value that is NOT a valid UUID is treated as a thread NAME
+            # and silently starts a NEW thread (rc==0, fresh thread.started).
+            # Stored ids are always real UUIDs, so silent-spawn is unreachable
+            # via normal state — this check is defense-in-depth (corrupt/manual
+            # state, or future CLI drift). Detect by comparing the emitted
+            # thread.started.thread_id to what we asked to resume; if mismatched,
+            # adopt the new id (no benefit re-running an already-completed turn)
+            # and warn — the role lost its prior accumulated framing.
             emitted_id = extract_session_id(stdout)
             if emitted_id and emitted_id != session_id:
                 warning = (
@@ -576,8 +690,20 @@ async def _run_role_once(role, prompt, attempt):
                 warning=warning,
             )
 
-        # rc != 0 on resume. Classify, then decide retry vs stale vs fail.
+        # rc != 0 on resume. Order: auth (never clear state) -> ANCHORED-status
+        # retriable (a real API 429/5xx, by JSON status / `HTTP NNN` / reason
+        # phrase, beats a stale-looking message) -> stale-resume (clear + restart
+        # fresh) -> SUBSTRING retriable fallback (inside _classify_failure). The
+        # substring fallback sits after the stale check so a stale error that
+        # merely contains a bare digit run (e.g. "...thread id stale-429-sid")
+        # still restarts fresh.
         if _is_auth_error(failure_text):
+            err = _classify_failure(failure_text, rc, "resume")
+            return RoleResult(
+                role=role, ok=False, error=err,
+                elapsed_seconds=time.monotonic() - started, attempts=attempt,
+            )
+        if _structured_retriable_class(failure_text):
             err = _classify_failure(failure_text, rc, "resume")
             return RoleResult(
                 role=role, ok=False, error=err,

@@ -428,7 +428,9 @@ class ClassifierTests(unittest.TestCase):
         self.assertTrue(codex_council._is_stale_resume_error("THREAD NOT FOUND"))
 
     def test_retriable_helper_covers_both(self):
-        self.assertTrue(codex_council._is_retriable_error("429 too many"))
+        # Bare "429" is no longer a marker (anchored parser covers numeric 429s),
+        # so the substring helper now keys off the phrase forms.
+        self.assertTrue(codex_council._is_retriable_error("429 too many requests"))
         self.assertTrue(codex_council._is_retriable_error("503 service unavailable"))
         self.assertFalse(codex_council._is_retriable_error("401 unauthorized"))
 
@@ -437,6 +439,201 @@ class ClassifierTests(unittest.TestCase):
         self.assertTrue(codex_council._is_stale_resume_error(s))
         self.assertFalse(codex_council._is_auth_error(s))
         self.assertFalse(codex_council._is_retriable_error(s))
+
+
+# ---------- structured (HTTP-status-aware) classification ----------
+
+def _nested_status_failure_text(status, message):
+    """Build failure_text the way codex-cli 0.135.0 emits it: the numeric HTTP
+    status lives only inside the nested JSON string under turn.failed."""
+    nested = json.dumps({"type": "error", "status": status,
+                         "error": {"message": message}})
+    stdout = json.dumps({"type": "turn.failed", "error": {"message": nested}})
+    return codex_council._failure_text(stdout, "")
+
+
+class StructuredStatusClassifierTests(unittest.TestCase):
+    """Status-first failure classification (codex-cli 0.135.0).
+
+    The numeric HTTP status parsed from the JSONL error body is the
+    authoritative retriable signal; substring markers are a fallback only when
+    no status is present. A non-retriable status (e.g. 400) suppresses the
+    fallback so a stray '429'/'service unavailable' in a 4xx body is not
+    mistaken for retriable.
+    """
+
+    # --- status extraction ---
+    def test_extract_statuses_from_nested_json_key(self):
+        self.assertEqual(
+            codex_council._extract_statuses('{"type":"error","status":429,"error":{}}'),
+            [429],
+        )
+
+    def test_extract_statuses_from_unexpected_status_prose(self):
+        self.assertEqual(
+            codex_council._extract_statuses(
+                "unexpected status 529 <unknown status code>: backend overloaded"),
+            [529],
+        )
+
+    def test_extract_statuses_from_last_status_prose(self):
+        self.assertEqual(
+            codex_council._extract_statuses(
+                "exceeded retry limit, last status: 429 Too Many Requests"),
+            [429],
+        )
+
+    def test_extract_statuses_requires_status_keyword(self):
+        # The '429' inside a thread id must NOT be read as a status — this is
+        # what keeps the stale-resume reorder safe.
+        self.assertEqual(
+            codex_council._extract_statuses(
+                "no rollout found for thread id stale-429-sid (code -32600)"),
+            [],
+        )
+
+    def test_extract_statuses_ignores_longer_digit_runs(self):
+        self.assertEqual(codex_council._extract_statuses("status 4290 widgets"), [])
+
+    # --- false positives fixed (status present, non-retriable) ---
+    def test_status_400_with_bare_429_text_not_retriable(self):
+        ft = _nested_status_failure_text(400, "branch revision 429 is invalid")
+        self.assertIsNone(codex_council._retriable_class(ft))
+        self.assertFalse(
+            codex_council._classify_failure(ft, 1, "exec").startswith("[retriable:"))
+
+    def test_status_400_service_unavailable_text_not_retriable(self):
+        ft = _nested_status_failure_text(
+            400, "plugin service unavailable for this account tier")
+        self.assertIsNone(codex_council._retriable_class(ft))
+
+    # --- false negatives fixed (real retriable status) ---
+    def test_status_429_is_rate_limit(self):
+        ft = _nested_status_failure_text(429, "rate limited")
+        self.assertEqual(codex_council._retriable_class(ft), "rate-limit")
+
+    def test_status_503_is_5xx(self):
+        ft = _nested_status_failure_text(503, "temporarily down")
+        self.assertEqual(codex_council._retriable_class(ft), "5xx")
+
+    def test_status_529_overloaded_is_5xx(self):
+        ft = _nested_status_failure_text(529, "backend overloaded")
+        self.assertEqual(codex_council._retriable_class(ft), "5xx")
+
+    def test_unexpected_status_529_prose_is_5xx(self):
+        ft = codex_council._failure_text(
+            "", "unexpected status 529 <unknown status code>: backend overloaded")
+        self.assertEqual(codex_council._retriable_class(ft), "5xx")
+
+    def test_http500_friendly_rewrite_is_5xx_via_phrase_fallback(self):
+        # codex-cli 0.135.0 rewrites HTTP 500 to a code-less phrase; the
+        # version-coupled marker catches it as a fallback (no status present).
+        ft = codex_council._failure_text(
+            "", "We're currently experiencing high demand, which may cause temporary errors.")
+        self.assertIsNone(codex_council._structured_retriable_class(ft))
+        self.assertEqual(codex_council._retriable_class(ft), "5xx")
+
+    # --- substring fallback preserved when no status present ---
+    def test_plain_429_stderr_still_retriable_via_fallback(self):
+        self.assertEqual(
+            codex_council._retriable_class("HTTP 429 too many requests"), "rate-limit")
+
+    def test_literal_5xx_strings_still_retriable_via_fallback(self):
+        self.assertEqual(codex_council._retriable_class("502 bad gateway"), "5xx")
+        self.assertEqual(
+            codex_council._retriable_class("Service unavailable, retry later"), "5xx")
+
+    # --- resume-reorder guard: structured-retriable must NOT fire on stale ---
+    def test_structured_retriable_does_not_fire_on_stale_429_message(self):
+        self.assertIsNone(codex_council._structured_retriable_class(
+            "Error: no rollout found for thread id stale-429-sid (code -32600)"))
+
+    # --- pins: no bare 529 marker; usage-limit never retriable-by-substring ---
+    def test_no_bare_529_substring_marker(self):
+        self.assertNotIn("529", codex_council.TRANSIENT_5XX_MARKERS)
+        self.assertNotIn("529", codex_council.RATE_LIMIT_MARKERS)
+
+    def test_usage_limit_tokens_not_in_retriable_markers(self):
+        for tok in ("usage_limit", "usage limit", "usage_limit_reached"):
+            self.assertNotIn(tok, codex_council.RATE_LIMIT_MARKERS)
+            self.assertNotIn(tok, codex_council.TRANSIENT_5XX_MARKERS)
+
+    def test_quota_exceeded_is_not_retriable(self):
+        # Usage/quota caps do not clear within a 5s backoff, so they are NOT
+        # retriable — matching the documented Retries contract (DESIGN/SKILL).
+        self.assertIsNone(codex_council._retriable_class("quota exceeded"))
+        self.assertIsNone(codex_council._retriable_class(
+            "You have exceeded your monthly quota exceeded for this plan"))
+        self.assertNotIn("quota exceeded", codex_council.RATE_LIMIT_MARKERS)
+
+    def test_codeless_overload_markers_pinned_and_no_false_positive(self):
+        # Confirmed code-less codex 0.135.0 rewrites are caught via fallback...
+        self.assertEqual(codex_council._retriable_class("backend overloaded"), "5xx")
+        self.assertEqual(
+            codex_council._retriable_class(
+                "We're currently experiencing high demand, please retry"), "5xx")
+        # ...but the markers are specific enough not to match unrelated text.
+        self.assertIsNone(
+            codex_council._retriable_class("operator overloaded method failed"))
+
+    # --- anchored detection: keyword + reason phrase (robustness caveat) ---
+    def test_anchored_http_keyword_status_detected(self):
+        self.assertEqual(
+            codex_council._extract_statuses("HTTP 429 too many requests"), [429])
+        self.assertEqual(
+            codex_council._extract_statuses("status code 429 returned"), [429])
+        self.assertEqual(
+            codex_council._structured_retriable_class("HTTP 429 Too Many Requests"),
+            "rate-limit")
+
+    def test_anchored_reason_phrase_status_detected(self):
+        self.assertEqual(
+            codex_council._extract_statuses("got 503 Service Unavailable"), [503])
+        self.assertEqual(
+            codex_council._structured_retriable_class("502 Bad Gateway from upstream"),
+            "5xx")
+
+    def test_anchored_status_beats_stale_text(self):
+        # Caveat-2: a real anchored 429 alongside a stale-looking phrase is
+        # retriable, so on the resume path it beats the stale branch.
+        self.assertEqual(
+            codex_council._structured_retriable_class(
+                "HTTP 429 Too Many Requests; thread not found"),
+            "rate-limit")
+
+    def test_bare_digit_runs_are_not_anchored_statuses(self):
+        # No keyword and no reason phrase -> not a status -> stale routing safe.
+        self.assertEqual(
+            codex_council._extract_statuses("commit 4291 merged at 503abc"), [])
+        self.assertEqual(
+            codex_council._extract_statuses("ticket #503 about checkout"), [])
+        self.assertIsNone(codex_council._structured_retriable_class(
+            "no rollout found for thread id stale-429-sid (code -32600)"))
+
+    def test_extract_statuses_dedupes_keyword_and_reason(self):
+        # "last status: 429 Too Many Requests" matches BOTH anchors -> one 429.
+        self.assertEqual(
+            codex_council._extract_statuses(
+                "exceeded retry limit, last status: 429 Too Many Requests"),
+            [429])
+
+    def test_url_host_or_port_is_not_a_status(self):
+        # A URL host/port must not be read as an HTTP status (the keyword
+        # separator class excludes "/", so "http://..." does not match).
+        self.assertEqual(
+            codex_council._extract_statuses("url: http://127.0.0.1:49818/v1/responses"), [])
+        self.assertEqual(
+            codex_council._extract_statuses("http://429.example.invalid/path"), [])
+        self.assertIsNone(
+            codex_council._retriable_class("bad request, url: http://503.example.test/v1"))
+
+    def test_no_bare_digit_run_false_positive_in_retriable_class(self):
+        # Anchored detection covers real 429 forms, so a bare digit run is not
+        # retriable at the _retriable_class level either (not just _extract_*).
+        self.assertIsNone(codex_council._retriable_class("commit 4291 merged"))
+        self.assertIsNone(codex_council._retriable_class(
+            "no rollout found for thread id stale-429-sid (code -32600)"))
+        self.assertNotIn("429", codex_council.RATE_LIMIT_MARKERS)
 
 
 # ---------- prompt composition ----------
@@ -755,6 +952,115 @@ class RunRoleAsyncTests(unittest.IsolatedAsyncioTestCase):
         # And no garbage state was written for a thread we never identified.
         sid, _ = codex_council.load_session("architect")
         self.assertIsNone(sid)
+
+
+def _status_turn_failed_stdout(status, message):
+    """A codex turn.failed JSONL line whose nested body carries an HTTP status."""
+    nested = json.dumps({"type": "error", "status": status,
+                         "error": {"message": message}})
+    return json.dumps({"type": "turn.failed", "error": {"message": nested}})
+
+
+class RunRoleStructuredStatusTests(unittest.IsolatedAsyncioTestCase):
+    """End-to-end (through _run_role_once / _run_role) of status-aware
+    classification: false-positive suppression, 5xx retry, and the resume
+    ordering where a structured 5xx beats the stale branch."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.project_patcher = patch.object(
+            codex_council, "_project_root", return_value=FIXED_PROJECT_ROOT
+        )
+        self.project_patcher.start()
+        self.addCleanup(self.project_patcher.stop)
+        self.state_patcher = patch.object(codex_council, "STATE_DIR", self.tmp.name)
+        self.state_patcher.start()
+        self.addCleanup(self.state_patcher.stop)
+        self.env_patcher = patch.dict(os.environ, _env_without_session_key(), clear=True)
+        self.env_patcher.start()
+        self.addCleanup(self.env_patcher.stop)
+
+    async def test_fresh_status400_with_429_text_not_tagged_retriable(self):
+        """A fresh exec failing rc!=0 with a nested status-400 body that mentions
+        '429' must NOT be tagged retriable (status suppresses the substring)."""
+        role = _make_role("architect", "Architect")
+        stdout = _status_turn_failed_stdout(400, "branch revision 429 is invalid")
+        async def fake_subproc(cmd, prompt):
+            return 1, stdout, ""
+        with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
+            result = await codex_council._run_role_once(role, "prompt", attempt=1)
+        self.assertFalse(result.ok)
+        self.assertFalse((result.error or "").startswith("[retriable:"))
+
+    async def test_fresh_status529_tagged_retriable_5xx(self):
+        role = _make_role("architect", "Architect")
+        stdout = _status_turn_failed_stdout(529, "backend overloaded")
+        async def fake_subproc(cmd, prompt):
+            return 1, stdout, ""
+        with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
+            result = await codex_council._run_role_once(role, "prompt", attempt=1)
+        self.assertFalse(result.ok)
+        self.assertTrue(result.error.startswith("[retriable:5xx]"))
+
+    async def test_run_role_retries_on_structured_5xx(self):
+        role = _make_role("architect", "Architect")
+        stdout = _status_turn_failed_stdout(503, "temporarily down")
+        async def fake_subproc(cmd, prompt):
+            return 1, stdout, ""
+        with patch.object(codex_council.asyncio, "sleep", AsyncMock(return_value=None)):
+            with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
+                result = await codex_council._run_role(role, "prompt")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.attempts, codex_council.MAX_RETRY_ATTEMPTS)
+        self.assertTrue(result.error.startswith("[retriable:5xx]"))
+
+    async def test_resume_structured_503_retries_and_keeps_state(self):
+        """On resume, a structured 5xx is retriable and must NOT clear state —
+        structured-retriable is checked before the stale branch."""
+        role = _make_role("architect", "Architect")
+        codex_council.save_session("architect", "live-sid")
+        stdout = _status_turn_failed_stdout(503, "temporarily down")
+        async def fake_subproc(cmd, prompt):
+            return 1, stdout, ""
+        with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
+            result = await codex_council._run_role_once(role, "prompt", attempt=1)
+        self.assertFalse(result.ok)
+        self.assertTrue(result.error.startswith("[retriable:5xx]"))
+        sid, _ = codex_council.load_session("architect")
+        self.assertEqual(sid, "live-sid")  # NOT cleared (structured-retriable beat stale)
+
+    async def test_resume_auth_first_even_with_status_and_stale_text(self):
+        """Auth must win over BOTH structured-retriable (a 429 status) and stale
+        on resume, and must never clear state."""
+        role = _make_role("architect", "Architect")
+        codex_council.save_session("architect", "live-sid")
+        nested = json.dumps({"type": "error", "status": 429,
+                             "error": {"message": "401 unauthorized; thread not found"}})
+        stdout = json.dumps({"type": "turn.failed", "error": {"message": nested}})
+        async def fake_subproc(cmd, prompt):
+            return 1, stdout, ""
+        with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
+            result = await codex_council._run_role_once(role, "prompt", attempt=1)
+        self.assertFalse(result.ok)
+        self.assertTrue(result.error.startswith("[auth]"))
+        sid, _ = codex_council.load_session("architect")
+        self.assertEqual(sid, "live-sid")  # auth never clears state
+
+    async def test_resume_anchored_429_prose_beats_stale_and_keeps_state(self):
+        """Caveat-2 end-to-end: a resume failing with anchored 'HTTP 429 Too Many
+        Requests' AND a stale-looking phrase is retried (not stale-cleared),
+        because anchored-status retriable is checked before the stale branch."""
+        role = _make_role("architect", "Architect")
+        codex_council.save_session("architect", "live-sid")
+        async def fake_subproc(cmd, prompt):
+            return 1, "", "HTTP 429 Too Many Requests while resuming; thread not found in cache"
+        with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
+            result = await codex_council._run_role_once(role, "prompt", attempt=1)
+        self.assertFalse(result.ok)
+        self.assertTrue(result.error.startswith("[retriable:rate-limit]"))
+        sid, _ = codex_council.load_session("architect")
+        self.assertEqual(sid, "live-sid")  # NOT cleared — anchored retriable beat stale
 
 
 class TerminateProcessGroupTests(unittest.IsolatedAsyncioTestCase):
@@ -1671,6 +1977,40 @@ class DocsContractTests(unittest.TestCase):
             text = f.read()
         self.assertIn("codex-council-dev-link.log", text)
         self.assertNotIn(">/dev/null 2>&1 || true", text)
+
+    def test_design_md_resume_footgun_describes_uuid_error_path(self):
+        """T2a: the corrected wording must describe the real 0.135.0 behavior
+        (unknown UUID errors; only a non-UUID name silently spawns), not the
+        old inaccurate 'bogus_or_invalid_uuid silently falls through' claim."""
+        path = self._repo_file("DESIGN.md")
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn("no rollout found", text)
+        self.assertIn("thread *name*", text)
+        self.assertNotIn("bogus_or_invalid_uuid", text)
+
+    def test_design_md_documents_structured_status_classification(self):
+        path = self._repo_file("DESIGN.md")
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn("_extract_statuses", text)
+        self.assertIn("500", text)
+        self.assertIn("Usage/quota", text)
+
+    def test_skill_md_documents_vscode_pid_caveat(self):
+        path = self._repo_file(
+            "plugins", "codex-council", "skills", "codex-council", "SKILL.md")
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn("same VS Code window", text)
+        self.assertIn("CODEX_COUNCIL_SESSION_KEY", text)
+
+    def test_skill_md_documents_usage_limit_nonretriable(self):
+        path = self._repo_file(
+            "plugins", "codex-council", "skills", "codex-council", "SKILL.md")
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn("Usage/quota-limit", text)
 
 
 if __name__ == "__main__":
