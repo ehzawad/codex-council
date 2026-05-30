@@ -169,7 +169,10 @@ ahead of the stale-resume check, so a transient `HTTP 429 … thread not
 found` on resume backs off and retries instead of discarding the thread. A structured status is authoritative — when a
 non-retriable status (e.g. `400`) is present, the looser substring
 markers are **suppressed**, so a bare `429` or `service unavailable`
-echoed inside a 400 body no longer forces a wrong retry. The substring
+echoed inside a 400 body no longer forces a wrong retry. A non-retriable
+error *type* (`invalid_request_error`) suppresses the fallback the same
+way, covering the 4xx bodies codex sometimes surfaces without a numeric
+status. The substring
 markers (`RATE_LIMIT_MARKERS` / `TRANSIENT_5XX_MARKERS`) are a
 **fallback** for failures that carry no parseable status — including the
 version-coupled phrases codex uses when it rewrites a 500/overload to

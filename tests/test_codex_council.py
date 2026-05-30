@@ -635,6 +635,30 @@ class StructuredStatusClassifierTests(unittest.TestCase):
             "no rollout found for thread id stale-429-sid (code -32600)"))
         self.assertNotIn("429", codex_council.RATE_LIMIT_MARKERS)
 
+    def test_statusless_400_invalid_request_error_suppresses_fallback(self):
+        # codex-cli 0.135.0 can surface a 4xx as raw JSON with NO status key but
+        # `"type": "invalid_request_error"`; that must NOT be retried even when
+        # its message text contains a 5xx reason phrase or rate-limit wording.
+        raw_su = ('{"error": {"message": "service unavailable for this account '
+                  'tier", "type": "invalid_request_error"}}')
+        self.assertEqual(codex_council._extract_statuses(raw_su), [])
+        self.assertIsNone(codex_council._retriable_class(raw_su))
+        raw_tmr = ('{"error": {"message": "too many requests in batch payload", '
+                   '"type": "invalid_request_error"}}')
+        self.assertIsNone(codex_council._retriable_class(raw_tmr))
+
+    def test_invalid_request_error_does_not_block_real_retriable(self):
+        # An anchored retriable status wins regardless of any type...
+        self.assertEqual(
+            codex_council._retriable_class(
+                '{"status":429,"error":{"type":"rate_limit_error"}}'),
+            "rate-limit")
+        # ...and a status-less rate-limit phrase with no client-error type still
+        # retries (suppression only fires on the non-retriable type).
+        self.assertEqual(
+            codex_council._retriable_class("upstream says too many requests, slow down"),
+            "rate-limit")
+
 
 # ---------- prompt composition ----------
 

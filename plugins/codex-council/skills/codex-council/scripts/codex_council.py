@@ -111,6 +111,16 @@ STALE_RESUME_MARKERS = (
     "thread expired",
 )
 
+# A definitively non-retriable error TYPE that codex/OpenAI put in the JSONL
+# error body for 4xx client errors. codex-cli 0.135.0 sometimes surfaces a 400
+# as raw JSON with this type but NO numeric status; its presence (when no
+# anchored retriable status is found) suppresses the substring retriable
+# fallback, so a 400 whose message text merely contains a 5xx reason phrase or
+# "too many requests" is not wrongly retried.
+NONRETRIABLE_ERROR_TYPE_MARKERS = (
+    "invalid_request_error",
+)
+
 SESSION_KEY_ENV = "CODEX_COUNCIL_SESSION_KEY"
 DISABLE_AUTO_SESSION_KEY_ENV = "CODEX_COUNCIL_DISABLE_AUTO_SESSION_KEY"
 AUTO_SESSION_ENV_VARS = (
@@ -506,9 +516,11 @@ def _retriable_class(text):
     A structured status is authoritative when present: a non-retriable status
     (e.g. 400/403) returns None and SUPPRESSES the substring fallback, so a bare
     "429" or "service unavailable" echoed inside a 400 body no longer forces a
-    wrong retry. Substring markers apply only when codex emitted no parseable
-    status (e.g. stderr-only transport errors, or the version-coupled overload
-    phrases above).
+    wrong retry. A non-retriable error TYPE ("invalid_request_error") suppresses
+    the fallback the same way, for 4xx bodies codex surfaces without a numeric
+    status. Substring markers apply only when codex emitted no parseable status
+    and no client-error type (e.g. stderr-only transport errors, or the
+    version-coupled overload phrases above).
     """
     statuses = _extract_statuses(text)
     if statuses:
@@ -516,6 +528,12 @@ def _retriable_class(text):
             return "rate-limit"
         if any(500 <= s <= 599 for s in statuses):
             return "5xx"
+        return None
+    # No anchored status. A definitively non-retriable error TYPE (a 4xx client
+    # error codex surfaces as `"type": "invalid_request_error"`, sometimes
+    # without a numeric status) also suppresses the substring fallback, so a 400
+    # whose message text merely contains a 5xx reason phrase is not retried.
+    if _stderr_contains(text, NONRETRIABLE_ERROR_TYPE_MARKERS):
         return None
     if _is_rate_limit_error(text):
         return "rate-limit"
