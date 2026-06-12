@@ -110,18 +110,32 @@ Design 2–6 roles (default 3, max 6). Each role is
   invocations resume the same Codex thread for that role; novel IDs
   start fresh.
 - `label` — human title shown in the report.
-- `instruction` — a single paragraph. Three properties make
-  instructions useful (in this order of importance):
+- `instruction` — **a JSON array of short strings, one sentence per
+  item** (the script joins them into one paragraph with single
+  spaces). Always write the array form. Never write the instruction
+  as one long string: a multi-kilobyte single-line JSON string
+  literal is exactly where file writes corrupt — spliced text, lost
+  fields, stray filler keys. Sentence-sized items on separate lines
+  avoid that observed failure surface. Three properties make
+  instructions useful (in
+  this order of importance):
   - **Specific to the work.** Name the failure modes this role
     should hunt, in the vocabulary of the actual task. A useful
     instruction reads like a checklist a human expert would run; a
     useless one reads like "review for quality and clarity."
-  - **Honest about scope.** Include the literal clause
+  - **Honest about scope.** Include an item with the literal clause
     **"if nothing material, say so clearly"** so the role can return
     silence rather than bluffing when out of its lens.
-  - **Conventionally paced.** End with the literal sentence
-    **"Thoroughness beats speed."** This shapes Codex's cadence and
-    is checked by tests.
+  - **Conventionally paced.** Make the final item exactly the literal
+    sentence **"Thoroughness beats speed."** This shapes Codex's
+    cadence and is checked by tests (the check runs on the joined
+    paragraph, so the sentence must come last).
+
+Each role object has **exactly** the keys `id`, `label`,
+`instruction` — nothing else. Do not add filler keys like `"_"` or
+`"notes"`; the script rejects any unknown key. If a written
+roles.json fails validation, rewrite the whole file cleanly — never
+patch a substring of it.
 
 Roles in the same panel must be **sharply distinct** so a role asked
 to review something outside its lens returns "nothing material"
@@ -199,10 +213,20 @@ mktemp -d "${TMPDIR:-/tmp}/codex-council.XXXXXX"
 #      ABS_RUNDIR/context.md
 #    Do not run mktemp again, do not use $TMPDIR again, and do not substitute a
 #    different temp root such as /var/folders.
-#    Panel shape:
-#    [{"id":"<lens>","label":"<Title>","instruction":"<single paragraph; name
-#      the specific failure modes; include: if nothing material, say so clearly;
-#      end with: Thoroughness beats speed.>"}, ...]
+#    Panel shape — instruction is ALWAYS an array of sentence-sized strings,
+#    and each object has exactly these three keys (unknown keys are rejected):
+#    [
+#      {
+#        "id": "<lens>",
+#        "label": "<Title>",
+#        "instruction": [
+#          "<one sentence naming a specific failure mode to hunt>",
+#          "<another sentence>",
+#          "If nothing material, say so clearly.",
+#          "Thoroughness beats speed."
+#        ]
+#      }
+#    ]
 
 # 2. Cheap pre-flight: confirm both launch inputs are in the same printed dir.
 python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
@@ -246,10 +270,23 @@ safety net for accidental fan-out.
 Constraints:
 
 - Max 6 roles per call (matches Codex's concurrent-thread default).
+- Each role object: exactly the keys `id`, `label`, `instruction`; any
+  other key is rejected with exit 2.
 - `id`: `^[a-z0-9_-]+$`, ≤32 chars.
 - `label`: non-empty single line, ≤80 UTF-8 bytes.
-- `instruction`: non-empty single paragraph, ≤8192 UTF-8 bytes; must include
-  "nothing material" and must end with "Thoroughness beats speed."
+- `instruction`: an array of non-empty strings, one sentence per item
+  (a legacy single-string paragraph is still accepted but should not be
+  written). The script joins items with single spaces and validates the
+  joined paragraph: ≤8192 UTF-8 bytes; must include "nothing material"
+  and must end with "Thoroughness beats speed."
+
+If `--check-staging-dir` rejects the staging directory (wrong mode,
+symlink, wrong owner, missing): **abandon that directory.** Do not
+chmod it, do not mkdir it, and do not reuse its name — a predictable,
+hand-created path defeats the privacy the gate exists for, and files
+already written there may have been exposed. Run `mktemp -d` again,
+copy the NEW printed path, re-Write BOTH `roles.json` and `context.md`
+into it, and re-run the pre-flight on that new path.
 
 ## Building the context
 

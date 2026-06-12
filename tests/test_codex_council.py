@@ -1575,6 +1575,165 @@ class ParseRolesJsonTests(unittest.TestCase):
         )
 
 
+class UnknownRoleKeyTests(unittest.TestCase):
+    """Stray keys are the corruption signature of a glitched LLM write
+    (GH issue #2: '"_": ""', '"instruction_note": ""'); they must be
+    rejected with a rewrite-the-whole-file recovery message, never
+    silently accepted."""
+
+    def _entry_with(self, extra_keys):
+        entry = _role_json("alpha", "A")
+        entry.update(extra_keys)
+        return json.dumps([entry])
+
+    def test_issue2_filler_key_rejected(self):
+        _assert_usage_exit(
+            self,
+            lambda: codex_council._parse_roles_json(self._entry_with({"_": ""})),
+            expect_in_stderr="unknown field(s) '_'",
+        )
+
+    def test_instruction_note_filler_key_rejected(self):
+        _assert_usage_exit(
+            self,
+            lambda: codex_council._parse_roles_json(
+                self._entry_with({"instruction_note": ""})),
+            expect_in_stderr="unknown field(s) 'instruction_note'",
+        )
+
+    def test_multiple_unknown_keys_all_named_sorted(self):
+        raw = self._entry_with({"zz": 1, "_": ""})
+        _assert_usage_exit(
+            self, lambda: codex_council._parse_roles_json(raw),
+            expect_in_stderr="unknown field(s) '_', 'zz'",
+        )
+
+    def test_recovery_message_demands_full_rewrite(self):
+        _assert_usage_exit(
+            self,
+            lambda: codex_council._parse_roles_json(self._entry_with({"_": ""})),
+            expect_in_stderr="Rewrite the whole roles.json file",
+        )
+
+    def test_unknown_key_reported_before_missing_field(self):
+        """Freeze diagnostic precedence: a corrupted object with both a
+        filler key and a missing required field reports the filler key,
+        because the recovery (full rewrite) covers both defects."""
+        raw = json.dumps([{"id": "x", "instruction": _valid_instruction("i"),
+                           "_": ""}])
+        _assert_usage_exit(
+            self, lambda: codex_council._parse_roles_json(raw),
+            expect_in_stderr="unknown field(s) '_'",
+        )
+
+    def test_exact_three_keys_still_accepted(self):
+        roles = codex_council._parse_roles_json(json.dumps([_role_json("a", "A")]))
+        self.assertEqual(roles[0].id, "a")
+
+
+class InstructionListFormTests(unittest.TestCase):
+    """List-form instruction: sentence-sized items the script joins into
+    the single paragraph Codex sees. Exists so the LLM writer never has
+    to emit a multi-KB single-line JSON string (GH issue #2)."""
+
+    def _roles(self, items):
+        return codex_council._parse_roles_json(
+            json.dumps([{"id": "x", "label": "L", "instruction": items}])
+        )
+
+    def test_list_joined_with_single_spaces(self):
+        roles = self._roles([
+            "Audit the join logic.",
+            "If nothing material, say so clearly.",
+            "Thoroughness beats speed.",
+        ])
+        self.assertEqual(
+            roles[0].instruction,
+            "Audit the join logic. If nothing material, say so clearly. "
+            "Thoroughness beats speed.",
+        )
+
+    def test_items_with_linebreaks_and_runs_are_normalized(self):
+        roles = self._roles([
+            "Audit\nthe  join logic.",
+            "If nothing material,\r\nsay so clearly.",
+            "Thoroughness beats speed.",
+        ])
+        self.assertEqual(
+            roles[0].instruction,
+            "Audit the join logic. If nothing material, say so clearly. "
+            "Thoroughness beats speed.",
+        )
+
+    def test_single_item_list_accepted(self):
+        roles = self._roles([_valid_instruction("solo")])
+        self.assertEqual(roles[0].instruction, _valid_instruction("solo"))
+
+    def test_empty_list_raises(self):
+        _assert_usage_exit(
+            self, lambda: self._roles([]),
+            expect_in_stderr="instruction list must not be empty",
+        )
+
+    def test_non_string_item_raises_with_index(self):
+        _assert_usage_exit(
+            self, lambda: self._roles(["ok", 7, "Thoroughness beats speed."]),
+            expect_in_stderr="instruction list item 1",
+        )
+
+    def test_blank_item_raises_with_index(self):
+        _assert_usage_exit(
+            self, lambda: self._roles(["ok", "   "]),
+            expect_in_stderr="instruction list item 1",
+        )
+
+    def test_scope_phrase_checked_on_joined_paragraph(self):
+        _assert_usage_exit(
+            self,
+            lambda: self._roles(["Review only.", "Thoroughness beats speed."]),
+            expect_in_stderr="nothing material",
+        )
+
+    def test_cadence_sentence_must_end_joined_paragraph(self):
+        _assert_usage_exit(
+            self,
+            lambda: self._roles([
+                "Thoroughness beats speed.",
+                "If nothing material, say so clearly.",
+            ]),
+            expect_in_stderr="Thoroughness beats speed.",
+        )
+
+    def test_byte_cap_applies_to_joined_paragraph(self):
+        items = ["a" * 5000, "b" * 5000,
+                 "If nothing material, say so clearly.",
+                 "Thoroughness beats speed."]
+        _assert_usage_exit(
+            self, lambda: self._roles(items),
+            expect_in_stderr="instruction exceeds",
+        )
+
+    def test_wrong_instruction_type_steers_to_array_form(self):
+        raw = json.dumps([{"id": "x", "label": "L", "instruction": 5}])
+        _assert_usage_exit(
+            self, lambda: codex_council._parse_roles_json(raw),
+            expect_in_stderr="JSON array of non-empty strings",
+        )
+
+    def test_list_item_error_names_full_rewrite_recovery(self):
+        _assert_usage_exit(
+            self, lambda: self._roles(["ok", 7]),
+            expect_in_stderr="rewrite the whole roles.json",
+        )
+
+    def test_string_form_still_strict_about_newlines(self):
+        raw = json.dumps([_role_json("x", "L", "one\ntwo")])
+        _assert_usage_exit(
+            self, lambda: codex_council._parse_roles_json(raw),
+            expect_in_stderr="single paragraph",
+        )
+
+
 class ResolveRolesJsonIntegrationTests(unittest.TestCase):
     """End-to-end of JSON parsing through resolution (custom roles only)."""
 
@@ -1747,6 +1906,102 @@ class CheckStagingDirTests(unittest.TestCase):
             self,
             lambda: codex_council._check_staging_dir(self.tmp.name),
             expect_in_stderr="not private 0700",
+        )
+
+    def test_mode_failure_recovery_forbids_chmod_and_reuse(self):
+        """GH issue #1: the old hint ('Create it with mktemp -d') was
+        satisfiable by chmod/mkdir on the same predictable path; the
+        recovery must demand abandoning the dir for a NEW mktemp one."""
+        os.chmod(self.tmp.name, 0o775)
+        self.addCleanup(lambda: os.chmod(self.tmp.name, 0o700))
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            with self.assertRaises(SystemExit) as ctx:
+                codex_council._check_staging_dir(self.tmp.name)
+        self.assertEqual(ctx.exception.code, 2)
+        err = buf.getvalue()
+        self.assertIn("abandon this directory", err)
+        self.assertIn("do not chmod it", err)
+        self.assertIn("do not reuse its name", err)
+        self.assertIn("`mktemp -d` again", err)
+        self.assertIn("re-Write BOTH roles.json and context.md", err)
+
+    def test_symlink_to_private_dir_is_rejected(self):
+        real = os.path.join(self.tmp.name, "real")
+        os.mkdir(real, 0o700)
+        link = os.path.join(self.tmp.name, "link")
+        os.symlink(real, link)
+        _assert_usage_exit(
+            self,
+            lambda: codex_council._check_staging_dir(link),
+            expect_in_stderr="is a symlink",
+        )
+
+    def test_symlink_with_trailing_slash_is_rejected(self):
+        """lstat('link/') follows the final symlink (the slash demands a
+        directory target), so an un-normalized path bypassed the gate."""
+        real = os.path.join(self.tmp.name, "real")
+        os.mkdir(real, 0o700)
+        with open(os.path.join(real, "roles.json"), "w", encoding="utf-8") as f:
+            json.dump([_role_json("a", "A")], f)
+        with open(os.path.join(real, "context.md"), "w", encoding="utf-8") as f:
+            f.write("context")
+        link = os.path.join(self.tmp.name, "link")
+        os.symlink(real, link)
+        _assert_usage_exit(
+            self,
+            lambda: codex_council._check_staging_dir(link + "/"),
+            expect_in_stderr="is a symlink",
+        )
+
+    def test_unreadable_lstat_failure_is_not_reported_as_missing(self):
+        """EACCES & co. must not be diagnosed as 'does not exist'."""
+        outer = os.path.join(self.tmp.name, "outer")
+        inner = os.path.join(outer, "inner")
+        os.makedirs(inner, mode=0o700)
+        os.chmod(outer, 0o000)
+        self.addCleanup(lambda: os.chmod(outer, 0o700))
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            with self.assertRaises(SystemExit) as ctx:
+                codex_council._check_staging_dir(inner)
+        self.assertEqual(ctx.exception.code, 2)
+        err = buf.getvalue()
+        self.assertIn("cannot inspect", err)
+        self.assertNotIn("does not exist", err)
+
+    def test_foreign_owned_dir_is_rejected(self):
+        self._write_valid_roles()
+        self._write_context()
+        real_euid = os.geteuid()
+        with patch("os.geteuid", return_value=real_euid + 1):
+            _assert_usage_exit(
+                self,
+                lambda: codex_council._check_staging_dir(self.tmp.name),
+                expect_in_stderr="not the invoking user",
+            )
+
+    def test_nonexistent_path_does_not_invite_mkdir(self):
+        """The old 'is not a directory' wording plausibly invited
+        `mkdir <same path>` — recreating exactly issue #1's 0775 dir."""
+        missing = os.path.join(self.tmp.name, "missing")
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            with self.assertRaises(SystemExit) as ctx:
+                codex_council._check_staging_dir(missing)
+        self.assertEqual(ctx.exception.code, 2)
+        err = buf.getvalue()
+        self.assertIn("does not exist", err)
+        self.assertIn("do not mkdir it", err)
+
+    def test_regular_file_is_rejected_as_not_directory(self):
+        path = os.path.join(self.tmp.name, "afile")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("x")
+        _assert_usage_exit(
+            self,
+            lambda: codex_council._check_staging_dir(path),
+            expect_in_stderr="is not a directory",
         )
 
 

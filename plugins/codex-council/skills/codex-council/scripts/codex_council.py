@@ -151,6 +151,16 @@ STAGING_PATH_HINT = (
     "out.md, and err.log under the same mktemp directory. Shell variables do "
     "not persist across Claude Code Bash calls."
 )
+# Action-first recovery text for a rejected staging DIRECTORY. The orchestrator
+# is an LLM; the cheapest literal reading of "create it with mktemp -d" was
+# observed (GH issue #1) to be satisfied by mkdir/chmod on the same predictable
+# path, so the recovery must forbid exactly those moves and demand a NEW path.
+STAGING_DIR_RECOVERY = (
+    "Recovery: abandon this directory — do not chmod it, do not mkdir it, "
+    "and do not reuse its name. Run `mktemp -d` again, copy the NEW printed "
+    "absolute path, re-Write BOTH roles.json and context.md into that new "
+    "directory, and re-run --check-staging-dir on it."
+)
 
 # No timeout, by design. Neither this script nor `codex exec` enforces a
 # wall-clock or run-level timeout, so a role may think for hours or days.
@@ -1097,12 +1107,47 @@ def _validate_role_label(label, ctx):
         )
 
 
+ROLE_FIELDS = ("id", "label", "instruction")
+
+
+def _normalize_instruction_list(value, ctx):
+    """Join a list-form instruction into one whitespace-normalized paragraph.
+
+    The list form exists because the only production writer of roles.json
+    is an LLM using a file-Write tool: multi-kilobyte single-line JSON
+    string literals are exactly where its writes corrupt (GH issue #2).
+    Sentence-sized items on separate physical lines remove that failure
+    surface; the script reassembles the paragraph Codex actually sees.
+    """
+    if not value:
+        _usage_exit(
+            f"--roles-file {ctx}: instruction list must not be empty. "
+            "Recovery: rewrite the whole roles.json file with one sentence "
+            "per list item, then re-run --check-staging-dir."
+        )
+    items = []
+    for i, item in enumerate(value):
+        if not isinstance(item, str) or not item.strip():
+            _usage_exit(
+                f"--roles-file {ctx}: instruction list item {i} must be a "
+                "non-empty string. Recovery: rewrite the whole roles.json "
+                "file with one sentence per list item, then re-run "
+                "--check-staging-dir."
+            )
+        # split() collapses every Unicode whitespace run, including all
+        # LINEBREAK_CHARS, so the joined paragraph is single-line by
+        # construction and the string-form validation below applies as-is.
+        items.append(" ".join(item.split()))
+    return " ".join(items)
+
+
 def _validate_role_instruction(instruction, ctx):
     """Reject instructions that violate the documented role contract."""
     if any(ch in instruction for ch in LINEBREAK_CHARS):
         _usage_exit(
             f"--roles-file {ctx}: instruction must be a single paragraph "
-            "with no newlines."
+            "with no newlines. Prefer the list form — one sentence per "
+            "JSON list item — and rewrite the whole roles.json file."
         )
     encoded_len = len(instruction.encode("utf-8"))
     if encoded_len > ROLE_INSTRUCTION_MAX_BYTES:
@@ -1126,9 +1171,14 @@ def _validate_role_instruction(instruction, ctx):
 def _parse_roles_json(raw):
     """Parse the --roles-file blob into a list of Role objects.
 
-    Validates each entry has non-empty id/label/instruction strings, id
-    is well-formed, instructions follow the documented contract, and ids
-    are unique within the JSON.
+    Validates each entry has exactly the id/label/instruction fields
+    (instruction may be a string or a list of strings, normalized to one
+    paragraph), id is well-formed, instructions follow the documented
+    contract, and ids are unique within the JSON. Unknown keys are
+    rejected, not ignored: stray filler fields like '"_": ""' are the
+    signature of a corrupted LLM write (GH issue #2), so surfacing them
+    forces a clean rewrite instead of silently launching from a file
+    that already glitched once.
     """
     try:
         data = json.loads(raw)
@@ -1142,10 +1192,32 @@ def _parse_roles_json(raw):
         ctx = f"entry {idx}"
         if not isinstance(entry, dict):
             _usage_exit(f"--roles-file {ctx}: each entry must be an object.")
-        for field in ("id", "label", "instruction"):
+        unknown = sorted(set(entry) - set(ROLE_FIELDS))
+        if unknown:
+            _usage_exit(
+                f"--roles-file {ctx}: unknown field(s) "
+                f"{', '.join(repr(k) for k in unknown)}. Each role object "
+                "must have exactly 'id', 'label', and 'instruction' — no "
+                "filler keys. Rewrite the whole roles.json file (do not "
+                "patch a substring), then re-run --check-staging-dir."
+            )
+        for field in ROLE_FIELDS:
             if field not in entry:
                 _usage_exit(f"--roles-file {ctx}: missing field {field!r}.")
             value = entry[field]
+            if field == "instruction":
+                if isinstance(value, list):
+                    continue
+                if not isinstance(value, str) or not value.strip():
+                    _usage_exit(
+                        f"--roles-file {ctx}: field 'instruction' must be a "
+                        "JSON array of non-empty strings, one sentence per "
+                        "item (a legacy single-string paragraph is accepted "
+                        "only for old callers). Recovery: rewrite the whole "
+                        "roles.json file using the array form, then re-run "
+                        "--check-staging-dir."
+                    )
+                continue
             if not isinstance(value, str) or not value.strip():
                 _usage_exit(
                     f"--roles-file {ctx}: field {field!r} must be a non-empty string."
@@ -1153,6 +1225,8 @@ def _parse_roles_json(raw):
         rid = entry["id"]
         label = entry["label"]
         instruction = entry["instruction"]
+        if isinstance(instruction, list):
+            instruction = _normalize_instruction_list(instruction, ctx)
         _validate_role_id(rid, ctx)
         _validate_role_label(label, ctx)
         _validate_role_instruction(instruction, ctx)
@@ -1245,25 +1319,66 @@ def _read_context_file(path):
 
 
 def _check_private_dir(path):
-    """Usage-error if a staging dir is missing or not private."""
-    if not os.path.isdir(path):
+    """Usage-error unless path is a user-owned, non-symlink, private dir.
+
+    Returns the normalized path the checks were performed on; callers
+    must use it for any subsequent joins so the validated path and the
+    used path cannot diverge.
+
+    lstat (not stat) so a symlink final component is rejected instead of
+    silently followed, and ownership is checked so a foreign-owned dir
+    that happens to be mode 0700 does not pass. Every rejection carries
+    the action-first recovery text: the caller is an LLM, and the one
+    correct move is always a NEW `mktemp -d` directory — never chmod,
+    mkdir, or reuse of the rejected path.
+    """
+    # normpath strips trailing slashes first: lstat("link/") follows the
+    # final symlink (the slash demands a directory target), so an
+    # un-normalized path would let a symlink pass the check below.
+    path = os.path.normpath(path)
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        _usage_exit(
+            f"--check-staging-dir: {path!r} does not exist. "
+            f"{STAGING_DIR_RECOVERY}"
+        )
+    except OSError as e:
+        _usage_exit(
+            f"--check-staging-dir: cannot inspect {path!r} "
+            f"({e.strerror or e}). {STAGING_DIR_RECOVERY}"
+        )
+    if stat.S_ISLNK(st.st_mode):
+        _usage_exit(
+            f"--check-staging-dir: {path!r} is a symlink, not the directory "
+            f"printed by `mktemp -d`. {STAGING_DIR_RECOVERY}"
+        )
+    if not stat.S_ISDIR(st.st_mode):
         _usage_exit(
             f"--check-staging-dir: {path!r} is not a directory. "
-            f"{STAGING_PATH_HINT}"
+            f"{STAGING_DIR_RECOVERY}"
         )
-    mode = stat.S_IMODE(os.stat(path).st_mode)
+    if st.st_uid != os.geteuid():
+        _usage_exit(
+            f"--check-staging-dir: {path!r} is owned by uid {st.st_uid}, not "
+            f"the invoking user (uid {os.geteuid()}). {STAGING_DIR_RECOVERY}"
+        )
+    mode = stat.S_IMODE(st.st_mode)
     if mode & 0o077:
         _usage_exit(
             f"--check-staging-dir: {path!r} is mode {mode:04o}, not private "
-            f"0700. Create it with mktemp -d. {STAGING_PATH_HINT}"
+            f"0700 — not the private mode `mktemp -d` produces. Files "
+            f"already written here may have been readable by other local "
+            f"users. {STAGING_DIR_RECOVERY}"
         )
+    return path
 
 
 def _check_staging_dir(path):
     """Validate the per-run staging dir before launching Codex."""
     if path == "":
         _usage_exit("--check-staging-dir must be non-empty.")
-    _check_private_dir(path)
+    path = _check_private_dir(path)
     roles_path = os.path.join(path, "roles.json")
     context_path = os.path.join(path, "context.md")
     _usage_exit_if_file_arg_problems(

@@ -8,7 +8,21 @@ Implementation details for contributors. User-facing docs live in
 The script accepts roles **only** via `--roles-file` (a path to a JSON
 file holding the list of `{id, label, instruction}` objects), and the
 preferred launch path supplies context via `--context-file` in the same
-private staging directory. Keeping the panel and context in files keeps
+private staging directory. `instruction` is preferably a **list of
+sentence-sized strings** that the script whitespace-normalizes and joins
+into the single paragraph Codex sees (a legacy single-string paragraph
+is still accepted, strict no-newline). The list form exists because the
+only production writer of roles.json is an LLM file-Write: multi-KB
+single-line JSON string literals are where its writes corrupt (GH issue
+#2). For the same reason, unknown keys in a role object are **rejected**
+with a rewrite-the-whole-file message — stray filler fields like
+`"_": ""` are the signature of a glitched write, not harmless extras.
+The staging-dir gate (`--check-staging-dir`) lstats the directory:
+symlinks, non-dirs, foreign-owned dirs, and group/other-accessible
+modes are all rejected with an action-first recovery hint that forbids
+chmod/mkdir/reuse of the rejected path and demands a fresh `mktemp -d`
+(GH issue #1: the old "Create it with mktemp -d" hint was satisfiable
+by chmod on the same predictable path). Keeping the panel and context in files keeps
 a large role array and multiline context out of the shell, where a
 stray quote, brace, or missing redirection target would otherwise break
 the call before the runner can diagnose it. There is no
