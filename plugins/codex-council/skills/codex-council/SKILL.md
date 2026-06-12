@@ -274,11 +274,10 @@ Constraints:
   other key is rejected with exit 2.
 - `id`: `^[a-z0-9_-]+$`, ≤32 chars.
 - `label`: non-empty single line, ≤80 UTF-8 bytes.
-- `instruction`: an array of non-empty strings, one sentence per item
-  (a legacy single-string paragraph is still accepted but should not be
-  written). The script joins items with single spaces and validates the
-  joined paragraph: ≤8192 UTF-8 bytes; must include "nothing material"
-  and must end with "Thoroughness beats speed."
+- `instruction`: an array of non-empty strings, one sentence per item —
+  the only accepted form. The script joins items with single spaces and
+  validates the joined paragraph: ≤8192 UTF-8 bytes; must include
+  "nothing material" and must end with "Thoroughness beats speed."
 
 If `--check-staging-dir` rejects the staging directory (wrong mode,
 symlink, wrong owner, missing): **abandon that directory.** Do not

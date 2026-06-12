@@ -86,6 +86,9 @@ FAKE_CODEX = textwrap.dedent(
 
 
 def _role(rid, label, instruction):
+    """instruction is array-only by contract; wrap a convenience string."""
+    if isinstance(instruction, str):
+        instruction = [instruction]
     return {"id": rid, "label": label, "instruction": instruction}
 
 

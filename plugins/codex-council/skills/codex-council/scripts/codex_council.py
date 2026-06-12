@@ -1162,19 +1162,17 @@ def _normalize_instruction_list(value, ctx):
             )
         # split() collapses every Unicode whitespace run, including all
         # LINEBREAK_CHARS, so the joined paragraph is single-line by
-        # construction and the string-form validation below applies as-is.
+        # construction.
         items.append(" ".join(item.split()))
     return " ".join(items)
 
 
 def _validate_role_instruction(instruction, ctx):
-    """Reject instructions that violate the documented role contract."""
-    if any(ch in instruction for ch in LINEBREAK_CHARS):
-        _usage_exit(
-            f"--roles-file {ctx}: instruction must be a single paragraph "
-            "with no newlines. Prefer the list form — one sentence per "
-            "JSON list item — and rewrite the whole roles.json file."
-        )
+    """Validate the joined instruction paragraph against the role contract.
+
+    Runs on the output of _normalize_instruction_list, which is
+    single-line by construction, so no linebreak check is needed here.
+    """
     encoded_len = len(instruction.encode("utf-8"))
     if encoded_len > ROLE_INSTRUCTION_MAX_BYTES:
         _usage_exit(
@@ -1198,13 +1196,13 @@ def _parse_roles_json(raw):
     """Parse the --roles-file blob into a list of Role objects.
 
     Validates each entry has exactly the id/label/instruction fields
-    (instruction may be a string or a list of strings, normalized to one
-    paragraph), id is well-formed, instructions follow the documented
-    contract, and ids are unique within the JSON. Unknown keys are
-    rejected, not ignored: stray filler fields like '"_": ""' are the
-    signature of a corrupted LLM write (GH issue #2), so surfacing them
-    forces a clean rewrite instead of silently launching from a file
-    that already glitched once.
+    (instruction is a list of sentence-sized strings, normalized and
+    joined to one paragraph), id is well-formed, instructions follow the
+    documented contract, and ids are unique within the JSON. Unknown
+    keys are rejected, not ignored: stray filler fields like '"_": ""'
+    are the signature of a corrupted LLM write (GH issue #2), so
+    surfacing them forces a clean rewrite instead of silently launching
+    from a file that already glitched once.
     """
     try:
         data = json.loads(raw)
@@ -1232,15 +1230,12 @@ def _parse_roles_json(raw):
                 _usage_exit(f"--roles-file {ctx}: missing field {field!r}.")
             value = entry[field]
             if field == "instruction":
-                if isinstance(value, list):
-                    continue
-                if not isinstance(value, str) or not value.strip():
+                if not isinstance(value, list):
                     _usage_exit(
                         f"--roles-file {ctx}: field 'instruction' must be a "
                         "JSON array of non-empty strings, one sentence per "
-                        "item (a legacy single-string paragraph is accepted "
-                        "only for old callers). Recovery: rewrite the whole "
-                        "roles.json file using the array form, then re-run "
+                        "item. Recovery: rewrite the whole roles.json file "
+                        "using the array form, then re-run "
                         "--check-staging-dir."
                     )
                 continue
@@ -1250,9 +1245,7 @@ def _parse_roles_json(raw):
                 )
         rid = entry["id"]
         label = entry["label"]
-        instruction = entry["instruction"]
-        if isinstance(instruction, list):
-            instruction = _normalize_instruction_list(instruction, ctx)
+        instruction = _normalize_instruction_list(entry["instruction"], ctx)
         _validate_role_id(rid, ctx)
         _validate_role_label(label, ctx)
         _validate_role_instruction(instruction, ctx)

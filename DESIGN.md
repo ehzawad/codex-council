@@ -8,10 +8,10 @@ Implementation details for contributors. User-facing docs live in
 The script accepts roles **only** via `--roles-file` (a path to a JSON
 file holding the list of `{id, label, instruction}` objects), and the
 preferred launch path supplies context via `--context-file` in the same
-private staging directory. `instruction` is preferably a **list of
-sentence-sized strings** that the script whitespace-normalizes and joins
-into the single paragraph Codex sees (a legacy single-string paragraph
-is still accepted, strict no-newline). The list form exists because the
+private staging directory. `instruction` is a **list of sentence-sized
+strings** — the only accepted form — that the script
+whitespace-normalizes and joins into the single paragraph Codex sees.
+The list form exists because the
 only production writer of roles.json is an LLM file-Write: multi-KB
 single-line JSON string literals are where its writes corrupt (GH issue
 #2). For the same reason, unknown keys in a role object are **rejected**

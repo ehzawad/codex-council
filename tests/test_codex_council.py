@@ -73,8 +73,12 @@ def _make_role(rid="test-role", label="Test Role",
 
 
 def _role_json(rid="alpha", label="A", instruction=None):
+    """JSON-shaped role entry; instruction is array-only by contract,
+    so a convenience string is wrapped into a single-item list."""
     if instruction is None:
         instruction = _valid_instruction("review")
+    if isinstance(instruction, str):
+        instruction = [instruction]
     return {"id": rid, "label": label, "instruction": instruction}
 
 
@@ -1508,19 +1512,25 @@ class ParseRolesJsonTests(unittest.TestCase):
             expect_in_stderr="label must not contain newlines",
         )
 
-    def test_instruction_newline_raises(self):
-        raw = json.dumps([_role_json("x", "L", "one\ntwo")])
+    def test_string_instruction_rejected(self):
+        """The legacy single-string form is gone: array-only contract."""
+        raw = json.dumps([{"id": "x", "label": "L",
+                           "instruction": _valid_instruction("review")}])
         _assert_usage_exit(
             self, lambda: codex_council._parse_roles_json(raw),
-            expect_in_stderr="single paragraph",
+            expect_in_stderr="must be a JSON array",
         )
 
-    def test_instruction_unicode_line_separator_raises(self):
-        raw = json.dumps([_role_json("x", "L", "one\u2028two")])
-        _assert_usage_exit(
-            self, lambda: codex_council._parse_roles_json(raw),
-            expect_in_stderr="single paragraph",
-        )
+    def test_unicode_line_separator_in_item_is_normalized(self):
+        """U+2028 inside a list item is whitespace-collapsed, not an error
+        \u2014 the joined paragraph is single-line by construction."""
+        raw = json.dumps([_role_json("x", "L", [
+            "one\u2028two; if nothing material, say so clearly.",
+            "Thoroughness beats speed.",
+        ])])
+        roles = codex_council._parse_roles_json(raw)
+        self.assertIn("one two", roles[0].instruction)
+        self.assertNotIn(" ", roles[0].instruction)
 
     def test_label_at_byte_cap_allowed(self):
         raw = json.dumps([_role_json("x", "a" * codex_council.ROLE_LABEL_MAX_BYTES)])
@@ -1747,11 +1757,11 @@ class InstructionListFormTests(unittest.TestCase):
             expect_in_stderr="rewrite the whole roles.json",
         )
 
-    def test_string_form_still_strict_about_newlines(self):
-        raw = json.dumps([_role_json("x", "L", "one\ntwo")])
+    def test_string_form_rejected_with_array_recovery(self):
+        raw = json.dumps([{"id": "x", "label": "L", "instruction": "one two"}])
         _assert_usage_exit(
             self, lambda: codex_council._parse_roles_json(raw),
-            expect_in_stderr="single paragraph",
+            expect_in_stderr="rewrite the whole roles.json file using the array form",
         )
 
 
@@ -1761,9 +1771,9 @@ class ResolveRolesJsonIntegrationTests(unittest.TestCase):
     def test_json_invocation_resolves(self):
         raw = json.dumps([
             {"id": "data-pipeline", "label": "Data",
-             "instruction": _valid_instruction("review pipeline")},
+             "instruction": [_valid_instruction("review pipeline")]},
             {"id": "ml-fairness", "label": "Fair",
-             "instruction": _valid_instruction("audit bias")},
+             "instruction": [_valid_instruction("audit bias")]},
         ])
         custom = codex_council._parse_roles_json(raw)
         roles = codex_council._resolve_roles(custom)
@@ -1773,7 +1783,7 @@ class ResolveRolesJsonIntegrationTests(unittest.TestCase):
         """MAX_PARALLEL + 1 custom roles must reject."""
         entries = [
             {"id": f"role-{i}", "label": f"R{i}",
-             "instruction": _valid_instruction("x")}
+             "instruction": [_valid_instruction("x")]}
             for i in range(codex_council.MAX_PARALLEL + 1)
         ]
         custom = codex_council._parse_roles_json(json.dumps(entries))
@@ -1849,7 +1859,7 @@ class ReadRolesFileTests(unittest.TestCase):
         path = os.path.join(self.tmp.name, "roles.json")
         with open(path, "w", encoding="utf-8") as f:
             json.dump([{"id": "a", "label": "Café",
-                        "instruction": _valid_instruction("réview €")}], f)
+                        "instruction": [_valid_instruction("réview €")]}], f)
         roles = codex_council._parse_roles_json(codex_council._read_roles_file(path))
         self.assertEqual(roles[0].label, "Café")
 
@@ -1871,9 +1881,9 @@ class ReadRolesFileTests(unittest.TestCase):
         with open(path, "w") as f:
             json.dump([
                 {"id": "alpha", "label": "A",
-                 "instruction": _valid_instruction("do a")},
+                 "instruction": [_valid_instruction("do a")]},
                 {"id": "beta", "label": "B",
-                 "instruction": _valid_instruction("do b")},
+                 "instruction": [_valid_instruction("do b")]},
             ], f)
         roles = codex_council._parse_roles_json(codex_council._read_roles_file(path))
         self.assertEqual([r.id for r in roles], ["alpha", "beta"])
