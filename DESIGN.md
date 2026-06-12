@@ -129,7 +129,7 @@ flowchart LR
 ## Resume footgun mitigation
 
 `codex exec resume <id>` parses `<id>` as a UUID first (UUIDs take
-precedence if it parses). Verified against codex-cli 0.135.0: a
+precedence if it parses). Verified against the installed codex-cli: a
 valid-but-unknown UUID **errors** (`no rollout found for thread id ...
 (code -32600)`, exit 1) and is handled by the stale-resume path (clear
 state + restart fresh); only a value that is **not** a valid UUID is
@@ -189,8 +189,9 @@ way, covering the 4xx bodies codex sometimes surfaces without a numeric
 status. The substring
 markers (`RATE_LIMIT_MARKERS` / `TRANSIENT_5XX_MARKERS`) are a
 **fallback** for failures that carry no parseable status — including the
-version-coupled phrases codex uses when it rewrites a 500/overload to
-code-less prose (`experiencing high demand`, `backend overloaded`). Usage/quota
+current codex-cli code-less prose `experiencing high demand` and
+`server overloaded` (`backend overloaded` is retained as a legacy
+fallback for older codex/provider text). Usage/quota
 limits are **not** retriable: a plan cap does not clear within a 5s
 backoff, so it is surfaced terminal rather than retried. JSONL parsing
 intentionally skips malformed and non-object events while preserving

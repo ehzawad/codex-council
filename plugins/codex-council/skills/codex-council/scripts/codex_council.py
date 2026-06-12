@@ -93,13 +93,15 @@ TRANSIENT_5XX_MARKERS = (
     "504 gateway timeout",
     "internal server error",
     "service unavailable",
-    # codex-cli 0.135.0 friendly-rewrites some upstream 5xx/overload errors to
+    # current codex-cli friendly-rewrites some upstream 5xx/overload errors to
     # prose that carries no status code (HTTP 500 -> "...experiencing high
-    # demand..."; serverOverloaded -> "...backend overloaded..."). These two
-    # phrases are version-coupled fallbacks for that code-less case; the numeric
-    # range in _structured_retriable_class handles every 5xx that DOES carry a
-    # status. "backend overloaded" is intentionally specific (not bare
+    # demand..."; overload -> "...server overloaded..."). "backend overloaded"
+    # is kept as a legacy fallback for older codex/provider text. These phrases
+    # are version-coupled fallbacks for that code-less case; the numeric range
+    # in _structured_retriable_class handles every 5xx that DOES carry a
+    # status. The overload markers are intentionally specific (not bare
     # "overloaded") so unrelated text like "operator overloaded" is not matched.
+    "server overloaded",
     "backend overloaded",
     "experiencing high demand",
 )
@@ -112,7 +114,7 @@ STALE_RESUME_MARKERS = (
 )
 
 # A definitively non-retriable error TYPE that codex/OpenAI put in the JSONL
-# error body for 4xx client errors. codex-cli 0.135.0 sometimes surfaces a 400
+# error body for 4xx client errors. current codex-cli sometimes surfaces a 400
 # as raw JSON with this type but NO numeric status; its presence (when no
 # anchored retriable status is found) suppresses the substring retriable
 # fallback, so a 400 whose message text merely contains a 5xx reason phrase or
@@ -170,7 +172,7 @@ STAGING_DIR_RECOVERY = (
 # trips. Widening that for long stalls is left to the user's
 # ~/.codex/config.toml rather than overridden here: it is provider-scoped
 # and the active provider id varies, so the council cannot target it
-# portably. (Verified against codex-cli 0.135.0.)
+# portably. (Verified against the installed codex-cli.)
 
 
 @dataclass(frozen=True)
@@ -458,7 +460,7 @@ def _is_stale_resume_error(stderr_text):
     return _stderr_contains(stderr_text, STALE_RESUME_MARKERS)
 
 
-# Numeric HTTP status as codex surfaces it. codex-cli 0.135.0 does NOT put a
+# Numeric HTTP status as codex surfaces it. current codex-cli does NOT put a
 # status on the top-level JSONL event, so we scan the combined failure text for
 # an ANCHORED status — one in a recognizable status context, so a bare digit run
 # (e.g. "429" inside a thread id like "stale-429-sid") is never mistaken for one.
@@ -681,8 +683,8 @@ async def _run_role_once(role, prompt, attempt):
 
         if rc == 0:
             # Resume-footgun mitigation. `codex exec resume <id>` parses <id>
-            # as a UUID first (UUIDs take precedence if it parses). On codex-cli
-            # 0.135.0 a valid-but-unknown UUID ERRORS ("no rollout found ...
+            # as a UUID first (UUIDs take precedence if it parses). On current
+            # codex-cli a valid-but-unknown UUID ERRORS ("no rollout found ...
             # -32600", exit 1) and is handled by the stale-resume branch below;
             # only a value that is NOT a valid UUID is treated as a thread NAME
             # and silently starts a NEW thread (rc==0, fresh thread.started).
@@ -1045,6 +1047,30 @@ def _usage_exit_if_file_arg_problems(*arg_pairs):
         )
 
 
+def _usage_exit_if_codex_missing(prefix):
+    """Exit 2 with an install-method-neutral recovery if codex is absent.
+
+    Shared by the --check-staging-dir preflight and the launch path: a
+    missing binary must fail loudly BEFORE a background launch, where the
+    error would otherwise surface only inside err.log (GH issue #1's
+    suspected nvm-switch failure class). PATH is included because the
+    failing Bash invocation's PATH is the diagnostic that matters —
+    Claude Code Bash calls do not share environment mutations.
+    """
+    if shutil.which("codex"):
+        return
+    _usage_exit(
+        f"{prefix}Codex CLI not found on PATH for this Bash invocation. "
+        "Recovery: make `codex --version` work in the same environment "
+        "that will run the council launch, then re-run --check-staging-dir "
+        "and launch. Do not rely on PATH changes from a previous Claude "
+        "Code Bash call. If Codex is already installed, add its install "
+        "directory to PATH (for example /opt/homebrew/bin, /usr/local/bin, "
+        "or your npm global bin); otherwise install Codex with your chosen "
+        f"install method. Current PATH: {os.environ.get('PATH', '')!r}"
+    )
+
+
 def _usage_exit_if_staging_dirs_differ(roles_file, context_file):
     """Require staged launch inputs to live in the same per-run directory."""
     if roles_file is None or context_file is None:
@@ -1267,55 +1293,91 @@ def _resolve_roles(custom_roles):
     return ordered
 
 
-def _read_prompt_body(stream, source_label):
+def _read_body_or_problem(stream):
     """Read a prompt body from a binary stream, enforcing the byte cap.
 
-    Counts BYTES, not characters: stdin is read raw and the cap is checked
+    Counts BYTES, not characters: input is read raw and the cap is checked
     against the byte length, because the prompt is later UTF-8 encoded for
     codex and a multibyte-heavy body would otherwise slip past a
-    character-count check (the cap claims bytes). Exits 1 if over the cap
-    or empty; input is never truncated. Decodes strictly as UTF-8 — a
-    prompt should be text, so invalid bytes are a clear error rather than
-    silently replaced.
+    character-count check (the cap claims bytes). Input is never
+    truncated. Decodes strictly as UTF-8 — a prompt should be text, so
+    invalid bytes are a clear error rather than silently replaced.
+
+    Returns (body, None) on success or (None, (kind, detail)) where kind
+    is "oversize", "not-utf8", or "empty". Exit codes are the CALLER's
+    decision: stdin defects are runtime input errors (exit 1), while a
+    staged context.md defect is a usage/staging error (exit 2) like every
+    other staging defect.
     """
     raw = stream.read(MAX_STDIN_BYTES + 1)
     if len(raw) > MAX_STDIN_BYTES:
-        print(
-            f"{source_label} exceeds {MAX_STDIN_BYTES} bytes "
-            f"({MAX_STDIN_BYTES >> 20} MiB) — trim before piping.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        return None, ("oversize", None)
     try:
         body = raw.decode("utf-8")
     except UnicodeDecodeError as e:
-        print(f"{source_label} is not valid UTF-8 ({e}) — pipe text.", file=sys.stderr)
-        sys.exit(1)
+        return None, ("not-utf8", e)
     if not body.strip():
-        if source_label == "Input":
-            msg = "Empty input — pipe a complete prompt instead."
-        else:
-            msg = f"Empty {source_label} — write complete context first."
-        print(msg, file=sys.stderr)
-        sys.exit(1)
-    return body
+        return None, ("empty", None)
+    return body, None
 
 
 def _read_stdin_body(stream):
-    """Read the prompt body from stdin."""
-    return _read_prompt_body(stream, "Input")
+    """Read the prompt body from stdin; defects exit 1 (runtime input)."""
+    body, problem = _read_body_or_problem(stream)
+    if problem is None:
+        return body
+    kind, detail = problem
+    if kind == "oversize":
+        print(
+            f"Input exceeds {MAX_STDIN_BYTES} bytes "
+            f"({MAX_STDIN_BYTES >> 20} MiB) — trim before piping.",
+            file=sys.stderr,
+        )
+    elif kind == "not-utf8":
+        print(f"Input is not valid UTF-8 ({detail}) — pipe text.", file=sys.stderr)
+    else:
+        print("Empty input — pipe a complete prompt instead.", file=sys.stderr)
+    sys.exit(1)
 
 
 def _read_context_file(path):
-    """Read a staged context file, preserving stdin body validation."""
+    """Read a staged context file; content defects are usage errors (exit 2).
+
+    Empty, non-UTF-8, and over-cap staged context files exit 2 like every
+    other staging defect, so 'exit 2 = fix the staged inputs and re-run
+    preflight' holds uniformly; exit 1 stays for runtime failures (stdin
+    defects, every role failing).
+    """
     problem = _file_arg_problem("--context-file", path)
     if problem:
         _usage_exit(f"{problem}. {STAGING_PATH_HINT}")
     try:
         with open(path, "rb") as f:
-            return _read_prompt_body(f, f"Context file {path!r}")
+            body, body_problem = _read_body_or_problem(f)
     except OSError as e:
         _usage_exit(f"--context-file: cannot read {path!r} ({e}). {STAGING_PATH_HINT}")
+    if body_problem is None:
+        return body
+    kind, detail = body_problem
+    if kind == "oversize":
+        _usage_exit(
+            f"--context-file: Context file {path!r} exceeds "
+            f"{MAX_STDIN_BYTES} bytes ({MAX_STDIN_BYTES >> 20} MiB). "
+            "Recovery: rewrite context.md as a smaller digest; do not "
+            "truncate blindly. Then re-run --check-staging-dir."
+        )
+    if kind == "not-utf8":
+        _usage_exit(
+            f"--context-file: Context file {path!r} is not valid UTF-8 "
+            f"({detail}). Recovery: rewrite context.md as UTF-8 text, then "
+            "re-run --check-staging-dir."
+        )
+    _usage_exit(
+        f"--context-file: Context file {path!r} is empty or "
+        "whitespace-only. Recovery: rewrite context.md with the review "
+        "context or a self-contained question, then re-run "
+        "--check-staging-dir."
+    )
 
 
 def _check_private_dir(path):
@@ -1387,6 +1449,10 @@ def _check_staging_dir(path):
     )
     roles = _resolve_roles(_parse_roles_json(_read_roles_file(roles_path)))
     _read_context_file(context_path)
+    # The codex binary is the one hard external dependency; a preflight
+    # that says "staging OK" while codex is missing defers the failure to
+    # a background launch whose error lands only in err.log.
+    _usage_exit_if_codex_missing("--check-staging-dir: ")
     print(
         f"[codex-council] staging OK: {os.path.abspath(path)} "
         f"({len(roles)} roles)"
@@ -1455,12 +1521,7 @@ def main():
             sys.exit(1)
         body = _read_stdin_body(sys.stdin.buffer)
 
-    if not shutil.which("codex"):
-        print(
-            "Codex CLI not found — install with: npm i -g @openai/codex",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    _usage_exit_if_codex_missing("")
 
     print(
         f"[codex-council] dispatching {len(roles)} roles "

@@ -34,7 +34,7 @@ SCRIPT = os.path.abspath(os.path.join(
 # non-zero with no agent_message, so that role is reported FAILED.
 FAIL_SENTINEL = "PLEASE_FAIL"
 STDOUT_ERROR_SENTINEL = "PLEASE_STDOUT_ERROR"
-# Makes the fake codex emit a real-shaped 0.135.0 failure: rc!=0 with a nested
+# Makes the fake codex emit a real-shaped current codex-cli failure: rc!=0 with a nested
 # status-400 API body whose text contains "429" — the false-positive that
 # status-aware classification must NOT tag retriable.
 STATUS400_429_SENTINEL = "PLEASE_STATUS400_429"
@@ -311,6 +311,47 @@ class HappyPathTests(CouncilCLITestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("staging OK", proc.stdout)
         self.assertIn("(1 roles)", proc.stdout)
+        self.assertNotIn("[codex-council] dispatching", proc.stderr)
+
+    def _strip_codex_from_path(self):
+        """Point PATH at one empty dir so no codex binary is findable."""
+        emptybin = tempfile.TemporaryDirectory()
+        self.addCleanup(emptybin.cleanup)
+        self.env["PATH"] = emptybin.name
+
+    def test_check_staging_dir_fails_without_codex(self):
+        """Preflight must not say 'staging OK' when the launch would die
+        on a missing codex binary inside a background process."""
+        self._write_roles([
+            _role("architect", "Architect",
+                  _instruction("Review architecture")),
+        ])
+        self._write_context("please review this change\n")
+        self._strip_codex_from_path()
+        proc = self._run(
+            input="",
+            args=("--check-staging-dir", self.workdir.name),
+        )
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn("Codex CLI not found on PATH", proc.stderr)
+        self.assertNotIn("staging OK", proc.stdout)
+        # Install hint must be install-method-neutral, with PATH diagnostics.
+        self.assertNotIn("npm i -g @openai/codex", proc.stderr)
+        self.assertIn("Current PATH:", proc.stderr)
+
+    def test_launch_without_codex_is_usage_error(self):
+        roles_path = self._write_roles([
+            _role("architect", "Architect",
+                  _instruction("Review architecture")),
+        ])
+        context_path = self._write_context("please review this change\n")
+        self._strip_codex_from_path()
+        proc = self._run(
+            input="",
+            args=("--roles-file", roles_path, "--context-file", context_path),
+        )
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn("Codex CLI not found on PATH", proc.stderr)
         self.assertNotIn("[codex-council] dispatching", proc.stderr)
 
     def test_report_precedes_sentinel_in_combined_stream(self):

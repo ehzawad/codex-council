@@ -421,6 +421,27 @@ class ClassifierTests(unittest.TestCase):
         self.assertTrue(codex_council._is_transient_5xx_error("502 bad gateway"))
         self.assertTrue(codex_council._is_transient_5xx_error("Service unavailable, retry later"))
 
+    def test_server_overloaded_is_5xx_phrase(self):
+        """Current codex-cli rewrites code-less overload errors to 'server
+        overloaded'; 'backend overloaded' is older codex/provider text."""
+        self.assertEqual(
+            codex_council._retriable_class(
+                "stream disconnected before completion: server overloaded"),
+            "5xx",
+        )
+        self.assertEqual(
+            codex_council._retriable_class("Server overloaded, retry shortly"),
+            "5xx",
+        )
+
+    def test_backend_overloaded_kept_as_legacy_marker(self):
+        self.assertEqual(
+            codex_council._retriable_class("backend overloaded"), "5xx")
+
+    def test_operator_overloaded_not_matched(self):
+        self.assertIsNone(
+            codex_council._retriable_class("error: operator overloaded in C++"))
+
     def test_stale_markers_match(self):
         self.assertTrue(codex_council._is_stale_resume_error(
             "Error: thread/resume failed: no rollout found for thread id abc (code -32600)"
@@ -444,7 +465,7 @@ class ClassifierTests(unittest.TestCase):
 # ---------- structured (HTTP-status-aware) classification ----------
 
 def _nested_status_failure_text(status, message):
-    """Build failure_text the way codex-cli 0.135.0 emits it: the numeric HTTP
+    """Build failure_text the way current codex-cli emits it: the numeric HTTP
     status lives only inside the nested JSON string under turn.failed."""
     nested = json.dumps({"type": "error", "status": status,
                          "error": {"message": message}})
@@ -453,7 +474,7 @@ def _nested_status_failure_text(status, message):
 
 
 class StructuredStatusClassifierTests(unittest.TestCase):
-    """Status-first failure classification (codex-cli 0.135.0).
+    """Status-first failure classification (current codex-cli).
 
     The numeric HTTP status parsed from the JSONL error body is the
     authoritative retriable signal; substring markers are a fallback only when
@@ -526,7 +547,7 @@ class StructuredStatusClassifierTests(unittest.TestCase):
         self.assertEqual(codex_council._retriable_class(ft), "5xx")
 
     def test_http500_friendly_rewrite_is_5xx_via_phrase_fallback(self):
-        # codex-cli 0.135.0 rewrites HTTP 500 to a code-less phrase; the
+        # current codex-cli rewrites HTTP 500 to a code-less phrase; the
         # version-coupled marker catches it as a fallback (no status present).
         ft = codex_council._failure_text(
             "", "We're currently experiencing high demand, which may cause temporary errors.")
@@ -567,7 +588,7 @@ class StructuredStatusClassifierTests(unittest.TestCase):
         self.assertNotIn("quota exceeded", codex_council.RATE_LIMIT_MARKERS)
 
     def test_codeless_overload_markers_pinned_and_no_false_positive(self):
-        # Confirmed code-less codex 0.135.0 rewrites are caught via fallback...
+        # Confirmed code-less fallback phrases (current and legacy) are caught...
         self.assertEqual(codex_council._retriable_class("backend overloaded"), "5xx")
         self.assertEqual(
             codex_council._retriable_class(
@@ -636,7 +657,7 @@ class StructuredStatusClassifierTests(unittest.TestCase):
         self.assertNotIn("429", codex_council.RATE_LIMIT_MARKERS)
 
     def test_statusless_400_invalid_request_error_suppresses_fallback(self):
-        # codex-cli 0.135.0 can surface a 4xx as raw JSON with NO status key but
+        # current codex-cli can surface a 4xx as raw JSON with NO status key but
         # `"type": "invalid_request_error"`; that must NOT be retried even when
         # its message text contains a 5xx reason phrase or rate-limit wording.
         raw_su = ('{"error": {"message": "service unavailable for this account '
@@ -1863,6 +1884,11 @@ class CheckStagingDirTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         os.chmod(self.tmp.name, 0o700)
+        # Preflight now requires codex on PATH; keep these tests hermetic
+        # so they pass on codex-less machines.
+        which_patcher = patch("shutil.which", return_value="/fake/bin/codex")
+        which_patcher.start()
+        self.addCleanup(which_patcher.stop)
 
     def _write_valid_roles(self):
         with open(os.path.join(self.tmp.name, "roles.json"), "w", encoding="utf-8") as f:
@@ -1889,15 +1915,45 @@ class CheckStagingDirTests(unittest.TestCase):
             expect_in_stderr="Staging hint",
         )
 
-    def test_empty_context_is_rejected(self):
+    def test_empty_context_is_rejected_as_usage_error(self):
+        """Exit 2 like every other staging defect — exit 1 stays reserved
+        for 'every role failed at runtime'."""
         self._write_valid_roles()
         self._write_context("   \n")
+        _assert_usage_exit(
+            self,
+            lambda: codex_council._check_staging_dir(self.tmp.name),
+            expect_in_stderr="empty or whitespace-only",
+        )
+
+    def test_missing_codex_fails_preflight(self):
+        """'staging OK' while the codex binary is missing defers the
+        failure to a background launch whose error lands only in err.log
+        (GH issue #1's suspected nvm-switch failure class)."""
+        self._write_valid_roles()
+        self._write_context()
+        out = io.StringIO()
+        with patch("shutil.which", return_value=None):
+            with contextlib.redirect_stdout(out):
+                _assert_usage_exit(
+                    self,
+                    lambda: codex_council._check_staging_dir(self.tmp.name),
+                    expect_in_stderr="Codex CLI not found on PATH",
+                )
+        self.assertNotIn("staging OK", out.getvalue())
+
+    def test_missing_codex_message_is_install_neutral(self):
+        self._write_valid_roles()
+        self._write_context()
         buf = io.StringIO()
-        with contextlib.redirect_stderr(buf):
-            with self.assertRaises(SystemExit) as ctx:
-                codex_council._check_staging_dir(self.tmp.name)
-        self.assertEqual(ctx.exception.code, 1)
-        self.assertIn("Empty Context file", buf.getvalue())
+        with patch("shutil.which", return_value=None):
+            with contextlib.redirect_stderr(buf):
+                with self.assertRaises(SystemExit):
+                    codex_council._check_staging_dir(self.tmp.name)
+        err = buf.getvalue()
+        self.assertNotIn("npm i -g", err)
+        self.assertIn("/opt/homebrew/bin", err)
+        self.assertIn("Current PATH:", err)
 
     def test_public_staging_dir_is_rejected(self):
         os.chmod(self.tmp.name, 0o755)
@@ -2027,37 +2083,46 @@ class ReadContextFileTests(unittest.TestCase):
             expect_in_stderr="Staging hint",
         )
 
-    def test_empty_context_file_exits_1(self):
+    def test_empty_context_file_is_usage_error(self):
+        """Exit 2 like every other staging defect; exit 1 stays reserved
+        for runtime failures (stdin defects, all-roles-failed)."""
         path = self._path()
         with open(path, "w", encoding="utf-8") as f:
             f.write("   \n")
-        buf = io.StringIO()
-        with contextlib.redirect_stderr(buf):
-            with self.assertRaises(SystemExit) as ctx:
-                codex_council._read_context_file(path)
-        self.assertEqual(ctx.exception.code, 1)
-        self.assertIn("Empty Context file", buf.getvalue())
+        _assert_usage_exit(
+            self,
+            lambda: codex_council._read_context_file(path),
+            expect_in_stderr="empty or whitespace-only",
+        )
 
-    def test_context_file_reuses_utf8_and_byte_cap_guards(self):
+    def test_empty_context_message_names_recovery(self):
+        path = self._path()
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("   \n")
+        _assert_usage_exit(
+            self,
+            lambda: codex_council._read_context_file(path),
+            expect_in_stderr="re-run --check-staging-dir",
+        )
+
+    def test_context_file_utf8_and_byte_cap_are_usage_errors(self):
         path = self._path()
         with open(path, "wb") as f:
             f.write(b"\xff\xfe bad")
-        buf = io.StringIO()
-        with contextlib.redirect_stderr(buf):
-            with self.assertRaises(SystemExit) as ctx:
-                codex_council._read_context_file(path)
-        self.assertEqual(ctx.exception.code, 1)
-        self.assertIn("not valid UTF-8", buf.getvalue())
+        _assert_usage_exit(
+            self,
+            lambda: codex_council._read_context_file(path),
+            expect_in_stderr="not valid UTF-8",
+        )
 
         with patch.object(codex_council, "MAX_STDIN_BYTES", 4):
             with open(path, "wb") as f:
                 f.write(b"abcde")
-            buf = io.StringIO()
-            with contextlib.redirect_stderr(buf):
-                with self.assertRaises(SystemExit) as ctx:
-                    codex_council._read_context_file(path)
-            self.assertEqual(ctx.exception.code, 1)
-            self.assertIn("exceeds", buf.getvalue())
+            _assert_usage_exit(
+                self,
+                lambda: codex_council._read_context_file(path),
+                expect_in_stderr="exceeds",
+            )
 
 
 class ReadStdinBodyTests(unittest.TestCase):
@@ -2258,7 +2323,7 @@ class DocsContractTests(unittest.TestCase):
         self.assertNotIn(">/dev/null 2>&1 || true", text)
 
     def test_design_md_resume_footgun_describes_uuid_error_path(self):
-        """T2a: the corrected wording must describe the real 0.135.0 behavior
+        """T2a: the corrected wording must describe the real current codex-cli behavior
         (unknown UUID errors; only a non-UUID name silently spawns), not the
         old inaccurate 'bogus_or_invalid_uuid silently falls through' claim."""
         path = self._repo_file("DESIGN.md")
