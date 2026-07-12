@@ -60,11 +60,17 @@ actually doing, then passing them to the script via `--roles-file`
 (a path to the panel JSON) and `--context-file` (a staged context file
 in the same private per-run directory). The script is a pure
 orchestrator: it reads those staged inputs, validates them before
-launch, fans out parallel `codex exec` subprocesses, and aggregates
+launch, fans out bounded-parallel `codex exec` subprocesses, and aggregates
 the replies. It imposes no size ceiling on the panel, role IDs, labels,
 instructions, staged context, stdin, or composed prompts, and it never
 truncates them. Actual model/provider context windows and available machine
 memory remain external constraints and are surfaced as downstream failures.
+
+For long Claude Code sessions, "full context" means a decision-complete
+working set rather than a raw transcript dump: current objective and recent
+work in high fidelity, live primary evidence from disk, and older still-relevant
+history summarized with its decisions, rejected paths, invariants, and
+uncertainties. Superseded state and conversational repetition are omitted.
 
 **Note on fit.** Codex is strongest where the task has technical,
 structured, or evidence-checking surfaces. For tasks where a single
@@ -87,7 +93,7 @@ flowchart LR
         Manifest[".claude-plugin/plugin.json"] -.-> Skill
         Script --> Validate["Validate staged inputs<br/>Parse and validate roles"]
         Validate --> Prompt["Bookend context with<br/>each role instruction"]
-        Prompt --> Fanout["asyncio.gather<br/>parallel fan-out"]
+        Prompt --> Fanout["asyncio.Semaphore + gather<br/>bounded parallel fan-out"]
 
         Fanout --> RoleA["Role runner A"]
         Fanout --> RoleB["Role runner B"]
@@ -210,6 +216,16 @@ other settings come from `~/.codex/config.toml`. No model is hardcoded.
 Sandbox and approval settings are overridden by the plugin (see
 Security above).
 
+Active role concurrency defaults to 6, matching the current
+[Codex configuration default](https://learn.chatgpt.com/docs/config-file/config-reference#configtoml)
+for `agents.max_threads`. If a positive user-level `agents.max_threads` is present,
+the runner uses it as a conservative local concurrency signal; set
+`CODEX_COUNCIL_MAX_PARALLEL` to a positive integer for an explicit council-only
+override. Panels may be larger than active concurrency: excess roles queue in
+the runner rather than being rejected or launched simultaneously. Because this
+plugin launches separate `codex exec` processes, Codex's in-process agent
+setting is a useful local preference, not a provider-capacity guarantee.
+
 No wall-clock timeout is enforced — neither the council nor `codex
 exec` imposes a run-level deadline, so a role runs as long as Codex
 takes, hours or days. An actively-working role streams continuously,
@@ -218,7 +234,11 @@ guard only covers a stalled connection (and is retried). To widen it
 for very long quiet stretches, raise
 `model_providers.<id>.stream_idle_timeout_ms` and the retry counts in
 your own `~/.codex/config.toml`. Ctrl+C tears down every codex process
-group.
+group. While work remains, the runner writes a 30-minute status heartbeat to
+the staged `err.log`; the skill uses Claude Code's native
+[background-task mechanism](https://code.claude.com/docs/en/interactive-mode)
+and, where available, [session-cron state](https://code.claude.com/docs/en/hooks)
+to surface progress without a shell polling loop.
 
 ## For development
 

@@ -29,6 +29,8 @@ Env vars:
     CODEX_COUNCIL_SESSION_KEY     explicit council thread scope override
     CODEX_COUNCIL_DISABLE_AUTO_SESSION_KEY=1
                                    fall back to project-wide role state
+    CODEX_COUNCIL_MAX_PARALLEL    positive active-role concurrency override;
+                                   otherwise use Codex agents.max_threads or 6
 
 No wall-clock timeouts are enforced — each role runs as long as Codex
 takes. Ctrl+C still tears down every in-flight codex process group.
@@ -54,6 +56,11 @@ import time
 from dataclasses import dataclass
 from functools import cache
 from typing import Optional
+
+try:
+    import tomllib
+except ImportError:  # Python < 3.11: keep the Codex default fallback.
+    tomllib = None
 
 STATE_DIR = os.path.join(
     os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
@@ -142,6 +149,9 @@ AUTO_SESSION_ENV_VARS = (
 MAX_RETRY_ATTEMPTS = 2
 INITIAL_BACKOFF_SECS = 5
 TERMINATION_GRACE_SECS = 0.2
+DEFAULT_MAX_PARALLEL = 6
+MAX_PARALLEL_ENV = "CODEX_COUNCIL_MAX_PARALLEL"
+PROGRESS_HEARTBEAT_SECS = 30 * 60
 REQUIRED_SCOPE_PHRASE = "nothing material"
 REQUIRED_CADENCE_SENTENCE = "Thoroughness beats speed."
 LINEBREAK_CHARS = ("\r", "\n", "\u2028", "\u2029")
@@ -249,6 +259,74 @@ def _session_key():
     if _truthy_env(DISABLE_AUTO_SESSION_KEY_ENV):
         return ""
     return _auto_session_key()
+
+
+def _configured_codex_max_threads():
+    """Read the user-level Codex agents.max_threads preference if available.
+
+    Codex currently defaults this setting to 6. The council launches separate
+    `codex exec` processes rather than Codex's in-process subagents, so this is
+    a conservative local concurrency signal, not a provider-capacity promise.
+    Invalid, absent, or unreadable config falls back cleanly.
+    """
+    codex_home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+    path = os.path.join(codex_home, "config.toml")
+    if tomllib is None:
+        # Python 3.10 and older have no stdlib TOML parser. Read only the one
+        # integer setting we need; keep the fallback deliberately strict so a
+        # complex or malformed value cannot accidentally raise concurrency.
+        try:
+            with open(path, encoding="utf-8") as f:
+                lines = f.readlines()
+        except (OSError, UnicodeDecodeError):
+            return None
+        in_agents = False
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("["):
+                in_agents = bool(
+                    re.fullmatch(r"\[\s*agents\s*\](?:\s*#.*)?", line)
+                )
+                continue
+            match = re.fullmatch(
+                r"(?:agents\.)?max_threads\s*=\s*([1-9][0-9_]*)"
+                r"(?:\s*#.*)?",
+                line,
+            )
+            if match and (in_agents or line.startswith("agents.")):
+                return int(match.group(1).replace("_", ""))
+        return None
+    try:
+        with open(path, "rb") as f:
+            config = tomllib.load(f)
+    except (OSError, ValueError):
+        return None
+    agents = config.get("agents")
+    if not isinstance(agents, dict):
+        return None
+    value = agents.get("max_threads")
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return None
+
+
+def _max_parallel_roles():
+    """Return the positive active-role limit for this council invocation."""
+    override = os.environ.get(MAX_PARALLEL_ENV, "").strip()
+    if override:
+        try:
+            value = int(override)
+        except ValueError:
+            value = 0
+        if value <= 0:
+            _usage_exit(
+                f"{MAX_PARALLEL_ENV} must be a positive integer; got "
+                f"{override!r}."
+            )
+        return value
+    return _configured_codex_max_threads() or DEFAULT_MAX_PARALLEL
 
 
 def _project_key(role_id):
@@ -823,11 +901,12 @@ async def _run_role(role, prompt):
         _release_role_state_lock(lock_file)
 
 
-async def run_council(roles, body):
+async def run_council(roles, body, max_parallel=None):
     """Fan out N roles in parallel and wait for all to finish.
 
     `roles` is an unrestricted-size list of Role objects supplied by the
-    caller via --roles-file. There is no built-in role registry.
+    caller via --roles-file. There is no built-in role registry. At most
+    `max_parallel` roles are active at once; additional roles remain queued.
 
     `return_exceptions=True` ensures one role's crash does not cancel
     its siblings — every role gets its turn and its result in the report.
@@ -838,6 +917,41 @@ async def run_council(roles, body):
     """
     total = len(roles)
     counter = {"done": 0}
+    active = set()
+    if max_parallel is None:
+        max_parallel = _max_parallel_roles()
+    if (
+        not isinstance(max_parallel, int)
+        or isinstance(max_parallel, bool)
+        or max_parallel <= 0
+    ):
+        raise ValueError("max_parallel must be a positive integer")
+    semaphore = asyncio.Semaphore(max_parallel)
+    started = time.monotonic()
+
+    async def _run_bounded(role):
+        async with semaphore:
+            active.add(role.id)
+            try:
+                return await _run_role(role, _compose_prompt(role, body))
+            finally:
+                active.discard(role.id)
+
+    async def _heartbeat():
+        while counter["done"] < total:
+            await asyncio.sleep(PROGRESS_HEARTBEAT_SECS)
+            if counter["done"] >= total:
+                return
+            active_ids = ", ".join(sorted(active)) or "none"
+            queued = max(0, total - counter["done"] - len(active))
+            elapsed = time.monotonic() - started
+            print(
+                f"[codex-council] still running after {elapsed:.0f}s: "
+                f"completed={counter['done']}/{total}; active={len(active)} "
+                f"({active_ids}); queued={queued}.",
+                file=sys.stderr,
+                flush=True,
+            )
 
     def _on_role_done(role, task):
         # Fires on the single event loop thread as each role settles, in
@@ -870,10 +984,10 @@ async def run_council(roles, body):
 
     tasks = []
     for role in roles:
-        t = asyncio.create_task(_run_role(role, _compose_prompt(role, body)))
+        t = asyncio.create_task(_run_bounded(role))
         t.add_done_callback(lambda task, role=role: _on_role_done(role, task))
         tasks.append(t)
-    started = time.monotonic()
+    heartbeat_task = asyncio.create_task(_heartbeat())
     try:
         results = await asyncio.gather(*tasks, return_exceptions=True)
     except asyncio.CancelledError:
@@ -881,6 +995,12 @@ async def run_council(roles, body):
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         raise
+    finally:
+        heartbeat_task.cancel()
+        # Progress reporting must never turn an otherwise successful council
+        # into a failure (for example if stderr was closed by the host).
+        with contextlib.suppress(asyncio.CancelledError, OSError):
+            await heartbeat_task
     elapsed = time.monotonic() - started
 
     out = []
@@ -1018,6 +1138,11 @@ def _file_arg_problem(arg_name, path):
         return (
             f"{arg_name}: cannot read {path!r}; parent directory does not "
             f"exist: {parent!r} ({details})"
+        )
+    if os.path.islink(path):
+        return (
+            f"{arg_name}: cannot read {path!r}; symbolic links are not "
+            f"accepted for staged inputs ({details})"
         )
     if os.path.isdir(path):
         return f"{arg_name}: cannot read {path!r}; path is a directory ({details})"
@@ -1408,16 +1533,19 @@ def _check_staging_dir(path):
     # that says "staging OK" while codex is missing defers the failure to
     # a background launch whose error lands only in err.log.
     _usage_exit_if_codex_missing("--check-staging-dir: ")
+    max_parallel = _max_parallel_roles()
     print(
         f"[codex-council] staging OK: {os.path.abspath(path)} "
-        f"({len(roles)} roles)"
+        f"({len(roles)} roles; max parallel {max_parallel})"
     )
 
 
-async def _run_council_with_signals(roles, body):
+async def _run_council_with_signals(roles, body, max_parallel):
     """Run the council and translate POSIX termination signals into cleanup."""
     loop = asyncio.get_running_loop()
-    council_task = asyncio.create_task(run_council(roles, body))
+    council_task = asyncio.create_task(
+        run_council(roles, body, max_parallel=max_parallel)
+    )
     interrupted = {"signum": None}
     registered = []
 
@@ -1477,16 +1605,20 @@ def main():
         body = _read_stdin_body(sys.stdin.buffer)
 
     _usage_exit_if_codex_missing("")
+    max_parallel = _max_parallel_roles()
 
     print(
         f"[codex-council] dispatching {len(roles)} roles "
+        f"with max parallel {max_parallel} "
         f"({', '.join(r.id for r in roles)}).",
         file=sys.stderr,
     )
 
     started = time.monotonic()
     try:
-        results, signum = asyncio.run(_run_council_with_signals(roles, body))
+        results, signum = asyncio.run(
+            _run_council_with_signals(roles, body, max_parallel)
+        )
     except KeyboardInterrupt:
         print("\n[codex-council] interrupted by user", file=sys.stderr)
         sys.exit(130)

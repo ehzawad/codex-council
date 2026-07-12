@@ -17,7 +17,6 @@ Run from repo root:
 import hashlib
 import json
 import os
-import re
 import subprocess
 import sys
 import tempfile
@@ -119,8 +118,10 @@ class CouncilCLITestCase(unittest.TestCase):
         self.env = dict(os.environ)
         self.env["PATH"] = self.bindir.name + os.pathsep + self.env.get("PATH", "")
         self.env["XDG_STATE_HOME"] = self.statedir.name
+        self.env["CODEX_HOME"] = self.statedir.name
         # Keep the env free of any session-key leakage from the dev shell.
         self.env.pop("CODEX_COUNCIL_SESSION_KEY", None)
+        self.env.pop("CODEX_COUNCIL_MAX_PARALLEL", None)
 
     def _write_roles(self, roles):
         path = os.path.join(self.workdir.name, "roles.json")
@@ -334,7 +335,7 @@ class HappyPathTests(CouncilCLITestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("staging OK", proc.stdout)
-        self.assertIn("(1 roles)", proc.stdout)
+        self.assertIn("(1 roles; max parallel 6)", proc.stdout)
         self.assertNotIn("[codex-council] dispatching", proc.stderr)
 
     def _strip_codex_from_path(self):

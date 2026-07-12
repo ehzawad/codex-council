@@ -41,6 +41,7 @@ def _env_without_session_key():
     excluded = {
         codex_council.SESSION_KEY_ENV,
         codex_council.DISABLE_AUTO_SESSION_KEY_ENV,
+        codex_council.MAX_PARALLEL_ENV,
         *codex_council.AUTO_SESSION_ENV_VARS,
     }
     return {k: v for k, v in os.environ.items() if k not in excluded}
@@ -162,6 +163,73 @@ class SessionKeyTests(unittest.TestCase):
         env["TERM_SESSION_ID"] = "term-123"
         with patch.dict(os.environ, env, clear=True):
             self.assertEqual(codex_council._session_key(), "")
+
+
+class MaxParallelTests(unittest.TestCase):
+    def setUp(self):
+        self.codex_home = tempfile.TemporaryDirectory()
+        self.addCleanup(self.codex_home.cleanup)
+        env = _env_without_session_key()
+        env["CODEX_HOME"] = self.codex_home.name
+        self.env_patcher = patch.dict(os.environ, env, clear=True)
+        self.env_patcher.start()
+        self.addCleanup(self.env_patcher.stop)
+
+    def _write_config(self, text):
+        with open(
+            os.path.join(self.codex_home.name, "config.toml"),
+            "w",
+            encoding="utf-8",
+        ) as f:
+            f.write(text)
+
+    def test_default_matches_current_codex_default(self):
+        self.assertEqual(codex_council._max_parallel_roles(), 6)
+
+    def test_reads_codex_agents_max_threads(self):
+        self._write_config("[agents]\nmax_threads = 9\n")
+        self.assertEqual(codex_council._max_parallel_roles(), 9)
+
+    def test_pre311_fallback_reads_only_strict_positive_integer(self):
+        self._write_config("[agents]\nmax_threads = 1_2 # intentional\n")
+        with patch.object(codex_council, "tomllib", None):
+            self.assertEqual(codex_council._max_parallel_roles(), 12)
+
+    def test_pre311_fallback_does_not_read_nested_agents_table(self):
+        self._write_config("[agents.worker]\nmax_threads = 99\n")
+        with patch.object(codex_council, "tomllib", None):
+            self.assertEqual(
+                codex_council._max_parallel_roles(),
+                codex_council.DEFAULT_MAX_PARALLEL,
+            )
+
+    def test_council_override_wins_over_codex_config(self):
+        self._write_config("[agents]\nmax_threads = 9\n")
+        os.environ[codex_council.MAX_PARALLEL_ENV] = "4"
+        self.assertEqual(codex_council._max_parallel_roles(), 4)
+
+    def test_invalid_config_falls_back_without_blocking_launch(self):
+        self._write_config("this is not valid TOML = [")
+        self.assertEqual(
+            codex_council._max_parallel_roles(),
+            codex_council.DEFAULT_MAX_PARALLEL,
+        )
+
+    def test_nonpositive_override_is_a_usage_error(self):
+        os.environ[codex_council.MAX_PARALLEL_ENV] = "0"
+        _assert_usage_exit(
+            self,
+            codex_council._max_parallel_roles,
+            expect_in_stderr="must be a positive integer",
+        )
+
+    def test_nonnumeric_override_is_a_usage_error(self):
+        os.environ[codex_council.MAX_PARALLEL_ENV] = "many"
+        _assert_usage_exit(
+            self,
+            codex_council._max_parallel_roles,
+            expect_in_stderr="must be a positive integer",
+        )
 
 
 # ---------- project / state path ----------
@@ -1297,6 +1365,58 @@ class RunTeamAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results[0].role.id, "ml-fairness")
         self.assertTrue(results[0].ok)
 
+    async def test_large_panel_never_exceeds_active_role_limit(self):
+        roles = [_make_role(f"role-{i}", f"Role {i}") for i in range(12)]
+        active = {"count": 0, "max": 0}
+
+        async def fake_role(role, prompt):
+            active["count"] += 1
+            active["max"] = max(active["max"], active["count"])
+            try:
+                await asyncio.sleep(0.01)
+                return codex_council.RoleResult(
+                    role=role, ok=True, text="ok", elapsed_seconds=0.01,
+                )
+            finally:
+                active["count"] -= 1
+
+        with patch.object(codex_council, "_run_role", side_effect=fake_role):
+            results = await codex_council.run_council(
+                roles, "body", max_parallel=3,
+            )
+        self.assertEqual(len(results), 12)
+        self.assertEqual(active["max"], 3)
+
+    async def test_invalid_active_role_limit_fails_instead_of_deadlocking(self):
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            await codex_council.run_council(
+                [self._roles("architect")[0]], "body", max_parallel=0,
+            )
+
+    async def test_cancellation_stops_active_and_queued_roles(self):
+        roles = [_make_role(f"role-{i}", f"Role {i}") for i in range(3)]
+        started = asyncio.Event()
+        cancelled = []
+
+        async def fake_role(role, prompt):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.append(role.id)
+                raise
+
+        with patch.object(codex_council, "_run_role", side_effect=fake_role):
+            task = asyncio.create_task(
+                codex_council.run_council(roles, "body", max_parallel=1)
+            )
+            await started.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        self.assertEqual(cancelled, ["role-0"])
+
     async def test_same_role_runs_are_serialized_by_state_lock(self):
         role = _make_role("architect", "Architect")
         first_started = asyncio.Event()
@@ -1428,6 +1548,40 @@ class RunCouncilProgressTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(counters, [1, 2, 3])
         # The final sentinel is main()'s job, never run_council's.
         self.assertNotIn("CODEX_COUNCIL_DONE", err)
+
+    async def test_long_run_emits_periodic_status_heartbeat(self):
+        release = asyncio.Event()
+
+        async def fake_role(role, prompt):
+            await release.wait()
+            return codex_council.RoleResult(
+                role=role, ok=True, text="ok", elapsed_seconds=0.1,
+            )
+
+        async def release_after_heartbeats():
+            await asyncio.sleep(0.035)
+            release.set()
+
+        buf = io.StringIO()
+        with patch.object(codex_council, "_run_role", side_effect=fake_role):
+            with patch.object(codex_council, "PROGRESS_HEARTBEAT_SECS", 0.01):
+                with contextlib.redirect_stderr(buf):
+                    releaser = asyncio.create_task(release_after_heartbeats())
+                    await codex_council.run_council(
+                        self._roles("architect", "security"),
+                        "body",
+                        max_parallel=1,
+                    )
+                    await releaser
+
+        heartbeats = [
+            line for line in buf.getvalue().splitlines()
+            if "still running after" in line
+        ]
+        self.assertGreaterEqual(len(heartbeats), 2)
+        self.assertIn("completed=0/2", heartbeats[0])
+        self.assertIn("active=1 (architect)", heartbeats[0])
+        self.assertIn("queued=1", heartbeats[0])
 
 
 # ---------- roles JSON parsing (--roles-file contents) ----------
@@ -1825,6 +1979,18 @@ class ReadRolesFileTests(unittest.TestCase):
             expect_in_stderr="Staging hint",
         )
 
+    def test_symlinked_roles_file_is_rejected(self):
+        target = os.path.join(self.tmp.name, "target.json")
+        link = os.path.join(self.tmp.name, "roles.json")
+        with open(target, "w", encoding="utf-8") as f:
+            json.dump([_role_json("a", "A")], f)
+        os.symlink(target, link)
+        _assert_usage_exit(
+            self,
+            lambda: codex_council._read_roles_file(link),
+            expect_in_stderr="symbolic links are not accepted",
+        )
+
     def test_empty_path_usage_exits(self):
         _assert_usage_exit(
             self, lambda: codex_council._read_roles_file(""),
@@ -1900,7 +2066,7 @@ class CheckStagingDirTests(unittest.TestCase):
         with contextlib.redirect_stdout(buf):
             codex_council._check_staging_dir(self.tmp.name)
         self.assertIn("staging OK", buf.getvalue())
-        self.assertIn("(1 roles)", buf.getvalue())
+        self.assertIn("(1 roles; max parallel 6)", buf.getvalue())
 
     def test_missing_context_mentions_staging_hint(self):
         self._write_valid_roles()
@@ -2076,6 +2242,18 @@ class ReadContextFileTests(unittest.TestCase):
             self,
             lambda: codex_council._read_context_file(path),
             expect_in_stderr="Staging hint",
+        )
+
+    def test_symlinked_context_file_is_rejected(self):
+        target = self._path("target.md")
+        link = self._path()
+        with open(target, "w", encoding="utf-8") as f:
+            f.write("context")
+        os.symlink(target, link)
+        _assert_usage_exit(
+            self,
+            lambda: codex_council._read_context_file(link),
+            expect_in_stderr="symbolic links are not accepted",
         )
 
     def test_empty_context_file_is_usage_error(self):
@@ -2278,7 +2456,7 @@ class DocsContractTests(unittest.TestCase):
         with open(skill_path, encoding="utf-8") as f:
             skill = f.read()
         for stale_name in (
-            "MAX_PARALLEL", "MAX_STDIN_BYTES", "MAX_PROMPT_BYTES",
+            "\nMAX_PARALLEL =", "MAX_STDIN_BYTES", "MAX_PROMPT_BYTES",
             "ROLE_ID_MAX_LEN", "ROLE_LABEL_MAX_BYTES",
             "ROLE_INSTRUCTION_MAX_BYTES", "_validate_prompt_size",
         ):
@@ -2289,8 +2467,30 @@ class DocsContractTests(unittest.TestCase):
             "size <= 32768",
         ):
             self.assertNotIn(stale_contract, skill)
-        self.assertIn("no plugin-imposed size or count caps", skill)
+        self.assertIn(
+            "no plugin-imposed content-size or panel-count caps",
+            skill,
+        )
         self.assertIn("never truncates", skill)
+
+    def test_skill_documents_adaptive_context_concurrency_and_progress(self):
+        path = self._repo_file(
+            "plugins", "codex-council", "skills", "codex-council", "SKILL.md"
+        )
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        for required in (
+            "decision-complete working set",
+            "Recent working context at high fidelity",
+            "Older durable context as a faithful summary",
+            "CODEX_COUNCIL_MAX_PARALLEL",
+            "in-process queue",
+            "status heartbeat every 30 minutes",
+            "one-shot 30-minute wake-up",
+            "TaskOutput",
+        ):
+            self.assertIn(required, text)
+        self.assertNotIn("every role is launched in parallel", text)
 
     def test_readme_dev_hook_keeps_diagnostics(self):
         path = self._repo_file("README.md")

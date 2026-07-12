@@ -102,8 +102,11 @@ the work shifts in one turn.
 
 ## Step 2 — Compose the panel JSON
 
-Design as many sharply distinct roles as the work benefits from (default 3;
-there is no script-imposed maximum). Each role is
+Design 2–6 sharply distinct roles by default (default 3). Use more only when
+the work genuinely has more independent lenses and the user's Codex
+`agents.max_threads` or `CODEX_COUNCIL_MAX_PARALLEL` is deliberately higher;
+extra roles are queued when the panel exceeds active concurrency. The panel
+itself has no script-imposed count limit. Each role is
 `{id, label, instruction}`:
 
 - `id` — kebab-case, `^[a-z0-9_-]+$`, with no length limit. Derive from the
@@ -244,10 +247,26 @@ python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
   2> 'ABS_RUNDIR/err.log'
 ```
 
-Then **wait for Claude Code's completion notification — do not sleep-poll.** When
-it arrives, read `ABS_RUNDIR/out.md` for the report; read `ABS_RUNDIR/err.log`
-for per-role progress and the final `[codex-council] CODEX_COUNCIL_DONE ...` line
-(its presence means the report is fully written; it carries the exit code).
+After launch, keep the Claude Code background-task id. The runner writes
+per-role completions immediately and a status heartbeat every 30 minutes to
+`ABS_RUNDIR/err.log` while work remains.
+
+- If this Claude Code version exposes session crons, create a **one-shot
+  30-minute wake-up** whose prompt names the background task id and exact
+  `ABS_RUNDIR`. At wake-up, retrieve the native background-task status, read the
+  end of `err.log`, send the user a concise update (completed/active/queued),
+  and schedule another one-shot 30-minute wake-up only if it is still running.
+  Cancel or let the pending wake-up become a no-op if completion arrives first.
+- Otherwise, use Claude Code's native background-task wait/output mechanism
+  (`TaskOutput` when exposed) with its supported wait horizon. Do not implement
+  a shell `sleep` loop. If the call is still running at 30 minutes, read
+  `err.log`, update the user, and continue through the same native mechanism.
+
+Claude Code emits a completion notification for a finished background task.
+When it arrives, read `ABS_RUNDIR/out.md` for the report and
+`ABS_RUNDIR/err.log` for per-role progress and the final
+`[codex-council] CODEX_COUNCIL_DONE ...` line (its presence means the report is
+fully written; it carries the exit code).
 
 The process exit code is deliberately council-level and partial-failure
 tolerant: it is `0` when at least one role responds and `1` only when every
@@ -270,9 +289,16 @@ Last err line is `CODEX_COUNCIL_DONE` → done, read `out.md`. No such line but
 Bare invocation (no `--roles-file`, with context piped or staged) exits 2 — a
 safety net for accidental fan-out.
 
-Role contract (no plugin-imposed size or count caps):
+Role contract (no plugin-imposed content-size or panel-count caps):
 
-- The panel may contain any number of roles; every role is launched in parallel.
+- The panel may contain any number of roles. Active concurrency defaults to 6,
+  follows a positive user-level Codex `agents.max_threads` when configured, and
+  can be explicitly set with `CODEX_COUNCIL_MAX_PARALLEL`. Remaining roles wait
+  in an in-process queue; the runner never launches more than the effective
+  maximum simultaneously.
+- `roles.json` and `context.md` must be regular, non-symlink files. This keeps
+  the validated private staging directory from redirecting either input to an
+  external path.
 - Each role object: exactly the keys `id`, `label`, `instruction`; any
   other key is rejected with exit 2.
 - `id`: non-empty and `^[a-z0-9_-]+$`; no length limit.
@@ -306,14 +332,37 @@ from one of two sources:
   materially relevant fact, decision, uncertainty, and artifact reference;
   remove only genuinely irrelevant or duplicated material.
 
-Include the complete context that materially affects the judgment. The script
-does not impose a byte ceiling on `context.md`, stdin, role fields, or the
-composed prompt, and it never truncates them. Do not compress or excerpt merely
-to satisfy this plugin: there is no plugin size budget. The active Codex model,
-provider, operating system, and available memory can still impose unavoidable
-upstream or physical limits; if one is reached, preserve the original staged
-files and surface the actual downstream error rather than silently dropping
-context.
+Build a **decision-complete working set**, not a literal transcript dump. The
+script does not impose a byte ceiling on `context.md`, stdin, role fields, or
+the composed prompt, and it never truncates them; relevance selection belongs
+to Claude as the host orchestrator. For a long-running session, assemble
+context in this order:
+
+1. **Immediate objective and present state:** the user's current request,
+   current branch/worktree/runtime state, unresolved questions, and what the
+   council must decide or produce now.
+2. **Recent working context at high fidelity:** recent user constraints,
+   actions, errors, outputs, and artifacts that directly led to the current
+   state. Preserve exact wording or raw material when its details matter.
+3. **Current primary evidence:** the relevant files, diffs, diagnostics, data,
+   or commands from disk, verified live rather than recalled from conversation.
+4. **Older durable context as a faithful summary:** decisions, rejected
+   approaches and why, invariants, user preferences, earlier evidence, and
+   dependencies that still constrain today's work. An old fact is included
+   whenever removing it could change the recommendation; age alone is never a
+   reason to discard it.
+5. **Explicit uncertainty and provenance:** distinguish verified current state,
+   host summaries of older turns, assumptions, and missing evidence.
+
+Exclude superseded state, conversational repetition, stale intermediate
+outputs, and unrelated history. If Claude Code compacted the host conversation,
+use the compaction summary as an index, re-check live project state, and carry
+forward the old details that remain decision-relevant. Do not compress or
+excerpt merely to satisfy this plugin: there is no plugin size budget. The
+active Codex model, provider, operating system, and available memory still
+impose unavoidable downstream or physical limits; if one is reached, preserve
+the staged source material and surface the actual downstream error rather than
+silently dropping context.
 
 In the examples below, `ABS_RUNDIR` is the exact private per-run dir printed by
 `mktemp` in Step 4. Every pipeline block starts with
@@ -356,9 +405,15 @@ set -euo pipefail
       [ -f "$f" ] && [ ! -L "$f" ] || continue
       mime=$(file --brief --mime -- "$f")
       case "$mime" in
-        *charset=binary*) continue ;;
+        *charset=binary*)
+          printf '\n=== non-text untracked artifact: %q (%s); inspect from disk if relevant ===\n' "$f" "$mime"
+          continue
+          ;;
         *charset=utf-8*|*charset=us-ascii*) ;;
-        *) continue ;;
+        *)
+          printf '\n=== non-UTF-8 untracked artifact: %q (%s); inspect from disk if relevant ===\n' "$f" "$mime"
+          continue
+          ;;
       esac
       printf '\n=== untracked file: %q ===\n' "$f"
       cat <"$f"
@@ -394,6 +449,13 @@ set -euo pipefail
 If the diagnosis needs source context too, append the complete relevant source
 using the same `[ -f ] && [ ! -L ] && file --mime` guards as the diff+untracked
 snippet above.
+
+`context.md` itself is UTF-8 text because it is sent to `codex exec` on stdin.
+For a material binary, image, archive, or non-UTF-8 artifact, do not pretend it
+does not exist and do not transcode it blindly: include its project path, type,
+and why it matters in the working set. Council roles run with full filesystem
+access and can inspect the original artifact using the tools supported by the
+active Codex installation.
 
 ### Claude-composed
 
@@ -456,8 +518,9 @@ only if you intentionally want the older project-wide state file shape:
 - No wall-clock timeout is enforced — each role runs as long as Codex
   takes (hours or days is fine). `codex exec` has no run-level timeout
   either; its per-provider stream-idle guard only covers a stalled
-  connection and is retried. Ctrl+C still tears down every in-flight
-  codex process group.
+  connection and is retried. The runner emits 30-minute status heartbeats;
+  Claude reports them through its background-task/session-cron mechanism.
+  Ctrl+C still tears down every in-flight codex process group.
 
 ## After Codex Council responds
 
