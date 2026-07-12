@@ -1,13 +1,14 @@
 ---
 name: codex-council
 description: >-
-  Multi-perspective Codex review via parallel `codex exec` sub-agents.
+  Adaptive general-purpose Codex council: Claude orchestrates role-framed
+  `codex exec` agents to collaborate and reconcile toward any shared goal.
   Claude (the orchestrator) composes the role panel on-the-fly per
   invocation from the user's actual work; there is no built-in role
-  catalog and no domain list. Auto-use ONLY when the user's text
-  contains the phrase "codex council" or "codex team reconciliation"
-  (and close variants such as "ask codex council," "codex council
-  review," "reconcile with codex team"). Otherwise stop — broader
+  catalog and no domain list. Auto-use ONLY when the user's text clearly
+  invokes "codex council," "codex coterie," or "codex team" (including
+  close variants such as "ask the codex coterie," "codex council review,"
+  and "reconcile with the codex team"). Otherwise stop — broader
   phrases like "codex agent team," "codex panel," "fan out to codex
   agents," "agent team," "agents in parallel," "subagents," "council
   review," "panel review," "multi-angle review" route to Claude
@@ -20,10 +21,16 @@ description: >-
 
 # Codex Council
 
-Fan out a prompt to N parallel `codex exec` sub-agents, each framed
-with a role tailored to the work. The script aggregates all responses
-into one structured markdown report. Each role keeps its own Codex
-thread per project so framings accumulate across calls.
+Coordinate N bounded-parallel `codex exec` agents around any user goal, each
+framed with a role tailored to make a distinct contribution. This is an
+AGI-style, general-purpose collaboration pattern rather than a claim that any
+underlying model is proven AGI: a role may investigate, build, diagnose,
+challenge, create, plan, research, or review across domains, subject to the
+active model and available tools. The script aggregates all responses into one
+structured markdown report, and Claude reconciles them into one coherent
+outcome rather than forwarding a pile of independent opinions. Each role keeps
+its own Codex thread per project so useful framing and project knowledge
+accumulate across calls.
 
 Codex is strongest on technical and structured reasoning. Whether a
 council adds value over a single pass should be judged from the
@@ -31,16 +38,16 @@ current task, not from a label on it.
 
 **You (Claude) are the orchestrator.** The panel-proposal step is
 load-bearing: **ultrathink** there. Read the user's actual work,
-figure out what judgment they need, design role ids / labels /
+figure out what outcome and contributions they need, design role ids / labels /
 instructions ground-up from that specific work. There is no catalog,
 no checklist of domains, no template panel to reach for. Treat your
 composed task-specific panel as granted by default: announce it
 briefly, then trigger `codex exec` without asking for launch approval.
 
-## Disambiguation gate — only if "codex council" / "codex team" is missing
+## Disambiguation gate — only if all three Codex trigger names are missing
 
 If the trigger phrase that fired this skill does **not** contain
-"codex council" or "codex team reconciliation" (or a close variant),
+"codex council," "codex coterie," or "codex team" (or a close variant),
 **stop**. The user may have meant Claude Code's built-in `Agent` tool
 (subagents spawned with `subagent_type` like `general-purpose`,
 `Plan`, `Explore`, `claude-code-guide`, `code-reviewer`) — a
@@ -50,16 +57,16 @@ OpenAI Codex via `codex exec`).
 Ask one short disambiguation via `AskUserQuestion` before doing
 anything:
 
-- Question: "Did you mean Claude's built-in `Agent` subagents, or
-  codex-council (OpenAI Codex fan-out)?"
+- Question: "Did you mean Claude's built-in `Agent` subagents, or the
+  Codex council/coterie/team?"
 - Header: "Which?"
 - Option 1: "Claude Agent subagents (Recommended)"
 - Option 2: "codex-council (OpenAI Codex)"
 
 Only proceed past this gate if the user explicitly picks codex-council.
 
-If the trigger phrase **does** clearly say "codex council" or
-"codex team reconciliation," skip this gate and go to Step 1.
+If the trigger phrase **does** clearly invoke "codex council," "codex
+coterie," or "codex team," skip this gate and go to Step 1.
 
 ## Step 1 — Read the actual work
 
@@ -69,8 +76,8 @@ Look at what the user is actually doing in the conversation: what
 they've been editing, what they've been asking, what files / objects
 / drafts / queries are in flight. Then ask one question:
 
-> *What distinct kinds of judgment would catch the
-> failure modes specific to this work?*
+> *What distinct contributions would move this shared goal forward and catch
+> its work-specific failure modes?*
 
 That question — answered from the actual material in front of you —
 is the panel. Do **not** start by assigning the task to a category
@@ -86,12 +93,11 @@ Cheap probes if you need them (otherwise skip):
   user is working with if it isn't already in your context
 
 Compose, don't pattern-match. For the material in front of you,
-name the independent ways it could fail or mislead — wrong on the
-substance, wrong for the audience, wrong against prior art, wrong
-in some specific operational dimension, etc. Each is a candidate
-lens. The lens names are local to this invocation; they should not
-look like they came from a menu, and you should not reuse them
-across unrelated work.
+name the independent contributions the goal needs: implementation or diagnosis,
+substantive correctness, audience fit, prior-art comparison, operational
+reliability, adversarial challenge, etc. Each is a candidate lens. The lens
+names are local to this invocation; they should not look like they came from a
+menu, and you should not reuse them across unrelated work.
 
 If the user named a panel in the invocation arguments (e.g.
 `/codex-council:codex-council 3 agents: <lens-a>, <lens-b>, <lens-c>`),
@@ -544,10 +550,11 @@ The output is markdown:
 _Failed: <error tag and message>_
 ```
 
-Reconcile across roles: where they agree, that's a strong signal;
-where they conflict, surface the disagreement rather than collapsing
-it. Then report your own read — what you accept, what you challenge,
-what remains uncertain. Failed-role messages start with a
+Reconcile every contribution toward the user's shared goal: combine compatible
+work, choose between conflicting recommendations with reasons, preserve useful
+dissent, and turn the panel into one actionable outcome. Do not merely relay N
+answers. Then report your own read — what you accept, what you challenge, what
+remains uncertain. Failed-role messages start with a
 bracket-tagged class (`[auth]`, `[retriable:rate-limit]`,
 `[retriable:5xx]`, `[orchestrator-exception]`, `[orchestrator-bug]`)
 so the failure mode is machine-readable.

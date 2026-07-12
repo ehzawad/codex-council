@@ -2,10 +2,10 @@
   "name": "codex-council",
   "displayName": "Codex Council",
   "version": "0.7.0",
-  "description": "Multi-perspective parallel Codex review — N sub-agents in parallel, each framed with a role you decide per call.",
+  "description": "Adaptive general-purpose Codex council — Claude orchestrates role-framed agents to collaborate and reconcile toward any shared goal.",
   "author": {"name": "ehzawad"},
   "homepage": "https://github.com/ehzawad/codex-council",
   "repository": "https://github.com/ehzawad/codex-council",
   "license": "MIT",
-  "keywords": ["codex", "council", "review", "openai", "parallel", "subagents", "second-opinion"]
+  "keywords": ["codex", "council", "adaptive", "general-purpose", "collaboration", "helper", "review", "openai", "parallel", "subagents"]
 }

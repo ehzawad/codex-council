@@ -48,13 +48,20 @@ helped non-coding work but still biased Claude toward
 the catalog out entirely forces Claude (the orchestrator) to
 ultrathink about the user's task, design role ids/labels/instructions
 on-the-fly, announce the composed panel, and then fan out. The
-script's job is fan-out, retry, and reconciliation — not role
-opinions.
+script's job is fan-out, retry, and aggregation — Claude owns reconciliation
+into the user's shared goal rather than relaying disconnected role opinions.
 
 Practical consequence: every invocation requires Claude to compose
 the full role JSON. That's more tokens per panel proposal, but it
 matches the actual design intent (adaptive in-context selection) and
 removes any pull toward formulaic coding-flavored panels.
+
+The intended product shape is an adaptive, general-purpose, AGI-style
+collaboration pattern, not a claim that the active model is proven AGI. Claude
+derives roles from the current goal and orchestrates them through shared
+context, workspace access, persisted role threads, and final reconciliation.
+The same machinery can support implementation, diagnosis, creation, planning,
+research, review, or other domains as far as the active model and tools allow.
 
 Codex itself now has a stable in-process `multi_agent` capability and a
 separate under-development `multi_agent_v2` feature. The council deliberately

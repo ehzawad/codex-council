@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fan out a prompt to a council of Codex sub-agents in parallel.
+"""Coordinate an adaptive, general-purpose council of Codex agents.
 
 Each role runs in its own `codex exec` subprocess with a distinct
 framing instruction. Sessions are isolated per (project, host session,
@@ -1073,7 +1073,7 @@ def _report_inline(value):
 def _parse_args(argv):
     parser = argparse.ArgumentParser(
         description=(
-            "Fan out a prompt to a council of Codex agents in parallel. "
+            "Coordinate role-framed Codex agents around a shared goal. "
             "Roles are caller-supplied per invocation via --roles-file; "
             "there is no built-in catalog."
         ),

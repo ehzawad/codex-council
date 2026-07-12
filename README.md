@@ -1,9 +1,11 @@
 # codex-council
 
-A Claude Code plugin that fans out the same context to **N parallel OpenAI
-Codex sub-agents**, each framed with a role you decide per call. You,
-Claude, and a council of Codex perspectives in the loop. Install once;
-invoke from any Claude Code project.
+An adaptive, general-purpose Claude Code plugin that coordinates **N
+role-framed OpenAI Codex agents** around any shared goal. Agents can
+investigate, build, diagnose, create, plan, research, challenge, or review from
+distinct lenses; Claude orchestrates their collaboration and reconciles their
+contributions into one coherent outcome. Install once; invoke from any Claude
+Code project.
 
 ## Prerequisites
 
@@ -42,13 +44,16 @@ Auto-trigger phrases (natural language) are restricted to:
 ```
 ask codex council
 codex council review
-reconcile with codex team
-codex team reconciliation
+ask the codex coterie
+codex coterie review
+ask the codex team
+reconcile with the codex team
 ```
 
 Broader phrases like "agent team," "agents in parallel," "subagents,"
-"council review," "panel review," "codex agent team," "codex panel,"
-or "fan out to codex agents" do **not** trigger this skill — they
+"council review," "panel review," "codex agent group," "codex panel,"
+or "fan out to codex agents" do **not** trigger this skill unless they clearly
+invoke `codex council`, `codex coterie`, or `codex team` — otherwise they
 route to Claude Code's built-in `Agent` tool (Claude subagents, a
 different mechanism). The skill's SKILL.md enforces this with a
 disambiguation gate.
@@ -72,10 +77,13 @@ work in high fidelity, live primary evidence from disk, and older still-relevant
 history summarized with its decisions, rejected paths, invariants, and
 uncertainties. Superseded state and conversational repetition are omitted.
 
-**Note on fit.** Codex is strongest where the task has technical,
-structured, or evidence-checking surfaces. For tasks where a single
-Claude pass is likely as good or better than a Codex council, don't
-force a council — say so.
+**General-purpose, with honest capability bounds.** The council uses an
+AGI-style adaptive collaboration pattern: Claude derives roles from the actual
+work instead of selecting from a domain catalog, so it can help across coding,
+operations, research, writing, planning, data, design, and other work. This is
+not a claim that the underlying models are proven AGI; results still depend on
+the active Codex model, tools, evidence, and task. For work where one Claude
+pass is likely as good or better, don't force a council — say so.
 
 The JSON role spec, retries, and panel-proposal flow are documented in
 [`plugins/codex-council/skills/codex-council/SKILL.md`](plugins/codex-council/skills/codex-council/SKILL.md).

@@ -2492,6 +2492,59 @@ class DocsContractTests(unittest.TestCase):
             self.assertIn(required, text)
         self.assertNotIn("every role is launched in parallel", text)
 
+    def test_plugin_copy_is_synced_on_adaptive_general_purpose_collaboration(self):
+        canonical = (
+            "Adaptive general-purpose Codex council — Claude orchestrates "
+            "role-framed agents to collaborate and reconcile toward any shared goal."
+        )
+        marketplace_path = self._repo_file(".claude-plugin", "marketplace.json")
+        manifest_path = self._repo_file(
+            "plugins", "codex-council", ".claude-plugin", "plugin.json"
+        )
+        skill_path = self._repo_file(
+            "plugins", "codex-council", "skills", "codex-council", "SKILL.md"
+        )
+        readme_path = self._repo_file("README.md")
+        with open(marketplace_path, encoding="utf-8") as f:
+            marketplace = json.load(f)
+        with open(manifest_path, encoding="utf-8") as f:
+            manifest = json.load(f)
+        self.assertEqual(marketplace["metadata"]["description"], canonical)
+        self.assertEqual(marketplace["plugins"][0]["description"], canonical)
+        self.assertEqual(manifest["description"], canonical)
+        with open(skill_path, encoding="utf-8") as f:
+            skill = f.read()
+        with open(readme_path, encoding="utf-8") as f:
+            readme = f.read()
+        combined = skill + "\n" + readme
+        self.assertIn("adaptive", combined.lower())
+        self.assertIn("general-purpose", combined)
+        self.assertIn("AGI-style", combined)
+        self.assertIn("not a claim", combined)
+        self.assertNotIn("Multi-perspective parallel Codex review —", combined)
+
+    def test_skill_and_readme_share_all_explicit_codex_trigger_names(self):
+        paths = (
+            self._repo_file(
+                "plugins", "codex-council", "skills", "codex-council",
+                "SKILL.md",
+            ),
+            self._repo_file("README.md"),
+        )
+        for path in paths:
+            with open(path, encoding="utf-8") as f:
+                text = f.read().lower()
+            for trigger in ("codex council", "codex coterie", "codex team"):
+                self.assertIn(trigger, text)
+
+    def test_release_manifest_is_0_7_0(self):
+        path = self._repo_file(
+            "plugins", "codex-council", ".claude-plugin", "plugin.json"
+        )
+        with open(path, encoding="utf-8") as f:
+            manifest = json.load(f)
+        self.assertEqual(manifest["version"], "0.7.0")
+
     def test_readme_dev_hook_keeps_diagnostics(self):
         path = self._repo_file("README.md")
         with open(path, encoding="utf-8") as f:
