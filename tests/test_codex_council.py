@@ -379,6 +379,20 @@ class StateIOTests(unittest.TestCase):
         self.assertIsNone(sid)
         self.assertIsNone(meta)
 
+    def test_load_valid_json_non_dict_returns_none_pair(self):
+        """Valid JSON that is not an object (a list, a bare string) must
+        degrade to a fresh start like malformed JSON, not raise
+        AttributeError on meta.get."""
+        for corrupt in ("[]", '"hello"', "42", "null"):
+            with self.subTest(corrupt=corrupt):
+                with patch.dict(os.environ, _env_without_session_key(), clear=True):
+                    os.makedirs(self.tmp.name, exist_ok=True)
+                    with open(codex_council._state_path("architect"), "w") as f:
+                        f.write(corrupt)
+                    sid, meta = codex_council.load_session("architect")
+                self.assertIsNone(sid)
+                self.assertIsNone(meta)
+
     def test_clear_session_removes_only_that_role(self):
         with patch.dict(os.environ, _env_without_session_key(), clear=True):
             codex_council.save_session("architect", "sid-a")
@@ -1059,6 +1073,26 @@ class RunRoleAsyncTests(unittest.IsolatedAsyncioTestCase):
         sid, _ = codex_council.load_session("architect")
         self.assertEqual(sid, "DIFFERENT-sid")
 
+    async def test_resume_mismatch_without_message_persists_adopted_id(self):
+        """When resume runs the turn on a DIFFERENT thread and that turn
+        produced no agent_message, the adopted id must still be persisted:
+        the stored id is proven wrong, and leaving it in place would repeat
+        the silent-spawn footgun on every subsequent call."""
+        role = _make_role("architect", "Architect")
+        codex_council.save_session("architect", "expected-sid")
+        stdout = json.dumps(
+            {"type": "thread.started", "thread_id": "DIFFERENT-sid"}
+        )
+        async def fake_subproc(cmd, prompt):
+            return 0, stdout, ""
+        with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
+            result = await codex_council._run_role_once(role, "prompt", attempt=1)
+        self.assertFalse(result.ok)
+        self.assertIn("no agent_message", result.error)
+        self.assertIsNotNone(result.warning)
+        sid, _ = codex_council.load_session("architect")
+        self.assertEqual(sid, "DIFFERENT-sid")
+
     async def test_resume_with_no_thread_started_event_keeps_stored_id(self):
         """Codex may omit thread.started on resume; treat as a normal resume."""
         role = _make_role("architect", "Architect")
@@ -1512,6 +1546,52 @@ class RunTeamAsyncTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([r.role.id for r in results], [blocked.id, free.id])
         self.assertTrue(all(r.ok for r in results))
+
+    async def test_lock_probe_backoff_grows_and_is_capped(self):
+        """A same-role continuity-lock waiter must not poll at a fixed 0.1s
+        forever: the other council holds the lock with no wall-clock cap, so
+        the probe interval doubles up to LOCK_PROBE_MAX_BACKOFF_SECS."""
+        role = self._roles("architect")[0]
+        held_box = [codex_council._try_role_state_lock(role.id)]
+        self.assertIsNotNone(held_box[0])
+        probe_sleeps = []
+        real_sleep = asyncio.sleep
+
+        async def recording_sleep(delay, *args, **kwargs):
+            # The heartbeat task sleeps PROGRESS_HEARTBEAT_SECS; only the
+            # short waiter probes are the subject here.
+            if delay < 100:
+                probe_sleeps.append(delay)
+                if len(probe_sleeps) >= 7 and held_box[0] is not None:
+                    codex_council._release_role_state_lock(held_box[0])
+                    held_box[0] = None
+            await real_sleep(0)
+
+        async def fake_role(r, prompt):
+            return codex_council.RoleResult(
+                role=r, ok=True, text="ok", elapsed_seconds=0.01,
+            )
+
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                with patch.object(codex_council.asyncio, "sleep", recording_sleep):
+                    with patch.object(
+                        codex_council, "_run_role_attempts", side_effect=fake_role
+                    ):
+                        results = await asyncio.wait_for(
+                            codex_council.run_council(
+                                [role], "body", max_parallel=1
+                            ),
+                            timeout=10,
+                        )
+        finally:
+            if held_box[0] is not None:
+                codex_council._release_role_state_lock(held_box[0])
+
+        self.assertTrue(results[0].ok)
+        self.assertEqual(
+            probe_sleeps[:7], [0.1, 0.2, 0.4, 0.8, 1.6, 2.0, 2.0]
+        )
 
     async def test_same_role_runs_are_serialized_by_state_lock(self):
         role = _make_role("architect", "Architect")
@@ -2276,6 +2356,11 @@ class CheckStagingDirTests(unittest.TestCase):
             expect_in_stderr="is a symlink",
         )
 
+    @unittest.skipIf(
+        os.geteuid() == 0,
+        "root bypasses the 0o000 permission barrier (CAP_DAC_OVERRIDE), "
+        "so lstat never fails with EACCES",
+    )
     def test_unreadable_lstat_failure_is_not_reported_as_missing(self):
         """EACCES & co. must not be diagnosed as 'does not exist'."""
         outer = os.path.join(self.tmp.name, "outer")

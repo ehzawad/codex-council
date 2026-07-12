@@ -1,7 +1,7 @@
 {
   "name": "codex-council",
   "displayName": "Codex Council",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "description": "Adaptive, context-driven Codex council for project implementation, computer science, software/ML engineering, DevSecOps, research, and other complex work — Claude orchestrates role-framed agents to collaborate and reconcile toward one shared goal.",
   "author": {"name": "ehzawad"},
   "homepage": "https://github.com/ehzawad/codex-council",

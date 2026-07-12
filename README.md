@@ -33,6 +33,13 @@ Persists across sessions — no flags needed.
 /codex-council:codex-council
 ```
 
+The plugin ships a single skill (no separate `commands/` directory), so the
+slash form relies on Claude Code exposing plugin skills as slash commands — a
+capability of current Claude Code releases whose exact minimum version is not
+documented in the changelog. If the slash command is not available on your
+version, invoke the skill with the natural-language triggers below instead;
+they work on any plugin-capable release.
+
 Claude reconstructs the live task model before composing roles: the problem and
 project being implemented, what the user has edited or asked, in-flight files,
 modules, objects, drafts, queries, tests, deployments, and research, active
@@ -236,7 +243,7 @@ Sandbox and approval settings are overridden by the plugin (see
 Security above).
 
 Active role concurrency defaults to 6, matching the current
-[Codex configuration default](https://learn.chatgpt.com/docs/config-file/config-reference#configtoml)
+[Codex configuration default](https://developers.openai.com/codex/config-reference)
 for `agents.max_threads`. If a positive user-level `agents.max_threads` is present,
 the runner uses it as a conservative local concurrency signal; set
 `CODEX_COUNCIL_MAX_PARALLEL` to a positive integer for an explicit council-only

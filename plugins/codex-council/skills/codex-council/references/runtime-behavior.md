@@ -36,4 +36,6 @@ project-wide `{project-hash}__{role-key}.json` state shape.
 - A role waiting for another council's same-role continuity lock remains queued.
   Each failed nonblocking probe closes its file descriptor and releases the
   subprocess permit before sleeping, so the waiter neither appears active nor
-  exhausts permits or file descriptors in a large panel.
+  exhausts permits or file descriptors in a large panel. The probe interval
+  backs off from 0.1s to a 2s cap, since the lock holder has no wall-clock
+  limit.
