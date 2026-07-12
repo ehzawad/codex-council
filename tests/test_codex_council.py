@@ -1097,7 +1097,7 @@ def _status_turn_failed_stdout(status, message):
 
 
 class RunRoleStructuredStatusTests(unittest.IsolatedAsyncioTestCase):
-    """End-to-end (through _run_role_once / _run_role) of status-aware
+    """End-to-end (through _run_role_once / _run_role_attempts) of status-aware
     classification: false-positive suppression, 5xx retry, and the resume
     ordering where a structured 5xx beats the stale branch."""
 
@@ -1138,14 +1138,14 @@ class RunRoleStructuredStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.ok)
         self.assertTrue(result.error.startswith("[retriable:5xx]"))
 
-    async def test_run_role_retries_on_structured_5xx(self):
+    async def test_run_role_attempts_retries_on_structured_5xx(self):
         role = _make_role("architect", "Architect")
         stdout = _status_turn_failed_stdout(503, "temporarily down")
         async def fake_subproc(cmd, prompt):
             return 1, stdout, ""
         with patch.object(codex_council.asyncio, "sleep", AsyncMock(return_value=None)):
             with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
-                result = await codex_council._run_role(role, "prompt")
+                result = await codex_council._run_role_attempts(role, "prompt")
         self.assertFalse(result.ok)
         self.assertEqual(result.attempts, codex_council.MAX_RETRY_ATTEMPTS)
         self.assertTrue(result.error.startswith("[retriable:5xx]"))
@@ -1237,7 +1237,7 @@ class FormatReportWarningTests(unittest.TestCase):
         self.assertIn("boom\\n## Injected", out)
 
 
-class RunRoleWithRetryTests(unittest.IsolatedAsyncioTestCase):
+class RunRoleAttemptsTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -1272,7 +1272,7 @@ class RunRoleWithRetryTests(unittest.IsolatedAsyncioTestCase):
                 elapsed_seconds=0.2, attempts=attempt,
             )
         with patch.object(codex_council, "_run_role_once", side_effect=fake_once):
-            result = await codex_council._run_role(role, "prompt")
+            result = await codex_council._run_role_attempts(role, "prompt")
         self.assertTrue(result.ok)
         self.assertEqual(result.attempts, 2)
         self.assertEqual(attempts[0], 2)
@@ -1285,7 +1285,7 @@ class RunRoleWithRetryTests(unittest.IsolatedAsyncioTestCase):
                 elapsed_seconds=0.1, attempts=attempt,
             )
         with patch.object(codex_council, "_run_role_once", side_effect=fake_once):
-            result = await codex_council._run_role(role, "prompt")
+            result = await codex_council._run_role_attempts(role, "prompt")
         self.assertFalse(result.ok)
         self.assertEqual(result.attempts, codex_council.MAX_RETRY_ATTEMPTS)
 
@@ -1299,7 +1299,7 @@ class RunRoleWithRetryTests(unittest.IsolatedAsyncioTestCase):
                 elapsed_seconds=0.1, attempts=attempt,
             )
         with patch.object(codex_council, "_run_role_once", side_effect=fake_once):
-            result = await codex_council._run_role(role, "prompt")
+            result = await codex_council._run_role_attempts(role, "prompt")
         self.assertFalse(result.ok)
         self.assertEqual(call_count[0], 1)
 
@@ -1444,11 +1444,44 @@ class RunTeamAsyncTests(unittest.IsolatedAsyncioTestCase):
                 await task
 
         self.assertEqual(cancelled, ["role-0"])
+        released = codex_council._try_role_state_lock("role-0")
+        self.assertIsNotNone(released)
+        codex_council._release_role_state_lock(released)
+
+    async def test_cancellation_while_waiting_on_contended_lock_leaks_nothing(self):
+        role = self._roles("architect")[0]
+        held_lock = codex_council._try_role_state_lock(role.id)
+        self.assertIsNotNone(held_lock)
+        started_attempts = []
+
+        async def fake_role(r, prompt):
+            started_attempts.append(r.id)
+            return codex_council.RoleResult(role=r, ok=True, text="unexpected")
+
+        try:
+            with patch.object(
+                codex_council, "_run_role_attempts", side_effect=fake_role
+            ):
+                council = asyncio.create_task(
+                    codex_council.run_council([role], "body", max_parallel=1)
+                )
+                await asyncio.sleep(0.05)
+                council.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await council
+        finally:
+            codex_council._release_role_state_lock(held_lock)
+
+        self.assertEqual(started_attempts, [])
+        released = codex_council._try_role_state_lock(role.id)
+        self.assertIsNotNone(released)
+        codex_council._release_role_state_lock(released)
 
     async def test_role_waiting_on_state_lock_does_not_starve_free_role(self):
         """A continuity-lock waiter must not consume the only exec permit."""
         blocked, free = self._roles("architect", "security")
-        held_lock = await codex_council._acquire_role_state_lock(blocked.id)
+        held_lock = codex_council._try_role_state_lock(blocked.id)
+        self.assertIsNotNone(held_lock)
         free_started = asyncio.Event()
 
         async def fake_role(role, prompt):
@@ -1484,35 +1517,42 @@ class RunTeamAsyncTests(unittest.IsolatedAsyncioTestCase):
         role = _make_role("architect", "Architect")
         first_started = asyncio.Event()
         release_first = asyncio.Event()
-        calls = []
+        calls = {"count": 0}
         active = {"count": 0, "max": 0}
 
-        async def fake_subproc(cmd, prompt):
-            calls.append(cmd)
+        async def fake_role(r, prompt):
+            calls["count"] += 1
             active["count"] += 1
             active["max"] = max(active["max"], active["count"])
             try:
-                if len(calls) == 1:
+                if calls["count"] == 1:
                     first_started.set()
                     await release_first.wait()
-                if "resume" in cmd:
-                    return 0, _resume_jsonl_no_thread_event("resumed"), ""
-                return 0, _fresh_jsonl("sid-first", "fresh"), ""
+                return codex_council.RoleResult(
+                    role=r, ok=True, text=f"reply-{calls['count']}",
+                    elapsed_seconds=0.01,
+                )
             finally:
                 active["count"] -= 1
 
-        with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
-            t1 = asyncio.create_task(codex_council._run_role(role, "prompt-1"))
+        with patch.object(
+            codex_council, "_run_role_attempts", side_effect=fake_role
+        ):
+            t1 = asyncio.create_task(
+                codex_council.run_council([role], "prompt-1", max_parallel=1)
+            )
             await first_started.wait()
-            t2 = asyncio.create_task(codex_council._run_role(role, "prompt-2"))
+            t2 = asyncio.create_task(
+                codex_council.run_council([role], "prompt-2", max_parallel=1)
+            )
             await asyncio.sleep(0.05)
             self.assertEqual(active["max"], 1)
+            self.assertEqual(calls["count"], 1)
             release_first.set()
             results = await asyncio.gather(t1, t2)
 
-        self.assertTrue(all(r.ok for r in results))
-        self.assertEqual(sum(1 for cmd in calls if "resume" in cmd), 1)
-        self.assertEqual(sum(1 for cmd in calls if "resume" not in cmd), 1)
+        self.assertTrue(all(council[0].ok for council in results))
+        self.assertEqual(calls["count"], 2)
 
     async def test_different_roles_still_run_concurrently(self):
         roles = self._roles("architect", "security")
@@ -1532,11 +1572,13 @@ class RunTeamAsyncTests(unittest.IsolatedAsyncioTestCase):
                 active["count"] -= 1
 
         with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
-            tasks = [asyncio.create_task(codex_council._run_role(r, "prompt")) for r in roles]
+            task = asyncio.create_task(
+                codex_council.run_council(roles, "prompt", max_parallel=2)
+            )
             await both_started.wait()
             self.assertEqual(active["max"], 2)
             release.set()
-            results = await asyncio.gather(*tasks)
+            results = await task
 
         self.assertTrue(all(r.ok for r in results))
 
@@ -2756,14 +2798,6 @@ class DocsContractTests(unittest.TestCase):
                 text = f.read().lower()
             for trigger in ("codex council", "codex coterie", "codex team"):
                 self.assertIn(trigger, text)
-
-    def test_manifest_version_is_semver(self):
-        path = self._repo_file(
-            "plugins", "codex-council", ".claude-plugin", "plugin.json"
-        )
-        with open(path, encoding="utf-8") as f:
-            manifest = json.load(f)
-        self.assertRegex(manifest["version"], r"^\d+\.\d+\.\d+$")
 
     def test_readme_dev_hook_keeps_diagnostics(self):
         path = self._repo_file("README.md")

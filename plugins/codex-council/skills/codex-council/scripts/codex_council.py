@@ -377,17 +377,8 @@ def _try_role_state_lock(role_id):
         raise
 
 
-async def _acquire_role_state_lock(role_id):
-    """Acquire an exclusive cross-process lock for one role's state."""
-    while True:
-        lock_file = _try_role_state_lock(role_id)
-        if lock_file is not None:
-            return lock_file
-        await asyncio.sleep(0.1)
-
-
 def _release_role_state_lock(lock_file):
-    """Release a lock returned by a blocking or nonblocking lock helper."""
+    """Release a lock returned by _try_role_state_lock."""
     try:
         fcntl.flock(lock_file, fcntl.LOCK_UN)
     finally:
@@ -914,20 +905,6 @@ async def _run_role_attempts(role, prompt):
         backoff *= 2
 
     return last_result  # type: ignore[return-value]
-
-
-async def _run_role(role, prompt):
-    """Lock and run one role with no wall-clock deadline.
-
-    Each attempt runs to completion; Codex decides when it is done.
-    Ctrl+C propagates as asyncio.CancelledError, which tears down the
-    codex process group via _run_codex_subprocess's cancellation path.
-    """
-    lock_file = await _acquire_role_state_lock(role.id)
-    try:
-        return await _run_role_attempts(role, prompt)
-    finally:
-        _release_role_state_lock(lock_file)
 
 
 async def run_council(roles, body, max_parallel=None):
