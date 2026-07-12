@@ -469,6 +469,25 @@ class ExtractFinalMessageTests(unittest.TestCase):
         ])
         self.assertEqual(codex_council.extract_final_message(jsonl), "ok")
 
+    def test_agent_message_with_unicode_line_separators_is_not_dropped(self):
+        """codex/serde_json may emit U+2028/U+2029/U+0085 UNescaped inside a
+        JSON string. str.splitlines() would tear that one physical record into
+        invalid fragments and drop the reply; splitting on "\\n" preserves it."""
+        for cp, name in ((" ", "U+2028"),
+                         (" ", "U+2029"),
+                         ("", "U+0085")):
+            with self.subTest(sep=name):
+                text = f"part one{cp}part two"
+                # ensure_ascii=False -> the separator is a LITERAL char in the
+                # physical JSONL line, exactly as codex emits it.
+                jsonl = json.dumps(
+                    {"type": "item.completed",
+                     "item": {"type": "agent_message", "text": text}},
+                    ensure_ascii=False,
+                )
+                self.assertIn(cp, jsonl)
+                self.assertEqual(codex_council.extract_final_message(jsonl), text)
+
 
 class ExtractErrorMessagesTests(unittest.TestCase):
     def test_extracts_error_message(self):
@@ -1917,6 +1936,23 @@ class ParseRolesJsonTests(unittest.TestCase):
             expect_in_stderr="must match",
         )
 
+    def test_id_with_trailing_newline_raises(self):
+        """`$` would accept "architect\\n" (it matches before a final newline),
+        injecting a newline into state filenames and report/progress lines;
+        `\\Z` rejects it."""
+        raw = json.dumps([_role_json("architect\n", "L")])
+        _assert_usage_exit(
+            self, lambda: codex_council._parse_roles_json(raw),
+            expect_in_stderr="must match",
+        )
+
+    def test_id_with_embedded_newline_raises(self):
+        raw = json.dumps([_role_json("arch\nitect", "L")])
+        _assert_usage_exit(
+            self, lambda: codex_council._parse_roles_json(raw),
+            expect_in_stderr="must match",
+        )
+
     def test_reported_issue_role_id_is_accepted(self):
         rid = "parent-mapper-augmentation-auditor"
         roles = codex_council._parse_roles_json(
@@ -2579,6 +2615,105 @@ class ArgParseTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as ctx:
                 codex_council._parse_args(["--roles-json", "[]"])
         self.assertEqual(ctx.exception.code, 2)
+
+
+class RunCodexSubprocessTests(unittest.IsolatedAsyncioTestCase):
+    """Spawn/encode/reap behavior of the real _run_codex_subprocess."""
+
+    async def test_encode_happens_before_spawn(self):
+        """A prompt UTF-8 cannot encode (a lone surrogate) must fail BEFORE the
+        child is spawned, so no codex process is left blocked on stdin."""
+        create_mock = AsyncMock()
+        with patch.object(
+            codex_council.asyncio, "create_subprocess_exec", create_mock
+        ):
+            with self.assertRaises(UnicodeEncodeError):
+                await codex_council._run_codex_subprocess(
+                    ["codex"], "bad \ud800 prompt"
+                )
+        create_mock.assert_not_called()
+
+    async def test_reaps_child_on_non_cancel_error(self):
+        """communicate() raising anything (not just CancelledError) after the
+        child exists must tear down the process group, not leak it."""
+        class FakeProc:
+            pid = 424242
+            returncode = None
+
+            async def communicate(self, data):
+                raise RuntimeError("boom")
+
+        proc = FakeProc()
+        terminate_mock = AsyncMock()
+        with patch.object(
+            codex_council.asyncio, "create_subprocess_exec",
+            AsyncMock(return_value=proc),
+        ), patch.object(
+            codex_council.os, "getpgid", return_value=proc.pid
+        ), patch.object(
+            codex_council, "_terminate_process_group", terminate_mock
+        ):
+            with self.assertRaises(RuntimeError):
+                await codex_council._run_codex_subprocess(["codex"], "ok prompt")
+        terminate_mock.assert_awaited_once()
+
+    async def test_cancellation_still_reaps_child(self):
+        """The original cancellation reap path still fires under the broadened
+        BaseException handler."""
+        class FakeProc:
+            pid = 424243
+            returncode = None
+
+            async def communicate(self, data):
+                raise asyncio.CancelledError()
+
+        proc = FakeProc()
+        terminate_mock = AsyncMock()
+        with patch.object(
+            codex_council.asyncio, "create_subprocess_exec",
+            AsyncMock(return_value=proc),
+        ), patch.object(
+            codex_council.os, "getpgid", return_value=proc.pid
+        ), patch.object(
+            codex_council, "_terminate_process_group", terminate_mock
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await codex_council._run_codex_subprocess(["codex"], "ok prompt")
+        terminate_mock.assert_awaited_once()
+
+
+class ForceUtf8StreamsTests(unittest.TestCase):
+    def test_reconfigures_stdout_stderr_to_utf8(self):
+        calls = []
+
+        class FakeStream:
+            def reconfigure(self, **kw):
+                calls.append(kw)
+
+        with patch.object(codex_council.sys, "stdout", FakeStream()), \
+             patch.object(codex_council.sys, "stderr", FakeStream()):
+            codex_council._force_utf8_streams()
+        self.assertEqual(len(calls), 2)
+        for kw in calls:
+            self.assertEqual(kw.get("encoding"), "utf-8")
+            self.assertEqual(kw.get("errors"), "replace")
+
+    def test_tolerates_stream_without_reconfigure(self):
+        class Bare:
+            pass
+
+        with patch.object(codex_council.sys, "stdout", Bare()), \
+             patch.object(codex_council.sys, "stderr", Bare()):
+            codex_council._force_utf8_streams()  # must not raise
+
+    def test_swallows_reconfigure_errors(self):
+        class Boom:
+            def reconfigure(self, **kw):
+                raise ValueError("nope")
+
+        with patch.object(codex_council.sys, "stdout", Boom()), \
+             patch.object(codex_council.sys, "stderr", Boom()):
+            codex_council._force_utf8_streams()  # must not raise
 
 
 class NoTimeoutTests(unittest.TestCase):

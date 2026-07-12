@@ -215,7 +215,10 @@ class RoleResult:
     warning: Optional[str] = None
 
 
-ROLE_ID_PATTERN = re.compile(r"^[a-z0-9_-]+$")
+# \Z, not $: in Python `$` also matches just before a trailing "\n", so
+# "architect\n" would pass and inject a newline into state filenames, the
+# report summary line, and stderr progress. \Z anchors the true end of string.
+ROLE_ID_PATTERN = re.compile(r"^[a-z0-9_-]+\Z")
 
 
 def _state_role_component(role_id):
@@ -440,8 +443,16 @@ def clear_session(role_id):
 # ---------- JSONL parsing ----------
 
 def _iter_json_objects(jsonl_output):
-    """Yield JSON object lines from a JSONL stream, skipping malformed lines."""
-    for line in jsonl_output.splitlines():
+    """Yield JSON object lines from a JSONL stream, skipping malformed lines.
+
+    Split strictly on "\\n" (JSONL's record separator), never str.splitlines():
+    splitlines also breaks on U+2028, U+2029, and U+0085, which are legal
+    *unescaped* inside a JSON string. codex/serde_json can emit an agent_message
+    containing one of those literally, and splitting there would tear the record
+    into two invalid fragments — silently dropping a completed reply and turning
+    a successful role into a failure.
+    """
+    for line in jsonl_output.split("\n"):
         line = line.strip()
         if not line:
             continue
@@ -698,6 +709,13 @@ async def _run_codex_subprocess(cmd, prompt):
     SIGTERM to the group also reaches any shell commands codex itself
     spawned for tool calls. Without it, those grandchildren leak.
     """
+    # Encode BEFORE spawning. A prompt carrying a char UTF-8 cannot encode
+    # (e.g. a lone surrogate from an escaped "\uD800" in roles.json) would
+    # otherwise raise from the .encode() call AFTER the child exists, and the
+    # cancellation-only cleanup would not run — leaking a codex process left
+    # blocked forever on the stdin it never received. Failing here, pre-spawn,
+    # means there is no child to leak.
+    prompt_bytes = prompt.encode("utf-8")
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdin=asyncio.subprocess.PIPE,
@@ -711,8 +729,11 @@ async def _run_codex_subprocess(cmd, prompt):
         # start_new_session=True makes the child process leader's pid the pgid.
         pgid = proc.pid
     try:
-        stdout_b, stderr_b = await proc.communicate(prompt.encode("utf-8"))
-    except asyncio.CancelledError:
+        stdout_b, stderr_b = await proc.communicate(prompt_bytes)
+    except BaseException:
+        # Reap on ANY post-spawn failure or cancellation, not just
+        # CancelledError — otherwise codex (and its tool-call grandchildren)
+        # leak whenever communicate() raises for any other reason.
         await _terminate_process_group(proc, pgid)
         raise
     return (
@@ -1609,7 +1630,29 @@ async def _run_council_with_signals(roles, body, max_parallel):
                 loop.remove_signal_handler(signum)
 
 
+def _force_utf8_streams():
+    """Pin stdout/stderr to UTF-8 regardless of the process locale.
+
+    The report header and role replies carry non-ASCII text (e.g. the em dash
+    in "# Codex Council — N/M"). Under a strict C locale with UTF-8 mode and
+    C-locale coercion both disabled (LC_ALL=C PYTHONUTF8=0 PYTHONCOERCECLOCALE=0),
+    the default stream encoding is ASCII, so printing the report raises
+    UnicodeEncodeError and loses BOTH the report and the CODEX_COUNCIL_DONE
+    sentinel the recovery contract depends on. The report and prompts are UTF-8
+    by contract, so make the streams agree. errors="replace" guarantees the
+    sentinel still writes even if some field is not encodable.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (ValueError, OSError):
+                pass
+
+
 def main():
+    _force_utf8_streams()
     args = _parse_args(sys.argv[1:])
 
     if args.check_staging_dir is not None:
