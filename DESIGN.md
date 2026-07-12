@@ -30,6 +30,13 @@ built-in role catalog, no positional shortcuts, and no `--list-roles`
 flag. Bare invocation (no `--roles-file`, with context piped or staged)
 exits 2 — the script's way of telling Claude to go compose a panel.
 
+The orchestrator deliberately has no plugin-imposed size or count ceilings:
+role count, role IDs, labels, instructions, staged context, stdin, and composed
+prompts are accepted without truncation. This keeps the full caller-supplied
+context intact. The active model/provider and available memory are still real
+downstream constraints; their failures are surfaced rather than guessed at by
+an arbitrary preflight cap.
+
 The reasoning: every hardcoded catalog is a bias. The original 6
 coding roles biased Claude toward coding panels. A later expansion to
 15 roles across four thematic groups (coding/writing/data/research)
@@ -110,10 +117,11 @@ flowchart TD
 flowchart LR
     Root["project root"] --> RootHash["sha256 root prefix"]
     Env["explicit or auto session key"] --> SessionHash["optional sha256 session prefix"]
-    Role["role id"] --> Filename["state filename"]
+    Role["role id"] --> RoleKey["literal legacy id or sha256 key"]
 
     RootHash --> Filename
     SessionHash --> Filename
+    RoleKey --> Filename
     Filename --> State["$XDG_STATE_HOME/codex-council/key__role.json"]
     State --> Lock["state-file lock"]
     Lock --> Load["load stored thread id"]
@@ -144,7 +152,11 @@ the turn has already completed on the new thread; re-running burns
 tokens for no benefit.
 
 Per-role state is protected by a POSIX advisory lock keyed by
-`(project, session key, role)`. The session key is explicit when
+`(project, session key, role)`. Role IDs longer than the formerly accepted
+32-character range use a deterministic SHA-256 filename component, avoiding
+the operating system's filename-length limit while preserving the full role ID
+in memory, reports, prompts, and state metadata. Short-role state filenames
+remain unchanged for thread-continuity compatibility. The session key is explicit when
 `CODEX_COUNCIL_SESSION_KEY` is set; otherwise the runner auto-detects common
 host-session identifiers such as Claude session ids, `CODEX_THREAD_ID`,
 `TERM_SESSION_ID`, `TMUX_PANE`, `STY`, and `VSCODE_PID`. That gives normal

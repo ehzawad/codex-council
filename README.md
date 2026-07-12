@@ -32,7 +32,7 @@ Persists across sessions — no flags needed.
 
 Claude looks at the current task, the relevant files or artifacts in
 flight, and the judgment the user actually needs, composes a tailored
-2–6 agent panel, announces it briefly, and launches without a manual
+agent panel, announces it briefly, and launches without a manual
 launch approval gate. Each role keeps its own Codex thread per
 project and host session, so framings accumulate across calls in the
 same terminal/session if you reuse role IDs.
@@ -61,7 +61,10 @@ actually doing, then passing them to the script via `--roles-file`
 in the same private per-run directory). The script is a pure
 orchestrator: it reads those staged inputs, validates them before
 launch, fans out parallel `codex exec` subprocesses, and aggregates
-the replies.
+the replies. It imposes no size ceiling on the panel, role IDs, labels,
+instructions, staged context, stdin, or composed prompts, and it never
+truncates them. Actual model/provider context windows and available machine
+memory remain external constraints and are surfaced as downstream failures.
 
 **Note on fit.** Codex is strongest where the task has technical,
 structured, or evidence-checking surfaces. For tasks where a single
@@ -168,19 +171,22 @@ flowchart TD
 ## State
 
 Council state lives at
-`$XDG_STATE_HOME/codex-council/{project-hash}-{session-hash}__{role-id}.json`
+`$XDG_STATE_HOME/codex-council/{project-hash}-{session-hash}__{role-key}.json`
 when the runner can detect a stable host-session id. It auto-detects common
 values such as Claude session ids, `CODEX_THREAD_ID`, `TERM_SESSION_ID`,
 `TMUX_PANE`, `STY`, and `VSCODE_PID`, so separate terminal tabs/panes in the
 same repo do not normally share role threads (except multiple integrated
 terminals in the **same VS Code window**, which share `VSCODE_PID`; set
 `CODEX_COUNCIL_SESSION_KEY` to isolate those). Follow-up calls from the same
-host session still resume the same per-role thread.
+host session still resume the same per-role thread. Long role IDs use a
+deterministic hashed filename key, while the full ID is preserved in reports,
+prompts, and state metadata; this avoids filesystem filename-length failures
+without imposing an ID-length limit.
 
 `CODEX_COUNCIL_SESSION_KEY` remains an explicit override for custom scoping
 per branch or task. Set `CODEX_COUNCIL_DISABLE_AUTO_SESSION_KEY=1` only if you
 want the older project-wide state file shape:
-`{project-hash}__{role-id}.json`.
+`{project-hash}__{role-key}.json`.
 
 ## Security
 

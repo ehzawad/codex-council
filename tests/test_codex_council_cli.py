@@ -14,6 +14,7 @@ Run from repo root:
     python3 -m unittest discover -s tests -p 'test_*.py'
 """
 
+import hashlib
 import json
 import os
 import re
@@ -248,6 +249,26 @@ class BareInvocationTests(CouncilCLITestCase):
 
 
 class HappyPathTests(CouncilCLITestCase):
+    def test_reported_long_role_id_runs_and_uses_a_safe_state_filename(self):
+        rid = "parent-mapper-augmentation-auditor"
+        roles_path = self._write_roles([
+            _role(rid, "Parent Mapper Auditor", _instruction("Review mapping")),
+        ])
+        proc = self._run(
+            input="please review this change\n",
+            args=("--roles-file", roles_path),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(rid, proc.stdout)
+        digest = hashlib.sha256(rid.encode("utf-8")).hexdigest()
+        state_root = os.path.join(self.statedir.name, "codex-council")
+        state_files = [name for name in os.listdir(state_root) if name.endswith(".json")]
+        self.assertEqual(len(state_files), 1)
+        self.assertTrue(
+            state_files[0].endswith(f"__role-sha256-{digest}.json"),
+            state_files[0],
+        )
+
     def test_happy_path_report_and_progress(self):
         roles_path = self._write_roles([
             _role("architect", "Architect",
@@ -391,18 +412,16 @@ class HappyPathTests(CouncilCLITestCase):
 
 
 class StdinGuardTests(CouncilCLITestCase):
-    def test_over_cap_stdin_exits_1(self):
+    def test_large_stdin_reaches_codex_without_a_plugin_cap(self):
         roles_path = self._write_roles([
             _role("architect", "Architect",
                   _instruction("Review")),
         ])
-        oversize = "a" * (10 * 1024 * 1024 + 1)
-        proc = self._run(input=oversize, args=("--roles-file", roles_path))
-        self.assertEqual(proc.returncode, 1, proc.stderr)
-        self.assertIn("exceeds", proc.stderr)
-        # Fake codex never ran, so no report / no sentinel.
-        self.assertNotIn("CODEX_COUNCIL_DONE", proc.stderr)
-        self.assertNotIn("# Codex Council", proc.stdout)
+        large_input = "a" * (10 * 1024 * 1024 + 1)
+        proc = self._run(input=large_input, args=("--roles-file", roles_path))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("CODEX_COUNCIL_DONE ok=1 total=1", proc.stderr)
+        self.assertIn("# Codex Council", proc.stdout)
 
     def test_empty_stdin_exits_1(self):
         roles_path = self._write_roles([
@@ -412,18 +431,6 @@ class StdinGuardTests(CouncilCLITestCase):
         proc = self._run(input="   \n ", args=("--roles-file", roles_path))
         self.assertEqual(proc.returncode, 1, proc.stderr)
         self.assertIn("Empty input", proc.stderr)
-
-    def test_prompt_over_cap_exits_before_codex(self):
-        roles_path = self._write_roles([
-            _role("architect", "Architect",
-                  _instruction("Review")),
-        ])
-        body = "a" * (10 * 1024 * 1024)
-        proc = self._run(input=body, args=("--roles-file", roles_path))
-        self.assertEqual(proc.returncode, 1, proc.stderr)
-        self.assertIn("Composed prompt", proc.stderr)
-        self.assertNotIn("CODEX_COUNCIL_DONE", proc.stderr)
-        self.assertNotIn("# Codex Council", proc.stdout)
 
     def test_context_file_missing_exits_2_before_codex(self):
         roles_path = self._write_roles([

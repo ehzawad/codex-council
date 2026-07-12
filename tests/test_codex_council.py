@@ -109,23 +109,13 @@ class ResolveRolesTests(unittest.TestCase):
         self.assertEqual([r.id for r in roles], ["alpha"])
         self.assertEqual(roles[0].label, "A1")  # first wins
 
-    def test_resolve_at_cap_is_allowed(self):
+    def test_resolve_large_panel_without_a_role_count_cap(self):
         roles_in = [
             _make_role(f"r{i}", f"R{i}", _valid_instruction("x"))
-            for i in range(codex_council.MAX_PARALLEL)
+            for i in range(100)
         ]
         roles = codex_council._resolve_roles(roles_in)
-        self.assertEqual(len(roles), codex_council.MAX_PARALLEL)
-
-    def test_resolve_over_cap_raises(self):
-        roles_in = [
-            _make_role(f"r{i}", f"R{i}", _valid_instruction("x"))
-            for i in range(codex_council.MAX_PARALLEL + 1)
-        ]
-        _assert_usage_exit(
-            self, lambda: codex_council._resolve_roles(roles_in),
-            expect_in_stderr="MAX_PARALLEL",
-        )
+        self.assertEqual(len(roles), 100)
 
 
 # ---------- env vars / session key ----------
@@ -194,6 +184,22 @@ class ProjectKeyTests(unittest.TestCase):
             a = codex_council._project_key("architect")
             s = codex_council._project_key("security")
         self.assertNotEqual(a, s)
+
+    def test_long_role_id_is_hashed_in_state_key(self):
+        rid = "parent-mapper-augmentation-auditor"
+        with patch.dict(os.environ, _env_without_session_key(), clear=True):
+            key = codex_council._project_key(rid)
+        digest = hashlib.sha256(rid.encode("utf-8")).hexdigest()
+        self.assertEqual(key, f"{FIXED_PROJECT_HASH}__role-sha256-{digest}")
+        self.assertNotIn(rid, key)
+
+    def test_very_long_role_ids_get_distinct_bounded_state_keys(self):
+        with patch.dict(os.environ, _env_without_session_key(), clear=True):
+            a = codex_council._project_key("a" * 100_000)
+            b = codex_council._project_key("a" * 99_999 + "b")
+        self.assertNotEqual(a, b)
+        self.assertLess(len(a), 255)
+        self.assertLess(len(b), 255)
 
     def test_with_session_key_appends_suffix_before_role(self):
         with patch.dict(os.environ, {codex_council.SESSION_KEY_ENV: "task-1"}, clear=False):
@@ -1445,10 +1451,10 @@ class ParseRolesJsonTests(unittest.TestCase):
         roles = codex_council._parse_roles_json(raw)
         self.assertEqual([r.id for r in roles], ["alpha", "beta", "gamma"])
 
-    def test_longer_id_allowed_up_to_32(self):
-        raw = json.dumps([_role_json("a" * 32, "L")])
+    def test_long_role_id_is_unrestricted(self):
+        raw = json.dumps([_role_json("a" * 100_000, "L")])
         roles = codex_council._parse_roles_json(raw)
-        self.assertEqual(roles[0].id, "a" * 32)
+        self.assertEqual(roles[0].id, "a" * 100_000)
 
     def test_invalid_json_raises(self):
         _assert_usage_exit(
@@ -1532,33 +1538,17 @@ class ParseRolesJsonTests(unittest.TestCase):
         self.assertIn("one two", roles[0].instruction)
         self.assertNotIn(" ", roles[0].instruction)
 
-    def test_label_at_byte_cap_allowed(self):
-        raw = json.dumps([_role_json("x", "a" * codex_council.ROLE_LABEL_MAX_BYTES)])
+    def test_large_label_is_accepted(self):
+        raw = json.dumps([_role_json("x", "a" * 100_000)])
         roles = codex_council._parse_roles_json(raw)
-        self.assertEqual(roles[0].label, "a" * codex_council.ROLE_LABEL_MAX_BYTES)
+        self.assertEqual(roles[0].label, "a" * 100_000)
 
-    def test_label_over_byte_cap_raises(self):
-        raw = json.dumps([_role_json("x", "a" * (codex_council.ROLE_LABEL_MAX_BYTES + 1))])
-        _assert_usage_exit(
-            self, lambda: codex_council._parse_roles_json(raw),
-            expect_in_stderr="label exceeds",
-        )
-
-    def test_instruction_over_byte_cap_raises(self):
-        oversized = "a" * (codex_council.ROLE_INSTRUCTION_MAX_BYTES + 1)
-        raw = json.dumps([_role_json("x", "L", oversized)])
-        _assert_usage_exit(
-            self, lambda: codex_council._parse_roles_json(raw),
-            expect_in_stderr="instruction exceeds",
-        )
-
-    def test_instruction_size_counts_utf8_bytes(self):
-        with patch.object(codex_council, "ROLE_INSTRUCTION_MAX_BYTES", 4):
-            raw = json.dumps([_role_json("x", "L", "€€")])
-            _assert_usage_exit(
-                self, lambda: codex_council._parse_roles_json(raw),
-                expect_in_stderr="instruction exceeds",
-            )
+    def test_large_multibyte_instruction_is_accepted(self):
+        instruction = "€" * 100_000 + "; if nothing material, say so clearly. " \
+            "Thoroughness beats speed."
+        raw = json.dumps([_role_json("x", "L", instruction)])
+        roles = codex_council._parse_roles_json(raw)
+        self.assertEqual(roles[0].instruction, instruction)
 
     def test_instruction_requires_scope_phrase(self):
         raw = json.dumps([_role_json("x", "L", "Review only. Thoroughness beats speed.")])
@@ -1588,12 +1578,12 @@ class ParseRolesJsonTests(unittest.TestCase):
             expect_in_stderr="must match",
         )
 
-    def test_id_over_32_chars_raises(self):
-        raw = json.dumps([_role_json("a" * 33, "L")])
-        _assert_usage_exit(
-            self, lambda: codex_council._parse_roles_json(raw),
-            expect_in_stderr="exceeds 32",
+    def test_reported_issue_role_id_is_accepted(self):
+        rid = "parent-mapper-augmentation-auditor"
+        roles = codex_council._parse_roles_json(
+            json.dumps([_role_json(rid, "Parent Mapper Auditor")])
         )
+        self.assertEqual(roles[0].id, rid)
 
     def test_duplicate_id_in_payload_raises(self):
         raw = json.dumps([
@@ -1735,14 +1725,12 @@ class InstructionListFormTests(unittest.TestCase):
             expect_in_stderr="Thoroughness beats speed.",
         )
 
-    def test_byte_cap_applies_to_joined_paragraph(self):
+    def test_large_joined_paragraph_is_accepted(self):
         items = ["a" * 5000, "b" * 5000,
                  "If nothing material, say so clearly.",
                  "Thoroughness beats speed."]
-        _assert_usage_exit(
-            self, lambda: self._roles(items),
-            expect_in_stderr="instruction exceeds",
-        )
+        roles = self._roles(items)
+        self.assertEqual(roles[0].instruction, " ".join(items))
 
     def test_wrong_instruction_type_steers_to_array_form(self):
         raw = json.dumps([{"id": "x", "label": "L", "instruction": 5}])
@@ -1779,18 +1767,15 @@ class ResolveRolesJsonIntegrationTests(unittest.TestCase):
         roles = codex_council._resolve_roles(custom)
         self.assertEqual([r.id for r in roles], ["data-pipeline", "ml-fairness"])
 
-    def test_max_parallel_enforced_via_json(self):
-        """MAX_PARALLEL + 1 custom roles must reject."""
+    def test_large_panel_resolves_via_json(self):
         entries = [
             {"id": f"role-{i}", "label": f"R{i}",
              "instruction": [_valid_instruction("x")]}
-            for i in range(codex_council.MAX_PARALLEL + 1)
+            for i in range(100)
         ]
         custom = codex_council._parse_roles_json(json.dumps(entries))
-        _assert_usage_exit(
-            self, lambda: codex_council._resolve_roles(custom),
-            expect_in_stderr="MAX_PARALLEL",
-        )
+        roles = codex_council._resolve_roles(custom)
+        self.assertEqual(len(roles), 100)
 
 
 class ProjectRootCacheTests(unittest.TestCase):
@@ -2115,7 +2100,7 @@ class ReadContextFileTests(unittest.TestCase):
             expect_in_stderr="re-run --check-staging-dir",
         )
 
-    def test_context_file_utf8_and_byte_cap_are_usage_errors(self):
+    def test_context_file_invalid_utf8_is_a_usage_error(self):
         path = self._path()
         with open(path, "wb") as f:
             f.write(b"\xff\xfe bad")
@@ -2125,60 +2110,24 @@ class ReadContextFileTests(unittest.TestCase):
             expect_in_stderr="not valid UTF-8",
         )
 
-        with patch.object(codex_council, "MAX_STDIN_BYTES", 4):
-            with open(path, "wb") as f:
-                f.write(b"abcde")
-            _assert_usage_exit(
-                self,
-                lambda: codex_council._read_context_file(path),
-                expect_in_stderr="exceeds",
-            )
+    def test_large_context_file_is_accepted_without_truncation(self):
+        path = self._path()
+        content = "€" * 4_000_000
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        self.assertEqual(codex_council._read_context_file(path), content)
 
 
 class ReadStdinBodyTests(unittest.TestCase):
-    """The cap is a BYTE cap (the prompt is UTF-8 encoded for codex), so the
-    reader counts bytes, not characters."""
-
-    def test_max_stdin_bytes_is_exactly_10_mib(self):
-        self.assertEqual(codex_council.MAX_STDIN_BYTES, 10 << 20)
-        self.assertEqual(codex_council.MAX_STDIN_BYTES, 10 * 1024 * 1024)
-
-    def test_returns_decoded_body_under_cap(self):
+    def test_returns_decoded_body(self):
         self.assertEqual(codex_council._read_stdin_body(io.BytesIO(b"hello")), "hello")
 
-    def test_rejects_over_byte_cap(self):
-        oversize = b"a" * (codex_council.MAX_STDIN_BYTES + 1)
-        buf = io.StringIO()
-        with contextlib.redirect_stderr(buf):
-            with self.assertRaises(SystemExit) as ctx:
-                codex_council._read_stdin_body(io.BytesIO(oversize))
-        self.assertEqual(ctx.exception.code, 1)
-        self.assertIn("exceeds", buf.getvalue())
-
-    def test_counts_bytes_not_characters(self):
-        """Regression: 3 multibyte chars (9 bytes) must be rejected at an
-        8-byte cap. A character-count check would have let it through."""
-        with patch.object(codex_council, "MAX_STDIN_BYTES", 8):
-            payload = "€€€".encode("utf-8")  # 3 chars, 9 bytes
-            self.assertEqual(len(payload), 9)
-            with contextlib.redirect_stderr(io.StringIO()):
-                with self.assertRaises(SystemExit) as ctx:
-                    codex_council._read_stdin_body(io.BytesIO(payload))
-            self.assertEqual(ctx.exception.code, 1)
-
-    def test_multibyte_under_cap_ok(self):
-        with patch.object(codex_council, "MAX_STDIN_BYTES", 16):
-            self.assertEqual(
-                codex_council._read_stdin_body(io.BytesIO("€€".encode("utf-8"))),
-                "€€",
-            )
-
-    def test_accepts_exactly_cap_bytes(self):
-        with patch.object(codex_council, "MAX_STDIN_BYTES", 8):
-            self.assertEqual(
-                codex_council._read_stdin_body(io.BytesIO(b"abcdefgh")),  # exactly 8
-                "abcdefgh",
-            )
+    def test_large_multibyte_stdin_is_accepted_without_truncation(self):
+        content = "€" * 4_000_000
+        self.assertEqual(
+            codex_council._read_stdin_body(io.BytesIO(content.encode("utf-8"))),
+            content,
+        )
 
     def test_rejects_invalid_utf8(self):
         buf = io.StringIO()
@@ -2197,21 +2146,12 @@ class ReadStdinBodyTests(unittest.TestCase):
         self.assertIn("Empty input", buf.getvalue())
 
 
-class PromptSizeTests(unittest.TestCase):
-    def test_composed_prompt_at_cap_allowed(self):
+class PromptCompositionTests(unittest.TestCase):
+    def test_large_prompt_is_composed_without_truncation(self):
         role = codex_council.Role("architect", "Architect", "i")
-        with patch.object(codex_council, "MAX_PROMPT_BYTES", len("i\n\nb\n\ni")):
-            codex_council._validate_prompt_size(role, "b")
-
-    def test_composed_prompt_over_cap_exits_1(self):
-        role = codex_council.Role("architect", "Architect", "i")
-        buf = io.StringIO()
-        with patch.object(codex_council, "MAX_PROMPT_BYTES", len("i\n\nb\n\ni") - 1):
-            with contextlib.redirect_stderr(buf):
-                with self.assertRaises(SystemExit) as ctx:
-                    codex_council._validate_prompt_size(role, "b")
-        self.assertEqual(ctx.exception.code, 1)
-        self.assertIn("architect", buf.getvalue())
+        body = "b" * 12_000_000
+        prompt = codex_council._compose_prompt(role, body)
+        self.assertEqual(prompt, f"i\n\n{body}\n\ni")
 
 
 class ArgParseTests(unittest.TestCase):
@@ -2324,6 +2264,33 @@ class DocsContractTests(unittest.TestCase):
         self.assertIn("read -r -d ''", text)
         self.assertIn("file --brief --mime --", text)
         self.assertIn("git diff --cached", text)
+
+    def test_runtime_and_skill_have_no_stale_size_or_panel_caps(self):
+        script_path = self._repo_file(
+            "plugins", "codex-council", "skills", "codex-council",
+            "scripts", "codex_council.py",
+        )
+        skill_path = self._repo_file(
+            "plugins", "codex-council", "skills", "codex-council", "SKILL.md"
+        )
+        with open(script_path, encoding="utf-8") as f:
+            script = f.read()
+        with open(skill_path, encoding="utf-8") as f:
+            skill = f.read()
+        for stale_name in (
+            "MAX_PARALLEL", "MAX_STDIN_BYTES", "MAX_PROMPT_BYTES",
+            "ROLE_ID_MAX_LEN", "ROLE_LABEL_MAX_BYTES",
+            "ROLE_INSTRUCTION_MAX_BYTES", "_validate_prompt_size",
+        ):
+            self.assertNotIn(stale_name, script)
+        for stale_contract in (
+            "Max 6 roles per call", "≤32 chars", "≤80 UTF-8 bytes",
+            "≤8192 UTF-8 bytes", "over 10 MiB", "tail -c 131072",
+            "size <= 32768",
+        ):
+            self.assertNotIn(stale_contract, skill)
+        self.assertIn("no plugin-imposed size or count caps", skill)
+        self.assertIn("never truncates", skill)
 
     def test_readme_dev_hook_keeps_diagnostics(self):
         path = self._repo_file("README.md")

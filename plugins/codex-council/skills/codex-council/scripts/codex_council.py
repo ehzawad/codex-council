@@ -18,6 +18,10 @@ script without waiting for manual launch approval. Roles arrive via
 `--roles-file` (a path to a JSON file holding the panel), which keeps
 a large role array out of the shell entirely.
 
+The orchestrator imposes no size or count ceiling on role panels, role
+fields, context, stdin, or composed prompts, and never truncates them.
+Downstream model/provider limits and physical memory remain external.
+
 Usage:
     python3 codex_council.py --roles-file roles.json --context-file context.md
 
@@ -135,15 +139,9 @@ AUTO_SESSION_ENV_VARS = (
     "VSCODE_PID",
 )
 
-MAX_PARALLEL = 6  # matches codex's own DEFAULT_AGENT_MAX_THREADS
 MAX_RETRY_ATTEMPTS = 2
 INITIAL_BACKOFF_SECS = 5
 TERMINATION_GRACE_SECS = 0.2
-MAX_STDIN_BYTES = 10 << 20  # 10 MiB (a sanity guard, not a model-context
-# limit — Codex's own context window is the real ceiling; compress anyway).
-MAX_PROMPT_BYTES = MAX_STDIN_BYTES
-ROLE_LABEL_MAX_BYTES = 80
-ROLE_INSTRUCTION_MAX_BYTES = 8192
 REQUIRED_SCOPE_PHRASE = "nothing material"
 REQUIRED_CADENCE_SENTENCE = "Thoroughness beats speed."
 LINEBREAK_CHARS = ("\r", "\n", "\u2028", "\u2029")
@@ -195,7 +193,20 @@ class RoleResult:
 
 
 ROLE_ID_PATTERN = re.compile(r"^[a-z0-9_-]+$")
-ROLE_ID_MAX_LEN = 32
+
+
+def _state_role_component(role_id):
+    """Return a filename-safe, bounded component for an unrestricted role ID.
+
+    Releases before unrestricted IDs stored the literal ID in the state
+    filename and accepted at most 32 characters. Preserve those existing
+    paths, but hash every newly-accepted longer ID so the plugin never runs
+    into the platform's per-component filename limit.
+    """
+    if len(role_id) <= 32:
+        return role_id
+    digest = hashlib.sha256(role_id.encode("utf-8")).hexdigest()
+    return f"role-sha256-{digest}"
 
 
 # ---------- project / session state (sync) ----------
@@ -243,15 +254,16 @@ def _session_key():
 def _project_key(role_id):
     """Stable state key for (project, role, optional session-key)."""
     base = hashlib.sha256(_project_root().encode()).hexdigest()[:16]
+    role_component = _state_role_component(role_id)
     session_key = _session_key()
     if session_key:
         suffix = hashlib.sha256(session_key.encode()).hexdigest()[:16]
-        return f"{base}-{suffix}__{role_id}"
-    return f"{base}__{role_id}"
+        return f"{base}-{suffix}__{role_component}"
+    return f"{base}__{role_component}"
 
 
 def _state_path(role_id):
-    """Per-(project, role) state file path."""
+    """Per-(project, role) state path; long IDs use a fixed-size hash key."""
     return os.path.join(STATE_DIR, f"{_project_key(role_id)}.json")
 
 
@@ -561,17 +573,6 @@ def _compose_prompt(role, body):
     return f"{role.instruction}\n\n{body}\n\n{role.instruction}"
 
 
-def _validate_prompt_size(role, body):
-    prompt_bytes = len(_compose_prompt(role, body).encode("utf-8"))
-    if prompt_bytes > MAX_PROMPT_BYTES:
-        print(
-            f"Composed prompt for role {role.id!r} is {prompt_bytes} bytes; "
-            f"limit is {MAX_PROMPT_BYTES}. Trim stdin or role instructions.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-
 # ---------- async codex invocation ----------
 
 def _resume_cmd(root, session_id):
@@ -825,8 +826,8 @@ async def _run_role(role, prompt):
 async def run_council(roles, body):
     """Fan out N roles in parallel and wait for all to finish.
 
-    `roles` is a list of Role objects supplied by the caller via
-    --roles-file. There is no built-in role registry.
+    `roles` is an unrestricted-size list of Role objects supplied by the
+    caller via --roles-file. There is no built-in role registry.
 
     `return_exceptions=True` ensures one role's crash does not cancel
     its siblings — every role gets its turn and its result in the report.
@@ -869,7 +870,6 @@ async def run_council(roles, body):
 
     tasks = []
     for role in roles:
-        _validate_prompt_size(role, body)
         t = asyncio.create_task(_run_role(role, _compose_prompt(role, body)))
         t.add_done_callback(lambda task, role=role: _on_role_done(role, task))
         tasks.append(t)
@@ -1090,10 +1090,10 @@ def _usage_exit_if_staging_dirs_differ(roles_file, context_file):
 def _read_roles_file(path):
     """Read the raw roles JSON from a file.
 
-    Passing the panel as a path lets the caller write the JSON with a real
-    editor/tool instead of escaping a large blob through the shell, where a
-    stray quote or unbalanced brace would break the call. Read and decode
-    errors exit 2 like other usage errors; JSON validity is left to
+    Passing the unrestricted-size panel as a path lets the caller write the
+    JSON with a real editor/tool instead of escaping a large blob through the
+    shell, where a stray quote or unbalanced brace would break the call.
+    Read and decode errors exit 2 like other usage errors; JSON validity is left to
     _parse_roles_json.
     """
     problem = _file_arg_problem("--roles-file", path)
@@ -1109,13 +1109,9 @@ def _read_roles_file(path):
 
 
 def _validate_role_id(rid, ctx):
-    """Reject malformed/oversize role IDs with a SystemExit citing context."""
+    """Reject malformed role IDs with a SystemExit citing context."""
     if not isinstance(rid, str) or not rid:
         _usage_exit(f"--roles-file {ctx}: 'id' must be a non-empty string.")
-    if len(rid) > ROLE_ID_MAX_LEN:
-        _usage_exit(
-            f"--roles-file {ctx}: id {rid!r} exceeds {ROLE_ID_MAX_LEN} chars."
-        )
     if not ROLE_ID_PATTERN.match(rid):
         _usage_exit(
             f"--roles-file {ctx}: id {rid!r} must match {ROLE_ID_PATTERN.pattern}."
@@ -1123,14 +1119,9 @@ def _validate_role_id(rid, ctx):
 
 
 def _validate_role_label(label, ctx):
-    """Reject labels that can break report structure or become unreadable."""
+    """Reject labels that can break report structure."""
     if any(ch in label for ch in LINEBREAK_CHARS):
         _usage_exit(f"--roles-file {ctx}: label must not contain newlines.")
-    encoded_len = len(label.encode("utf-8"))
-    if encoded_len > ROLE_LABEL_MAX_BYTES:
-        _usage_exit(
-            f"--roles-file {ctx}: label exceeds {ROLE_LABEL_MAX_BYTES} UTF-8 bytes."
-        )
 
 
 ROLE_FIELDS = ("id", "label", "instruction")
@@ -1173,12 +1164,6 @@ def _validate_role_instruction(instruction, ctx):
     Runs on the output of _normalize_instruction_list, which is
     single-line by construction, so no linebreak check is needed here.
     """
-    encoded_len = len(instruction.encode("utf-8"))
-    if encoded_len > ROLE_INSTRUCTION_MAX_BYTES:
-        _usage_exit(
-            f"--roles-file {ctx}: instruction exceeds "
-            f"{ROLE_INSTRUCTION_MAX_BYTES} bytes."
-        )
     lowered = instruction.lower()
     if REQUIRED_SCOPE_PHRASE not in lowered:
         _usage_exit(
@@ -1261,9 +1246,9 @@ def _parse_roles_json(raw):
 def _resolve_roles(custom_roles):
     """Validate and return the list of caller-supplied Role objects.
 
-    Errors if empty or > MAX_PARALLEL. Deduplicates by id preserving
-    first occurrence — defense in depth; `_parse_roles_json` already
-    rejects duplicate ids within a single JSON payload.
+    Errors if empty. Deduplicates by id preserving first occurrence —
+    defense in depth; `_parse_roles_json` already rejects duplicate ids
+    within a single JSON payload. Panel size is unrestricted.
     """
     if not custom_roles:
         _usage_exit(
@@ -1279,32 +1264,22 @@ def _resolve_roles(custom_roles):
         ordered.append(role)
         seen.add(role.id)
 
-    if len(ordered) > MAX_PARALLEL:
-        _usage_exit(
-            f"Too many roles: {len(ordered)} > MAX_PARALLEL={MAX_PARALLEL}."
-        )
     return ordered
 
 
 def _read_body_or_problem(stream):
-    """Read a prompt body from a binary stream, enforcing the byte cap.
+    """Read an unrestricted prompt body from a binary stream.
 
-    Counts BYTES, not characters: input is read raw and the cap is checked
-    against the byte length, because the prompt is later UTF-8 encoded for
-    codex and a multibyte-heavy body would otherwise slip past a
-    character-count check (the cap claims bytes). Input is never
-    truncated. Decodes strictly as UTF-8 — a prompt should be text, so
-    invalid bytes are a clear error rather than silently replaced.
+    The plugin imposes no byte ceiling and never truncates. Decoding remains
+    strict UTF-8 because a prompt is text; invalid bytes are a clear error
+    rather than being silently replaced.
 
     Returns (body, None) on success or (None, (kind, detail)) where kind
-    is "oversize", "not-utf8", or "empty". Exit codes are the CALLER's
-    decision: stdin defects are runtime input errors (exit 1), while a
-    staged context.md defect is a usage/staging error (exit 2) like every
-    other staging defect.
+    is "not-utf8" or "empty". Exit codes are the CALLER's decision: stdin
+    defects are runtime input errors (exit 1), while a staged context.md
+    defect is a usage/staging error (exit 2) like every other staging defect.
     """
-    raw = stream.read(MAX_STDIN_BYTES + 1)
-    if len(raw) > MAX_STDIN_BYTES:
-        return None, ("oversize", None)
+    raw = stream.read()
     try:
         body = raw.decode("utf-8")
     except UnicodeDecodeError as e:
@@ -1320,13 +1295,7 @@ def _read_stdin_body(stream):
     if problem is None:
         return body
     kind, detail = problem
-    if kind == "oversize":
-        print(
-            f"Input exceeds {MAX_STDIN_BYTES} bytes "
-            f"({MAX_STDIN_BYTES >> 20} MiB) — trim before piping.",
-            file=sys.stderr,
-        )
-    elif kind == "not-utf8":
+    if kind == "not-utf8":
         print(f"Input is not valid UTF-8 ({detail}) — pipe text.", file=sys.stderr)
     else:
         print("Empty input — pipe a complete prompt instead.", file=sys.stderr)
@@ -1336,10 +1305,10 @@ def _read_stdin_body(stream):
 def _read_context_file(path):
     """Read a staged context file; content defects are usage errors (exit 2).
 
-    Empty, non-UTF-8, and over-cap staged context files exit 2 like every
-    other staging defect, so 'exit 2 = fix the staged inputs and re-run
-    preflight' holds uniformly; exit 1 stays for runtime failures (stdin
-    defects, every role failing).
+    Empty and non-UTF-8 staged context files exit 2 like every other staging
+    defect, so 'exit 2 = fix the staged inputs and re-run preflight' holds
+    uniformly; exit 1 stays for runtime failures (stdin defects, every role
+    failing). There is no plugin-imposed context size ceiling.
     """
     problem = _file_arg_problem("--context-file", path)
     if problem:
@@ -1352,13 +1321,6 @@ def _read_context_file(path):
     if body_problem is None:
         return body
     kind, detail = body_problem
-    if kind == "oversize":
-        _usage_exit(
-            f"--context-file: Context file {path!r} exceeds "
-            f"{MAX_STDIN_BYTES} bytes ({MAX_STDIN_BYTES >> 20} MiB). "
-            "Recovery: rewrite context.md as a smaller digest; do not "
-            "truncate blindly. Then re-run --check-staging-dir."
-        )
     if kind == "not-utf8":
         _usage_exit(
             f"--context-file: Context file {path!r} is not valid UTF-8 "
