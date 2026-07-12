@@ -412,6 +412,42 @@ class HappyPathTests(CouncilCLITestCase):
         )
 
 
+class LocaleRobustnessTests(CouncilCLITestCase):
+    def test_report_writes_under_strict_c_locale(self):
+        """Under LC_ALL=C with UTF-8 mode and C-locale coercion both disabled,
+        stdout defaults to ASCII, so the em dash in the report header ("# Codex
+        Council — N/M") would raise UnicodeEncodeError and lose BOTH the report
+        and the CODEX_COUNCIL_DONE sentinel. _force_utf8_streams prevents that.
+        The role reply itself is ASCII, so this isolates the header em dash."""
+        roles_path = self._write_roles([
+            _role("architect", "Architect", _instruction("Review architecture")),
+        ])
+        env = dict(self.env)
+        env["LC_ALL"] = "C"
+        env["LANG"] = "C"
+        env["PYTHONUTF8"] = "0"
+        env["PYTHONCOERCECLOCALE"] = "0"
+        env.pop("PYTHONIOENCODING", None)
+        # Decode the child's output as UTF-8 on the parent side regardless of
+        # the parent's own locale, so the test asserts the child's behavior.
+        proc = subprocess.run(
+            [sys.executable, SCRIPT, "--roles-file", roles_path],
+            input="please review this change\n",
+            capture_output=True,
+            encoding="utf-8",
+            env=env,
+            cwd=self.workdir.name,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("# Codex Council", proc.stdout)
+        self.assertIn("—", proc.stdout)  # the em dash survived the write
+        self.assertRegex(
+            self._last_nonempty_stderr_line(proc.stderr),
+            r"\[codex-council\] CODEX_COUNCIL_DONE ok=1 total=1 "
+            r"elapsed=[\d.]+s exit=0$",
+        )
+
+
 class StdinGuardTests(CouncilCLITestCase):
     def test_large_stdin_reaches_codex_without_a_plugin_cap(self):
         roles_path = self._write_roles([
