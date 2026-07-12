@@ -4,13 +4,13 @@
     "name": "ehzawad"
   },
   "metadata": {
-    "description": "Adaptive general-purpose Codex council — Claude orchestrates role-framed agents to collaborate and reconcile toward any shared goal."
+    "description": "Adaptive, context-driven Codex council for project implementation, computer science, software/ML engineering, DevSecOps, research, and other complex work — Claude orchestrates role-framed agents to collaborate and reconcile toward one shared goal."
   },
   "plugins": [
     {
       "name": "codex-council",
       "source": "./plugins/codex-council",
-      "description": "Adaptive general-purpose Codex council — Claude orchestrates role-framed agents to collaborate and reconcile toward any shared goal."
+      "description": "Adaptive, context-driven Codex council for project implementation, computer science, software/ML engineering, DevSecOps, research, and other complex work — Claude orchestrates role-framed agents to collaborate and reconcile toward one shared goal."
     }
   ]
 }

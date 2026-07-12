@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Coordinate an adaptive, general-purpose council of Codex agents.
+"""Coordinate an adaptive, context-driven council of Codex agents.
 
 Each role runs in its own `codex exec` subprocess with a distinct
 framing instruction. Sessions are isolated per (project, host session,
@@ -10,13 +10,12 @@ thread of project knowledge.
 Results are aggregated into one structured markdown report on stdout
 for Claude to reconcile.
 
-This script is a pure orchestrator — there is no built-in role
-catalog and no default council. Callers (Claude as orchestrator)
-ultrathink about the user's task, compose the role panel JSON
-on-the-fly per invocation, announce it briefly, then invoke this
-script without waiting for manual launch approval. Roles arrive via
-`--roles-file` (a path to a JSON file holding the panel), which keeps
-a large role array out of the shell entirely.
+This script is a pure runner — there is no built-in role catalog and no
+default council. Claude reconstructs the user's live problem, project state,
+implementation or research trajectory, active failures and uncertainties,
+then composes the contextual role panel on-the-fly. Roles arrive via
+`--roles-file` (a path to a JSON file holding the panel), which keeps a large
+role array out of the shell entirely.
 
 The orchestrator imposes no size or count ceiling on role panels, role
 fields, context, stdin, or composed prompts, and never truncates them.
@@ -155,6 +154,18 @@ PROGRESS_HEARTBEAT_SECS = 30 * 60
 REQUIRED_SCOPE_PHRASE = "nothing material"
 REQUIRED_CADENCE_SENTENCE = "Thoroughness beats speed."
 LINEBREAK_CHARS = ("\r", "\n", "\u2028", "\u2029")
+COLLABORATION_BRIEF = (
+    "You are one contributor in a Claude-orchestrated Codex council. Treat the "
+    "shared working context as the source of truth: reconstruct the user's "
+    "actual problem, project and implementation or research trajectory, "
+    "in-flight artifacts and modules, active bugs, errors, and tests, known "
+    "unknowns and plausible blind spots, unstated or possibly wrong "
+    "assumptions, and whether the work is converging or still exploratory. "
+    "Distinguish evidence from inference, stay within your assigned lens, and "
+    "return concrete work, findings, decisions, dependencies, and open "
+    "questions that Claude can reconcile with the other roles toward the same "
+    "goal."
+)
 STAGING_PATH_HINT = (
     "Staging hint: use the exact directory printed by `mktemp -d` for "
     "both roles.json and context.md in this invocation; keep roles, context, "
@@ -350,25 +361,33 @@ def _state_lock_path(role_id):
     return _state_path(role_id) + ".lock"
 
 
-async def _acquire_role_state_lock(role_id):
-    """Acquire an exclusive cross-process lock for one role's state."""
+def _try_role_state_lock(role_id):
+    """Return a held role-state lock, or None without waiting."""
     os.makedirs(STATE_DIR, exist_ok=True)
     lock_path = _state_lock_path(role_id)
     lock_file = open(lock_path, "a+")
     try:
-        while True:
-            try:
-                fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                return lock_file
-            except BlockingIOError:
-                await asyncio.sleep(0.1)
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return lock_file
+    except BlockingIOError:
+        lock_file.close()
+        return None
     except BaseException:
         lock_file.close()
         raise
 
 
+async def _acquire_role_state_lock(role_id):
+    """Acquire an exclusive cross-process lock for one role's state."""
+    while True:
+        lock_file = _try_role_state_lock(role_id)
+        if lock_file is not None:
+            return lock_file
+        await asyncio.sleep(0.1)
+
+
 def _release_role_state_lock(lock_file):
-    """Release a lock returned by _acquire_role_state_lock."""
+    """Release a lock returned by a blocking or nonblocking lock helper."""
     try:
         fcntl.flock(lock_file, fcntl.LOCK_UN)
     finally:
@@ -647,8 +666,13 @@ def _retriable_class(text):
 # ---------- prompt composition ----------
 
 def _compose_prompt(role, body):
-    """Bookend the body with the role's framing instruction (both ends)."""
-    return f"{role.instruction}\n\n{body}\n\n{role.instruction}"
+    """Frame intact shared context for one role and reinforce its lens."""
+    return (
+        f"{role.instruction}\n\n"
+        f"{COLLABORATION_BRIEF}\n\n"
+        f"## Shared working context\n\n{body}\n\n"
+        f"{role.instruction}"
+    )
 
 
 # ---------- async codex invocation ----------
@@ -869,8 +893,31 @@ async def _run_role_once(role, prompt, attempt):
     )
 
 
+async def _run_role_attempts(role, prompt):
+    """Run one already-locked role with retry on rate-limit/5xx."""
+    last_result = None
+    backoff = INITIAL_BACKOFF_SECS
+
+    for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
+        result = await _run_role_once(role, prompt, attempt)
+        last_result = result
+        if result.ok or not (result.error or "").startswith("[retriable:"):
+            return result
+        if attempt >= MAX_RETRY_ATTEMPTS:
+            return result
+        print(
+            f"[codex-council:{role.id}] retriable error on attempt "
+            f"{attempt}/{MAX_RETRY_ATTEMPTS}; sleeping {backoff}s.",
+            file=sys.stderr,
+        )
+        await asyncio.sleep(backoff)
+        backoff *= 2
+
+    return last_result  # type: ignore[return-value]
+
+
 async def _run_role(role, prompt):
-    """One role with retry on rate-limit/5xx. No wall-clock deadline.
+    """Lock and run one role with no wall-clock deadline.
 
     Each attempt runs to completion; Codex decides when it is done.
     Ctrl+C propagates as asyncio.CancelledError, which tears down the
@@ -878,25 +925,7 @@ async def _run_role(role, prompt):
     """
     lock_file = await _acquire_role_state_lock(role.id)
     try:
-        last_result = None
-        backoff = INITIAL_BACKOFF_SECS
-
-        for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
-            result = await _run_role_once(role, prompt, attempt)
-            last_result = result
-            if result.ok or not (result.error or "").startswith("[retriable:"):
-                return result
-            if attempt >= MAX_RETRY_ATTEMPTS:
-                return result
-            print(
-                f"[codex-council:{role.id}] retriable error on attempt "
-                f"{attempt}/{MAX_RETRY_ATTEMPTS}; sleeping {backoff}s.",
-                file=sys.stderr,
-            )
-            await asyncio.sleep(backoff)
-            backoff *= 2
-
-        return last_result  # type: ignore[return-value]
+        return await _run_role_attempts(role, prompt)
     finally:
         _release_role_state_lock(lock_file)
 
@@ -930,12 +959,26 @@ async def run_council(roles, body, max_parallel=None):
     started = time.monotonic()
 
     async def _run_bounded(role):
-        async with semaphore:
-            active.add(role.id)
-            try:
-                return await _run_role(role, _compose_prompt(role, body))
-            finally:
-                active.discard(role.id)
+        while True:
+            async with semaphore:
+                # A nonblocking probe lets a same-role lock waiter yield this
+                # execution permit immediately. It also avoids holding one
+                # lock file descriptor per queued role in a very large panel.
+                lock_file = _try_role_state_lock(role.id)
+                if lock_file is None:
+                    pass
+                else:
+                    active.add(role.id)
+                    try:
+                        return await _run_role_attempts(
+                            role, _compose_prompt(role, body)
+                        )
+                    finally:
+                        active.discard(role.id)
+                        _release_role_state_lock(lock_file)
+            # Stay off the execution permit while another council owns this
+            # role's continuity lock; unrelated roles get their turn.
+            await asyncio.sleep(0.1)
 
     async def _heartbeat():
         while counter["done"] < total:
@@ -1073,8 +1116,9 @@ def _report_inline(value):
 def _parse_args(argv):
     parser = argparse.ArgumentParser(
         description=(
-            "Coordinate role-framed Codex agents around a shared goal. "
-            "Roles are caller-supplied per invocation via --roles-file; "
+            "Coordinate context-grounded, role-framed Codex collaborators "
+            "around a shared implementation, research, or problem-solving "
+            "goal. Roles are caller-supplied per invocation via --roles-file; "
             "there is no built-in catalog."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1454,8 +1498,9 @@ def _read_context_file(path):
         )
     _usage_exit(
         f"--context-file: Context file {path!r} is empty or "
-        "whitespace-only. Recovery: rewrite context.md with the review "
-        "context or a self-contained question, then re-run "
+        "whitespace-only. Recovery: rewrite context.md with the "
+        "decision-complete working context or a self-contained question, "
+        "then re-run "
         "--check-staging-dir."
     )
 

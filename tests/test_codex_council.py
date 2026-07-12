@@ -762,12 +762,24 @@ class StructuredStatusClassifierTests(unittest.TestCase):
 # ---------- prompt composition ----------
 
 class ComposePromptTests(unittest.TestCase):
-    def test_bookends_with_role_instruction(self):
+    def test_frames_shared_context_and_bookends_with_role_instruction(self):
         role = _make_role("architect", "Architect",
                           _valid_instruction("Review as architect"))
         out = codex_council._compose_prompt(role, "BODY")
         self.assertTrue(out.startswith(role.instruction + "\n\n"))
         self.assertTrue(out.endswith("\n\n" + role.instruction))
+        self.assertIn(codex_council.COLLABORATION_BRIEF, out)
+        self.assertIn("## Shared working context\n\nBODY", out)
+        for concept in (
+            "actual problem",
+            "in-flight artifacts and modules",
+            "active bugs, errors, and tests",
+            "known unknowns",
+            "possibly wrong assumptions",
+            "converging or still exploratory",
+            "reconcile with the other roles toward the same goal",
+        ):
+            self.assertIn(concept, out)
         self.assertIn("BODY", out)
 
     def test_different_roles_produce_different_prompts(self):
@@ -1317,13 +1329,29 @@ class RunTeamAsyncTests(unittest.IsolatedAsyncioTestCase):
     def _roles(self, *ids):
         return [_make_role(i, self._LABELS.get(i, i)) for i in ids]
 
+    def test_contended_nonblocking_lock_probe_closes_its_descriptor(self):
+        class FakeLockFile:
+            closed = False
+
+            def close(self):
+                self.closed = True
+
+        fake_file = FakeLockFile()
+        with patch("builtins.open", return_value=fake_file):
+            with patch.object(
+                codex_council.fcntl, "flock", side_effect=BlockingIOError
+            ):
+                lock = codex_council._try_role_state_lock("architect")
+        self.assertIsNone(lock)
+        self.assertTrue(fake_file.closed)
+
     async def test_parallel_fanout_preserves_order(self):
         async def fake_role(role, prompt):
             return codex_council.RoleResult(
                 role=role, ok=True, text=f"reply-{role.id}",
                 elapsed_seconds=0.1, attempts=1, thread_id=f"sid-{role.id}",
             )
-        with patch.object(codex_council, "_run_role", side_effect=fake_role):
+        with patch.object(codex_council, "_run_role_attempts", side_effect=fake_role):
             results = await codex_council.run_council(
                 self._roles("tester", "architect"), "body",
             )
@@ -1336,7 +1364,7 @@ class RunTeamAsyncTests(unittest.IsolatedAsyncioTestCase):
             if role.id == "security":
                 raise RuntimeError("simulated crash")
             return codex_council.RoleResult(role=role, ok=True, text="ok", elapsed_seconds=0.1)
-        with patch.object(codex_council, "_run_role", side_effect=fake_role):
+        with patch.object(codex_council, "_run_role_attempts", side_effect=fake_role):
             results = await codex_council.run_council(
                 self._roles("architect", "security", "tester"), "body",
             )
@@ -1359,7 +1387,7 @@ class RunTeamAsyncTests(unittest.IsolatedAsyncioTestCase):
                 role=role, ok=True, text=f"reply-{role.id}",
                 elapsed_seconds=0.1, attempts=1,
             )
-        with patch.object(codex_council, "_run_role", side_effect=fake_role):
+        with patch.object(codex_council, "_run_role_attempts", side_effect=fake_role):
             results = await codex_council.run_council([custom], "body")
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].role.id, "ml-fairness")
@@ -1380,7 +1408,7 @@ class RunTeamAsyncTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 active["count"] -= 1
 
-        with patch.object(codex_council, "_run_role", side_effect=fake_role):
+        with patch.object(codex_council, "_run_role_attempts", side_effect=fake_role):
             results = await codex_council.run_council(
                 roles, "body", max_parallel=3,
             )
@@ -1406,7 +1434,7 @@ class RunTeamAsyncTests(unittest.IsolatedAsyncioTestCase):
                 cancelled.append(role.id)
                 raise
 
-        with patch.object(codex_council, "_run_role", side_effect=fake_role):
+        with patch.object(codex_council, "_run_role_attempts", side_effect=fake_role):
             task = asyncio.create_task(
                 codex_council.run_council(roles, "body", max_parallel=1)
             )
@@ -1416,6 +1444,41 @@ class RunTeamAsyncTests(unittest.IsolatedAsyncioTestCase):
                 await task
 
         self.assertEqual(cancelled, ["role-0"])
+
+    async def test_role_waiting_on_state_lock_does_not_starve_free_role(self):
+        """A continuity-lock waiter must not consume the only exec permit."""
+        blocked, free = self._roles("architect", "security")
+        held_lock = await codex_council._acquire_role_state_lock(blocked.id)
+        free_started = asyncio.Event()
+
+        async def fake_role(role, prompt):
+            if role.id == free.id:
+                free_started.set()
+            return codex_council.RoleResult(
+                role=role, ok=True, text=f"reply-{role.id}",
+                elapsed_seconds=0.01, attempts=1,
+            )
+
+        try:
+            with patch.object(
+                codex_council, "_run_role_attempts", side_effect=fake_role
+            ):
+                council = asyncio.create_task(
+                    codex_council.run_council(
+                        [blocked, free], "body", max_parallel=1
+                    )
+                )
+                await asyncio.wait_for(free_started.wait(), timeout=1)
+                self.assertFalse(council.done())
+                codex_council._release_role_state_lock(held_lock)
+                held_lock = None
+                results = await asyncio.wait_for(council, timeout=1)
+        finally:
+            if held_lock is not None:
+                codex_council._release_role_state_lock(held_lock)
+
+        self.assertEqual([r.role.id for r in results], [blocked.id, free.id])
+        self.assertTrue(all(r.ok for r in results))
 
     async def test_same_role_runs_are_serialized_by_state_lock(self):
         role = _make_role("architect", "Architect")
@@ -1518,7 +1581,7 @@ class RunCouncilProgressTests(unittest.IsolatedAsyncioTestCase):
                 elapsed_seconds=0.1, attempts=1,
             )
         buf = io.StringIO()
-        with patch.object(codex_council, "_run_role", side_effect=fake_role):
+        with patch.object(codex_council, "_run_role_attempts", side_effect=fake_role):
             with contextlib.redirect_stderr(buf):
                 results = await codex_council.run_council(
                     self._roles("architect", "security", "tester"), "body",
@@ -1563,7 +1626,7 @@ class RunCouncilProgressTests(unittest.IsolatedAsyncioTestCase):
             release.set()
 
         buf = io.StringIO()
-        with patch.object(codex_council, "_run_role", side_effect=fake_role):
+        with patch.object(codex_council, "_run_role_attempts", side_effect=fake_role):
             with patch.object(codex_council, "PROGRESS_HEARTBEAT_SECS", 0.01):
                 with contextlib.redirect_stderr(buf):
                     releaser = asyncio.create_task(release_after_heartbeats())
@@ -1941,7 +2004,7 @@ class ProjectRootCacheTests(unittest.TestCase):
 
     def test_only_one_git_call_across_many_lookups(self):
         calls = {"count": 0}
-        def fake_run(*args, **kwargs):
+        def fake_run(*args, **_kwargs):
             calls["count"] += 1
             from subprocess import CompletedProcess
             return CompletedProcess(args=args[0], returncode=0, stdout="/x\n", stderr="")
@@ -2329,10 +2392,28 @@ class PromptCompositionTests(unittest.TestCase):
         role = codex_council.Role("architect", "Architect", "i")
         body = "b" * 12_000_000
         prompt = codex_council._compose_prompt(role, body)
-        self.assertEqual(prompt, f"i\n\n{body}\n\ni")
+        self.assertEqual(
+            prompt,
+            (
+                f"i\n\n{codex_council.COLLABORATION_BRIEF}\n\n"
+                f"## Shared working context\n\n{body}\n\ni"
+            ),
+        )
+        self.assertEqual(prompt.count(body), 1)
 
 
 class ArgParseTests(unittest.TestCase):
+    def test_help_describes_contextual_programmatic_collaboration(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            with self.assertRaises(SystemExit) as ctx:
+                codex_council._parse_args(["--help"])
+        self.assertEqual(ctx.exception.code, 0)
+        help_text = out.getvalue()
+        self.assertIn("context-grounded, role-framed Codex collaborators", help_text)
+        self.assertIn("implementation, research, or problem-solving", help_text)
+        self.assertIn("there is no built-in catalog", help_text)
+
     def test_roles_file_parses_to_namespace(self):
         args = codex_council._parse_args(["--roles-file", "x.json"])
         self.assertEqual(args.roles_file, "x.json")
@@ -2431,17 +2512,31 @@ class DocsContractTests(unittest.TestCase):
     def _repo_file(self, *parts):
         return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", *parts))
 
+    def _read_repo_file(self, *parts):
+        with open(self._repo_file(*parts), encoding="utf-8") as f:
+            return f.read()
+
+    @staticmethod
+    def _flat(text):
+        return " ".join(text.split())
+
     def test_skill_context_pipelines_are_fail_closed_and_filename_safe(self):
-        path = self._repo_file(
+        skill = self._read_repo_file(
             "plugins", "codex-council", "skills", "codex-council", "SKILL.md"
         )
-        with open(path, encoding="utf-8") as f:
-            text = f.read()
-        self.assertIn("set -euo pipefail", text)
-        self.assertIn("git ls-files -z", text)
-        self.assertIn("read -r -d ''", text)
-        self.assertIn("file --brief --mime --", text)
-        self.assertIn("git diff --cached", text)
+        reference = self._read_repo_file(
+            "plugins", "codex-council", "skills", "codex-council",
+            "references", "context-staging.md",
+        )
+        self.assertIn("references/context-staging.md", skill)
+        for required in (
+            "set -euo pipefail",
+            "git ls-files -z",
+            "read -r -d ''",
+            "file --brief --mime --",
+            "git diff --cached",
+        ):
+            self.assertIn(required, reference)
 
     def test_runtime_and_skill_have_no_stale_size_or_panel_caps(self):
         script_path = self._repo_file(
@@ -2492,10 +2587,135 @@ class DocsContractTests(unittest.TestCase):
             self.assertIn(required, text)
         self.assertNotIn("every role is launched in parallel", text)
 
+    def test_skill_frontmatter_uses_contextual_programmatic_routing(self):
+        text = self._read_repo_file(
+            "plugins", "codex-council", "skills", "codex-council", "SKILL.md"
+        )
+        frontmatter = text.split("---", 2)[1]
+        flat = self._flat(frontmatter)
+        for required in (
+            "codex council",
+            "codex coterie",
+            "codex team",
+            "/codex-council:codex-council",
+            "project implementation",
+            "computer science",
+            "software/ML engineering",
+            "DevSecOps",
+            "autonomously ask and answer contextual working questions",
+        ):
+            self.assertIn(required, flat)
+        for stale in (
+            "Auto-use ONLY",
+            "Otherwise stop",
+            "only if all three",
+            "Only proceed past this gate",
+        ):
+            self.assertNotIn(stale, text)
+
+    def test_disambiguation_prefers_codex_before_claude_ultracode(self):
+        text = self._read_repo_file(
+            "plugins", "codex-council", "skills", "codex-council", "SKILL.md"
+        )
+        section = text.split(
+            "## Disambiguation when the requested agent workflow is unclear", 1
+        )[1].split("## Step 1", 1)[0]
+        flat = self._flat(section)
+        self.assertIn(
+            "Question: \"Did you mean Claude's built-in Agent subagents, "
+            "or the Codex council/coterie/team?\"",
+            flat,
+        )
+        self.assertIn('Header: "Which?"', flat)
+        codex = 'Option 1: "codex-council (Recommended)"'
+        claude = 'Option 2: "Claude dynamic workflow (ultracode)"'
+        self.assertIn(codex, flat)
+        self.assertIn(claude, flat)
+        self.assertLess(flat.index(codex), flat.index(claude))
+        self.assertIn("OpenAI Codex role-framed collaborators", flat)
+        self.assertIn("Claude Code's built-in Agent subagents", flat)
+        self.assertIn("never an automatic stop", flat)
+        self.assertIn("Do not ask merely because an exact trigger name is absent", flat)
+        self.assertNotIn("Claude Agent subagents (Recommended)", section)
+
+    def test_step1_synthesizes_roles_from_the_full_live_situation(self):
+        text = self._read_repo_file(
+            "plugins", "codex-council", "skills", "codex-council", "SKILL.md"
+        )
+        section = text.split("## Step 1", 1)[1].split("## Step 2", 1)[0]
+        flat = self._flat(section)
+        for required in (
+            "Privately ask and answer",
+            "larger problem",
+            "project are they implementing",
+            "files, modules, features, objects, drafts, datasets, queries",
+            "bugs, errors, symptoms, regressions",
+            "hypotheses and evidence",
+            "known unknowns",
+            "unknown unknowns or blind spots",
+            "unstated, contradictory, outdated, or possibly wrong",
+            "converging on a defined goal",
+            "zigzagging through exploratory unknowns",
+            "Ask the user only when a missing choice would materially change",
+        ):
+            self.assertIn(required, flat)
+
+    def test_context_working_set_passes_the_full_situational_map(self):
+        text = self._read_repo_file(
+            "plugins", "codex-council", "skills", "codex-council", "SKILL.md"
+        )
+        section = text.split("## Building the context", 1)[1].split(
+            "## Runtime continuity", 1
+        )[0]
+        flat = self._flat(section)
+        for required in (
+            "Problem, project, trajectory, and immediate objective",
+            "exploratory/zigzagging through unknowns",
+            "files, modules, features, objects, drafts",
+            "bugs, errors, symptoms, regressions",
+            "attempted fixes, working theories",
+            "Recent working context at high fidelity",
+            "Current primary evidence",
+            "Older durable context as a faithful summary",
+            "known unknowns, plausible blind spots",
+            "unstated or possibly wrong assumptions",
+            "Live problem-solving and implementation map",
+        ):
+            self.assertIn(required, flat)
+
+    def test_programmatic_domain_lean_is_synced_without_a_role_catalog(self):
+        paths = (
+            ("plugins", "codex-council", "skills", "codex-council", "SKILL.md"),
+            ("README.md",),
+            ("DESIGN.md",),
+        )
+        for parts in paths:
+            flat = self._flat(self._read_repo_file(*parts)).lower()
+            for required in (
+                "general-purpose",
+                "project implementation",
+                "computer science",
+                "software",
+                "ml/ai engineering",
+                "devsecops",
+                "technical research",
+            ):
+                self.assertIn(required, flat, f"missing {required!r} in {parts}")
+        combined = "\n".join(self._read_repo_file(*parts) for parts in paths)
+        self.assertIn("no built-in role catalog", combined.lower())
+
+    def test_skill_core_stays_within_progressive_disclosure_budget(self):
+        text = self._read_repo_file(
+            "plugins", "codex-council", "skills", "codex-council", "SKILL.md"
+        )
+        self.assertLessEqual(len(text.splitlines()), 500)
+
     def test_plugin_copy_is_synced_on_adaptive_general_purpose_collaboration(self):
         canonical = (
-            "Adaptive general-purpose Codex council — Claude orchestrates "
-            "role-framed agents to collaborate and reconcile toward any shared goal."
+            "Adaptive, context-driven Codex council for project implementation, "
+            "computer science, software/ML engineering, DevSecOps, research, and "
+            "other complex work — Claude orchestrates role-framed agents to "
+            "collaborate and reconcile toward one shared goal."
         )
         marketplace_path = self._repo_file(".claude-plugin", "marketplace.json")
         manifest_path = self._repo_file(
@@ -2537,13 +2757,13 @@ class DocsContractTests(unittest.TestCase):
             for trigger in ("codex council", "codex coterie", "codex team"):
                 self.assertIn(trigger, text)
 
-    def test_release_manifest_is_0_7_0(self):
+    def test_manifest_version_is_semver(self):
         path = self._repo_file(
             "plugins", "codex-council", ".claude-plugin", "plugin.json"
         )
         with open(path, encoding="utf-8") as f:
             manifest = json.load(f)
-        self.assertEqual(manifest["version"], "0.7.0")
+        self.assertRegex(manifest["version"], r"^\d+\.\d+\.\d+$")
 
     def test_readme_dev_hook_keeps_diagnostics(self):
         path = self._repo_file("README.md")
@@ -2573,7 +2793,8 @@ class DocsContractTests(unittest.TestCase):
 
     def test_skill_md_documents_vscode_pid_caveat(self):
         path = self._repo_file(
-            "plugins", "codex-council", "skills", "codex-council", "SKILL.md")
+            "plugins", "codex-council", "skills", "codex-council",
+            "references", "runtime-behavior.md")
         with open(path, encoding="utf-8") as f:
             text = f.read()
         self.assertIn("same VS Code window", text)
@@ -2581,7 +2802,8 @@ class DocsContractTests(unittest.TestCase):
 
     def test_skill_md_documents_usage_limit_nonretriable(self):
         path = self._repo_file(
-            "plugins", "codex-council", "skills", "codex-council", "SKILL.md")
+            "plugins", "codex-council", "skills", "codex-council",
+            "references", "runtime-behavior.md")
         with open(path, encoding="utf-8") as f:
             text = f.read()
         self.assertIn("Usage/quota-limit", text)

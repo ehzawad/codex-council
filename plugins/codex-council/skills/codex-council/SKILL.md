@@ -1,22 +1,19 @@
 ---
 name: codex-council
 description: >-
-  Adaptive general-purpose Codex council: Claude orchestrates role-framed
-  `codex exec` agents to collaborate and reconcile toward any shared goal.
-  Claude (the orchestrator) composes the role panel on-the-fly per
-  invocation from the user's actual work; there is no built-in role
-  catalog and no domain list. Auto-use ONLY when the user's text clearly
-  invokes "codex council," "codex coterie," or "codex team" (including
-  close variants such as "ask the codex coterie," "codex council review,"
-  and "reconcile with the codex team"). Otherwise stop — broader
-  phrases like "codex agent team," "codex panel," "fan out to codex
-  agents," "agent team," "agents in parallel," "subagents," "council
-  review," "panel review," "multi-angle review" route to Claude
-  Code's built-in `Agent` tool. Direct invocation
-  `/codex-council:codex-council`. On invocation, ultrathink about
-  what the user is actually doing, compose a tailored panel
-  ground-up, announce it briefly, then launch without a manual approval
-  gate.
+  Adaptive, context-driven Codex council for project implementation, computer
+  science, software/ML engineering, DevSecOps, research, and other complex
+  work: Claude orchestrates role-framed `codex exec` agents to collaborate and
+  reconcile toward one shared goal. Use for direct invocation
+  `/codex-council:codex-council` or when the user invokes "codex council,"
+  "codex coterie," or "codex team." For nearby agent-team language, infer the
+  intended workflow from the live conversation and project state; ask a brief
+  disambiguation only when OpenAI Codex and Claude Code's built-in Agent
+  workflow remain genuinely plausible. On invocation, reconstruct what the
+  user is actually doing, autonomously ask and answer contextual working
+  questions, compose task-specific roles with no built-in catalog, share the
+  decision-complete context, announce the panel, and launch without a manual
+  approval gate.
 ---
 
 # Codex Council
@@ -36,6 +33,11 @@ Codex is strongest on technical and structured reasoning. Whether a
 council adds value over a single pass should be judged from the
 current task, not from a label on it.
 
+The skill is general-purpose with a deliberate programmatic center of gravity:
+project implementation, computer science, software and ML/AI engineering,
+DevSecOps, platform/security/automation, debugging and testing, and technical
+research—without turning those fields into a fixed role menu.
+
 **You (Claude) are the orchestrator.** The panel-proposal step is
 load-bearing: **ultrathink** there. Read the user's actual work,
 figure out what outcome and contributions they need, design role ids / labels /
@@ -44,37 +46,62 @@ no checklist of domains, no template panel to reach for. Treat your
 composed task-specific panel as granted by default: announce it
 briefly, then trigger `codex exec` without asking for launch approval.
 
-## Disambiguation gate — only if all three Codex trigger names are missing
+## Disambiguation when the requested agent workflow is unclear
 
-If the trigger phrase that fired this skill does **not** contain
-"codex council," "codex coterie," or "codex team" (or a close variant),
-**stop**. The user may have meant Claude Code's built-in `Agent` tool
-(subagents spawned with `subagent_type` like `general-purpose`,
-`Plan`, `Explore`, `claude-code-guide`, `code-reviewer`) — a
-different mechanism (Claude's model with direct tool access, not
-OpenAI Codex via `codex exec`).
+Treat the direct slash invocation or a clear use of "codex council," "codex
+coterie," or "codex team" as Codex Council intent and go to Step 1. Missing
+those exact names is only an ambiguity signal, never an automatic stop. Read the
+surrounding conversation, current project, prior turns, and requested outcome.
+If the user is clearly continuing council work or asking for OpenAI Codex, use
+this skill. If they clearly want Claude Code's built-in `Agent` subagents, use
+that dynamic workflow instead.
 
-Ask one short disambiguation via `AskUserQuestion` before doing
-anything:
+When both mechanisms remain genuinely plausible, ask one short disambiguation
+via `AskUserQuestion` (or concise plain text if that tool is unavailable):
 
-- Question: "Did you mean Claude's built-in `Agent` subagents, or the
-  Codex council/coterie/team?"
+- Question: "Did you mean Claude's built-in Agent subagents, or the Codex
+  council/coterie/team?"
 - Header: "Which?"
-- Option 1: "Claude Agent subagents (Recommended)"
-- Option 2: "codex-council (OpenAI Codex)"
+- Option 1: "codex-council (Recommended)"
+  - Description: "Use OpenAI Codex role-framed collaborators with shared task
+    context and Claude reconciliation toward one result."
+- Option 2: "Claude dynamic workflow (ultracode)"
+  - Description: "Use Claude Code's built-in Agent subagents with direct tool
+    access and Claude-native orchestration."
 
-Only proceed past this gate if the user explicitly picks codex-council.
-
-If the trigger phrase **does** clearly invoke "codex council," "codex
-coterie," or "codex team," skip this gate and go to Step 1.
+Follow the selected workflow. Do not ask merely because an exact trigger name
+is absent when the user's surrounding intent already resolves the choice.
 
 ## Step 1 — Read the actual work
 
 **Ultrathink here.** This is the step where adaptivity lives or dies.
 
-Look at what the user is actually doing in the conversation: what
-they've been editing, what they've been asking, what files / objects
-/ drafts / queries are in flight. Then ask one question:
+Look at what the user is actually doing in the conversation and workspace.
+Privately ask and answer the following contextual questions from available
+evidence; this is self-questioning, not a questionnaire for the user:
+
+- What larger problem are they solving, what project are they implementing,
+  and what concrete outcome or decision do they need now?
+- What have they been editing or asking about, and which files, modules,
+  features, objects, drafts, datasets, queries, experiments, or deployments are
+  currently being implemented, tested, researched, or operated?
+- Which bugs, errors, symptoms, regressions, security risks, performance
+  failures, or ambiguous behaviors are they hunting, and what hypotheses and
+  evidence already exist?
+- What are the known unknowns, plausible unknown unknowns or blind spots,
+  missing evidence, and dependencies that could overturn the current path?
+- Which constraints or assumptions are unstated, contradictory, outdated, or
+  possibly wrong? What does the user appear to believe that the artifacts do
+  not yet prove?
+- Is the work converging on a defined goal, recursing toward a blocked
+  dependency, or zigzagging through exploratory unknowns? What next move would
+  create the most information or progress?
+- What recent decisions, rejected approaches, user preferences, and research
+  findings still constrain the implementation?
+
+Ask the user only when a missing choice would materially change the panel or
+authorized outcome. Otherwise infer cautiously, mark uncertainty, and proceed.
+Then ask one final synthesis question:
 
 > *What distinct contributions would move this shared goal forward and catch
 > its work-specific failure modes?*
@@ -92,12 +119,13 @@ Cheap probes if you need them (otherwise skip):
 - Read the relevant file / draft / dataset / query / artifact the
   user is working with if it isn't already in your context
 
-Compose, don't pattern-match. For the material in front of you,
-name the independent contributions the goal needs: implementation or diagnosis,
-substantive correctness, audience fit, prior-art comparison, operational
-reliability, adversarial challenge, etc. Each is a candidate lens. The lens
-names are local to this invocation; they should not look like they came from a
-menu, and you should not reuse them across unrelated work.
+Compose, don't pattern-match. For the material in front of you, name the
+independent contributions the goal needs: implementation, testing, diagnosis,
+research synthesis, substantive correctness, operational reliability,
+adversarial challenge, integration, or another work-specific contribution.
+Each is a candidate lens. The lens names are local to this invocation; they
+should not look like they came from a menu, and you should not reuse them across
+unrelated work.
 
 If the user named a panel in the invocation arguments (e.g.
 `/codex-council:codex-council 3 agents: <lens-a>, <lens-b>, <lens-c>`),
@@ -153,6 +181,20 @@ Roles in the same panel must be **sharply distinct** so a role asked
 to review something outside its lens returns "nothing material"
 instead of overlapping with its siblings. Overlap = wasted Codex
 calls.
+
+Frame every role as a collaborator contributing concrete work toward the same
+goal, not as an isolated opinion generator. Its instruction should consume the
+shared context, form and answer lens-specific working questions, distinguish
+evidence from inference, and return findings, proposed or completed work,
+dependencies, risks, and open questions in a form Claude can reconcile with
+the other roles.
+
+For implementation tasks in one shared workspace, prevent write races: assign
+one explicit executor/integrator to mutate files by default while parallel
+roles inspect, test, research, or propose. If multiple roles must write, give
+them isolated worktrees or serialize the phases. Retries can repeat side
+effects, so do not let independently retried roles perform overlapping or
+irreversible mutations.
 
 ## Step 3 — Announce the panel and proceed
 
@@ -324,12 +366,8 @@ into it, and re-run the pre-flight on that new path.
 
 ## Building the context
 
-The snippets below show only how to compose `ABS_RUNDIR/context.md`; the actual
-launch must always use Step 4's `--context-file` form — `run_in_background:
-true`, stdout+stderr redirected to files, nothing appended.
-
-The context contents are whatever the roles need to see. Context comes
-from one of two sources:
+The context contents are whatever the roles need to understand and advance the
+same live goal. Context comes from one or both sources:
 
 - **Shell-extracted from disk** — raw artifacts the user is looking
   at right now. The shell composition and its safety guards matter.
@@ -344,21 +382,30 @@ the composed prompt, and it never truncates them; relevance selection belongs
 to Claude as the host orchestrator. For a long-running session, assemble
 context in this order:
 
-1. **Immediate objective and present state:** the user's current request,
-   current branch/worktree/runtime state, unresolved questions, and what the
-   council must decide or produce now.
-2. **Recent working context at high fidelity:** recent user constraints,
-   actions, errors, outputs, and artifacts that directly led to the current
-   state. Preserve exact wording or raw material when its details matter.
-3. **Current primary evidence:** the relevant files, diffs, diagnostics, data,
-   or commands from disk, verified live rather than recalled from conversation.
-4. **Older durable context as a faithful summary:** decisions, rejected
+1. **Problem, project, trajectory, and immediate objective:** state what the
+   user is solving or implementing, the result needed now, the current
+   branch/worktree/runtime state, and whether the work is goal-directed,
+   recursively blocked, or exploratory/zigzagging through unknowns.
+2. **In-flight work:** identify files, modules, features, objects, drafts,
+   datasets, queries, experiments, deployments, tests, and research currently
+   being changed, implemented, validated, or operated.
+3. **Active problems and hypotheses:** preserve bugs, errors, symptoms,
+   regressions, security/performance failures, failing commands, attempted
+   fixes, working theories, and the evidence for or against them.
+4. **Recent working context at high fidelity:** include recent user constraints,
+   decisions, actions, outputs, and artifacts that directly led to the current
+   state. Preserve exact wording or raw material when details matter.
+5. **Current primary evidence:** include relevant files, diffs, diagnostics,
+   data, research sources, or commands verified live rather than recalled.
+6. **Older durable context as a faithful summary:** carry decisions, rejected
    approaches and why, invariants, user preferences, earlier evidence, and
    dependencies that still constrain today's work. An old fact is included
    whenever removing it could change the recommendation; age alone is never a
    reason to discard it.
-5. **Explicit uncertainty and provenance:** distinguish verified current state,
-   host summaries of older turns, assumptions, and missing evidence.
+7. **Unknowns, assumptions, and provenance:** distinguish verified current
+   state from host summaries and inference; name known unknowns, plausible
+   blind spots, missing evidence, unstated or possibly wrong assumptions, and
+   what observation would resolve each material uncertainty.
 
 Exclude superseded state, conversational repetition, stale intermediate
 outputs, and unrelated history. If Claude Code compacted the host conversation,
@@ -370,98 +417,10 @@ impose unavoidable downstream or physical limits; if one is reached, preserve
 the staged source material and surface the actual downstream error rather than
 silently dropping context.
 
-In the examples below, `ABS_RUNDIR` is the exact private per-run dir printed by
-`mktemp` in Step 4. Every pipeline block starts with
-`set -euo pipefail`. Put that line in the same Bash invocation as the pipeline;
-shell options do not persist across Claude Code Bash calls. This makes context
-extraction fail closed: if an upstream extractor (`git diff`, `git ls-files`,
-`tail`, etc.) fails, stale or partial context is not written. Do not add
-`|| true` to context pipelines.
-
-Staging context: `git diff HEAD` means tracked worktree vs `HEAD`, so it
-includes both staged and unstaged tracked changes. Use `git diff --cached` for
-staged-only reviews and `git diff` for unstaged-only reviews. Untracked files
-are never included by those diff commands; add them explicitly with the
-NUL-delimited snippet below when they matter.
-
-### Shell-extracted
-
-**Uncommitted diff:**
-
-```bash
-set -euo pipefail
-git diff HEAD > 'ABS_RUNDIR/context.md'
-```
-
-**Staged-only diff:**
-
-```bash
-set -euo pipefail
-git diff --cached > 'ABS_RUNDIR/context.md'
-```
-
-**Diff plus untracked files that matter** (with binary and symlink guards):
-
-```bash
-set -euo pipefail
-{
-  git diff HEAD
-  git ls-files -z --others --exclude-standard -- |
-    while IFS= read -r -d '' f; do
-      [ -f "$f" ] && [ ! -L "$f" ] || continue
-      mime=$(file --brief --mime -- "$f")
-      case "$mime" in
-        *charset=binary*)
-          printf '\n=== non-text untracked artifact: %q (%s); inspect from disk if relevant ===\n' "$f" "$mime"
-          continue
-          ;;
-        *charset=utf-8*|*charset=us-ascii*) ;;
-        *)
-          printf '\n=== non-UTF-8 untracked artifact: %q (%s); inspect from disk if relevant ===\n' "$f" "$mime"
-          continue
-          ;;
-      esac
-      printf '\n=== untracked file: %q ===\n' "$f"
-      cat <"$f"
-    done
-} > 'ABS_RUNDIR/context.md'
-```
-
-**An artifact plus a question** — write the complete relevant file plus the
-question the council should answer:
-
-```bash
-set -euo pipefail
-{
-  printf 'Question: %s\n\n' '<what you want the council to check>'
-  cat <"$file"      # or: pbpaste, etc.
-} > 'ABS_RUNDIR/context.md'
-```
-
-**Complete diagnostic transcript** — for a test / CI failure or any
-command output the council should diagnose:
-
-```bash
-set -euo pipefail
-{
-  printf 'Question: %s\n\n' '<what should the council diagnose?>'
-  printf 'Command: %s\n' '<the failing command>'
-  printf 'Exit status: %s\n\n' "$exit_status"
-  echo 'Output:'
-  cat <"$log_file"
-} > 'ABS_RUNDIR/context.md'
-```
-
-If the diagnosis needs source context too, append the complete relevant source
-using the same `[ -f ] && [ ! -L ] && file --mime` guards as the diff+untracked
-snippet above.
-
-`context.md` itself is UTF-8 text because it is sent to `codex exec` on stdin.
-For a material binary, image, archive, or non-UTF-8 artifact, do not pretend it
-does not exist and do not transcode it blindly: include its project path, type,
-and why it matters in the working set. Council roles run with full filesystem
-access and can inspect the original artifact using the tools supported by the
-active Codex installation.
+When extracting diffs, files, untracked artifacts, or diagnostics from disk,
+read [context-staging.md](references/context-staging.md) and use its fail-closed,
+filename-safe recipes. The actual launch still uses Step 4's `--context-file`
+background flow.
 
 ### Claude-composed
 
@@ -471,12 +430,18 @@ material details and remove only redundancy or information unrelated to the
 decision. Write it with the Write tool directly to `ABS_RUNDIR/context.md`,
 using the exact path printed by `mktemp`.
 
-Two common context scopes:
+Three common context scopes:
 
 - **Project context** — what the codebase IS. Purpose, architecture,
   load-bearing modules, conventions, current direction, known
   constraints. For when the council should evaluate the project as
   a whole without a specific change in flight.
+- **Live problem-solving and implementation map** — what the user is trying to
+  accomplish now; in-flight modules/artifacts/tests/research; observed bugs,
+  errors, and hypotheses; what has been tried; known unknowns and blind spots;
+  possibly wrong assumptions; blockers, ownership, and the next decision or
+  executable step. For building, debugging, operating, or researching a
+  project through uncertain terrain.
 - **Session retrospective** — what we DID this session. Goal, files
   touched, decisions made, open questions, current branch state.
   For meta-questions about accumulated work.
@@ -488,45 +453,16 @@ Mark uncertainty explicitly. When state matters, verify live (e.g.
 nothing and there's no context to add, write a self-contained question to
 `ABS_RUNDIR/context.md` instead.
 
-## Session continuity
+## Runtime continuity and retries
 
-One Codex thread per (project, host session, role) tuple, stored at
-`$XDG_STATE_HOME/codex-council/{project-hash}-{session-hash}__{role-key}.json`
-when a stable host-session id is available. The runner auto-detects common
-session identifiers such as Claude session ids, `CODEX_THREAD_ID`,
-`TERM_SESSION_ID`, `TMUX_PANE`, `STY`, and `VSCODE_PID`, so separate terminal
-tabs/panes in the same repo do not normally share role threads (except multiple
-integrated terminals in the **same VS Code window**, which share `VSCODE_PID`;
-set `CODEX_COUNCIL_SESSION_KEY` to isolate those). Follow-up calls
-from the same host session resume the per-role thread so each role accumulates
-its framing. Stale resumes restart only the affected role — siblings are
-unaffected. Role IDs reused across calls continue their own thread; new IDs
-start fresh. For compatibility, formerly accepted short IDs remain literal
-state filename components; longer IDs use a deterministic SHA-256 role key so
-role length can never hit the filesystem's filename-component limit.
-
-`CODEX_COUNCIL_SESSION_KEY` remains an explicit override for custom scoping
-(e.g. per branch or task ID). Set `CODEX_COUNCIL_DISABLE_AUTO_SESSION_KEY=1`
-only if you intentionally want the older project-wide state file shape:
-`{project-hash}__{role-key}.json`.
-
-## Retries
-
-- Rate-limit (429) and 5xx errors retry once with exponential backoff.
-  Retriability is decided primarily from the numeric HTTP status in the
-  JSONL error body (429 → rate-limit, 500–599 → 5xx), with substring
-  markers as a fallback; a non-retriable status (e.g. 400) suppresses the
-  fallback so a stray "429" inside a 400 error body is not mistaken for a
-  rate limit. **Usage/quota-limit** errors are *not* retried — a plan cap
-  does not clear within a 5s backoff, so it is surfaced terminal.
-- Auth errors never clear state and never retry — fix the auth then
-  re-run.
-- No wall-clock timeout is enforced — each role runs as long as Codex
-  takes (hours or days is fine). `codex exec` has no run-level timeout
-  either; its per-provider stream-idle guard only covers a stalled
-  connection and is retried. The runner emits 30-minute status heartbeats;
-  Claude reports them through its background-task/session-cron mechanism.
-  Ctrl+C still tears down every in-flight codex process group.
+Each `(project, host session, role)` has a persisted Codex thread. Reuse a role
+ID only for a semantically continuous lens and task; otherwise mint a new ID,
+and always let current staged evidence override remembered assumptions. The
+runner retries transient 429/5xx failures once, never retries auth or quota
+failures, applies no wall-clock timeout, and keeps continuity-lock waiters out
+of active concurrency. Read
+[runtime-behavior.md](references/runtime-behavior.md) when scoping sessions or
+diagnosing continuity, retries, long runs, or heartbeat state.
 
 ## After Codex Council responds
 
@@ -537,17 +473,10 @@ The output is markdown:
 
 ## Summary
 - **<Label>** [<id>]: ok — 12.3s
-- **<Label>** [<id>]: ok — 18.7s
 - **<Label>** [<id>]: FAILED — 0.4s
 
 ## <Label> (<id>)
-<full reply>
-
-## <Label> (<id>)
-<full reply>
-
-## <Label> (<id>)
-_Failed: <error tag and message>_
+<full reply or _Failed: error tag and message_>
 ```
 
 Reconcile every contribution toward the user's shared goal: combine compatible
@@ -559,5 +488,9 @@ bracket-tagged class (`[auth]`, `[retriable:rate-limit]`,
 `[retriable:5xx]`, `[orchestrator-exception]`, `[orchestrator-bug]`)
 so the failure mode is machine-readable.
 
-Multi-turn is available when a reply warrants follow-up; default is
-single-turn.
+The parallel roles do not directly message one another during a single fan-out.
+Their collaboration happens through the shared context, complementary role
+contracts, and Claude's reconciliation. When cross-pollination would improve
+the result, stage the first-round findings, decisions, and open questions into
+fresh context and re-invoke only the relevant roles; reuse IDs only for
+semantically continuous follow-up. Default to one round when it is sufficient.
