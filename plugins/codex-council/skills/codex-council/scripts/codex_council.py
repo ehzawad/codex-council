@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fan out a prompt to a council of Codex sub-agents in parallel.
+"""Coordinate an adaptive, general-purpose council of Codex agents.
 
 Each role runs in its own `codex exec` subprocess with a distinct
 framing instruction. Sessions are isolated per (project, host session,
@@ -18,6 +18,10 @@ script without waiting for manual launch approval. Roles arrive via
 `--roles-file` (a path to a JSON file holding the panel), which keeps
 a large role array out of the shell entirely.
 
+The orchestrator imposes no size or count ceiling on role panels, role
+fields, context, stdin, or composed prompts, and never truncates them.
+Downstream model/provider limits and physical memory remain external.
+
 Usage:
     python3 codex_council.py --roles-file roles.json --context-file context.md
 
@@ -25,6 +29,8 @@ Env vars:
     CODEX_COUNCIL_SESSION_KEY     explicit council thread scope override
     CODEX_COUNCIL_DISABLE_AUTO_SESSION_KEY=1
                                    fall back to project-wide role state
+    CODEX_COUNCIL_MAX_PARALLEL    positive active-role concurrency override;
+                                   otherwise use Codex agents.max_threads or 6
 
 No wall-clock timeouts are enforced — each role runs as long as Codex
 takes. Ctrl+C still tears down every in-flight codex process group.
@@ -50,6 +56,11 @@ import time
 from dataclasses import dataclass
 from functools import cache
 from typing import Optional
+
+try:
+    import tomllib
+except ImportError:  # Python < 3.11: keep the Codex default fallback.
+    tomllib = None
 
 STATE_DIR = os.path.join(
     os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
@@ -135,15 +146,12 @@ AUTO_SESSION_ENV_VARS = (
     "VSCODE_PID",
 )
 
-MAX_PARALLEL = 6  # matches codex's own DEFAULT_AGENT_MAX_THREADS
 MAX_RETRY_ATTEMPTS = 2
 INITIAL_BACKOFF_SECS = 5
 TERMINATION_GRACE_SECS = 0.2
-MAX_STDIN_BYTES = 10 << 20  # 10 MiB (a sanity guard, not a model-context
-# limit — Codex's own context window is the real ceiling; compress anyway).
-MAX_PROMPT_BYTES = MAX_STDIN_BYTES
-ROLE_LABEL_MAX_BYTES = 80
-ROLE_INSTRUCTION_MAX_BYTES = 8192
+DEFAULT_MAX_PARALLEL = 6
+MAX_PARALLEL_ENV = "CODEX_COUNCIL_MAX_PARALLEL"
+PROGRESS_HEARTBEAT_SECS = 30 * 60
 REQUIRED_SCOPE_PHRASE = "nothing material"
 REQUIRED_CADENCE_SENTENCE = "Thoroughness beats speed."
 LINEBREAK_CHARS = ("\r", "\n", "\u2028", "\u2029")
@@ -195,7 +203,20 @@ class RoleResult:
 
 
 ROLE_ID_PATTERN = re.compile(r"^[a-z0-9_-]+$")
-ROLE_ID_MAX_LEN = 32
+
+
+def _state_role_component(role_id):
+    """Return a filename-safe, bounded component for an unrestricted role ID.
+
+    Releases before unrestricted IDs stored the literal ID in the state
+    filename and accepted at most 32 characters. Preserve those existing
+    paths, but hash every newly-accepted longer ID so the plugin never runs
+    into the platform's per-component filename limit.
+    """
+    if len(role_id) <= 32:
+        return role_id
+    digest = hashlib.sha256(role_id.encode("utf-8")).hexdigest()
+    return f"role-sha256-{digest}"
 
 
 # ---------- project / session state (sync) ----------
@@ -240,18 +261,87 @@ def _session_key():
     return _auto_session_key()
 
 
+def _configured_codex_max_threads():
+    """Read the user-level Codex agents.max_threads preference if available.
+
+    Codex currently defaults this setting to 6. The council launches separate
+    `codex exec` processes rather than Codex's in-process subagents, so this is
+    a conservative local concurrency signal, not a provider-capacity promise.
+    Invalid, absent, or unreadable config falls back cleanly.
+    """
+    codex_home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+    path = os.path.join(codex_home, "config.toml")
+    if tomllib is None:
+        # Python 3.10 and older have no stdlib TOML parser. Read only the one
+        # integer setting we need; keep the fallback deliberately strict so a
+        # complex or malformed value cannot accidentally raise concurrency.
+        try:
+            with open(path, encoding="utf-8") as f:
+                lines = f.readlines()
+        except (OSError, UnicodeDecodeError):
+            return None
+        in_agents = False
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("["):
+                in_agents = bool(
+                    re.fullmatch(r"\[\s*agents\s*\](?:\s*#.*)?", line)
+                )
+                continue
+            match = re.fullmatch(
+                r"(?:agents\.)?max_threads\s*=\s*([1-9][0-9_]*)"
+                r"(?:\s*#.*)?",
+                line,
+            )
+            if match and (in_agents or line.startswith("agents.")):
+                return int(match.group(1).replace("_", ""))
+        return None
+    try:
+        with open(path, "rb") as f:
+            config = tomllib.load(f)
+    except (OSError, ValueError):
+        return None
+    agents = config.get("agents")
+    if not isinstance(agents, dict):
+        return None
+    value = agents.get("max_threads")
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return None
+
+
+def _max_parallel_roles():
+    """Return the positive active-role limit for this council invocation."""
+    override = os.environ.get(MAX_PARALLEL_ENV, "").strip()
+    if override:
+        try:
+            value = int(override)
+        except ValueError:
+            value = 0
+        if value <= 0:
+            _usage_exit(
+                f"{MAX_PARALLEL_ENV} must be a positive integer; got "
+                f"{override!r}."
+            )
+        return value
+    return _configured_codex_max_threads() or DEFAULT_MAX_PARALLEL
+
+
 def _project_key(role_id):
     """Stable state key for (project, role, optional session-key)."""
     base = hashlib.sha256(_project_root().encode()).hexdigest()[:16]
+    role_component = _state_role_component(role_id)
     session_key = _session_key()
     if session_key:
         suffix = hashlib.sha256(session_key.encode()).hexdigest()[:16]
-        return f"{base}-{suffix}__{role_id}"
-    return f"{base}__{role_id}"
+        return f"{base}-{suffix}__{role_component}"
+    return f"{base}__{role_component}"
 
 
 def _state_path(role_id):
-    """Per-(project, role) state file path."""
+    """Per-(project, role) state path; long IDs use a fixed-size hash key."""
     return os.path.join(STATE_DIR, f"{_project_key(role_id)}.json")
 
 
@@ -561,17 +651,6 @@ def _compose_prompt(role, body):
     return f"{role.instruction}\n\n{body}\n\n{role.instruction}"
 
 
-def _validate_prompt_size(role, body):
-    prompt_bytes = len(_compose_prompt(role, body).encode("utf-8"))
-    if prompt_bytes > MAX_PROMPT_BYTES:
-        print(
-            f"Composed prompt for role {role.id!r} is {prompt_bytes} bytes; "
-            f"limit is {MAX_PROMPT_BYTES}. Trim stdin or role instructions.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-
 # ---------- async codex invocation ----------
 
 def _resume_cmd(root, session_id):
@@ -822,11 +901,12 @@ async def _run_role(role, prompt):
         _release_role_state_lock(lock_file)
 
 
-async def run_council(roles, body):
+async def run_council(roles, body, max_parallel=None):
     """Fan out N roles in parallel and wait for all to finish.
 
-    `roles` is a list of Role objects supplied by the caller via
-    --roles-file. There is no built-in role registry.
+    `roles` is an unrestricted-size list of Role objects supplied by the
+    caller via --roles-file. There is no built-in role registry. At most
+    `max_parallel` roles are active at once; additional roles remain queued.
 
     `return_exceptions=True` ensures one role's crash does not cancel
     its siblings — every role gets its turn and its result in the report.
@@ -837,6 +917,41 @@ async def run_council(roles, body):
     """
     total = len(roles)
     counter = {"done": 0}
+    active = set()
+    if max_parallel is None:
+        max_parallel = _max_parallel_roles()
+    if (
+        not isinstance(max_parallel, int)
+        or isinstance(max_parallel, bool)
+        or max_parallel <= 0
+    ):
+        raise ValueError("max_parallel must be a positive integer")
+    semaphore = asyncio.Semaphore(max_parallel)
+    started = time.monotonic()
+
+    async def _run_bounded(role):
+        async with semaphore:
+            active.add(role.id)
+            try:
+                return await _run_role(role, _compose_prompt(role, body))
+            finally:
+                active.discard(role.id)
+
+    async def _heartbeat():
+        while counter["done"] < total:
+            await asyncio.sleep(PROGRESS_HEARTBEAT_SECS)
+            if counter["done"] >= total:
+                return
+            active_ids = ", ".join(sorted(active)) or "none"
+            queued = max(0, total - counter["done"] - len(active))
+            elapsed = time.monotonic() - started
+            print(
+                f"[codex-council] still running after {elapsed:.0f}s: "
+                f"completed={counter['done']}/{total}; active={len(active)} "
+                f"({active_ids}); queued={queued}.",
+                file=sys.stderr,
+                flush=True,
+            )
 
     def _on_role_done(role, task):
         # Fires on the single event loop thread as each role settles, in
@@ -869,11 +984,10 @@ async def run_council(roles, body):
 
     tasks = []
     for role in roles:
-        _validate_prompt_size(role, body)
-        t = asyncio.create_task(_run_role(role, _compose_prompt(role, body)))
+        t = asyncio.create_task(_run_bounded(role))
         t.add_done_callback(lambda task, role=role: _on_role_done(role, task))
         tasks.append(t)
-    started = time.monotonic()
+    heartbeat_task = asyncio.create_task(_heartbeat())
     try:
         results = await asyncio.gather(*tasks, return_exceptions=True)
     except asyncio.CancelledError:
@@ -881,6 +995,12 @@ async def run_council(roles, body):
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         raise
+    finally:
+        heartbeat_task.cancel()
+        # Progress reporting must never turn an otherwise successful council
+        # into a failure (for example if stderr was closed by the host).
+        with contextlib.suppress(asyncio.CancelledError, OSError):
+            await heartbeat_task
     elapsed = time.monotonic() - started
 
     out = []
@@ -953,7 +1073,7 @@ def _report_inline(value):
 def _parse_args(argv):
     parser = argparse.ArgumentParser(
         description=(
-            "Fan out a prompt to a council of Codex agents in parallel. "
+            "Coordinate role-framed Codex agents around a shared goal. "
             "Roles are caller-supplied per invocation via --roles-file; "
             "there is no built-in catalog."
         ),
@@ -1018,6 +1138,11 @@ def _file_arg_problem(arg_name, path):
         return (
             f"{arg_name}: cannot read {path!r}; parent directory does not "
             f"exist: {parent!r} ({details})"
+        )
+    if os.path.islink(path):
+        return (
+            f"{arg_name}: cannot read {path!r}; symbolic links are not "
+            f"accepted for staged inputs ({details})"
         )
     if os.path.isdir(path):
         return f"{arg_name}: cannot read {path!r}; path is a directory ({details})"
@@ -1090,10 +1215,10 @@ def _usage_exit_if_staging_dirs_differ(roles_file, context_file):
 def _read_roles_file(path):
     """Read the raw roles JSON from a file.
 
-    Passing the panel as a path lets the caller write the JSON with a real
-    editor/tool instead of escaping a large blob through the shell, where a
-    stray quote or unbalanced brace would break the call. Read and decode
-    errors exit 2 like other usage errors; JSON validity is left to
+    Passing the unrestricted-size panel as a path lets the caller write the
+    JSON with a real editor/tool instead of escaping a large blob through the
+    shell, where a stray quote or unbalanced brace would break the call.
+    Read and decode errors exit 2 like other usage errors; JSON validity is left to
     _parse_roles_json.
     """
     problem = _file_arg_problem("--roles-file", path)
@@ -1109,13 +1234,9 @@ def _read_roles_file(path):
 
 
 def _validate_role_id(rid, ctx):
-    """Reject malformed/oversize role IDs with a SystemExit citing context."""
+    """Reject malformed role IDs with a SystemExit citing context."""
     if not isinstance(rid, str) or not rid:
         _usage_exit(f"--roles-file {ctx}: 'id' must be a non-empty string.")
-    if len(rid) > ROLE_ID_MAX_LEN:
-        _usage_exit(
-            f"--roles-file {ctx}: id {rid!r} exceeds {ROLE_ID_MAX_LEN} chars."
-        )
     if not ROLE_ID_PATTERN.match(rid):
         _usage_exit(
             f"--roles-file {ctx}: id {rid!r} must match {ROLE_ID_PATTERN.pattern}."
@@ -1123,14 +1244,9 @@ def _validate_role_id(rid, ctx):
 
 
 def _validate_role_label(label, ctx):
-    """Reject labels that can break report structure or become unreadable."""
+    """Reject labels that can break report structure."""
     if any(ch in label for ch in LINEBREAK_CHARS):
         _usage_exit(f"--roles-file {ctx}: label must not contain newlines.")
-    encoded_len = len(label.encode("utf-8"))
-    if encoded_len > ROLE_LABEL_MAX_BYTES:
-        _usage_exit(
-            f"--roles-file {ctx}: label exceeds {ROLE_LABEL_MAX_BYTES} UTF-8 bytes."
-        )
 
 
 ROLE_FIELDS = ("id", "label", "instruction")
@@ -1173,12 +1289,6 @@ def _validate_role_instruction(instruction, ctx):
     Runs on the output of _normalize_instruction_list, which is
     single-line by construction, so no linebreak check is needed here.
     """
-    encoded_len = len(instruction.encode("utf-8"))
-    if encoded_len > ROLE_INSTRUCTION_MAX_BYTES:
-        _usage_exit(
-            f"--roles-file {ctx}: instruction exceeds "
-            f"{ROLE_INSTRUCTION_MAX_BYTES} bytes."
-        )
     lowered = instruction.lower()
     if REQUIRED_SCOPE_PHRASE not in lowered:
         _usage_exit(
@@ -1261,9 +1371,9 @@ def _parse_roles_json(raw):
 def _resolve_roles(custom_roles):
     """Validate and return the list of caller-supplied Role objects.
 
-    Errors if empty or > MAX_PARALLEL. Deduplicates by id preserving
-    first occurrence — defense in depth; `_parse_roles_json` already
-    rejects duplicate ids within a single JSON payload.
+    Errors if empty. Deduplicates by id preserving first occurrence —
+    defense in depth; `_parse_roles_json` already rejects duplicate ids
+    within a single JSON payload. Panel size is unrestricted.
     """
     if not custom_roles:
         _usage_exit(
@@ -1279,32 +1389,22 @@ def _resolve_roles(custom_roles):
         ordered.append(role)
         seen.add(role.id)
 
-    if len(ordered) > MAX_PARALLEL:
-        _usage_exit(
-            f"Too many roles: {len(ordered)} > MAX_PARALLEL={MAX_PARALLEL}."
-        )
     return ordered
 
 
 def _read_body_or_problem(stream):
-    """Read a prompt body from a binary stream, enforcing the byte cap.
+    """Read an unrestricted prompt body from a binary stream.
 
-    Counts BYTES, not characters: input is read raw and the cap is checked
-    against the byte length, because the prompt is later UTF-8 encoded for
-    codex and a multibyte-heavy body would otherwise slip past a
-    character-count check (the cap claims bytes). Input is never
-    truncated. Decodes strictly as UTF-8 — a prompt should be text, so
-    invalid bytes are a clear error rather than silently replaced.
+    The plugin imposes no byte ceiling and never truncates. Decoding remains
+    strict UTF-8 because a prompt is text; invalid bytes are a clear error
+    rather than being silently replaced.
 
     Returns (body, None) on success or (None, (kind, detail)) where kind
-    is "oversize", "not-utf8", or "empty". Exit codes are the CALLER's
-    decision: stdin defects are runtime input errors (exit 1), while a
-    staged context.md defect is a usage/staging error (exit 2) like every
-    other staging defect.
+    is "not-utf8" or "empty". Exit codes are the CALLER's decision: stdin
+    defects are runtime input errors (exit 1), while a staged context.md
+    defect is a usage/staging error (exit 2) like every other staging defect.
     """
-    raw = stream.read(MAX_STDIN_BYTES + 1)
-    if len(raw) > MAX_STDIN_BYTES:
-        return None, ("oversize", None)
+    raw = stream.read()
     try:
         body = raw.decode("utf-8")
     except UnicodeDecodeError as e:
@@ -1320,13 +1420,7 @@ def _read_stdin_body(stream):
     if problem is None:
         return body
     kind, detail = problem
-    if kind == "oversize":
-        print(
-            f"Input exceeds {MAX_STDIN_BYTES} bytes "
-            f"({MAX_STDIN_BYTES >> 20} MiB) — trim before piping.",
-            file=sys.stderr,
-        )
-    elif kind == "not-utf8":
+    if kind == "not-utf8":
         print(f"Input is not valid UTF-8 ({detail}) — pipe text.", file=sys.stderr)
     else:
         print("Empty input — pipe a complete prompt instead.", file=sys.stderr)
@@ -1336,10 +1430,10 @@ def _read_stdin_body(stream):
 def _read_context_file(path):
     """Read a staged context file; content defects are usage errors (exit 2).
 
-    Empty, non-UTF-8, and over-cap staged context files exit 2 like every
-    other staging defect, so 'exit 2 = fix the staged inputs and re-run
-    preflight' holds uniformly; exit 1 stays for runtime failures (stdin
-    defects, every role failing).
+    Empty and non-UTF-8 staged context files exit 2 like every other staging
+    defect, so 'exit 2 = fix the staged inputs and re-run preflight' holds
+    uniformly; exit 1 stays for runtime failures (stdin defects, every role
+    failing). There is no plugin-imposed context size ceiling.
     """
     problem = _file_arg_problem("--context-file", path)
     if problem:
@@ -1352,13 +1446,6 @@ def _read_context_file(path):
     if body_problem is None:
         return body
     kind, detail = body_problem
-    if kind == "oversize":
-        _usage_exit(
-            f"--context-file: Context file {path!r} exceeds "
-            f"{MAX_STDIN_BYTES} bytes ({MAX_STDIN_BYTES >> 20} MiB). "
-            "Recovery: rewrite context.md as a smaller digest; do not "
-            "truncate blindly. Then re-run --check-staging-dir."
-        )
     if kind == "not-utf8":
         _usage_exit(
             f"--context-file: Context file {path!r} is not valid UTF-8 "
@@ -1446,16 +1533,19 @@ def _check_staging_dir(path):
     # that says "staging OK" while codex is missing defers the failure to
     # a background launch whose error lands only in err.log.
     _usage_exit_if_codex_missing("--check-staging-dir: ")
+    max_parallel = _max_parallel_roles()
     print(
         f"[codex-council] staging OK: {os.path.abspath(path)} "
-        f"({len(roles)} roles)"
+        f"({len(roles)} roles; max parallel {max_parallel})"
     )
 
 
-async def _run_council_with_signals(roles, body):
+async def _run_council_with_signals(roles, body, max_parallel):
     """Run the council and translate POSIX termination signals into cleanup."""
     loop = asyncio.get_running_loop()
-    council_task = asyncio.create_task(run_council(roles, body))
+    council_task = asyncio.create_task(
+        run_council(roles, body, max_parallel=max_parallel)
+    )
     interrupted = {"signum": None}
     registered = []
 
@@ -1515,16 +1605,20 @@ def main():
         body = _read_stdin_body(sys.stdin.buffer)
 
     _usage_exit_if_codex_missing("")
+    max_parallel = _max_parallel_roles()
 
     print(
         f"[codex-council] dispatching {len(roles)} roles "
+        f"with max parallel {max_parallel} "
         f"({', '.join(r.id for r in roles)}).",
         file=sys.stderr,
     )
 
     started = time.monotonic()
     try:
-        results, signum = asyncio.run(_run_council_with_signals(roles, body))
+        results, signum = asyncio.run(
+            _run_council_with_signals(roles, body, max_parallel)
+        )
     except KeyboardInterrupt:
         print("\n[codex-council] interrupted by user", file=sys.stderr)
         sys.exit(130)

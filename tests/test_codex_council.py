@@ -41,6 +41,7 @@ def _env_without_session_key():
     excluded = {
         codex_council.SESSION_KEY_ENV,
         codex_council.DISABLE_AUTO_SESSION_KEY_ENV,
+        codex_council.MAX_PARALLEL_ENV,
         *codex_council.AUTO_SESSION_ENV_VARS,
     }
     return {k: v for k, v in os.environ.items() if k not in excluded}
@@ -109,23 +110,13 @@ class ResolveRolesTests(unittest.TestCase):
         self.assertEqual([r.id for r in roles], ["alpha"])
         self.assertEqual(roles[0].label, "A1")  # first wins
 
-    def test_resolve_at_cap_is_allowed(self):
+    def test_resolve_large_panel_without_a_role_count_cap(self):
         roles_in = [
             _make_role(f"r{i}", f"R{i}", _valid_instruction("x"))
-            for i in range(codex_council.MAX_PARALLEL)
+            for i in range(100)
         ]
         roles = codex_council._resolve_roles(roles_in)
-        self.assertEqual(len(roles), codex_council.MAX_PARALLEL)
-
-    def test_resolve_over_cap_raises(self):
-        roles_in = [
-            _make_role(f"r{i}", f"R{i}", _valid_instruction("x"))
-            for i in range(codex_council.MAX_PARALLEL + 1)
-        ]
-        _assert_usage_exit(
-            self, lambda: codex_council._resolve_roles(roles_in),
-            expect_in_stderr="MAX_PARALLEL",
-        )
+        self.assertEqual(len(roles), 100)
 
 
 # ---------- env vars / session key ----------
@@ -174,6 +165,73 @@ class SessionKeyTests(unittest.TestCase):
             self.assertEqual(codex_council._session_key(), "")
 
 
+class MaxParallelTests(unittest.TestCase):
+    def setUp(self):
+        self.codex_home = tempfile.TemporaryDirectory()
+        self.addCleanup(self.codex_home.cleanup)
+        env = _env_without_session_key()
+        env["CODEX_HOME"] = self.codex_home.name
+        self.env_patcher = patch.dict(os.environ, env, clear=True)
+        self.env_patcher.start()
+        self.addCleanup(self.env_patcher.stop)
+
+    def _write_config(self, text):
+        with open(
+            os.path.join(self.codex_home.name, "config.toml"),
+            "w",
+            encoding="utf-8",
+        ) as f:
+            f.write(text)
+
+    def test_default_matches_current_codex_default(self):
+        self.assertEqual(codex_council._max_parallel_roles(), 6)
+
+    def test_reads_codex_agents_max_threads(self):
+        self._write_config("[agents]\nmax_threads = 9\n")
+        self.assertEqual(codex_council._max_parallel_roles(), 9)
+
+    def test_pre311_fallback_reads_only_strict_positive_integer(self):
+        self._write_config("[agents]\nmax_threads = 1_2 # intentional\n")
+        with patch.object(codex_council, "tomllib", None):
+            self.assertEqual(codex_council._max_parallel_roles(), 12)
+
+    def test_pre311_fallback_does_not_read_nested_agents_table(self):
+        self._write_config("[agents.worker]\nmax_threads = 99\n")
+        with patch.object(codex_council, "tomllib", None):
+            self.assertEqual(
+                codex_council._max_parallel_roles(),
+                codex_council.DEFAULT_MAX_PARALLEL,
+            )
+
+    def test_council_override_wins_over_codex_config(self):
+        self._write_config("[agents]\nmax_threads = 9\n")
+        os.environ[codex_council.MAX_PARALLEL_ENV] = "4"
+        self.assertEqual(codex_council._max_parallel_roles(), 4)
+
+    def test_invalid_config_falls_back_without_blocking_launch(self):
+        self._write_config("this is not valid TOML = [")
+        self.assertEqual(
+            codex_council._max_parallel_roles(),
+            codex_council.DEFAULT_MAX_PARALLEL,
+        )
+
+    def test_nonpositive_override_is_a_usage_error(self):
+        os.environ[codex_council.MAX_PARALLEL_ENV] = "0"
+        _assert_usage_exit(
+            self,
+            codex_council._max_parallel_roles,
+            expect_in_stderr="must be a positive integer",
+        )
+
+    def test_nonnumeric_override_is_a_usage_error(self):
+        os.environ[codex_council.MAX_PARALLEL_ENV] = "many"
+        _assert_usage_exit(
+            self,
+            codex_council._max_parallel_roles,
+            expect_in_stderr="must be a positive integer",
+        )
+
+
 # ---------- project / state path ----------
 
 class ProjectKeyTests(unittest.TestCase):
@@ -194,6 +252,22 @@ class ProjectKeyTests(unittest.TestCase):
             a = codex_council._project_key("architect")
             s = codex_council._project_key("security")
         self.assertNotEqual(a, s)
+
+    def test_long_role_id_is_hashed_in_state_key(self):
+        rid = "parent-mapper-augmentation-auditor"
+        with patch.dict(os.environ, _env_without_session_key(), clear=True):
+            key = codex_council._project_key(rid)
+        digest = hashlib.sha256(rid.encode("utf-8")).hexdigest()
+        self.assertEqual(key, f"{FIXED_PROJECT_HASH}__role-sha256-{digest}")
+        self.assertNotIn(rid, key)
+
+    def test_very_long_role_ids_get_distinct_bounded_state_keys(self):
+        with patch.dict(os.environ, _env_without_session_key(), clear=True):
+            a = codex_council._project_key("a" * 100_000)
+            b = codex_council._project_key("a" * 99_999 + "b")
+        self.assertNotEqual(a, b)
+        self.assertLess(len(a), 255)
+        self.assertLess(len(b), 255)
 
     def test_with_session_key_appends_suffix_before_role(self):
         with patch.dict(os.environ, {codex_council.SESSION_KEY_ENV: "task-1"}, clear=False):
@@ -1291,6 +1365,58 @@ class RunTeamAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results[0].role.id, "ml-fairness")
         self.assertTrue(results[0].ok)
 
+    async def test_large_panel_never_exceeds_active_role_limit(self):
+        roles = [_make_role(f"role-{i}", f"Role {i}") for i in range(12)]
+        active = {"count": 0, "max": 0}
+
+        async def fake_role(role, prompt):
+            active["count"] += 1
+            active["max"] = max(active["max"], active["count"])
+            try:
+                await asyncio.sleep(0.01)
+                return codex_council.RoleResult(
+                    role=role, ok=True, text="ok", elapsed_seconds=0.01,
+                )
+            finally:
+                active["count"] -= 1
+
+        with patch.object(codex_council, "_run_role", side_effect=fake_role):
+            results = await codex_council.run_council(
+                roles, "body", max_parallel=3,
+            )
+        self.assertEqual(len(results), 12)
+        self.assertEqual(active["max"], 3)
+
+    async def test_invalid_active_role_limit_fails_instead_of_deadlocking(self):
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            await codex_council.run_council(
+                [self._roles("architect")[0]], "body", max_parallel=0,
+            )
+
+    async def test_cancellation_stops_active_and_queued_roles(self):
+        roles = [_make_role(f"role-{i}", f"Role {i}") for i in range(3)]
+        started = asyncio.Event()
+        cancelled = []
+
+        async def fake_role(role, prompt):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.append(role.id)
+                raise
+
+        with patch.object(codex_council, "_run_role", side_effect=fake_role):
+            task = asyncio.create_task(
+                codex_council.run_council(roles, "body", max_parallel=1)
+            )
+            await started.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        self.assertEqual(cancelled, ["role-0"])
+
     async def test_same_role_runs_are_serialized_by_state_lock(self):
         role = _make_role("architect", "Architect")
         first_started = asyncio.Event()
@@ -1423,6 +1549,40 @@ class RunCouncilProgressTests(unittest.IsolatedAsyncioTestCase):
         # The final sentinel is main()'s job, never run_council's.
         self.assertNotIn("CODEX_COUNCIL_DONE", err)
 
+    async def test_long_run_emits_periodic_status_heartbeat(self):
+        release = asyncio.Event()
+
+        async def fake_role(role, prompt):
+            await release.wait()
+            return codex_council.RoleResult(
+                role=role, ok=True, text="ok", elapsed_seconds=0.1,
+            )
+
+        async def release_after_heartbeats():
+            await asyncio.sleep(0.035)
+            release.set()
+
+        buf = io.StringIO()
+        with patch.object(codex_council, "_run_role", side_effect=fake_role):
+            with patch.object(codex_council, "PROGRESS_HEARTBEAT_SECS", 0.01):
+                with contextlib.redirect_stderr(buf):
+                    releaser = asyncio.create_task(release_after_heartbeats())
+                    await codex_council.run_council(
+                        self._roles("architect", "security"),
+                        "body",
+                        max_parallel=1,
+                    )
+                    await releaser
+
+        heartbeats = [
+            line for line in buf.getvalue().splitlines()
+            if "still running after" in line
+        ]
+        self.assertGreaterEqual(len(heartbeats), 2)
+        self.assertIn("completed=0/2", heartbeats[0])
+        self.assertIn("active=1 (architect)", heartbeats[0])
+        self.assertIn("queued=1", heartbeats[0])
+
 
 # ---------- roles JSON parsing (--roles-file contents) ----------
 
@@ -1445,10 +1605,10 @@ class ParseRolesJsonTests(unittest.TestCase):
         roles = codex_council._parse_roles_json(raw)
         self.assertEqual([r.id for r in roles], ["alpha", "beta", "gamma"])
 
-    def test_longer_id_allowed_up_to_32(self):
-        raw = json.dumps([_role_json("a" * 32, "L")])
+    def test_long_role_id_is_unrestricted(self):
+        raw = json.dumps([_role_json("a" * 100_000, "L")])
         roles = codex_council._parse_roles_json(raw)
-        self.assertEqual(roles[0].id, "a" * 32)
+        self.assertEqual(roles[0].id, "a" * 100_000)
 
     def test_invalid_json_raises(self):
         _assert_usage_exit(
@@ -1532,33 +1692,17 @@ class ParseRolesJsonTests(unittest.TestCase):
         self.assertIn("one two", roles[0].instruction)
         self.assertNotIn(" ", roles[0].instruction)
 
-    def test_label_at_byte_cap_allowed(self):
-        raw = json.dumps([_role_json("x", "a" * codex_council.ROLE_LABEL_MAX_BYTES)])
+    def test_large_label_is_accepted(self):
+        raw = json.dumps([_role_json("x", "a" * 100_000)])
         roles = codex_council._parse_roles_json(raw)
-        self.assertEqual(roles[0].label, "a" * codex_council.ROLE_LABEL_MAX_BYTES)
+        self.assertEqual(roles[0].label, "a" * 100_000)
 
-    def test_label_over_byte_cap_raises(self):
-        raw = json.dumps([_role_json("x", "a" * (codex_council.ROLE_LABEL_MAX_BYTES + 1))])
-        _assert_usage_exit(
-            self, lambda: codex_council._parse_roles_json(raw),
-            expect_in_stderr="label exceeds",
-        )
-
-    def test_instruction_over_byte_cap_raises(self):
-        oversized = "a" * (codex_council.ROLE_INSTRUCTION_MAX_BYTES + 1)
-        raw = json.dumps([_role_json("x", "L", oversized)])
-        _assert_usage_exit(
-            self, lambda: codex_council._parse_roles_json(raw),
-            expect_in_stderr="instruction exceeds",
-        )
-
-    def test_instruction_size_counts_utf8_bytes(self):
-        with patch.object(codex_council, "ROLE_INSTRUCTION_MAX_BYTES", 4):
-            raw = json.dumps([_role_json("x", "L", "€€")])
-            _assert_usage_exit(
-                self, lambda: codex_council._parse_roles_json(raw),
-                expect_in_stderr="instruction exceeds",
-            )
+    def test_large_multibyte_instruction_is_accepted(self):
+        instruction = "€" * 100_000 + "; if nothing material, say so clearly. " \
+            "Thoroughness beats speed."
+        raw = json.dumps([_role_json("x", "L", instruction)])
+        roles = codex_council._parse_roles_json(raw)
+        self.assertEqual(roles[0].instruction, instruction)
 
     def test_instruction_requires_scope_phrase(self):
         raw = json.dumps([_role_json("x", "L", "Review only. Thoroughness beats speed.")])
@@ -1588,12 +1732,12 @@ class ParseRolesJsonTests(unittest.TestCase):
             expect_in_stderr="must match",
         )
 
-    def test_id_over_32_chars_raises(self):
-        raw = json.dumps([_role_json("a" * 33, "L")])
-        _assert_usage_exit(
-            self, lambda: codex_council._parse_roles_json(raw),
-            expect_in_stderr="exceeds 32",
+    def test_reported_issue_role_id_is_accepted(self):
+        rid = "parent-mapper-augmentation-auditor"
+        roles = codex_council._parse_roles_json(
+            json.dumps([_role_json(rid, "Parent Mapper Auditor")])
         )
+        self.assertEqual(roles[0].id, rid)
 
     def test_duplicate_id_in_payload_raises(self):
         raw = json.dumps([
@@ -1735,14 +1879,12 @@ class InstructionListFormTests(unittest.TestCase):
             expect_in_stderr="Thoroughness beats speed.",
         )
 
-    def test_byte_cap_applies_to_joined_paragraph(self):
+    def test_large_joined_paragraph_is_accepted(self):
         items = ["a" * 5000, "b" * 5000,
                  "If nothing material, say so clearly.",
                  "Thoroughness beats speed."]
-        _assert_usage_exit(
-            self, lambda: self._roles(items),
-            expect_in_stderr="instruction exceeds",
-        )
+        roles = self._roles(items)
+        self.assertEqual(roles[0].instruction, " ".join(items))
 
     def test_wrong_instruction_type_steers_to_array_form(self):
         raw = json.dumps([{"id": "x", "label": "L", "instruction": 5}])
@@ -1779,18 +1921,15 @@ class ResolveRolesJsonIntegrationTests(unittest.TestCase):
         roles = codex_council._resolve_roles(custom)
         self.assertEqual([r.id for r in roles], ["data-pipeline", "ml-fairness"])
 
-    def test_max_parallel_enforced_via_json(self):
-        """MAX_PARALLEL + 1 custom roles must reject."""
+    def test_large_panel_resolves_via_json(self):
         entries = [
             {"id": f"role-{i}", "label": f"R{i}",
              "instruction": [_valid_instruction("x")]}
-            for i in range(codex_council.MAX_PARALLEL + 1)
+            for i in range(100)
         ]
         custom = codex_council._parse_roles_json(json.dumps(entries))
-        _assert_usage_exit(
-            self, lambda: codex_council._resolve_roles(custom),
-            expect_in_stderr="MAX_PARALLEL",
-        )
+        roles = codex_council._resolve_roles(custom)
+        self.assertEqual(len(roles), 100)
 
 
 class ProjectRootCacheTests(unittest.TestCase):
@@ -1838,6 +1977,18 @@ class ReadRolesFileTests(unittest.TestCase):
         _assert_usage_exit(
             self, lambda: codex_council._read_roles_file(missing),
             expect_in_stderr="Staging hint",
+        )
+
+    def test_symlinked_roles_file_is_rejected(self):
+        target = os.path.join(self.tmp.name, "target.json")
+        link = os.path.join(self.tmp.name, "roles.json")
+        with open(target, "w", encoding="utf-8") as f:
+            json.dump([_role_json("a", "A")], f)
+        os.symlink(target, link)
+        _assert_usage_exit(
+            self,
+            lambda: codex_council._read_roles_file(link),
+            expect_in_stderr="symbolic links are not accepted",
         )
 
     def test_empty_path_usage_exits(self):
@@ -1915,7 +2066,7 @@ class CheckStagingDirTests(unittest.TestCase):
         with contextlib.redirect_stdout(buf):
             codex_council._check_staging_dir(self.tmp.name)
         self.assertIn("staging OK", buf.getvalue())
-        self.assertIn("(1 roles)", buf.getvalue())
+        self.assertIn("(1 roles; max parallel 6)", buf.getvalue())
 
     def test_missing_context_mentions_staging_hint(self):
         self._write_valid_roles()
@@ -2093,6 +2244,18 @@ class ReadContextFileTests(unittest.TestCase):
             expect_in_stderr="Staging hint",
         )
 
+    def test_symlinked_context_file_is_rejected(self):
+        target = self._path("target.md")
+        link = self._path()
+        with open(target, "w", encoding="utf-8") as f:
+            f.write("context")
+        os.symlink(target, link)
+        _assert_usage_exit(
+            self,
+            lambda: codex_council._read_context_file(link),
+            expect_in_stderr="symbolic links are not accepted",
+        )
+
     def test_empty_context_file_is_usage_error(self):
         """Exit 2 like every other staging defect; exit 1 stays reserved
         for runtime failures (stdin defects, all-roles-failed)."""
@@ -2115,7 +2278,7 @@ class ReadContextFileTests(unittest.TestCase):
             expect_in_stderr="re-run --check-staging-dir",
         )
 
-    def test_context_file_utf8_and_byte_cap_are_usage_errors(self):
+    def test_context_file_invalid_utf8_is_a_usage_error(self):
         path = self._path()
         with open(path, "wb") as f:
             f.write(b"\xff\xfe bad")
@@ -2125,60 +2288,24 @@ class ReadContextFileTests(unittest.TestCase):
             expect_in_stderr="not valid UTF-8",
         )
 
-        with patch.object(codex_council, "MAX_STDIN_BYTES", 4):
-            with open(path, "wb") as f:
-                f.write(b"abcde")
-            _assert_usage_exit(
-                self,
-                lambda: codex_council._read_context_file(path),
-                expect_in_stderr="exceeds",
-            )
+    def test_large_context_file_is_accepted_without_truncation(self):
+        path = self._path()
+        content = "€" * 4_000_000
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        self.assertEqual(codex_council._read_context_file(path), content)
 
 
 class ReadStdinBodyTests(unittest.TestCase):
-    """The cap is a BYTE cap (the prompt is UTF-8 encoded for codex), so the
-    reader counts bytes, not characters."""
-
-    def test_max_stdin_bytes_is_exactly_10_mib(self):
-        self.assertEqual(codex_council.MAX_STDIN_BYTES, 10 << 20)
-        self.assertEqual(codex_council.MAX_STDIN_BYTES, 10 * 1024 * 1024)
-
-    def test_returns_decoded_body_under_cap(self):
+    def test_returns_decoded_body(self):
         self.assertEqual(codex_council._read_stdin_body(io.BytesIO(b"hello")), "hello")
 
-    def test_rejects_over_byte_cap(self):
-        oversize = b"a" * (codex_council.MAX_STDIN_BYTES + 1)
-        buf = io.StringIO()
-        with contextlib.redirect_stderr(buf):
-            with self.assertRaises(SystemExit) as ctx:
-                codex_council._read_stdin_body(io.BytesIO(oversize))
-        self.assertEqual(ctx.exception.code, 1)
-        self.assertIn("exceeds", buf.getvalue())
-
-    def test_counts_bytes_not_characters(self):
-        """Regression: 3 multibyte chars (9 bytes) must be rejected at an
-        8-byte cap. A character-count check would have let it through."""
-        with patch.object(codex_council, "MAX_STDIN_BYTES", 8):
-            payload = "€€€".encode("utf-8")  # 3 chars, 9 bytes
-            self.assertEqual(len(payload), 9)
-            with contextlib.redirect_stderr(io.StringIO()):
-                with self.assertRaises(SystemExit) as ctx:
-                    codex_council._read_stdin_body(io.BytesIO(payload))
-            self.assertEqual(ctx.exception.code, 1)
-
-    def test_multibyte_under_cap_ok(self):
-        with patch.object(codex_council, "MAX_STDIN_BYTES", 16):
-            self.assertEqual(
-                codex_council._read_stdin_body(io.BytesIO("€€".encode("utf-8"))),
-                "€€",
-            )
-
-    def test_accepts_exactly_cap_bytes(self):
-        with patch.object(codex_council, "MAX_STDIN_BYTES", 8):
-            self.assertEqual(
-                codex_council._read_stdin_body(io.BytesIO(b"abcdefgh")),  # exactly 8
-                "abcdefgh",
-            )
+    def test_large_multibyte_stdin_is_accepted_without_truncation(self):
+        content = "€" * 4_000_000
+        self.assertEqual(
+            codex_council._read_stdin_body(io.BytesIO(content.encode("utf-8"))),
+            content,
+        )
 
     def test_rejects_invalid_utf8(self):
         buf = io.StringIO()
@@ -2197,21 +2324,12 @@ class ReadStdinBodyTests(unittest.TestCase):
         self.assertIn("Empty input", buf.getvalue())
 
 
-class PromptSizeTests(unittest.TestCase):
-    def test_composed_prompt_at_cap_allowed(self):
+class PromptCompositionTests(unittest.TestCase):
+    def test_large_prompt_is_composed_without_truncation(self):
         role = codex_council.Role("architect", "Architect", "i")
-        with patch.object(codex_council, "MAX_PROMPT_BYTES", len("i\n\nb\n\ni")):
-            codex_council._validate_prompt_size(role, "b")
-
-    def test_composed_prompt_over_cap_exits_1(self):
-        role = codex_council.Role("architect", "Architect", "i")
-        buf = io.StringIO()
-        with patch.object(codex_council, "MAX_PROMPT_BYTES", len("i\n\nb\n\ni") - 1):
-            with contextlib.redirect_stderr(buf):
-                with self.assertRaises(SystemExit) as ctx:
-                    codex_council._validate_prompt_size(role, "b")
-        self.assertEqual(ctx.exception.code, 1)
-        self.assertIn("architect", buf.getvalue())
+        body = "b" * 12_000_000
+        prompt = codex_council._compose_prompt(role, body)
+        self.assertEqual(prompt, f"i\n\n{body}\n\ni")
 
 
 class ArgParseTests(unittest.TestCase):
@@ -2324,6 +2442,108 @@ class DocsContractTests(unittest.TestCase):
         self.assertIn("read -r -d ''", text)
         self.assertIn("file --brief --mime --", text)
         self.assertIn("git diff --cached", text)
+
+    def test_runtime_and_skill_have_no_stale_size_or_panel_caps(self):
+        script_path = self._repo_file(
+            "plugins", "codex-council", "skills", "codex-council",
+            "scripts", "codex_council.py",
+        )
+        skill_path = self._repo_file(
+            "plugins", "codex-council", "skills", "codex-council", "SKILL.md"
+        )
+        with open(script_path, encoding="utf-8") as f:
+            script = f.read()
+        with open(skill_path, encoding="utf-8") as f:
+            skill = f.read()
+        for stale_name in (
+            "\nMAX_PARALLEL =", "MAX_STDIN_BYTES", "MAX_PROMPT_BYTES",
+            "ROLE_ID_MAX_LEN", "ROLE_LABEL_MAX_BYTES",
+            "ROLE_INSTRUCTION_MAX_BYTES", "_validate_prompt_size",
+        ):
+            self.assertNotIn(stale_name, script)
+        for stale_contract in (
+            "Max 6 roles per call", "≤32 chars", "≤80 UTF-8 bytes",
+            "≤8192 UTF-8 bytes", "over 10 MiB", "tail -c 131072",
+            "size <= 32768",
+        ):
+            self.assertNotIn(stale_contract, skill)
+        self.assertIn(
+            "no plugin-imposed content-size or panel-count caps",
+            skill,
+        )
+        self.assertIn("never truncates", skill)
+
+    def test_skill_documents_adaptive_context_concurrency_and_progress(self):
+        path = self._repo_file(
+            "plugins", "codex-council", "skills", "codex-council", "SKILL.md"
+        )
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        for required in (
+            "decision-complete working set",
+            "Recent working context at high fidelity",
+            "Older durable context as a faithful summary",
+            "CODEX_COUNCIL_MAX_PARALLEL",
+            "in-process queue",
+            "status heartbeat every 30 minutes",
+            "one-shot 30-minute wake-up",
+            "TaskOutput",
+        ):
+            self.assertIn(required, text)
+        self.assertNotIn("every role is launched in parallel", text)
+
+    def test_plugin_copy_is_synced_on_adaptive_general_purpose_collaboration(self):
+        canonical = (
+            "Adaptive general-purpose Codex council — Claude orchestrates "
+            "role-framed agents to collaborate and reconcile toward any shared goal."
+        )
+        marketplace_path = self._repo_file(".claude-plugin", "marketplace.json")
+        manifest_path = self._repo_file(
+            "plugins", "codex-council", ".claude-plugin", "plugin.json"
+        )
+        skill_path = self._repo_file(
+            "plugins", "codex-council", "skills", "codex-council", "SKILL.md"
+        )
+        readme_path = self._repo_file("README.md")
+        with open(marketplace_path, encoding="utf-8") as f:
+            marketplace = json.load(f)
+        with open(manifest_path, encoding="utf-8") as f:
+            manifest = json.load(f)
+        self.assertEqual(marketplace["metadata"]["description"], canonical)
+        self.assertEqual(marketplace["plugins"][0]["description"], canonical)
+        self.assertEqual(manifest["description"], canonical)
+        with open(skill_path, encoding="utf-8") as f:
+            skill = f.read()
+        with open(readme_path, encoding="utf-8") as f:
+            readme = f.read()
+        combined = skill + "\n" + readme
+        self.assertIn("adaptive", combined.lower())
+        self.assertIn("general-purpose", combined)
+        self.assertIn("AGI-style", combined)
+        self.assertIn("not a claim", combined)
+        self.assertNotIn("Multi-perspective parallel Codex review —", combined)
+
+    def test_skill_and_readme_share_all_explicit_codex_trigger_names(self):
+        paths = (
+            self._repo_file(
+                "plugins", "codex-council", "skills", "codex-council",
+                "SKILL.md",
+            ),
+            self._repo_file("README.md"),
+        )
+        for path in paths:
+            with open(path, encoding="utf-8") as f:
+                text = f.read().lower()
+            for trigger in ("codex council", "codex coterie", "codex team"):
+                self.assertIn(trigger, text)
+
+    def test_release_manifest_is_0_7_0(self):
+        path = self._repo_file(
+            "plugins", "codex-council", ".claude-plugin", "plugin.json"
+        )
+        with open(path, encoding="utf-8") as f:
+            manifest = json.load(f)
+        self.assertEqual(manifest["version"], "0.7.0")
 
     def test_readme_dev_hook_keeps_diagnostics(self):
         path = self._repo_file("README.md")

@@ -1,9 +1,11 @@
 # codex-council
 
-A Claude Code plugin that fans out the same context to **N parallel OpenAI
-Codex sub-agents**, each framed with a role you decide per call. You,
-Claude, and a council of Codex perspectives in the loop. Install once;
-invoke from any Claude Code project.
+An adaptive, general-purpose Claude Code plugin that coordinates **N
+role-framed OpenAI Codex agents** around any shared goal. Agents can
+investigate, build, diagnose, create, plan, research, challenge, or review from
+distinct lenses; Claude orchestrates their collaboration and reconciles their
+contributions into one coherent outcome. Install once; invoke from any Claude
+Code project.
 
 ## Prerequisites
 
@@ -32,7 +34,7 @@ Persists across sessions — no flags needed.
 
 Claude looks at the current task, the relevant files or artifacts in
 flight, and the judgment the user actually needs, composes a tailored
-2–6 agent panel, announces it briefly, and launches without a manual
+agent panel, announces it briefly, and launches without a manual
 launch approval gate. Each role keeps its own Codex thread per
 project and host session, so framings accumulate across calls in the
 same terminal/session if you reuse role IDs.
@@ -42,13 +44,16 @@ Auto-trigger phrases (natural language) are restricted to:
 ```
 ask codex council
 codex council review
-reconcile with codex team
-codex team reconciliation
+ask the codex coterie
+codex coterie review
+ask the codex team
+reconcile with the codex team
 ```
 
 Broader phrases like "agent team," "agents in parallel," "subagents,"
-"council review," "panel review," "codex agent team," "codex panel,"
-or "fan out to codex agents" do **not** trigger this skill — they
+"council review," "panel review," "codex agent group," "codex panel,"
+or "fan out to codex agents" do **not** trigger this skill unless they clearly
+invoke `codex council`, `codex coterie`, or `codex team` — otherwise they
 route to Claude Code's built-in `Agent` tool (Claude subagents, a
 different mechanism). The skill's SKILL.md enforces this with a
 disambiguation gate.
@@ -60,13 +65,25 @@ actually doing, then passing them to the script via `--roles-file`
 (a path to the panel JSON) and `--context-file` (a staged context file
 in the same private per-run directory). The script is a pure
 orchestrator: it reads those staged inputs, validates them before
-launch, fans out parallel `codex exec` subprocesses, and aggregates
-the replies.
+launch, fans out bounded-parallel `codex exec` subprocesses, and aggregates
+the replies. It imposes no size ceiling on the panel, role IDs, labels,
+instructions, staged context, stdin, or composed prompts, and it never
+truncates them. Actual model/provider context windows and available machine
+memory remain external constraints and are surfaced as downstream failures.
 
-**Note on fit.** Codex is strongest where the task has technical,
-structured, or evidence-checking surfaces. For tasks where a single
-Claude pass is likely as good or better than a Codex council, don't
-force a council — say so.
+For long Claude Code sessions, "full context" means a decision-complete
+working set rather than a raw transcript dump: current objective and recent
+work in high fidelity, live primary evidence from disk, and older still-relevant
+history summarized with its decisions, rejected paths, invariants, and
+uncertainties. Superseded state and conversational repetition are omitted.
+
+**General-purpose, with honest capability bounds.** The council uses an
+AGI-style adaptive collaboration pattern: Claude derives roles from the actual
+work instead of selecting from a domain catalog, so it can help across coding,
+operations, research, writing, planning, data, design, and other work. This is
+not a claim that the underlying models are proven AGI; results still depend on
+the active Codex model, tools, evidence, and task. For work where one Claude
+pass is likely as good or better, don't force a council — say so.
 
 The JSON role spec, retries, and panel-proposal flow are documented in
 [`plugins/codex-council/skills/codex-council/SKILL.md`](plugins/codex-council/skills/codex-council/SKILL.md).
@@ -84,7 +101,7 @@ flowchart LR
         Manifest[".claude-plugin/plugin.json"] -.-> Skill
         Script --> Validate["Validate staged inputs<br/>Parse and validate roles"]
         Validate --> Prompt["Bookend context with<br/>each role instruction"]
-        Prompt --> Fanout["asyncio.gather<br/>parallel fan-out"]
+        Prompt --> Fanout["asyncio.Semaphore + gather<br/>bounded parallel fan-out"]
 
         Fanout --> RoleA["Role runner A"]
         Fanout --> RoleB["Role runner B"]
@@ -168,19 +185,22 @@ flowchart TD
 ## State
 
 Council state lives at
-`$XDG_STATE_HOME/codex-council/{project-hash}-{session-hash}__{role-id}.json`
+`$XDG_STATE_HOME/codex-council/{project-hash}-{session-hash}__{role-key}.json`
 when the runner can detect a stable host-session id. It auto-detects common
 values such as Claude session ids, `CODEX_THREAD_ID`, `TERM_SESSION_ID`,
 `TMUX_PANE`, `STY`, and `VSCODE_PID`, so separate terminal tabs/panes in the
 same repo do not normally share role threads (except multiple integrated
 terminals in the **same VS Code window**, which share `VSCODE_PID`; set
 `CODEX_COUNCIL_SESSION_KEY` to isolate those). Follow-up calls from the same
-host session still resume the same per-role thread.
+host session still resume the same per-role thread. Long role IDs use a
+deterministic hashed filename key, while the full ID is preserved in reports,
+prompts, and state metadata; this avoids filesystem filename-length failures
+without imposing an ID-length limit.
 
 `CODEX_COUNCIL_SESSION_KEY` remains an explicit override for custom scoping
 per branch or task. Set `CODEX_COUNCIL_DISABLE_AUTO_SESSION_KEY=1` only if you
 want the older project-wide state file shape:
-`{project-hash}__{role-id}.json`.
+`{project-hash}__{role-key}.json`.
 
 ## Security
 
@@ -204,6 +224,16 @@ other settings come from `~/.codex/config.toml`. No model is hardcoded.
 Sandbox and approval settings are overridden by the plugin (see
 Security above).
 
+Active role concurrency defaults to 6, matching the current
+[Codex configuration default](https://learn.chatgpt.com/docs/config-file/config-reference#configtoml)
+for `agents.max_threads`. If a positive user-level `agents.max_threads` is present,
+the runner uses it as a conservative local concurrency signal; set
+`CODEX_COUNCIL_MAX_PARALLEL` to a positive integer for an explicit council-only
+override. Panels may be larger than active concurrency: excess roles queue in
+the runner rather than being rejected or launched simultaneously. Because this
+plugin launches separate `codex exec` processes, Codex's in-process agent
+setting is a useful local preference, not a provider-capacity guarantee.
+
 No wall-clock timeout is enforced — neither the council nor `codex
 exec` imposes a run-level deadline, so a role runs as long as Codex
 takes, hours or days. An actively-working role streams continuously,
@@ -212,7 +242,11 @@ guard only covers a stalled connection (and is retried). To widen it
 for very long quiet stretches, raise
 `model_providers.<id>.stream_idle_timeout_ms` and the retry counts in
 your own `~/.codex/config.toml`. Ctrl+C tears down every codex process
-group.
+group. While work remains, the runner writes a 30-minute status heartbeat to
+the staged `err.log`; the skill uses Claude Code's native
+[background-task mechanism](https://code.claude.com/docs/en/interactive-mode)
+and, where available, [session-cron state](https://code.claude.com/docs/en/hooks)
+to surface progress without a shell polling loop.
 
 ## For development
 

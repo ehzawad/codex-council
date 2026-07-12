@@ -1,13 +1,14 @@
 ---
 name: codex-council
 description: >-
-  Multi-perspective Codex review via parallel `codex exec` sub-agents.
+  Adaptive general-purpose Codex council: Claude orchestrates role-framed
+  `codex exec` agents to collaborate and reconcile toward any shared goal.
   Claude (the orchestrator) composes the role panel on-the-fly per
   invocation from the user's actual work; there is no built-in role
-  catalog and no domain list. Auto-use ONLY when the user's text
-  contains the phrase "codex council" or "codex team reconciliation"
-  (and close variants such as "ask codex council," "codex council
-  review," "reconcile with codex team"). Otherwise stop — broader
+  catalog and no domain list. Auto-use ONLY when the user's text clearly
+  invokes "codex council," "codex coterie," or "codex team" (including
+  close variants such as "ask the codex coterie," "codex council review,"
+  and "reconcile with the codex team"). Otherwise stop — broader
   phrases like "codex agent team," "codex panel," "fan out to codex
   agents," "agent team," "agents in parallel," "subagents," "council
   review," "panel review," "multi-angle review" route to Claude
@@ -20,10 +21,16 @@ description: >-
 
 # Codex Council
 
-Fan out a prompt to N parallel `codex exec` sub-agents, each framed
-with a role tailored to the work. The script aggregates all responses
-into one structured markdown report. Each role keeps its own Codex
-thread per project so framings accumulate across calls.
+Coordinate N bounded-parallel `codex exec` agents around any user goal, each
+framed with a role tailored to make a distinct contribution. This is an
+AGI-style, general-purpose collaboration pattern rather than a claim that any
+underlying model is proven AGI: a role may investigate, build, diagnose,
+challenge, create, plan, research, or review across domains, subject to the
+active model and available tools. The script aggregates all responses into one
+structured markdown report, and Claude reconciles them into one coherent
+outcome rather than forwarding a pile of independent opinions. Each role keeps
+its own Codex thread per project so useful framing and project knowledge
+accumulate across calls.
 
 Codex is strongest on technical and structured reasoning. Whether a
 council adds value over a single pass should be judged from the
@@ -31,16 +38,16 @@ current task, not from a label on it.
 
 **You (Claude) are the orchestrator.** The panel-proposal step is
 load-bearing: **ultrathink** there. Read the user's actual work,
-figure out what judgment they need, design role ids / labels /
+figure out what outcome and contributions they need, design role ids / labels /
 instructions ground-up from that specific work. There is no catalog,
 no checklist of domains, no template panel to reach for. Treat your
 composed task-specific panel as granted by default: announce it
 briefly, then trigger `codex exec` without asking for launch approval.
 
-## Disambiguation gate — only if "codex council" / "codex team" is missing
+## Disambiguation gate — only if all three Codex trigger names are missing
 
 If the trigger phrase that fired this skill does **not** contain
-"codex council" or "codex team reconciliation" (or a close variant),
+"codex council," "codex coterie," or "codex team" (or a close variant),
 **stop**. The user may have meant Claude Code's built-in `Agent` tool
 (subagents spawned with `subagent_type` like `general-purpose`,
 `Plan`, `Explore`, `claude-code-guide`, `code-reviewer`) — a
@@ -50,16 +57,16 @@ OpenAI Codex via `codex exec`).
 Ask one short disambiguation via `AskUserQuestion` before doing
 anything:
 
-- Question: "Did you mean Claude's built-in `Agent` subagents, or
-  codex-council (OpenAI Codex fan-out)?"
+- Question: "Did you mean Claude's built-in `Agent` subagents, or the
+  Codex council/coterie/team?"
 - Header: "Which?"
 - Option 1: "Claude Agent subagents (Recommended)"
 - Option 2: "codex-council (OpenAI Codex)"
 
 Only proceed past this gate if the user explicitly picks codex-council.
 
-If the trigger phrase **does** clearly say "codex council" or
-"codex team reconciliation," skip this gate and go to Step 1.
+If the trigger phrase **does** clearly invoke "codex council," "codex
+coterie," or "codex team," skip this gate and go to Step 1.
 
 ## Step 1 — Read the actual work
 
@@ -69,8 +76,8 @@ Look at what the user is actually doing in the conversation: what
 they've been editing, what they've been asking, what files / objects
 / drafts / queries are in flight. Then ask one question:
 
-> *What are 2–6 distinct kinds of judgment that would catch the
-> failure modes specific to this work?*
+> *What distinct contributions would move this shared goal forward and catch
+> its work-specific failure modes?*
 
 That question — answered from the actual material in front of you —
 is the panel. Do **not** start by assigning the task to a category
@@ -86,12 +93,11 @@ Cheap probes if you need them (otherwise skip):
   user is working with if it isn't already in your context
 
 Compose, don't pattern-match. For the material in front of you,
-name 2–6 independent ways it could fail or mislead — wrong on the
-substance, wrong for the audience, wrong against prior art, wrong
-in some specific operational dimension, etc. Each is a candidate
-lens. The lens names are local to this invocation; they should not
-look like they came from a menu, and you should not reuse them
-across unrelated work.
+name the independent contributions the goal needs: implementation or diagnosis,
+substantive correctness, audience fit, prior-art comparison, operational
+reliability, adversarial challenge, etc. Each is a candidate lens. The lens
+names are local to this invocation; they should not look like they came from a
+menu, and you should not reuse them across unrelated work.
 
 If the user named a panel in the invocation arguments (e.g.
 `/codex-council:codex-council 3 agents: <lens-a>, <lens-b>, <lens-c>`),
@@ -102,14 +108,20 @@ the work shifts in one turn.
 
 ## Step 2 — Compose the panel JSON
 
-Design 2–6 roles (default 3, max 6). Each role is
+Design 2–6 sharply distinct roles by default (default 3). Use more only when
+the work genuinely has more independent lenses and the user's Codex
+`agents.max_threads` or `CODEX_COUNCIL_MAX_PARALLEL` is deliberately higher;
+extra roles are queued when the panel exceeds active concurrency. The panel
+itself has no script-imposed count limit. Each role is
 `{id, label, instruction}`:
 
-- `id` — kebab-case, `^[a-z0-9_-]+$`, ≤32 chars. Derive from the
+- `id` — kebab-case, `^[a-z0-9_-]+$`, with no length limit. Derive from the
   lens you just composed for THIS work. Stable IDs reused across
   invocations resume the same Codex thread for that role; novel IDs
-  start fresh.
-- `label` — human title shown in the report.
+  start fresh. Long IDs are hashed only for the internal state filename;
+  the full ID remains intact in the role, report, prompt, and state metadata.
+- `label` — non-empty, single-line human title shown in the report, with no
+  length limit.
 - `instruction` — **a JSON array of short strings, one sentence per
   item** (the script joins them into one paragraph with single
   spaces). Always write the array form. Never write the instruction
@@ -241,10 +253,26 @@ python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
   2> 'ABS_RUNDIR/err.log'
 ```
 
-Then **wait for Claude Code's completion notification — do not sleep-poll.** When
-it arrives, read `ABS_RUNDIR/out.md` for the report; read `ABS_RUNDIR/err.log`
-for per-role progress and the final `[codex-council] CODEX_COUNCIL_DONE ...` line
-(its presence means the report is fully written; it carries the exit code).
+After launch, keep the Claude Code background-task id. The runner writes
+per-role completions immediately and a status heartbeat every 30 minutes to
+`ABS_RUNDIR/err.log` while work remains.
+
+- If this Claude Code version exposes session crons, create a **one-shot
+  30-minute wake-up** whose prompt names the background task id and exact
+  `ABS_RUNDIR`. At wake-up, retrieve the native background-task status, read the
+  end of `err.log`, send the user a concise update (completed/active/queued),
+  and schedule another one-shot 30-minute wake-up only if it is still running.
+  Cancel or let the pending wake-up become a no-op if completion arrives first.
+- Otherwise, use Claude Code's native background-task wait/output mechanism
+  (`TaskOutput` when exposed) with its supported wait horizon. Do not implement
+  a shell `sleep` loop. If the call is still running at 30 minutes, read
+  `err.log`, update the user, and continue through the same native mechanism.
+
+Claude Code emits a completion notification for a finished background task.
+When it arrives, read `ABS_RUNDIR/out.md` for the report and
+`ABS_RUNDIR/err.log` for per-role progress and the final
+`[codex-council] CODEX_COUNCIL_DONE ...` line (its presence means the report is
+fully written; it carries the exit code).
 
 The process exit code is deliberately council-level and partial-failure
 tolerant: it is `0` when at least one role responds and `1` only when every
@@ -267,17 +295,24 @@ Last err line is `CODEX_COUNCIL_DONE` → done, read `out.md`. No such line but
 Bare invocation (no `--roles-file`, with context piped or staged) exits 2 — a
 safety net for accidental fan-out.
 
-Constraints:
+Role contract (no plugin-imposed content-size or panel-count caps):
 
-- Max 6 roles per call (matches Codex's concurrent-thread default).
+- The panel may contain any number of roles. Active concurrency defaults to 6,
+  follows a positive user-level Codex `agents.max_threads` when configured, and
+  can be explicitly set with `CODEX_COUNCIL_MAX_PARALLEL`. Remaining roles wait
+  in an in-process queue; the runner never launches more than the effective
+  maximum simultaneously.
+- `roles.json` and `context.md` must be regular, non-symlink files. This keeps
+  the validated private staging directory from redirecting either input to an
+  external path.
 - Each role object: exactly the keys `id`, `label`, `instruction`; any
   other key is rejected with exit 2.
-- `id`: `^[a-z0-9_-]+$`, ≤32 chars.
-- `label`: non-empty single line, ≤80 UTF-8 bytes.
+- `id`: non-empty and `^[a-z0-9_-]+$`; no length limit.
+- `label`: non-empty and single-line; no length limit.
 - `instruction`: an array of non-empty strings, one sentence per item —
   the only accepted form. The script joins items with single spaces and
-  validates the joined paragraph: ≤8192 UTF-8 bytes; must include
-  "nothing material" and must end with "Thoroughness beats speed."
+  validates the joined paragraph: no length limit; must include "nothing
+  material" and must end with "Thoroughness beats speed."
 
 If `--check-staging-dir` rejects the staging directory (wrong mode,
 symlink, wrong owner, missing): **abandon that directory.** Do not
@@ -298,14 +333,42 @@ from one of two sources:
 
 - **Shell-extracted from disk** — raw artifacts the user is looking
   at right now. The shell composition and its safety guards matter.
-- **Claude-composed prose digest** — when Claude already has the
-  understanding and Codex doesn't need the raw source to evaluate
-  the question. Compress, don't dump.
+- **Claude-composed context** — when Claude already has the understanding and
+  Codex does not need raw source to evaluate the question. Preserve every
+  materially relevant fact, decision, uncertainty, and artifact reference;
+  remove only genuinely irrelevant or duplicated material.
 
-Choose the smallest sufficient slice. The script hard-rejects input
-over 10 MiB (by byte count); it does not truncate. That ceiling is a
-sanity guard, not a budget — Codex's own context window is the real
-limit, so compress regardless.
+Build a **decision-complete working set**, not a literal transcript dump. The
+script does not impose a byte ceiling on `context.md`, stdin, role fields, or
+the composed prompt, and it never truncates them; relevance selection belongs
+to Claude as the host orchestrator. For a long-running session, assemble
+context in this order:
+
+1. **Immediate objective and present state:** the user's current request,
+   current branch/worktree/runtime state, unresolved questions, and what the
+   council must decide or produce now.
+2. **Recent working context at high fidelity:** recent user constraints,
+   actions, errors, outputs, and artifacts that directly led to the current
+   state. Preserve exact wording or raw material when its details matter.
+3. **Current primary evidence:** the relevant files, diffs, diagnostics, data,
+   or commands from disk, verified live rather than recalled from conversation.
+4. **Older durable context as a faithful summary:** decisions, rejected
+   approaches and why, invariants, user preferences, earlier evidence, and
+   dependencies that still constrain today's work. An old fact is included
+   whenever removing it could change the recommendation; age alone is never a
+   reason to discard it.
+5. **Explicit uncertainty and provenance:** distinguish verified current state,
+   host summaries of older turns, assumptions, and missing evidence.
+
+Exclude superseded state, conversational repetition, stale intermediate
+outputs, and unrelated history. If Claude Code compacted the host conversation,
+use the compaction summary as an index, re-check live project state, and carry
+forward the old details that remain decision-relevant. Do not compress or
+excerpt merely to satisfy this plugin: there is no plugin size budget. The
+active Codex model, provider, operating system, and available memory still
+impose unavoidable downstream or physical limits; if one is reached, preserve
+the staged source material and surface the actual downstream error rather than
+silently dropping context.
 
 In the examples below, `ABS_RUNDIR` is the exact private per-run dir printed by
 `mktemp` in Step 4. Every pipeline block starts with
@@ -337,8 +400,7 @@ set -euo pipefail
 git diff --cached > 'ABS_RUNDIR/context.md'
 ```
 
-**Diff plus untracked files that matter** (with binary / size /
-symlink guards):
+**Diff plus untracked files that matter** (with binary and symlink guards):
 
 ```bash
 set -euo pipefail
@@ -349,34 +411,35 @@ set -euo pipefail
       [ -f "$f" ] && [ ! -L "$f" ] || continue
       mime=$(file --brief --mime -- "$f")
       case "$mime" in
-        *charset=binary*) continue ;;
+        *charset=binary*)
+          printf '\n=== non-text untracked artifact: %q (%s); inspect from disk if relevant ===\n' "$f" "$mime"
+          continue
+          ;;
         *charset=utf-8*|*charset=us-ascii*) ;;
-        *) continue ;;
+        *)
+          printf '\n=== non-UTF-8 untracked artifact: %q (%s); inspect from disk if relevant ===\n' "$f" "$mime"
+          continue
+          ;;
       esac
-      size=$(wc -c <"$f")
-      size=${size//[[:space:]]/}
-      [[ "$size" =~ ^[0-9]+$ ]]
-      (( size <= 32768 )) || continue
       printf '\n=== untracked file: %q ===\n' "$f"
       cat <"$f"
     done
 } > 'ABS_RUNDIR/context.md'
 ```
 
-**An artifact plus a question** — write the relevant file or excerpt
-plus the question the council should answer:
+**An artifact plus a question** — write the complete relevant file plus the
+question the council should answer:
 
 ```bash
 set -euo pipefail
 {
   printf 'Question: %s\n\n' '<what you want the council to check>'
-  cat <"$file"      # or: head -50 data.csv, or: pbpaste, etc.
+  cat <"$file"      # or: pbpaste, etc.
 } > 'ABS_RUNDIR/context.md'
 ```
 
-**Bounded diagnostic transcript** — for a test / CI failure or any
-command output the council should diagnose. Bound the noise so the
-question survives the 10 MiB cap:
+**Complete diagnostic transcript** — for a test / CI failure or any
+command output the council should diagnose:
 
 ```bash
 set -euo pipefail
@@ -384,25 +447,33 @@ set -euo pipefail
   printf 'Question: %s\n\n' '<what should the council diagnose?>'
   printf 'Command: %s\n' '<the failing command>'
   printf 'Exit status: %s\n\n' "$exit_status"
-  echo 'Output (last 128 KiB):'
-  tail -c 131072 <"$log_file"
+  echo 'Output:'
+  cat <"$log_file"
 } > 'ABS_RUNDIR/context.md'
 ```
 
-If the diagnosis needs source context too, append bounded source
-excerpts using the same `[ -f ] && [ ! -L ] && file --mime && wc -c`
-guards as the diff+untracked snippet above.
+If the diagnosis needs source context too, append the complete relevant source
+using the same `[ -f ] && [ ! -L ] && file --mime` guards as the diff+untracked
+snippet above.
+
+`context.md` itself is UTF-8 text because it is sent to `codex exec` on stdin.
+For a material binary, image, archive, or non-UTF-8 artifact, do not pretend it
+does not exist and do not transcode it blindly: include its project path, type,
+and why it matters in the working set. Council roles run with full filesystem
+access and can inspect the original artifact using the tools supported by the
+active Codex installation.
 
 ### Claude-composed
 
-When Claude already understands the situation, compress the
-understanding into prose rather than making Codex re-discover it
-from raw source. Write the digest with the Write tool directly to
-`ABS_RUNDIR/context.md`, using the exact path printed by `mktemp`.
+When Claude already understands the situation, carry that understanding into
+prose rather than making Codex re-discover it from raw source. Preserve all
+material details and remove only redundancy or information unrelated to the
+decision. Write it with the Write tool directly to `ABS_RUNDIR/context.md`,
+using the exact path printed by `mktemp`.
 
-Two common digest scopes:
+Two common context scopes:
 
-- **Project digest** — what the codebase IS. Purpose, architecture,
+- **Project context** — what the codebase IS. Purpose, architecture,
   load-bearing modules, conventions, current direction, known
   constraints. For when the council should evaluate the project as
   a whole without a specific change in flight.
@@ -414,13 +485,13 @@ Mark uncertainty explicitly. When state matters, verify live (e.g.
 `git status --short --branch`) rather than recalling it from memory.
 
 **Never write an empty context file.** If a shell extractor would yield
-nothing and there's nothing to digest, write a self-contained question to
+nothing and there's no context to add, write a self-contained question to
 `ABS_RUNDIR/context.md` instead.
 
 ## Session continuity
 
 One Codex thread per (project, host session, role) tuple, stored at
-`$XDG_STATE_HOME/codex-council/{project-hash}-{session-hash}__{role-id}.json`
+`$XDG_STATE_HOME/codex-council/{project-hash}-{session-hash}__{role-key}.json`
 when a stable host-session id is available. The runner auto-detects common
 session identifiers such as Claude session ids, `CODEX_THREAD_ID`,
 `TERM_SESSION_ID`, `TMUX_PANE`, `STY`, and `VSCODE_PID`, so separate terminal
@@ -430,12 +501,14 @@ set `CODEX_COUNCIL_SESSION_KEY` to isolate those). Follow-up calls
 from the same host session resume the per-role thread so each role accumulates
 its framing. Stale resumes restart only the affected role — siblings are
 unaffected. Role IDs reused across calls continue their own thread; new IDs
-start fresh.
+start fresh. For compatibility, formerly accepted short IDs remain literal
+state filename components; longer IDs use a deterministic SHA-256 role key so
+role length can never hit the filesystem's filename-component limit.
 
 `CODEX_COUNCIL_SESSION_KEY` remains an explicit override for custom scoping
 (e.g. per branch or task ID). Set `CODEX_COUNCIL_DISABLE_AUTO_SESSION_KEY=1`
 only if you intentionally want the older project-wide state file shape:
-`{project-hash}__{role-id}.json`.
+`{project-hash}__{role-key}.json`.
 
 ## Retries
 
@@ -451,8 +524,9 @@ only if you intentionally want the older project-wide state file shape:
 - No wall-clock timeout is enforced — each role runs as long as Codex
   takes (hours or days is fine). `codex exec` has no run-level timeout
   either; its per-provider stream-idle guard only covers a stalled
-  connection and is retried. Ctrl+C still tears down every in-flight
-  codex process group.
+  connection and is retried. The runner emits 30-minute status heartbeats;
+  Claude reports them through its background-task/session-cron mechanism.
+  Ctrl+C still tears down every in-flight codex process group.
 
 ## After Codex Council responds
 
@@ -476,10 +550,11 @@ The output is markdown:
 _Failed: <error tag and message>_
 ```
 
-Reconcile across roles: where they agree, that's a strong signal;
-where they conflict, surface the disagreement rather than collapsing
-it. Then report your own read — what you accept, what you challenge,
-what remains uncertain. Failed-role messages start with a
+Reconcile every contribution toward the user's shared goal: combine compatible
+work, choose between conflicting recommendations with reasons, preserve useful
+dissent, and turn the panel into one actionable outcome. Do not merely relay N
+answers. Then report your own read — what you accept, what you challenge, what
+remains uncertain. Failed-role messages start with a
 bracket-tagged class (`[auth]`, `[retriable:rate-limit]`,
 `[retriable:5xx]`, `[orchestrator-exception]`, `[orchestrator-bug]`)
 so the failure mode is machine-readable.

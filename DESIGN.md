@@ -22,13 +22,23 @@ symlinks, non-dirs, foreign-owned dirs, and group/other-accessible
 modes are all rejected with an action-first recovery hint that forbids
 chmod/mkdir/reuse of the rejected path and demands a fresh `mktemp -d`
 (GH issue #1: the old "Create it with mktemp -d" hint was satisfiable
-by chmod on the same predictable path). Keeping the panel and context in files keeps
-a large role array and multiline context out of the shell, where a
-stray quote, brace, or missing redirection target would otherwise break
-the call before the runner can diagnose it. There is no
+by chmod on the same predictable path). The staged input files themselves must
+be regular non-symlinks, preventing a private directory from redirecting
+validation or reads to an external path. Keeping the panel and context in files
+also keeps a large role array and multiline context out of the shell, where a
+stray quote, brace, or missing redirection target would otherwise break the
+call before the runner can diagnose it. There is no
 built-in role catalog, no positional shortcuts, and no `--list-roles`
 flag. Bare invocation (no `--roles-file`, with context piped or staged)
 exits 2 — the script's way of telling Claude to go compose a panel.
+
+The orchestrator deliberately has no plugin-imposed content-size or panel-count
+ceiling: role count, role IDs, labels, instructions, staged context, stdin, and
+composed prompts are accepted without truncation. Active role concurrency is
+bounded separately, so a large panel queues instead of spawning every process
+at once. The active model/provider and available memory are still real
+downstream constraints; their failures are surfaced rather than guessed at by
+an arbitrary content cap.
 
 The reasoning: every hardcoded catalog is a bias. The original 6
 coding roles biased Claude toward coding panels. A later expansion to
@@ -38,22 +48,28 @@ helped non-coding work but still biased Claude toward
 the catalog out entirely forces Claude (the orchestrator) to
 ultrathink about the user's task, design role ids/labels/instructions
 on-the-fly, announce the composed panel, and then fan out. The
-script's job is fan-out, retry, and reconciliation — not role
-opinions.
+script's job is fan-out, retry, and aggregation — Claude owns reconciliation
+into the user's shared goal rather than relaying disconnected role opinions.
 
 Practical consequence: every invocation requires Claude to compose
 the full role JSON. That's more tokens per panel proposal, but it
 matches the actual design intent (adaptive in-context selection) and
 removes any pull toward formulaic coding-flavored panels.
 
-Codex itself has an in-process multi-agent capability behind the
-`multi_agent_v2` feature flag (verified live: `--enable multi_agent_v2`
-opens up `spawn_agent`/`wait_agent`/`close_agent` tools). The council
-deliberately does **not** use it — its v1 stage is "under
-development" and its v1 surface is gated behind `tool_search` deferral
-plus prose discouragement. External fan-out gives us failure
-isolation, distinct thread_ids on disk, and ~20% the dependency
-surface.
+The intended product shape is an adaptive, general-purpose, AGI-style
+collaboration pattern, not a claim that the active model is proven AGI. Claude
+derives roles from the current goal and orchestrates them through shared
+context, workspace access, persisted role threads, and final reconciliation.
+The same machinery can support implementation, diagnosis, creation, planning,
+research, review, or other domains as far as the active model and tools allow.
+
+Codex itself now has a stable in-process `multi_agent` capability and a
+separate under-development `multi_agent_v2` feature. The council deliberately
+uses external `codex exec` fan-out because each role needs an independently
+persisted thread id and process-level failure/cancellation isolation. Codex's
+documented `agents.max_threads` setting (default 6) is still used as a
+conservative concurrency signal; it is not treated as proof of provider
+capacity because these are separate processes.
 
 ## End-to-end fan-out
 
@@ -66,7 +82,7 @@ sequenceDiagram
     participant N as codex exec (role N)
 
     C->>T: Staged context via --context-file + --roles-file
-    par
+    par up to effective max_parallel
         T->>A: bookended prompt (role A framing)
         T->>B: bookended prompt (role B framing)
         T->>N: bookended prompt (role N framing)
@@ -78,6 +94,38 @@ sequenceDiagram
     T-->>C: aggregated markdown report
     C-->>C: reconcile across roles
 ```
+
+## Context working set
+
+Claude, not the Python runner, decides what conversation context to stage. For
+long host sessions it constructs a decision-complete working set: immediate
+objective and current state; recent working context at high fidelity; live
+primary evidence from disk; and older still-relevant decisions, invariants,
+rejected approaches, and uncertainties as a faithful summary. Conversation age
+alone never controls inclusion. Superseded state, duplicate discussion, and
+irrelevant history are omitted. If Claude Code compacted its own conversation,
+the compacted summary is an index that must be reconciled with current live
+state before launch.
+
+The runner accepts that staged context without a byte cap or truncation. It
+does not attempt token counting because the active model/provider owns the real
+context window and can change independently of this plugin.
+
+## Adaptive concurrency and progress
+
+Panels have no count cap, but `run_council` wraps role execution in an
+`asyncio.Semaphore`. The active limit resolves in this order:
+
+1. positive `CODEX_COUNCIL_MAX_PARALLEL` override;
+2. positive user-level Codex `agents.max_threads` from
+   `$CODEX_HOME/config.toml` (or `~/.codex/config.toml`);
+3. `DEFAULT_MAX_PARALLEL=6`, matching Codex's current documented default.
+
+Queued roles do not launch a subprocess until a permit is available. A
+30-minute heartbeat records completed, active, and queued counts in stderr.
+Claude Code redirects that stream to `err.log` and uses its native background
+task output/completion notifications plus a one-shot session cron when
+available to report status without shell sleep-polling.
 
 ## Staging validation
 
@@ -110,10 +158,11 @@ flowchart TD
 flowchart LR
     Root["project root"] --> RootHash["sha256 root prefix"]
     Env["explicit or auto session key"] --> SessionHash["optional sha256 session prefix"]
-    Role["role id"] --> Filename["state filename"]
+    Role["role id"] --> RoleKey["literal legacy id or sha256 key"]
 
     RootHash --> Filename
     SessionHash --> Filename
+    RoleKey --> Filename
     Filename --> State["$XDG_STATE_HOME/codex-council/key__role.json"]
     State --> Lock["state-file lock"]
     Lock --> Load["load stored thread id"]
@@ -144,7 +193,11 @@ the turn has already completed on the new thread; re-running burns
 tokens for no benefit.
 
 Per-role state is protected by a POSIX advisory lock keyed by
-`(project, session key, role)`. The session key is explicit when
+`(project, session key, role)`. Role IDs longer than the formerly accepted
+32-character range use a deterministic SHA-256 filename component, avoiding
+the operating system's filename-length limit while preserving the full role ID
+in memory, reports, prompts, and state metadata. Short-role state filenames
+remain unchanged for thread-continuity compatibility. The session key is explicit when
 `CODEX_COUNCIL_SESSION_KEY` is set; otherwise the runner auto-detects common
 host-session identifiers such as Claude session ids, `CODEX_THREAD_ID`,
 `TERM_SESSION_ID`, `TMUX_PANE`, `STY`, and `VSCODE_PID`. That gives normal
