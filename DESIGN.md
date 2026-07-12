@@ -51,6 +51,15 @@ on-the-fly, announce the composed panel, and then fan out. The
 script's job is fan-out, retry, and aggregation — Claude owns reconciliation
 into the user's shared goal rather than relaying disconnected role opinions.
 
+Context-derived roles do not mean context-light roles. Before panel synthesis,
+Claude reconstructs the user's live task model: the larger problem and project
+implementation, current trajectory, in-flight files/modules/tests/artifacts,
+bugs and errors under investigation, hypotheses and research evidence, known
+unknowns and plausible blind spots, and unstated or possibly wrong assumptions.
+Claude asks and answers those working questions from the conversation and live
+workspace, asking the user only when a missing choice materially changes the
+authorized outcome.
+
 Practical consequence: every invocation requires Claude to compose
 the full role JSON. That's more tokens per panel proposal, but it
 matches the actual design intent (adaptive in-context selection) and
@@ -62,6 +71,10 @@ derives roles from the current goal and orchestrates them through shared
 context, workspace access, persisted role threads, and final reconciliation.
 The same machinery can support implementation, diagnosis, creation, planning,
 research, review, or other domains as far as the active model and tools allow.
+It deliberately leans toward programmatic problem-solving—computer science,
+software and ML/AI engineering, DevSecOps, platform/security automation,
+debugging/testing, project implementation, and evidence-based technical
+research—without reinstating a domain catalog or fixed role shelf.
 
 Codex itself now has a stable in-process `multi_agent` capability and a
 separate under-development `multi_agent_v2` feature. The council deliberately
@@ -70,6 +83,14 @@ persisted thread id and process-level failure/cancellation isolation. Codex's
 documented `agents.max_threads` setting (default 6) is still used as a
 conservative concurrency signal; it is not treated as proof of provider
 capacity because these are separate processes.
+
+A single fan-out is parallel contribution, not direct peer messaging. Claude
+mediates collaboration by giving every role the same situational context,
+reconciling the report, and staging material findings into selective follow-up
+rounds. Because all subprocesses share the working directory, implementation
+panels assign one write-owning executor/integrator by default; multiple writers
+must use isolated worktrees or serialized phases. This also limits duplicate
+side effects when a transient failure causes a role retry.
 
 ## End-to-end fan-out
 
@@ -83,9 +104,9 @@ sequenceDiagram
 
     C->>T: Staged context via --context-file + --roles-file
     par up to effective max_parallel
-        T->>A: bookended prompt (role A framing)
-        T->>B: bookended prompt (role B framing)
-        T->>N: bookended prompt (role N framing)
+        T->>A: role framing + collaboration brief + shared context
+        T->>B: role framing + collaboration brief + shared context
+        T->>N: role framing + collaboration brief + shared context
     end
     A-->>T: JSONL events
     B-->>T: JSONL events
@@ -98,18 +119,23 @@ sequenceDiagram
 ## Context working set
 
 Claude, not the Python runner, decides what conversation context to stage. For
-long host sessions it constructs a decision-complete working set: immediate
-objective and current state; recent working context at high fidelity; live
-primary evidence from disk; and older still-relevant decisions, invariants,
-rejected approaches, and uncertainties as a faithful summary. Conversation age
-alone never controls inclusion. Superseded state, duplicate discussion, and
-irrelevant history are omitted. If Claude Code compacted its own conversation,
-the compacted summary is an index that must be reconciled with current live
-state before launch.
+long host sessions it constructs a decision-complete working set: the current
+problem/project and goal-directed or exploratory trajectory; in-flight modules,
+files, objects, drafts, queries, experiments, tests, deployments, and research;
+active bugs/errors, symptoms, attempted fixes, hypotheses, and evidence; recent
+working context at high fidelity; live primary evidence from disk; known
+unknowns, blind spots, assumptions, and provenance; and older still-relevant
+decisions, invariants, and rejected approaches as a faithful summary.
+Conversation age alone never controls inclusion. Superseded state, duplicate
+discussion, and irrelevant history are omitted. A compacted host summary is an
+index that must be reconciled with current live state before launch.
 
 The runner accepts that staged context without a byte cap or truncation. It
 does not attempt token counting because the active model/provider owns the real
-context window and can change independently of this plugin.
+context window and can change independently of this plugin. `_compose_prompt`
+keeps the shared context intact, labels it, adds a compact collaboration brief
+that tells each role how to interpret the situational map, and bookends it with
+the role-specific instruction.
 
 ## Adaptive concurrency and progress
 
@@ -121,11 +147,15 @@ Panels have no count cap, but `run_council` wraps role execution in an
    `$CODEX_HOME/config.toml` (or `~/.codex/config.toml`);
 3. `DEFAULT_MAX_PARALLEL=6`, matching Codex's current documented default.
 
-Queued roles do not launch a subprocess until a permit is available. A
-30-minute heartbeat records completed, active, and queued counts in stderr.
-Claude Code redirects that stream to `err.log` and uses its native background
-task output/completion notifications plus a one-shot session cron when
-available to report status without shell sleep-polling.
+Each queued role makes a nonblocking continuity-lock probe while it briefly
+holds a subprocess permit. If another council owns the same persisted thread,
+the probe closes its file descriptor, releases the permit immediately, sleeps
+outside the permit, and retries; unrelated roles can run, and arbitrarily large
+panels do not accumulate one open lock file per queued role. Only a role that
+holds both its continuity lock and permit appears active or launches Codex. A
+30-minute heartbeat records completed, active, and queued counts in stderr;
+Claude Code redirects it to `err.log` and uses native task notifications plus a
+one-shot session cron when available.
 
 ## Staging validation
 

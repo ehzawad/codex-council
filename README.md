@@ -1,11 +1,12 @@
 # codex-council
 
-An adaptive, general-purpose Claude Code plugin that coordinates **N
-role-framed OpenAI Codex agents** around any shared goal. Agents can
-investigate, build, diagnose, create, plan, research, challenge, or review from
-distinct lenses; Claude orchestrates their collaboration and reconciles their
-contributions into one coherent outcome. Install once; invoke from any Claude
-Code project.
+An adaptive, context-driven Claude Code plugin that coordinates **N role-framed
+OpenAI Codex agents** around one shared goal. It is general-purpose with a
+programmatic center of gravity—project implementation, computer science,
+software and ML/AI engineering, DevSecOps, debugging/testing, and technical
+research—while adapting beyond those domains. Agents investigate, build,
+diagnose, research, challenge, or review from distinct lenses; Claude
+reconciles their contributions into one coherent outcome.
 
 ## Prerequisites
 
@@ -32,14 +33,16 @@ Persists across sessions — no flags needed.
 /codex-council:codex-council
 ```
 
-Claude looks at the current task, the relevant files or artifacts in
-flight, and the judgment the user actually needs, composes a tailored
-agent panel, announces it briefly, and launches without a manual
-launch approval gate. Each role keeps its own Codex thread per
-project and host session, so framings accumulate across calls in the
-same terminal/session if you reuse role IDs.
+Claude reconstructs the live task model before composing roles: the problem and
+project being implemented, what the user has edited or asked, in-flight files,
+modules, objects, drafts, queries, tests, deployments, and research, active
+bugs/errors and hypotheses, known unknowns and blind spots, unstated or possibly
+wrong assumptions, and whether the work is converging or still exploratory.
+It answers those contextual questions from conversation and workspace evidence,
+asks the user only when a missing choice materially changes the work, announces
+the resulting panel, and launches without a manual approval gate.
 
-Auto-trigger phrases (natural language) are restricted to:
+Strong natural-language triggers are:
 
 ```
 ask codex council
@@ -50,40 +53,48 @@ ask the codex team
 reconcile with the codex team
 ```
 
-Broader phrases like "agent team," "agents in parallel," "subagents,"
-"council review," "panel review," "codex agent group," "codex panel,"
-or "fan out to codex agents" do **not** trigger this skill unless they clearly
-invoke `codex council`, `codex coterie`, or `codex team` — otherwise they
-route to Claude Code's built-in `Agent` tool (Claude subagents, a
-different mechanism). The skill's SKILL.md enforces this with a
-disambiguation gate.
+The slash command or any of those three names means Codex Council. Nearby terms
+such as "agent team," "subagents," "council review," or "fan out to agents"
+are interpreted from the surrounding conversation rather than rejected by a
+missing-string rule. Only genuinely ambiguous requests prompt a choice, with
+`codex-council (Recommended)` first and `Claude dynamic workflow (ultracode)`—
+Claude Code's built-in Agent subagents—second.
 
-There is **no built-in role catalog**. Claude composes the panel
-on-the-fly per invocation — ultrathinking about the task, drafting
-role ids, labels, and instructions tailored to what the user is
-actually doing, then passing them to the script via `--roles-file`
+There is **no built-in role catalog**. Claude composes the panel on-the-fly per
+invocation from the live problem, evidence, trajectory, uncertainty, and work
+ownership—drafting role IDs, labels, and instructions tailored to what the user
+is actually doing, then passing them to the script via `--roles-file`
 (a path to the panel JSON) and `--context-file` (a staged context file
-in the same private per-run directory). The script is a pure
-orchestrator: it reads those staged inputs, validates them before
+in the same private per-run directory). The script is a pure runner:
+it reads those staged inputs, validates them before
 launch, fans out bounded-parallel `codex exec` subprocesses, and aggregates
 the replies. It imposes no size ceiling on the panel, role IDs, labels,
 instructions, staged context, stdin, or composed prompts, and it never
 truncates them. Actual model/provider context windows and available machine
 memory remain external constraints and are surfaced as downstream failures.
 
+Collaboration is shared-context and Claude-mediated: parallel roles do not
+secretly chat with one another, so Claude reconciles each round and can feed
+material findings into a focused follow-up round. For implementation in one
+workspace, one executor/integrator owns writes by default while other roles
+inspect, test, research, or propose; multiple writers require isolated
+worktrees or serialized phases.
+
 For long Claude Code sessions, "full context" means a decision-complete
-working set rather than a raw transcript dump: current objective and recent
-work in high fidelity, live primary evidence from disk, and older still-relevant
-history summarized with its decisions, rejected paths, invariants, and
-uncertainties. Superseded state and conversational repetition are omitted.
+working set rather than a raw transcript dump: the project/problem and current
+trajectory; in-flight modules, artifacts, tests, errors, hypotheses, and
+research; recent work in high fidelity; live primary evidence; known unknowns,
+blind spots, assumptions, and provenance; plus older still-relevant history
+summarized with its decisions, rejected paths, and invariants.
 
 **General-purpose, with honest capability bounds.** The council uses an
 AGI-style adaptive collaboration pattern: Claude derives roles from the actual
-work instead of selecting from a domain catalog, so it can help across coding,
-operations, research, writing, planning, data, design, and other work. This is
-not a claim that the underlying models are proven AGI; results still depend on
-the active Codex model, tools, evidence, and task. For work where one Claude
-pass is likely as good or better, don't force a council — say so.
+work instead of selecting from a domain catalog. Its strongest lean is complex
+programmatic problem-solving—implementation, software/ML systems, DevSecOps,
+testing, diagnosis, and evidence-based technical research—but the role synthesis
+remains situational across other work. This is not a claim that the underlying
+models are proven AGI; results still depend on the active Codex model, tools,
+evidence, and task.
 
 The JSON role spec, retries, and panel-proposal flow are documented in
 [`plugins/codex-council/skills/codex-council/SKILL.md`](plugins/codex-council/skills/codex-council/SKILL.md).
