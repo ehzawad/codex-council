@@ -150,8 +150,9 @@ Panels have no count cap, but `run_council` wraps role execution in an
 Each queued role makes a nonblocking continuity-lock probe while it briefly
 holds a subprocess permit. If another council owns the same persisted thread,
 the probe closes its file descriptor, releases the permit immediately, sleeps
-outside the permit, and retries; unrelated roles can run, and arbitrarily large
-panels do not accumulate one open lock file per queued role. Only a role that
+outside the permit (doubling from 0.1s to a 2s cap, since the lock holder has
+no wall-clock limit), and retries; unrelated roles can run, and arbitrarily
+large panels do not accumulate one open lock file per queued role. Only a role that
 holds both its continuity lock and permit appears active or launches Codex. A
 30-minute heartbeat records completed, active, and queued counts in stderr;
 Claude Code redirects it to `err.log` and uses native task notifications plus a
