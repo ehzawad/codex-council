@@ -148,6 +148,8 @@ AUTO_SESSION_ENV_VARS = (
 MAX_RETRY_ATTEMPTS = 2
 INITIAL_BACKOFF_SECS = 5
 TERMINATION_GRACE_SECS = 0.2
+LOCK_PROBE_INITIAL_BACKOFF_SECS = 0.1
+LOCK_PROBE_MAX_BACKOFF_SECS = 2.0
 DEFAULT_MAX_PARALLEL = 6
 MAX_PARALLEL_ENV = "CODEX_COUNCIL_MAX_PARALLEL"
 PROGRESS_HEARTBEAT_SECS = 30 * 60
@@ -390,11 +392,14 @@ def load_session(role_id):
     try:
         with open(_state_path(role_id)) as f:
             meta = json.load(f)
-            sid = meta.get("session_id")
-            if isinstance(sid, str) and sid:
-                return sid, meta
     except (OSError, json.JSONDecodeError):
-        pass
+        return None, None
+    # Corrupt state that is valid JSON but not an object (e.g. "[]") must
+    # degrade to a fresh start like any other corruption, not crash the role.
+    if isinstance(meta, dict):
+        sid = meta.get("session_id")
+        if isinstance(sid, str) and sid:
+            return sid, meta
     return None, None
 
 
@@ -799,6 +804,12 @@ async def _run_role_once(role, prompt, attempt):
                     file=sys.stderr,
                 )
                 session_id = emitted_id
+                # Persist the adoption immediately: the stored id is proven
+                # wrong (codex ran this turn on a different thread), so even
+                # a no-agent_message failure below must not leave state
+                # pointing at the old thread — resuming it again would just
+                # repeat the silent-spawn footgun next call.
+                save_session(role.id, session_id)
             msg = extract_final_message(stdout)
             elapsed = time.monotonic() - started
             if msg:
@@ -936,6 +947,7 @@ async def run_council(roles, body, max_parallel=None):
     started = time.monotonic()
 
     async def _run_bounded(role):
+        probe_backoff = LOCK_PROBE_INITIAL_BACKOFF_SECS
         while True:
             async with semaphore:
                 # A nonblocking probe lets a same-role lock waiter yield this
@@ -954,8 +966,12 @@ async def run_council(roles, body, max_parallel=None):
                         active.discard(role.id)
                         _release_role_state_lock(lock_file)
             # Stay off the execution permit while another council owns this
-            # role's continuity lock; unrelated roles get their turn.
-            await asyncio.sleep(0.1)
+            # role's continuity lock; unrelated roles get their turn. The
+            # probe interval backs off to a small cap: the other council has
+            # no wall-clock limit, so a fixed 0.1s poll could spin the event
+            # loop 10x/second for hours while staying responsive gains nothing.
+            await asyncio.sleep(probe_backoff)
+            probe_backoff = min(probe_backoff * 2, LOCK_PROBE_MAX_BACKOFF_SECS)
 
     async def _heartbeat():
         while counter["done"] < total:
