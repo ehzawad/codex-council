@@ -117,7 +117,7 @@ flowchart LR
 
     subgraph Plugin["codex-council plugin"]
         Manifest[".claude-plugin/plugin.json"] -.-> Skill
-        Script --> Validate["Validate staged inputs<br/>Parse and validate roles"]
+        Script --> Validate["Launch-side privacy gate<br/>Validate staged inputs<br/>Parse and validate roles"]
         Validate --> Prompt["Bookend context with<br/>each role instruction"]
         Prompt --> Fanout["asyncio.Semaphore + gather<br/>bounded parallel fan-out"]
 
@@ -128,12 +128,16 @@ flowchart LR
         RoleA <--> State["Per-project/session/role state<br/>$XDG_STATE_HOME/codex-council"]
         RoleB <--> State
         RoleN <--> State
+
+        RoleA --> Live["Liveness layer per subprocess<br/>incremental stdout/stderr readers<br/>output-inactivity watchdog<br/>CODEX_COUNCIL_STALL_SECS"]
+        RoleB --> Live
+        RoleN --> Live
     end
 
     subgraph Codex["Codex CLI subprocesses"]
-        RoleA --> ExecA["codex exec resume or fresh"]
-        RoleB --> ExecB["codex exec resume or fresh"]
-        RoleN --> ExecN["codex exec resume or fresh"]
+        Live --> ExecA["codex exec resume or fresh"]
+        Live --> ExecB["codex exec resume or fresh"]
+        Live --> ExecN["codex exec resume or fresh"]
     end
 
     ExecA --> JSONL["JSONL events"]
@@ -160,13 +164,20 @@ sequenceDiagram
     C->>U: Announce panel
     C->>F: mktemp -d once
     C->>F: Write roles.json and context.md
-    C->>S: --check-staging-dir F
+    C->>S: --check-staging-dir F --skill-contract 1
     S-->>C: staging OK or precise staging error
-    C->>S: --roles-file F/roles.json --context-file F/context.md
+    C->>S: --roles-file F/roles.json --context-file F/context.md --skill-contract 1
+    S->>S: launch privacy gate re-validates each input's parent dir
     par role fan-out
         S->>X: codex exec role A
         S->>X: codex exec role B
         S->>X: codex exec role N
+    end
+    X-->>S: stdout/stderr bytes reset each role's quiet clock
+    S->>F: err.log heartbeat with quiet=Ns and watchdog=Ns
+    loop stall policy when quiet reaches CODEX_COUNCIL_STALL_SECS
+        S->>X: SIGTERM then SIGKILL the stalled attempt
+        S->>S: success-with-warning, retriable retry, or terminal stall
     end
     X-->>S: JSONL events
     S->>F: out.md report
@@ -252,19 +263,40 @@ the runner rather than being rejected or launched simultaneously. Because this
 plugin launches separate `codex exec` processes, Codex's in-process agent
 setting is a useful local preference, not a provider-capacity guarantee.
 
-No wall-clock timeout is enforced — neither the council nor `codex
-exec` imposes a run-level deadline, so a role runs as long as Codex
-takes, hours or days. An actively-working role streams continuously,
-so codex's per-request stream-idle guard never applies to it; that
-guard only covers a stalled connection (and is retried). To widen it
-for very long quiet stretches, raise
-`model_providers.<id>.stream_idle_timeout_ms` and the retry counts in
-your own `~/.codex/config.toml`. Ctrl+C tears down every codex process
-group. While work remains, the runner writes a 30-minute status heartbeat to
-the staged `err.log`; the skill uses Claude Code's native
+The council has no total elapsed-time or run-level deadline. A role may run
+indefinitely while its codex subprocess continues producing output bytes, and
+a council call takes as long as its slowest role. Separately, each codex
+subprocess has an **output-inactivity watchdog** based only on the time since
+its most recent stdout/stderr byte: after `CODEX_COUNCIL_STALL_SECS` seconds
+of council-visible silence (default 1800; positive integer override; 0
+disables), the runner terminates that attempt and applies the stall policy —
+retried as `[retriable:stall]` when no tool work had begun,
+success-with-warning when the turn had already completed, terminal `[stall]`
+otherwise. Setting 0 may again permit an indefinitely silent role. Byte
+silence is not proof of a wedge: current codex `exec --json` suppresses
+agent-message/reasoning deltas, so a healthy role can be byte-silent for long
+stretches — the heartbeat's `quiet=Ns` measures bytes, not progress. Codex's
+own per-provider stream-idle guard
+(`model_providers.<id>.stream_idle_timeout_ms`) remains a separate,
+provider-scoped control in your own `~/.codex/config.toml`. Ctrl+C tears down
+every codex process group. While work remains, the runner writes a status
+heartbeat to the staged `err.log` — cadence adapts to the watchdog
+(`stall_secs / 3`, bounded 300–1800s; every 600s at the default watchdog,
+every 1800s when disabled) and each line carries per-role `quiet=Ns` (or
+`retry-wait` during backoff), the `watchdog=` threshold, and the plugin
+`version=`. The skill uses Claude Code's native
 [background-task mechanism](https://code.claude.com/docs/en/interactive-mode)
 and, where available, [session-cron state](https://code.claude.com/docs/en/hooks)
 to surface progress without a shell polling loop.
+
+**v0.9.0 behavior change — launch-side privacy gate.** The launch path now
+re-validates what the preflight validates: every on-disk input's parent
+directory must be a private (0700), user-owned, non-symlink directory at
+launch as well as at `--check-staging-dir` time, checked before any content is
+read. Migration note for direct CLI users: stage `roles.json` (and
+`context.md` when used) in a private directory, e.g. one created by
+`mktemp -d`; a public or symlinked parent is refused with an
+abandon-this-directory recovery.
 
 ## For development
 
@@ -284,6 +316,14 @@ claude plugins install codex-council@codex-council       # skip if already insta
 3. Prunes any stale sibling entries in the cache dir for other versions, so bumping `plugin.json` and re-running dev-link doesn't leave old directories or symlinks behind.
 
 Step 2 is load-bearing: the harness loads whichever `installPath` the manifest declares, **not** whichever symlinks exist in the cache. Without the manifest rewrite, bumping the version in `plugin.json` and re-running dev-link creates a new symlink that the harness will happily ignore.
+
+Two skew guards help here. The runner prints `version=<plugin version>` in the
+preflight "staging OK" line, the dispatch line, the heartbeat, and the
+`CODEX_COUNCIL_DONE` sentinel — postmortem **visibility** into which plugin
+version actually ran, not skew prevention. And `SKILL.md`'s command templates
+pass `--skill-contract 1`: if the linked script's contract epoch differs, the
+invocation is refused (exit 2) as a stale SKILL/script pair — re-run
+`scripts/dev-link.sh` (or reinstall the plugin) and restart the session.
 
 After the one-time restart, edits to `plugins/codex-council/**` are live on the next `/codex-council:codex-council` invocation. **SKILL.md caveat:** the Claude Code harness's skill-content caching behavior is not documented, so `SKILL.md` edits may still require a session restart; the script and the rest of the plugin files update live.
 

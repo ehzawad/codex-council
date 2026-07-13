@@ -13,16 +13,24 @@ strings** — the only accepted form — that the script
 whitespace-normalizes and joins into the single paragraph Codex sees.
 The list form exists because the
 only production writer of roles.json is an LLM file-Write: multi-KB
-single-line JSON string literals are where its writes corrupt (GH issue
-#2). For the same reason, unknown keys in a role object are **rejected**
+single-line JSON string literals are where its writes corrupt.
+For the same reason, unknown keys in a role object are **rejected**
 with a rewrite-the-whole-file message — stray filler fields like
 `"_": ""` are the signature of a glitched write, not harmless extras.
+Every roles-file validation defect carries the same uniform recovery:
+rewrite the entire file in one complete Write operation, never patch a
+substring of a file that already glitched once.
 The staging-dir gate (`--check-staging-dir`) lstats the directory:
 symlinks, non-dirs, foreign-owned dirs, and group/other-accessible
 modes are all rejected with an action-first recovery hint that forbids
 chmod/mkdir/reuse of the rejected path and demands a fresh `mktemp -d`
-(GH issue #1: the old "Create it with mktemp -d" hint was satisfiable
-by chmod on the same predictable path). The staged input files themselves must
+(a recovery hint satisfiable by chmod/mkdir on the same predictable
+path would defeat the privacy the gate exists for). The **launch path
+re-validates the same privacy contract**: each on-disk input's lexical
+parent directory (`dirname(abspath(...))`, never realpath-first, so a
+symlink parent cannot launder into its target) must pass the identical
+private-dir check before any content is read, in both staged and
+stdin-context modes. The staged input files themselves must
 be regular non-symlinks, preventing a private directory from redirecting
 validation or reads to an external path. Keeping the panel and context in files
 also keeps a large role array and multiline context out of the shell, where a
@@ -40,12 +48,11 @@ at once. The active model/provider and available memory are still real
 downstream constraints; their failures are surfaced rather than guessed at by
 an arbitrary content cap.
 
-The reasoning: every hardcoded catalog is a bias. The original 6
-coding roles biased Claude toward coding panels. A later expansion to
-15 roles across four thematic groups (coding/writing/data/research)
-helped non-coding work but still biased Claude toward
-"pick-from-this-shelf" rather than "compose-from-context." Pulling
-the catalog out entirely forces Claude (the orchestrator) to
+The reasoning: every hardcoded catalog is a bias. A fixed set of coding
+roles biases Claude toward coding panels, and even a broad thematic
+shelf still biases Claude toward "pick-from-this-shelf" rather than
+"compose-from-context." Leaving the catalog out entirely forces Claude
+(the orchestrator) to
 ultrathink about the user's task, design role ids/labels/instructions
 on-the-fly, announce the composed panel, and then fan out. The
 script's job is fan-out, retry, and aggregation — Claude owns reconciliation
@@ -98,19 +105,27 @@ side effects when a transient failure causes a role retry.
 sequenceDiagram
     participant C as Claude Code
     participant T as codex_council.py
+    participant R as per-subprocess readers + watchdog
     participant A as codex exec (role A)
     participant B as codex exec (role B)
     participant N as codex exec (role N)
 
     C->>T: Staged context via --context-file + --roles-file
+    T->>T: launch privacy gate on each input's lexical parent
     par up to effective max_parallel
         T->>A: role framing + collaboration brief + shared context
         T->>B: role framing + collaboration brief + shared context
         T->>N: role framing + collaboration brief + shared context
     end
-    A-->>T: JSONL events
-    B-->>T: JSONL events
-    N-->>T: JSONL events
+    A-->>R: stdout/stderr chunks reset the shared quiet clock
+    B-->>R: stdout/stderr chunks reset the shared quiet clock
+    N-->>R: stdout/stderr chunks reset the shared quiet clock
+    opt quiet reaches CODEX_COUNCIL_STALL_SECS
+        R->>A: SIGTERM then SIGKILL the stalled attempt
+        R-->>T: stall verdict + replay-safety flags
+        T->>T: stall policy - ok-with-warning, retriable, or terminal
+    end
+    R-->>T: buffered JSONL events per role
     T->>T: per-role extract_final_message
     T-->>C: aggregated markdown report
     C-->>C: reconcile across roles
@@ -151,12 +166,22 @@ Each queued role makes a nonblocking continuity-lock probe while it briefly
 holds a subprocess permit. If another council owns the same persisted thread,
 the probe closes its file descriptor, releases the permit immediately, sleeps
 outside the permit (doubling from 0.1s to a 2s cap, since the lock holder has
-no wall-clock limit), and retries; unrelated roles can run, and arbitrarily
+no run-level deadline), and retries; unrelated roles can run, and arbitrarily
 large panels do not accumulate one open lock file per queued role. Only a role that
-holds both its continuity lock and permit appears active or launches Codex. A
-30-minute heartbeat records completed, active, and queued counts in stderr;
-Claude Code redirects it to `err.log` and uses native task notifications plus a
-one-shot session cron when available.
+holds both its continuity lock and permit appears active or launches Codex.
+
+Progress is stderr-only and best-effort: one shared diagnostics helper writes
+the dispatch line, per-attempt start lines
+(`<role>: started (fresh|resume) attempt=K/N watchdog=…`), retry/adoption
+notices, stall diagnostics, the heartbeat, and the `CODEX_COUNCIL_DONE`
+sentinel. A dead stderr permanently redirects diagnostics to a no-op sink and
+never changes role results or the exit code. The heartbeat cadence adapts to
+the watchdog — `min(1800, stall_secs // 3)` with a 300s floor while enabled
+(600s at the default threshold), 1800s when disabled — and each line records
+completed/active/queued counts, per-active-role `quiet=Ns` (or `retry-wait`
+during backoff), the `watchdog=` threshold, and the plugin `version=`.
+Claude Code redirects it to `err.log` and uses native task notifications plus
+a one-shot session cron when available.
 
 ## Staging validation
 
@@ -168,7 +193,7 @@ flowchart TD
     Rundir --> Out["out.md"]
     Rundir --> Err["err.log"]
 
-    Roles --> Preflight["--check-staging-dir"]
+    Roles --> Preflight["--check-staging-dir<br/>private-dir gate: lstat, owner, 0700"]
     Context --> Preflight
     Preflight --> Exists{"both files exist?"}
     Exists -->|no| StageError["exit 2 with staging hint"]
@@ -176,7 +201,9 @@ flowchart TD
     SameDir -->|no| StageError
     SameDir -->|yes| Parse["parse roles + validate context"]
     Parse -->|bad JSON/empty context| StageError
-    Parse -->|ok| Launch["launch fan-out"]
+    Parse -->|ok| LaunchGate["launch path re-validates privacy<br/>lexical parent of every on-disk input<br/>before any content read"]
+    LaunchGate -->|"public, symlinked, or foreign-owned parent"| StageError
+    LaunchGate -->|private| Launch["launch fan-out"]
 
     Launch --> Out
     Launch --> Err
@@ -245,14 +272,26 @@ parallel.
 
 ## Failure-class tagging
 
-Per-role errors are tagged before they hit the report:
+Recognized failure classes are tagged before they hit the report;
+unrecognized failures carry the raw stderr untagged:
 
 | Tag | Behavior |
 |---|---|
 | `[auth]` | Never clears state, never retries — caller must fix auth then re-run |
 | `[retriable:rate-limit]` / `[retriable:5xx]` | One retry after a 5s backoff (MAX_RETRY_ATTEMPTS=2; bumping that adds 10s, 20s, … via `backoff *= 2`) |
+| `[retriable:stall]` | Output-inactivity watchdog fired before any side-effect-capable tool work began; replay is safe, so it retries through the same shared budget as rate-limit/5xx |
+| `[stall]` | Watchdog fired after tool work began — terminal, because an automatic replay could duplicate side effects; a buffered agent_message without turn completion is quoted but never auto-promoted to success |
 | `[orchestrator-exception]` | A role's coroutine raised — siblings still complete via `gather(..., return_exceptions=True)` |
 | (untagged stale) | Detected via `STALE_RESUME_MARKERS`; that role's state is cleared and a fresh thread is started for it only |
+
+A stall verdict is structured (from the watchdog), not text-sniffed, and is
+handled before auth/stale/retriable classification: partial stale- or
+auth-looking stderr in a killed run must neither classify the failure nor
+clear resume state. A stalled attempt whose turn had already completed (final
+agent_message buffered plus turn completion) is not a failure at all — the
+kill hit a wedged shutdown, so the reply is kept as success with the warning
+"codex wedged after completing its turn; process terminated" and state is
+saved best-effort.
 
 Classification uses stderr plus structured Codex JSONL stdout error
 events (`type:error`, `turn.failed`). The **primary** retriable signal
@@ -272,25 +311,48 @@ error *type* (`invalid_request_error`) suppresses the fallback the same
 way, covering the 4xx bodies codex sometimes surfaces without a numeric
 status. The substring
 markers (`RATE_LIMIT_MARKERS` / `TRANSIENT_5XX_MARKERS`) are a
-**fallback** for failures that carry no parseable status — including the
-current codex-cli code-less prose `experiencing high demand` and
-`server overloaded` (`backend overloaded` is retained as a legacy
-fallback for older codex/provider text). Usage/quota
+**fallback** for failures that carry no parseable status — covering the
+current codex-cli code-less rewrites such as `experiencing high demand`,
+`server overloaded`, `selected model is at capacity`, and
+`request was throttled` (`backend overloaded` is retained as a legacy
+fallback for older codex/provider text). That coverage is deliberately
+scoped: an echoed status phrase inside an `error.message` has no
+provenance and remains a known limit, not something the markers try to
+guess at. Usage/quota
 limits are **not** retriable: a plan cap does not clear within a 5s
 backoff, so it is surfaced terminal rather than retried. JSONL parsing
 intentionally skips malformed and non-object events while preserving
 later valid agent messages.
 
-No wall-clock cap is applied to roles or to the council as a whole —
-each role runs as long as Codex takes (hours or days is fine).
-`codex exec` itself has no run-level timeout. Its only default that
-could end a long-*quiet* run is the per-provider stream-idle timeout
-(`model_providers.<id>.stream_idle_timeout_ms`, 5 min, then a bounded
-retry count), which an actively-streaming role never trips. Widening
-it is left to the user's `~/.codex/config.toml` rather than overridden
-here: it is provider-scoped and the active provider id varies, so the
-council cannot target it portably. `start_new_session=True` on each
-`codex exec` puts it in its own process group, so a Ctrl+C (or any
+## Liveness: no run-level deadline, output-inactivity watchdog
+
+The council has no total elapsed-time or run-level deadline. A role may run
+indefinitely while its codex subprocess continues producing output bytes —
+hours or days is fine — and `codex exec` itself imposes no run-level timeout
+either. Separately, each codex subprocess has an **output-inactivity
+watchdog** based only on the time since its most recent stdout/stderr byte.
+Incremental readers pump both pipes in fixed-size chunks (never
+line-buffered reads, which would cap unrestricted JSONL line sizes) and stamp
+a shared last-activity clock; raw bytes are buffered per stream and decoded
+once after the pumps join, so a UTF-8 sequence split across chunks survives.
+After `CODEX_COUNCIL_STALL_SECS` seconds of council-visible silence
+(default 1800; positive integer override; 0 disables; anything else is a
+usage error, exit 2), the watchdog terminates that attempt — SIGTERM, a short
+grace, then SIGKILL to the process group, with every termination path
+converging on a single idempotent owner so watchdog, cancellation, and error
+teardowns never race — and the stall policy in the table above decides the
+outcome. Setting 0 may again permit an indefinitely silent role.
+
+The watchdog measures **bytes, not progress**: current codex `exec --json`
+suppresses agent-message/reasoning `item.started` events and all
+token/exec-output deltas, so a healthy role can be byte-silent for long
+stretches — the claim is output-inactivity recovery only, never semantic
+wedge detection. Codex's per-provider stream-idle timeout
+(`model_providers.<id>.stream_idle_timeout_ms`, 5 min default, bounded
+retries) is a separate provider-side control left to the user's
+`~/.codex/config.toml`: it is provider-scoped and the active provider id
+varies, so the council cannot target it portably. `start_new_session=True` on
+each `codex exec` puts it in its own process group, so a Ctrl+C (or any
 other cancellation) sends SIGTERM, waits briefly, then sends SIGKILL
 to the group; any shell commands codex itself spawned for tool calls
 are also reaped. SIGINT/SIGTERM/SIGHUP to the council process cancel
