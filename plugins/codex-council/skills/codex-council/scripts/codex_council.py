@@ -30,9 +30,26 @@ Env vars:
                                    fall back to project-wide role state
     CODEX_COUNCIL_MAX_PARALLEL    positive active-role concurrency override;
                                    otherwise use Codex agents.max_threads or 6
+    CODEX_COUNCIL_STALL_SECS      output-inactivity watchdog threshold in
+                                   seconds (default 1800; 0 disables)
 
-No wall-clock timeouts are enforced — each role runs as long as Codex
-takes. Ctrl+C still tears down every in-flight codex process group.
+The council has no total elapsed-time or run-level deadline. A role may run
+indefinitely while its codex subprocess continues producing output bytes.
+Separately, each codex subprocess has an OUTPUT-INACTIVITY watchdog based
+only on time since its most recent stdout/stderr byte. After
+CODEX_COUNCIL_STALL_SECS of council-visible silence the runner terminates
+that attempt and applies the stall policy: retriable only when no
+side-effect-capable work had begun, success-with-warning when the turn had
+already completed, terminal otherwise. Setting 0 may again permit an
+indefinitely silent role. Ctrl+C still tears down every in-flight codex
+process group.
+
+The optional `--skill-contract <int>` flag pins the SKILL/script contract
+epoch: absent it is ignored; present it must equal this script's epoch or
+the launch is refused as a stale SKILL/script pair. The staging-OK,
+dispatch, heartbeat, and CODEX_COUNCIL_DONE lines carry
+`version=<plugin version>` for postmortem visibility (it does not prevent
+skew; the contract epoch does).
 
 POSIX-only: uses start_new_session and process-group signals.
 """
@@ -40,6 +57,7 @@ POSIX-only: uses start_new_session and process-group signals.
 import argparse
 import asyncio
 import contextlib
+import errno
 import fcntl
 import hashlib
 import json
@@ -54,6 +72,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from functools import cache
+from pathlib import Path
 from typing import Optional
 
 try:
@@ -82,15 +101,25 @@ AUTH_ERROR_MARKERS = (
     "auth: token rejected",
     "please run `codex login`",
     "please run codex login",
+    # current codex-cli terminal refresh-token failure wording ("Your access
+    # token could not be refreshed because your refresh token ...").
+    "access token could not be refreshed",
 )
 RATE_LIMIT_MARKERS = (
-    # NB: bare "429" is intentionally NOT here — the anchored status parser
-    # (_extract_statuses) covers every real 429 form ("status":429, HTTP 429,
-    # status 429, last status: 429, 429 Too Many Requests), so a bare digit run
-    # like "4291" or "stale-429-sid" is never mistaken for a rate limit.
+    # NB: bare "429" is intentionally NOT here — codex normalizes ordinary
+    # HTTP errors to text carrying the real transport status, which the
+    # anchored parser (_extract_statuses) reads, so a bare digit run like
+    # "4291" or "stale-429-sid" is never mistaken for a rate limit. The phrase
+    # markers below cover codex's code-less rewrites; an echoed status phrase
+    # inside an error.message has no provenance and remains a known limit.
     "rate limit",
     "rate_limit",
     "too many requests",
+    # Exact current codex wording for a throttled SSE stream: response.failed
+    # handling drops code/status_code/statusCode and keeps only the message
+    # ("stream disconnected before completion: Request was throttled").
+    # Deliberately NOT bare "throttled" — quota/policy prose could collide.
+    "request was throttled",
     # NB: "quota exceeded" / usage caps are deliberately NOT retriable markers —
     # a plan/usage cap does not clear within a 5s backoff, so it is surfaced
     # terminal (see the Retries note in SKILL.md / DESIGN.md). Genuine transient
@@ -105,15 +134,18 @@ TRANSIENT_5XX_MARKERS = (
     "service unavailable",
     # current codex-cli friendly-rewrites some upstream 5xx/overload errors to
     # prose that carries no status code (HTTP 500 -> "...experiencing high
-    # demand..."; overload -> "...server overloaded..."). "backend overloaded"
-    # is kept as a legacy fallback for older codex/provider text. These phrases
-    # are version-coupled fallbacks for that code-less case; the numeric range
-    # in _structured_retriable_class handles every 5xx that DOES carry a
-    # status. The overload markers are intentionally specific (not bare
-    # "overloaded") so unrelated text like "operator overloaded" is not matched.
+    # demand..."; overload -> "...server overloaded..."; HTTP 503
+    # server_is_overloaded/slow_down -> "Selected model is at capacity. Please
+    # try a different model."). "backend overloaded" is kept as a fallback for
+    # older codex/provider text. These phrases are version-coupled fallbacks
+    # for the code-less case; the numeric range in _structured_retriable_class
+    # handles every 5xx that DOES carry a status. The overload markers are
+    # intentionally specific (not bare "overloaded") so unrelated text like
+    # "operator overloaded" is not matched.
     "server overloaded",
     "backend overloaded",
     "experiencing high demand",
+    "selected model is at capacity",
 )
 STALE_RESUME_MARKERS = (
     "no rollout found",
@@ -152,10 +184,26 @@ LOCK_PROBE_INITIAL_BACKOFF_SECS = 0.1
 LOCK_PROBE_MAX_BACKOFF_SECS = 2.0
 DEFAULT_MAX_PARALLEL = 6
 MAX_PARALLEL_ENV = "CODEX_COUNCIL_MAX_PARALLEL"
+STALL_SECS_ENV = "CODEX_COUNCIL_STALL_SECS"
+DEFAULT_STALL_SECS = 1800
 PROGRESS_HEARTBEAT_SECS = 30 * 60
+# Heartbeat cadence floor while the watchdog is enabled; the cadence adapts to
+# min(PROGRESS_HEARTBEAT_SECS, stall_secs // 3) so at least two heartbeats can
+# report a rising quiet value before the watchdog threshold.
+HEARTBEAT_FLOOR_SECS = 300
+# Contract epoch for the optional --skill-contract handshake. Bump only when
+# SKILL.md's launch/preflight command contract changes incompatibly.
+SKILL_CONTRACT_EPOCH = 1
+_READ_CHUNK_BYTES = 65536
 REQUIRED_SCOPE_PHRASE = "nothing material"
 REQUIRED_CADENCE_SENTENCE = "Thoroughness beats speed."
-LINEBREAK_CHARS = ("\r", "\n", "\u2028", "\u2029")
+# Every line-boundary character str.splitlines() recognizes (beyond the plain
+# space): CR, LF, VT, FF, FS, GS, RS, NEL, LS, PS. Labels reject the full set
+# and _report_inline escapes the same set, so the two contracts agree.
+LINEBREAK_CHARS = (
+    "\r", "\n", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e",
+    "\x85", "\u2028", "\u2029",
+)
 COLLABORATION_BRIEF = (
     "You are one contributor in a Claude-orchestrated Codex council. Treat the "
     "shared working context as the source of truth: reconstruct the user's "
@@ -175,25 +223,47 @@ STAGING_PATH_HINT = (
     "not persist across Claude Code Bash calls."
 )
 # Action-first recovery text for a rejected staging DIRECTORY. The orchestrator
-# is an LLM; the cheapest literal reading of "create it with mktemp -d" was
-# observed (GH issue #1) to be satisfied by mkdir/chmod on the same predictable
-# path, so the recovery must forbid exactly those moves and demand a NEW path.
+# is an LLM; the cheapest literal reading of "create it with mktemp -d" is
+# satisfiable by mkdir/chmod on the same predictable path, so the recovery must
+# forbid exactly those moves and demand a NEW path.
 STAGING_DIR_RECOVERY = (
     "Recovery: abandon this directory — do not chmod it, do not mkdir it, "
     "and do not reuse its name. Run `mktemp -d` again, copy the NEW printed "
     "absolute path, re-Write BOTH roles.json and context.md into that new "
     "directory, and re-run --check-staging-dir on it."
 )
+# Same action, phrased for the stdin launch mode, where roles.json is the only
+# on-disk input: no context.md and no preflight exist to mention.
+STDIN_DIR_RECOVERY = (
+    "Recovery: abandon this directory — do not chmod it, do not mkdir it, "
+    "and do not reuse its name. Run `mktemp -d` again, copy the NEW printed "
+    "absolute path, rewrite the roles file into that new directory, and "
+    "re-run the direct command against it."
+)
+# Uniform recovery appended to EVERY roles-file validation failure. The only
+# production writer of roles.json is an LLM; partial patches of a file that
+# already glitched once are the corruption vector, so every defect demands one
+# complete rewrite. The suffix stays mode-neutral because parse-time code
+# cannot know whether the caller staged a context file or piped stdin.
+ROLES_REWRITE_RECOVERY = (
+    "Recovery: rewrite the entire file passed to --roles-file in one "
+    "complete Write operation; do not patch, append, or replace a "
+    "substring. Do not launch until the rewritten file validates, then "
+    "re-run the pre-flight or the direct command you used."
+)
 
-# No timeout, by design. Neither this script nor `codex exec` enforces a
-# wall-clock or run-level timeout, so a role may think for hours or days.
-# codex's only default that could end a long-QUIET run is the
-# per-PROVIDER stream-idle timeout (`model_providers.<id>.stream_idle_timeout_ms`,
-# 5 min, then bounded retries), which an actively-streaming role never
-# trips. Widening that for long stalls is left to the user's
-# ~/.codex/config.toml rather than overridden here: it is provider-scoped
-# and the active provider id varies, so the council cannot target it
-# portably. (Verified against the installed codex-cli.)
+# No run-level deadline, by design: neither this script nor `codex exec`
+# bounds a role's total duration, so a role may think for hours while its
+# subprocess keeps producing output bytes. The only liveness control here is
+# the per-subprocess OUTPUT-INACTIVITY watchdog (CODEX_COUNCIL_STALL_SECS),
+# which measures council-visible bytes, not progress: current codex exec
+# --json suppresses agent-message/reasoning item.started events and all
+# token/exec-output deltas, so a healthy role can be byte-silent for long
+# stretches. codex's own per-PROVIDER stream-idle timeout
+# (`model_providers.<id>.stream_idle_timeout_ms`, 5 min default, bounded
+# retries) is a separate provider-side control left to the user's
+# ~/.codex/config.toml: it is provider-scoped and the active provider id
+# varies, so the council cannot target it portably.
 
 
 @dataclass(frozen=True)
@@ -215,6 +285,161 @@ class RoleResult:
     warning: Optional[str] = None
 
 
+@dataclass
+class CodexRun:
+    """Structured outcome of one codex subprocess attempt.
+
+    `stalled` is the watchdog verdict and outranks any text classification of
+    stdout/stderr. `turn_completed` / `unsafe_to_replay` are derived from the
+    buffered JSONL events so the stall policy can tell a wedged shutdown from
+    an interrupted turn, and a replay-safe attempt from one whose tool work
+    may have had side effects.
+    """
+    returncode: Optional[int]
+    stdout: str
+    stderr: str
+    stalled: bool = False
+    turn_completed: bool = False
+    unsafe_to_replay: bool = False
+
+
+class _NullDiagnostics:
+    """Write sink used after the real stderr is confirmed dead.
+
+    Implements just enough of the text-stream surface (write/flush/isatty/
+    encoding) for print() and interpreter-shutdown flushing; cheaper than
+    holding a devnull descriptor open (no EMFILE risk).
+    """
+
+    encoding = "utf-8"
+
+    def write(self, s):
+        return len(s)
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        return False
+
+
+# Diagnostics path for every advisory stderr write (progress, notices, stall
+# diagnostics, interruption messages, and the CODEX_COUNCIL_DONE sentinel).
+# None means "use the live sys.stderr"; a dead stderr swaps in the no-op sink.
+_diagnostics = {"stream": None}
+
+
+def _diag(message):
+    """Best-effort advisory stderr write.
+
+    stderr is advisory: its death must never change role results or the
+    process exit code (never exit 120). Terminal failures — BrokenPipeError,
+    EBADF, or a closed-stream ValueError — permanently redirect all further
+    diagnostics to a no-op sink (and close the dead stream so an
+    interpreter-shutdown flush cannot fail); any other one-off OSError (e.g.
+    a transient EAGAIN) is suppressed while the stream stays in use, so a
+    hiccup does not silently swallow the sentinel.
+    """
+    if _diagnostics["stream"] is not None:
+        return
+    try:
+        print(message, file=sys.stderr, flush=True)
+    except (BrokenPipeError, ValueError):
+        _retire_diagnostics_stream()
+    except OSError as e:
+        if e.errno == errno.EBADF:
+            _retire_diagnostics_stream()
+
+
+def _retire_diagnostics_stream():
+    """Permanently stop writing diagnostics to the dead stderr."""
+    _diagnostics["stream"] = _NullDiagnostics()
+    with contextlib.suppress(Exception):
+        sys.stderr.close()
+    # Replace the module-visible stderr too so interpreter-shutdown flushing
+    # and stray writers (e.g. asyncio's exception handler) cannot raise into
+    # the exit path.
+    sys.stderr = _diagnostics["stream"]
+
+
+def _append_warning(existing, new):
+    """Compose role warnings without overwriting earlier (higher-value) ones."""
+    if not new:
+        return existing
+    if not existing:
+        return new
+    return f"{existing}; {new}"
+
+
+def _plugin_version():
+    """Best-effort plugin version for postmortem visibility; never raises.
+
+    The manifest lives three directory levels above scripts/:
+    plugins/codex-council/.claude-plugin/plugin.json.
+    """
+    try:
+        manifest = (
+            Path(__file__).resolve().parents[3] / ".claude-plugin" / "plugin.json"
+        )
+        with open(manifest, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError, IndexError):
+        return "unknown"
+    version = data.get("version") if isinstance(data, dict) else None
+    if isinstance(version, str) and version:
+        return version
+    return "unknown"
+
+
+def _stall_secs():
+    """Output-inactivity watchdog threshold in seconds; 0 means disabled."""
+    raw = os.environ.get(STALL_SECS_ENV, "").strip()
+    if not raw:
+        return DEFAULT_STALL_SECS
+    try:
+        value = int(raw)
+    except ValueError:
+        value = -1
+    if value < 0:
+        _usage_exit(
+            f"{STALL_SECS_ENV} must be a positive integer (or 0 to disable "
+            f"the watchdog); got {raw!r}."
+        )
+    return value
+
+
+def _watchdog_desc(stall_secs):
+    """Human/heartbeat-facing rendering of the watchdog threshold."""
+    return f"{stall_secs}s" if stall_secs > 0 else "disabled"
+
+
+def _heartbeat_secs(stall_secs):
+    """Adaptive heartbeat cadence: denser while the watchdog is armed."""
+    if stall_secs <= 0:
+        return PROGRESS_HEARTBEAT_SECS
+    return max(
+        HEARTBEAT_FLOOR_SECS, min(PROGRESS_HEARTBEAT_SECS, stall_secs // 3)
+    )
+
+
+# Per-role liveness the heartbeat reads. Written by the subprocess pumps and
+# the retry loop; module-level because run_council and the pumps are far
+# apart, and same-role concurrency is already excluded by the continuity lock.
+# Values: a monotonic stamp of the last output byte, or "retry-wait" while a
+# role sleeps out a retry backoff (a stale quiet value would be misleading).
+_ROLE_LIVENESS = {}
+
+
+def _role_liveness_desc(role_id, now):
+    """One heartbeat fragment for an active role."""
+    state = _ROLE_LIVENESS.get(role_id)
+    if state == "retry-wait":
+        return f"{role_id} retry-wait"
+    if isinstance(state, (int, float)):
+        return f"{role_id} quiet={max(0.0, now - state):.0f}s"
+    return role_id
+
+
 # \Z, not $: in Python `$` also matches just before a trailing "\n", so
 # "architect\n" would pass and inject a newline into state filenames, the
 # report summary line, and stderr progress. \Z anchors the true end of string.
@@ -224,10 +449,9 @@ ROLE_ID_PATTERN = re.compile(r"^[a-z0-9_-]+\Z")
 def _state_role_component(role_id):
     """Return a filename-safe, bounded component for an unrestricted role ID.
 
-    Releases before unrestricted IDs stored the literal ID in the state
-    filename and accepted at most 32 characters. Preserve those existing
-    paths, but hash every newly-accepted longer ID so the plugin never runs
-    into the platform's per-component filename limit.
+    IDs of 32 characters or fewer keep the literal ID (existing state paths
+    stay valid); longer IDs are hashed to a fixed-size component so the state
+    filename never exceeds the platform's per-component limit.
     """
     if len(role_id) <= 32:
         return role_id
@@ -433,10 +657,15 @@ def save_session(role_id, session_id):
 
 
 def clear_session(role_id):
-    """Remove this role's stored thread state."""
+    """Remove this role's stored thread state.
+
+    Ignores only a missing file. Any other OSError propagates so callers can
+    attach a warning — a swallowed failure here would make stale state
+    silently immortal.
+    """
     try:
         os.remove(_state_path(role_id))
-    except OSError:
+    except FileNotFoundError:
         pass
 
 
@@ -582,7 +811,8 @@ def _is_stale_resume_error(stderr_text):
 # (e.g. "429" inside a thread id like "stale-429-sid") is never mistaken for one.
 # Two anchors are accepted:
 #   * keyword-prefixed: `"status": 429`, `status 529`, `status code 429`,
-#     `HTTP 429`, `last status: 429` (the JSON key and the prose forms);
+#     `status_code: 400`, `statusCode: 503`, `HTTP 429`, `last status: 429`
+#     (the JSON key spellings and the prose forms);
 #   * reason-phrase-suffixed: `429 Too Many Requests`, `503 Service Unavailable`,
 #     `502 Bad Gateway`, `504 Gateway Timeout`, `500 Internal Server Error`,
 #     `529 <unknown status code>` (codex's "unexpected status N" form).
@@ -592,7 +822,7 @@ def _is_stale_resume_error(stderr_text):
 # is NOT read as "http" + status 127; only real `HTTP 429` / `status: 429`
 # forms match.
 _STATUS_KEYWORD_RE = re.compile(
-    r"(?:^|[^0-9a-z_])(?:http|status)(?:\s+code)?[\s:=\"']*([0-9]{3})(?![0-9])",
+    r"(?:^|[^0-9a-z_])(?:http|status(?:[\s_-]*code)?)[\s:=\"']*([0-9]{3})(?![0-9])",
     re.IGNORECASE,
 )
 _STATUS_REASON_RE = re.compile(
@@ -702,20 +932,75 @@ def _fresh_cmd(root):
     ]
 
 
-async def _run_codex_subprocess(cmd, prompt):
-    """Run codex exec async; on cancellation, kill the whole process group.
+class _EventFlagScanner:
+    """Derive replay-safety flags from the stdout JSONL as chunks arrive.
+
+    Splits strictly on b"\\n" (JSONL's record separator) for the same reason
+    as _iter_json_objects: U+2028/U+2029/U+0085 are legal unescaped inside a
+    JSON string. Item types other than the pure-text agent_message/reasoning
+    (command executions, MCP tool calls, file changes, web searches, collab,
+    and any unknown/future type) mark the attempt unsafe to replay —
+    conservative by default, since replaying such a turn could duplicate
+    side effects.
+    """
+
+    _SAFE_ITEM_TYPES = frozenset({"agent_message", "reasoning"})
+
+    def __init__(self):
+        self.turn_completed = False
+        self.unsafe_to_replay = False
+        self._pending = b""
+
+    def feed(self, chunk):
+        data = self._pending + chunk
+        lines = data.split(b"\n")
+        self._pending = lines.pop()
+        for line in lines:
+            self._scan_line(line)
+
+    def finish(self):
+        """Scan any final unterminated line (a kill can truncate the stream)."""
+        pending, self._pending = self._pending, b""
+        self._scan_line(pending)
+
+    def _scan_line(self, line):
+        line = line.strip()
+        if not line:
+            return
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return
+        if not isinstance(event, dict):
+            return
+        event_type = event.get("type")
+        if event_type == "turn.completed":
+            self.turn_completed = True
+        elif event_type in ("item.started", "item.completed"):
+            item = event.get("item")
+            item_type = item.get("type") if isinstance(item, dict) else None
+            if item_type not in self._SAFE_ITEM_TYPES:
+                self.unsafe_to_replay = True
+
+
+async def _run_codex_subprocess(cmd, prompt, role_id=""):
+    """Run codex exec async with incremental readers and a stall watchdog.
 
     start_new_session=True puts codex in its own process group so a
     SIGTERM to the group also reaches any shell commands codex itself
     spawned for tool calls. Without it, those grandchildren leak.
+
+    Returns a CodexRun. All termination paths — the watchdog, outer
+    cancellation, and any post-spawn failure — converge on one idempotent
+    termination task, so duplicate teardowns never race.
     """
     # Encode BEFORE spawning. A prompt carrying a char UTF-8 cannot encode
     # (e.g. a lone surrogate from an escaped "\uD800" in roles.json) would
-    # otherwise raise from the .encode() call AFTER the child exists, and the
-    # cancellation-only cleanup would not run — leaking a codex process left
-    # blocked forever on the stdin it never received. Failing here, pre-spawn,
-    # means there is no child to leak.
+    # otherwise raise AFTER the child exists, before any pump/teardown task
+    # ran — leaking a codex process left blocked forever on the stdin it
+    # never received. Failing here, pre-spawn, means there is no child to leak.
     prompt_bytes = prompt.encode("utf-8")
+    stall_secs = _stall_secs()
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdin=asyncio.subprocess.PIPE,
@@ -728,18 +1013,116 @@ async def _run_codex_subprocess(cmd, prompt):
     except OSError:
         # start_new_session=True makes the child process leader's pid the pgid.
         pgid = proc.pid
+
+    scanner = _EventFlagScanner()
+    stdout_buf = bytearray()
+    stderr_buf = bytearray()
+    # Shared last-activity stamp: any byte on either stream resets the
+    # watchdog. Raw bytes are buffered per stream and decoded once after the
+    # pumps join, so a UTF-8 sequence split across chunks survives.
+    activity = {"at": time.monotonic()}
+    if role_id:
+        _ROLE_LIVENESS[role_id] = activity["at"]
+
+    def _record_activity():
+        activity["at"] = time.monotonic()
+        if role_id:
+            _ROLE_LIVENESS[role_id] = activity["at"]
+
+    async def _pump(stream, buf, feed_scanner):
+        # read(chunk), never readline()/readuntil(): asyncio's stream limit
+        # would cap unrestricted JSONL line sizes.
+        while True:
+            chunk = await stream.read(_READ_CHUNK_BYTES)
+            if not chunk:
+                return
+            _record_activity()
+            buf.extend(chunk)
+            if feed_scanner:
+                scanner.feed(chunk)
+
+    async def _feed_stdin():
+        try:
+            proc.stdin.write(prompt_bytes)
+            await proc.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            # The child exited or closed stdin early; its buffered output and
+            # exit status still tell the story.
+            pass
+        finally:
+            with contextlib.suppress(OSError):
+                proc.stdin.close()
+
+    termination = {"task": None}
+
+    def _begin_termination():
+        """Single idempotent termination owner; every caller awaits it."""
+        if termination["task"] is None:
+            termination["task"] = asyncio.ensure_future(
+                _terminate_process_group(proc, pgid)
+            )
+        return termination["task"]
+
+    stalled = {"flag": False}
+
+    async def _watchdog():
+        # Hand-rolled on purpose: an asyncio.sleep loop over time.monotonic,
+        # never asyncio.wait_for/asyncio.timeout — there is no deadline on the
+        # subprocess itself, only on its output inactivity.
+        while True:
+            remaining = stall_secs - (time.monotonic() - activity["at"])
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+                continue
+            # Threshold reached: yield once and re-check, so a reader chunk
+            # scheduled in this same event-loop turn is not misread as a stall.
+            await asyncio.sleep(0)
+            quiet = time.monotonic() - activity["at"]
+            if quiet < stall_secs:
+                continue
+            stalled["flag"] = True
+            _diag(
+                f"[codex-council:{role_id}] stall threshold reached "
+                f"(quiet={quiet:.0f}s, watchdog={stall_secs}s); "
+                "terminating attempt"
+            )
+            _begin_termination()
+            return
+
+    # Pumps start BEFORE the prompt is written: a child that writes output
+    # before consuming an unrestricted-size stdin must not deadlock on full
+    # pipes.
+    pump_out = asyncio.create_task(_pump(proc.stdout, stdout_buf, True))
+    pump_err = asyncio.create_task(_pump(proc.stderr, stderr_buf, False))
+    feeder = asyncio.create_task(_feed_stdin())
+    watchdog = (
+        asyncio.create_task(_watchdog()) if stall_secs > 0 else None
+    )
     try:
-        stdout_b, stderr_b = await proc.communicate(prompt_bytes)
+        await proc.wait()
     except BaseException:
-        # Reap on ANY post-spawn failure or cancellation, not just
-        # CancelledError — otherwise codex (and its tool-call grandchildren)
-        # leak whenever communicate() raises for any other reason.
-        await _terminate_process_group(proc, pgid)
+        # Reap on ANY failure or cancellation while the child may be alive.
+        if watchdog is not None:
+            watchdog.cancel()
+        for task in (feeder, pump_out, pump_err):
+            task.cancel()
+        await _begin_termination()
         raise
-    return (
-        proc.returncode,
-        stdout_b.decode("utf-8", errors="replace"),
-        stderr_b.decode("utf-8", errors="replace"),
+    # The process is gone: the watchdog must not fire while the remaining
+    # pipe bytes are drained (post-exit data is data, not a stall).
+    if watchdog is not None:
+        watchdog.cancel()
+    if termination["task"] is not None:
+        await termination["task"]
+    await asyncio.gather(feeder, pump_out, pump_err)
+    scanner.finish()
+    return CodexRun(
+        returncode=proc.returncode,
+        stdout=bytes(stdout_buf).decode("utf-8", errors="replace"),
+        stderr=bytes(stderr_buf).decode("utf-8", errors="replace"),
+        stalled=stalled["flag"],
+        turn_completed=scanner.turn_completed,
+        unsafe_to_replay=scanner.unsafe_to_replay,
     )
 
 
@@ -776,6 +1159,71 @@ def _format_clean_exit_no_message(stderr_stripped):
     return f"{base}\n{stderr_stripped}" if stderr_stripped else base
 
 
+def _save_session_reply_first(role_id, session_id, warning):
+    """Persist continuity state; a failed save must never cost the reply."""
+    try:
+        save_session(role_id, session_id)
+    except OSError as e:
+        warning = _append_warning(
+            warning,
+            f"reply completed; session state could not be persisted ({e})",
+        )
+    return warning
+
+
+def _stalled_role_result(role, run, stored_id, attempt, started, warning=None):
+    """Apply the stall policy to a watchdog-terminated attempt.
+
+    The structured stall verdict outranks text sniffing: partial stale/auth
+    text in a killed run's stderr must neither classify the failure nor clear
+    resume state. Policy:
+      * turn.completed AND a final agent_message buffered: the reply is
+        definitively complete — the kill hit a wedged shutdown. Success with
+        a warning; state saved best-effort; no retry.
+      * no side-effect-capable item started: replay is safe — retriable
+        through the ordinary shared retry budget.
+      * otherwise: terminal — replaying could duplicate tool side effects.
+        An agent_message without turn.completed is quoted but never
+        auto-promoted to success.
+    """
+    stall = _stall_secs()
+    elapsed = time.monotonic() - started
+    msg = extract_final_message(run.stdout)
+    if run.turn_completed and msg:
+        thread_id = extract_session_id(run.stdout) or stored_id
+        warning = _append_warning(
+            warning,
+            "codex wedged after completing its turn; process terminated",
+        )
+        if thread_id:
+            warning = _save_session_reply_first(role.id, thread_id, warning)
+        return RoleResult(
+            role=role, ok=True, text=msg, thread_id=thread_id,
+            elapsed_seconds=elapsed, attempts=attempt, warning=warning,
+        )
+    if not run.unsafe_to_replay:
+        return RoleResult(
+            role=role, ok=False,
+            error=(
+                f"[retriable:stall] no output for {stall}s (watchdog "
+                f"{stall}s); no tool work had begun — retrying"
+            ),
+            thread_id=stored_id, elapsed_seconds=elapsed, attempts=attempt,
+            warning=warning,
+        )
+    error = (
+        f"[stall] no output for {stall}s (watchdog {stall}s); not "
+        "automatically retried because tool work had begun — re-invoke the "
+        "role manually if needed"
+    )
+    if msg:
+        error += f"\nlast (possibly incomplete) agent_message: {msg}"
+    return RoleResult(
+        role=role, ok=False, error=error, thread_id=stored_id,
+        elapsed_seconds=elapsed, attempts=attempt, warning=warning,
+    )
+
+
 def _classify_failure(stderr_stripped, rc, phase):
     """Return a tagged error string for a non-zero codex exit."""
     if _is_auth_error(stderr_stripped):
@@ -788,20 +1236,35 @@ def _classify_failure(stderr_stripped, rc, phase):
     return stderr_stripped or f"codex {phase} exited {rc}"
 
 
+def _start_line(role, phase, attempt, stall_secs):
+    return (
+        f"[codex-council] {role.id}: started ({phase}) "
+        f"attempt={attempt}/{MAX_RETRY_ATTEMPTS} "
+        f"watchdog={_watchdog_desc(stall_secs)}"
+    )
+
+
 async def _run_role_once(role, prompt, attempt):
     """One codex invocation for one role. No retry logic here."""
     started = time.monotonic()
     root = _project_root()
+    stall_secs = _stall_secs()
     session_id, meta = load_session(role.id)
     warning = None
 
     if session_id:
-        rc, stdout, stderr = await _run_codex_subprocess(
-            _resume_cmd(root, session_id), prompt
+        _diag(_start_line(role, "resume", attempt, stall_secs))
+        run = await _run_codex_subprocess(
+            _resume_cmd(root, session_id), prompt, role_id=role.id
         )
-        failure_text = _failure_text(stdout, stderr)
+        # The structured stall verdict is handled BEFORE any text
+        # classification: a killed run's partial stderr could look stale or
+        # auth-shaped, and must not clear resume state.
+        if run.stalled:
+            return _stalled_role_result(role, run, session_id, attempt, started)
+        failure_text = _failure_text(run.stdout, run.stderr)
 
-        if rc == 0:
+        if run.returncode == 0:
             # Resume-footgun mitigation. `codex exec resume <id>` parses <id>
             # as a UUID first (UUIDs take precedence if it parses). On current
             # codex-cli a valid-but-unknown UUID ERRORS ("no rollout found ...
@@ -814,27 +1277,53 @@ async def _run_role_once(role, prompt, attempt):
             # thread.started.thread_id to what we asked to resume; if mismatched,
             # adopt the new id (no benefit re-running an already-completed turn)
             # and warn — the role lost its prior accumulated framing.
-            emitted_id = extract_session_id(stdout)
+            # The reply is extracted BEFORE any state write so persistence
+            # failures can never cost a completed reply.
+            msg = extract_final_message(run.stdout)
+            emitted_id = extract_session_id(run.stdout)
+            adopted_from = None
             if emitted_id and emitted_id != session_id:
+                adopted_from = session_id
                 warning = (
                     f"resume returned thread_id {emitted_id} != stored "
                     f"{session_id}; adopted new id (prior continuity lost)"
                 )
-                print(
-                    f"[codex-council:{role.id}] {warning}",
-                    file=sys.stderr,
-                )
+                _diag(f"[codex-council:{role.id}] {warning}")
                 session_id = emitted_id
-                # Persist the adoption immediately: the stored id is proven
-                # wrong (codex ran this turn on a different thread), so even
-                # a no-agent_message failure below must not leave state
-                # pointing at the old thread — resuming it again would just
-                # repeat the silent-spawn footgun next call.
-                save_session(role.id, session_id)
-            msg = extract_final_message(stdout)
+            # ONE save covers both the reply-success case and the adoption
+            # case. An adoption is persisted even without an agent_message:
+            # the stored id is proven wrong (codex ran this turn on a
+            # different thread), and leaving it would repeat the
+            # silent-spawn footgun on every subsequent call.
+            if msg or adopted_from is not None:
+                try:
+                    save_session(role.id, session_id)
+                except OSError as e:
+                    if msg:
+                        warning = _append_warning(
+                            warning,
+                            "reply completed; session state could not be "
+                            f"persisted ({e})",
+                        )
+                    else:
+                        warning = _append_warning(
+                            warning,
+                            f"session state could not be persisted ({e})",
+                        )
+                    if adopted_from is not None:
+                        # The stored id is proven wrong; best-effort clear it
+                        # so the next invocation does not resume it again.
+                        try:
+                            clear_session(role.id)
+                        except OSError as clear_err:
+                            warning = _append_warning(
+                                warning,
+                                "obsolete session state for "
+                                f"{adopted_from} remains and may repeat "
+                                f"adoption next invocation ({clear_err})",
+                            )
             elapsed = time.monotonic() - started
             if msg:
-                save_session(role.id, session_id)
                 return RoleResult(
                     role=role, ok=True, text=msg, thread_id=session_id,
                     elapsed_seconds=elapsed, attempts=attempt, warning=warning,
@@ -854,48 +1343,72 @@ async def _run_role_once(role, prompt, attempt):
         # merely contains a bare digit run (e.g. "...thread id stale-429-sid")
         # still restarts fresh.
         if _is_auth_error(failure_text):
-            err = _classify_failure(failure_text, rc, "resume")
+            err = _classify_failure(failure_text, run.returncode, "resume")
             return RoleResult(
                 role=role, ok=False, error=err,
                 elapsed_seconds=time.monotonic() - started, attempts=attempt,
             )
         if _structured_retriable_class(failure_text):
-            err = _classify_failure(failure_text, rc, "resume")
+            err = _classify_failure(failure_text, run.returncode, "resume")
             return RoleResult(
                 role=role, ok=False, error=err,
                 elapsed_seconds=time.monotonic() - started, attempts=attempt,
             )
         if not _is_stale_resume_error(failure_text):
-            err = _classify_failure(failure_text, rc, "resume")
+            err = _classify_failure(failure_text, run.returncode, "resume")
             return RoleResult(
                 role=role, ok=False, error=err,
                 elapsed_seconds=time.monotonic() - started, attempts=attempt,
             )
 
-        # Stale: log, clear, fall through to fresh.
+        # Stale: log, clear, fall through to fresh. A failed clear is only
+        # worth a warning in the outcomes where stale state actually remains
+        # on disk (a later successful save atomically replaces it anyway).
         updated = (meta or {}).get("updated_at", "unknown")
-        print(
+        _diag(
             f"[codex-council:{role.id}] session {session_id} (last used {updated}) "
-            f"is stale ({failure_text}) — starting fresh.",
-            file=sys.stderr,
+            f"is stale ({failure_text}) — starting fresh."
         )
+        stale_clear_error = None
         current_id, _ = load_session(role.id)
         if current_id == session_id:
-            clear_session(role.id)
+            try:
+                clear_session(role.id)
+            except OSError as e:
+                stale_clear_error = e
 
-    # Fresh path.
-    rc, stdout, stderr = await _run_codex_subprocess(_fresh_cmd(root), prompt)
-    failure_text = _failure_text(stdout, stderr)
+    else:
+        stale_clear_error = None
 
-    if rc != 0:
-        return RoleResult(
-            role=role, ok=False,
-            error=_classify_failure(failure_text, rc, "exec"),
-            elapsed_seconds=time.monotonic() - started, attempts=attempt,
+    def _with_stale_clear_warning(existing):
+        if stale_clear_error is None:
+            return existing
+        return _append_warning(
+            existing,
+            "stale session state could not be cleared and remains on disk "
+            f"({stale_clear_error})",
         )
 
-    msg = extract_final_message(stdout)
-    new_id = extract_session_id(stdout)
+    # Fresh path.
+    _diag(_start_line(role, "fresh", attempt, stall_secs))
+    run = await _run_codex_subprocess(_fresh_cmd(root), prompt, role_id=role.id)
+    if run.stalled:
+        return _stalled_role_result(
+            role, run, None, attempt, started,
+            warning=_with_stale_clear_warning(warning),
+        )
+    failure_text = _failure_text(run.stdout, run.stderr)
+
+    if run.returncode != 0:
+        return RoleResult(
+            role=role, ok=False,
+            error=_classify_failure(failure_text, run.returncode, "exec"),
+            elapsed_seconds=time.monotonic() - started, attempts=attempt,
+            warning=_with_stale_clear_warning(warning),
+        )
+
+    msg = extract_final_message(run.stdout)
+    new_id = extract_session_id(run.stdout)
     elapsed = time.monotonic() - started
     if msg:
         # Persist only when both halves of session continuity are
@@ -904,15 +1417,25 @@ async def _run_role_once(role, prompt, attempt):
         # persist a thread that produced no agent_message, but don't
         # drop a reply either.
         if new_id:
-            save_session(role.id, new_id)
+            try:
+                save_session(role.id, new_id)
+            except OSError as e:
+                warning = _append_warning(
+                    warning,
+                    f"reply completed; session state could not be persisted ({e})",
+                )
+                warning = _with_stale_clear_warning(warning)
+        else:
+            warning = _with_stale_clear_warning(warning)
         return RoleResult(
             role=role, ok=True, text=msg, thread_id=new_id,
-            elapsed_seconds=elapsed, attempts=attempt,
+            elapsed_seconds=elapsed, attempts=attempt, warning=warning,
         )
     return RoleResult(
         role=role, ok=False,
         error=_format_clean_exit_no_message(failure_text),
         thread_id=new_id, elapsed_seconds=elapsed, attempts=attempt,
+        warning=_with_stale_clear_warning(warning),
     )
 
 
@@ -928,11 +1451,12 @@ async def _run_role_attempts(role, prompt):
             return result
         if attempt >= MAX_RETRY_ATTEMPTS:
             return result
-        print(
+        _diag(
             f"[codex-council:{role.id}] retriable error on attempt "
-            f"{attempt}/{MAX_RETRY_ATTEMPTS}; sleeping {backoff}s.",
-            file=sys.stderr,
+            f"{attempt}/{MAX_RETRY_ATTEMPTS}; sleeping {backoff}s."
         )
+        # A stale quiet value would be misleading while no subprocess runs.
+        _ROLE_LIVENESS[role.id] = "retry-wait"
         await asyncio.sleep(backoff)
         backoff *= 2
 
@@ -948,7 +1472,8 @@ async def run_council(roles, body, max_parallel=None):
 
     `return_exceptions=True` ensures one role's crash does not cancel
     its siblings — every role gets its turn and its result in the report.
-    No wall-clock timeout: Codex decides when each role is done.
+    No run-level deadline: a role runs as long as its codex subprocess
+    keeps producing output bytes (see the output-inactivity watchdog).
 
     Per-role completion progress is emitted to stderr (in completion
     order) as each role settles; stdout stays the report.
@@ -979,35 +1504,43 @@ async def run_council(roles, body, max_parallel=None):
                     pass
                 else:
                     active.add(role.id)
+                    _ROLE_LIVENESS[role.id] = time.monotonic()
                     try:
                         return await _run_role_attempts(
                             role, _compose_prompt(role, body)
                         )
                     finally:
                         active.discard(role.id)
+                        _ROLE_LIVENESS.pop(role.id, None)
                         _release_role_state_lock(lock_file)
             # Stay off the execution permit while another council owns this
             # role's continuity lock; unrelated roles get their turn. The
             # probe interval backs off to a small cap: the other council has
-            # no wall-clock limit, so a fixed 0.1s poll could spin the event
+            # no run-level deadline, so a fixed 0.1s poll could spin the event
             # loop 10x/second for hours while staying responsive gains nothing.
             await asyncio.sleep(probe_backoff)
             probe_backoff = min(probe_backoff * 2, LOCK_PROBE_MAX_BACKOFF_SECS)
 
+    stall_secs = _stall_secs()
+    heartbeat_secs = _heartbeat_secs(stall_secs)
+
     async def _heartbeat():
         while counter["done"] < total:
-            await asyncio.sleep(PROGRESS_HEARTBEAT_SECS)
+            await asyncio.sleep(heartbeat_secs)
             if counter["done"] >= total:
                 return
-            active_ids = ", ".join(sorted(active)) or "none"
+            now = time.monotonic()
+            active_desc = ", ".join(
+                _role_liveness_desc(rid, now) for rid in sorted(active)
+            ) or "none"
             queued = max(0, total - counter["done"] - len(active))
-            elapsed = time.monotonic() - started
-            print(
+            elapsed = now - started
+            _diag(
                 f"[codex-council] still running after {elapsed:.0f}s: "
                 f"completed={counter['done']}/{total}; active={len(active)} "
-                f"({active_ids}); queued={queued}.",
-                file=sys.stderr,
-                flush=True,
+                f"({active_desc}); queued={queued}; "
+                f"watchdog={_watchdog_desc(stall_secs)}; "
+                f"version={_plugin_version()}."
             )
 
     def _on_role_done(role, task):
@@ -1020,24 +1553,19 @@ async def run_council(roles, body, max_parallel=None):
             return
         exc = task.exception()
         if exc is not None:
-            print(
-                f"[codex-council] {n}/{total} {role.id}: crashed ({type(exc).__name__})",
-                file=sys.stderr, flush=True,
+            _diag(
+                f"[codex-council] {n}/{total} {role.id}: crashed ({type(exc).__name__})"
             )
             return
         res = task.result()
         if isinstance(res, RoleResult):
             status = "ok" if res.ok else "FAILED"
-            print(
+            _diag(
                 f"[codex-council] {n}/{total} {role.id}: {status} "
-                f"({res.elapsed_seconds:.1f}s)",
-                file=sys.stderr, flush=True,
+                f"({res.elapsed_seconds:.1f}s)"
             )
         else:
-            print(
-                f"[codex-council] {n}/{total} {role.id}: done",
-                file=sys.stderr, flush=True,
-            )
+            _diag(f"[codex-council] {n}/{total} {role.id}: done")
 
     tasks = []
     for role in roles:
@@ -1120,9 +1648,29 @@ def _format_report(results, total_elapsed):
     return "\n".join(lines).rstrip() + "\n"
 
 
+# Escapes for the FULL str.splitlines() boundary set beyond the plain space:
+# \r \n \x0b \x0c \x1c \x1d \x1e U+0085 U+2028 U+2029 (matches LINEBREAK_CHARS).
+_REPORT_INLINE_ESCAPES = str.maketrans({
+    "\r": "\\r",
+    "\n": "\\n",
+    "\x0b": "\\x0b",
+    "\x0c": "\\x0c",
+    "\x1c": "\\x1c",
+    "\x1d": "\\x1d",
+    "\x1e": "\\x1e",
+    "\x85": "\\u0085",
+    "\u2028": "\\u2028",
+    "\u2029": "\\u2029",
+})
+
+
 def _report_inline(value):
-    """Keep report metadata on one Markdown line."""
-    return str(value).replace("\r", "\\r").replace("\n", "\\n")
+    """Keep report metadata on one line under any splitlines-based consumer.
+
+    Escapes every character str.splitlines() treats as a boundary: \\r \\n
+    \\x0b \\x0c \\x1c \\x1d \\x1e U+0085 U+2028 U+2029.
+    """
+    return str(value).translate(_REPORT_INLINE_ESCAPES)
 
 
 # ---------- CLI / entry point ----------
@@ -1134,6 +1682,13 @@ def _parse_args(argv):
             "around a shared implementation, research, or problem-solving "
             "goal. Roles are caller-supplied per invocation via --roles-file; "
             "there is no built-in catalog."
+        ),
+        epilog=(
+            "v0.9.0 behavior change: every on-disk input's parent directory "
+            "must be private (0700, user-owned, non-symlink) at LAUNCH as "
+            "well as preflight. Direct CLI users must stage roles.json (and "
+            "context.md when used) in a private directory, e.g. one created "
+            "by `mktemp -d`."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1164,6 +1719,16 @@ def _parse_args(argv):
             "before launching any Codex subprocess."
         ),
     )
+    parser.add_argument(
+        "--skill-contract", default=None, type=int, metavar="EPOCH",
+        help=(
+            "Contract epoch the invoking SKILL text was written against. "
+            "Optional (bare/direct invocations stay valid); when present it "
+            f"must equal this script's epoch ({SKILL_CONTRACT_EPOCH}), "
+            "otherwise the invocation is refused as a stale SKILL/script "
+            "pair."
+        ),
+    )
     args = parser.parse_args(argv)
     if args.roles_file == "":
         parser.error("--roles-file must be non-empty")
@@ -1175,6 +1740,16 @@ def _parse_args(argv):
         parser.error("--check-staging-dir cannot be combined with --roles-file")
     if args.check_staging_dir is not None and args.context_file is not None:
         parser.error("--check-staging-dir cannot be combined with --context-file")
+    if (
+        args.skill_contract is not None
+        and args.skill_contract != SKILL_CONTRACT_EPOCH
+    ):
+        parser.error(
+            f"--skill-contract {args.skill_contract} does not match this "
+            f"script's contract epoch {SKILL_CONTRACT_EPOCH}: stale "
+            "SKILL/script pair; re-run scripts/dev-link.sh (or reinstall "
+            "the plugin) and restart the session."
+        )
     return args
 
 
@@ -1235,10 +1810,9 @@ def _usage_exit_if_codex_missing(prefix):
 
     Shared by the --check-staging-dir preflight and the launch path: a
     missing binary must fail loudly BEFORE a background launch, where the
-    error would otherwise surface only inside err.log (GH issue #1's
-    suspected nvm-switch failure class). PATH is included because the
-    failing Bash invocation's PATH is the diagnostic that matters —
-    Claude Code Bash calls do not share environment mutations.
+    error would otherwise surface only inside err.log. PATH is included
+    because the failing Bash invocation's PATH is the diagnostic that
+    matters — Claude Code Bash calls do not share environment mutations.
     """
     if shutil.which("codex"):
         return
@@ -1291,12 +1865,17 @@ def _read_roles_file(path):
         _usage_exit(f"--roles-file: {path!r} is not valid UTF-8 ({e}).")
 
 
+def _roles_usage_exit(msg):
+    """Exit 2 on a roles-file validation defect, with the uniform recovery."""
+    _usage_exit(f"{msg} {ROLES_REWRITE_RECOVERY}")
+
+
 def _validate_role_id(rid, ctx):
     """Reject malformed role IDs with a SystemExit citing context."""
     if not isinstance(rid, str) or not rid:
-        _usage_exit(f"--roles-file {ctx}: 'id' must be a non-empty string.")
+        _roles_usage_exit(f"--roles-file {ctx}: 'id' must be a non-empty string.")
     if not ROLE_ID_PATTERN.match(rid):
-        _usage_exit(
+        _roles_usage_exit(
             f"--roles-file {ctx}: id {rid!r} must match {ROLE_ID_PATTERN.pattern}."
         )
 
@@ -1304,7 +1883,9 @@ def _validate_role_id(rid, ctx):
 def _validate_role_label(label, ctx):
     """Reject labels that can break report structure."""
     if any(ch in label for ch in LINEBREAK_CHARS):
-        _usage_exit(f"--roles-file {ctx}: label must not contain newlines.")
+        _roles_usage_exit(
+            f"--roles-file {ctx}: label must not contain newlines."
+        )
 
 
 ROLE_FIELDS = ("id", "label", "instruction")
@@ -1315,24 +1896,21 @@ def _normalize_instruction_list(value, ctx):
 
     The list form exists because the only production writer of roles.json
     is an LLM using a file-Write tool: multi-kilobyte single-line JSON
-    string literals are exactly where its writes corrupt (GH issue #2).
-    Sentence-sized items on separate physical lines remove that failure
-    surface; the script reassembles the paragraph Codex actually sees.
+    string literals are exactly where such writes corrupt. Sentence-sized
+    items on separate physical lines remove that failure surface; the
+    script reassembles the paragraph Codex actually sees.
     """
     if not value:
-        _usage_exit(
-            f"--roles-file {ctx}: instruction list must not be empty. "
-            "Recovery: rewrite the whole roles.json file with one sentence "
-            "per list item, then re-run --check-staging-dir."
+        _roles_usage_exit(
+            f"--roles-file {ctx}: instruction list must not be empty "
+            "(one sentence per list item)."
         )
     items = []
     for i, item in enumerate(value):
         if not isinstance(item, str) or not item.strip():
-            _usage_exit(
+            _roles_usage_exit(
                 f"--roles-file {ctx}: instruction list item {i} must be a "
-                "non-empty string. Recovery: rewrite the whole roles.json "
-                "file with one sentence per list item, then re-run "
-                "--check-staging-dir."
+                "non-empty string (one sentence per list item)."
             )
         # split() collapses every Unicode whitespace run, including all
         # LINEBREAK_CHARS, so the joined paragraph is single-line by
@@ -1349,12 +1927,12 @@ def _validate_role_instruction(instruction, ctx):
     """
     lowered = instruction.lower()
     if REQUIRED_SCOPE_PHRASE not in lowered:
-        _usage_exit(
+        _roles_usage_exit(
             f"--roles-file {ctx}: instruction must include "
             f"{REQUIRED_SCOPE_PHRASE!r}."
         )
     if not instruction.rstrip().endswith(REQUIRED_CADENCE_SENTENCE):
-        _usage_exit(
+        _roles_usage_exit(
             f"--roles-file {ctx}: instruction must end with "
             f"{REQUIRED_CADENCE_SENTENCE!r}."
         )
@@ -1368,47 +1946,47 @@ def _parse_roles_json(raw):
     joined to one paragraph), id is well-formed, instructions follow the
     documented contract, and ids are unique within the JSON. Unknown
     keys are rejected, not ignored: stray filler fields like '"_": ""'
-    are the signature of a corrupted LLM write (GH issue #2), so
-    surfacing them forces a clean rewrite instead of silently launching
-    from a file that already glitched once.
+    are the signature of a corrupted LLM write, so surfacing them forces
+    a clean rewrite instead of silently launching from a file that
+    already glitched once. Every validation defect carries the same
+    full-rewrite recovery (ROLES_REWRITE_RECOVERY).
     """
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as e:
-        _usage_exit(f"--roles-file: invalid JSON ({e}).")
+        _roles_usage_exit(f"--roles-file: invalid JSON ({e}).")
     if not isinstance(data, list):
-        _usage_exit("--roles-file: top-level value must be a JSON list.")
+        _roles_usage_exit("--roles-file: top-level value must be a JSON list.")
+    if not data:
+        _roles_usage_exit("--roles-file: role panel must not be empty.")
     roles = []
     seen = set()
     for idx, entry in enumerate(data):
         ctx = f"entry {idx}"
         if not isinstance(entry, dict):
-            _usage_exit(f"--roles-file {ctx}: each entry must be an object.")
+            _roles_usage_exit(f"--roles-file {ctx}: each entry must be an object.")
         unknown = sorted(set(entry) - set(ROLE_FIELDS))
         if unknown:
-            _usage_exit(
+            _roles_usage_exit(
                 f"--roles-file {ctx}: unknown field(s) "
                 f"{', '.join(repr(k) for k in unknown)}. Each role object "
                 "must have exactly 'id', 'label', and 'instruction' — no "
-                "filler keys. Rewrite the whole roles.json file (do not "
-                "patch a substring), then re-run --check-staging-dir."
+                "filler keys."
             )
         for field in ROLE_FIELDS:
             if field not in entry:
-                _usage_exit(f"--roles-file {ctx}: missing field {field!r}.")
+                _roles_usage_exit(f"--roles-file {ctx}: missing field {field!r}.")
             value = entry[field]
             if field == "instruction":
                 if not isinstance(value, list):
-                    _usage_exit(
+                    _roles_usage_exit(
                         f"--roles-file {ctx}: field 'instruction' must be a "
                         "JSON array of non-empty strings, one sentence per "
-                        "item. Recovery: rewrite the whole roles.json file "
-                        "using the array form, then re-run "
-                        "--check-staging-dir."
+                        "item."
                     )
                 continue
             if not isinstance(value, str) or not value.strip():
-                _usage_exit(
+                _roles_usage_exit(
                     f"--roles-file {ctx}: field {field!r} must be a non-empty string."
                 )
         rid = entry["id"]
@@ -1418,7 +1996,7 @@ def _parse_roles_json(raw):
         _validate_role_label(label, ctx)
         _validate_role_instruction(instruction, ctx)
         if rid in seen:
-            _usage_exit(
+            _roles_usage_exit(
                 f"--roles-file {ctx}: duplicate id {rid!r} within JSON payload."
             )
         seen.add(rid)
@@ -1519,7 +2097,8 @@ def _read_context_file(path):
     )
 
 
-def _check_private_dir(path):
+def _check_private_dir(path, prefix="--check-staging-dir: ",
+                       recovery=STAGING_DIR_RECOVERY):
     """Usage-error unless path is a user-owned, non-symlink, private dir.
 
     Returns the normalized path the checks were performed on; callers
@@ -1531,7 +2110,9 @@ def _check_private_dir(path):
     that happens to be mode 0700 does not pass. Every rejection carries
     the action-first recovery text: the caller is an LLM, and the one
     correct move is always a NEW `mktemp -d` directory — never chmod,
-    mkdir, or reuse of the rejected path.
+    mkdir, or reuse of the rejected path. `prefix` names the actual
+    entrypoint (a direct-launch rejection must not claim it came from
+    --check-staging-dir) and `recovery` is mode-specific.
     """
     # normpath strips trailing slashes first: lstat("link/") follows the
     # final symlink (the slash demands a directory target), so an
@@ -1541,38 +2122,51 @@ def _check_private_dir(path):
         st = os.lstat(path)
     except FileNotFoundError:
         _usage_exit(
-            f"--check-staging-dir: {path!r} does not exist. "
-            f"{STAGING_DIR_RECOVERY}"
+            f"{prefix}{path!r} does not exist. "
+            f"{recovery}"
         )
     except OSError as e:
         _usage_exit(
-            f"--check-staging-dir: cannot inspect {path!r} "
-            f"({e.strerror or e}). {STAGING_DIR_RECOVERY}"
+            f"{prefix}cannot inspect {path!r} "
+            f"({e.strerror or e}). {recovery}"
         )
     if stat.S_ISLNK(st.st_mode):
         _usage_exit(
-            f"--check-staging-dir: {path!r} is a symlink, not the directory "
-            f"printed by `mktemp -d`. {STAGING_DIR_RECOVERY}"
+            f"{prefix}{path!r} is a symlink, not the directory "
+            f"printed by `mktemp -d`. {recovery}"
         )
     if not stat.S_ISDIR(st.st_mode):
         _usage_exit(
-            f"--check-staging-dir: {path!r} is not a directory. "
-            f"{STAGING_DIR_RECOVERY}"
+            f"{prefix}{path!r} is not a directory. "
+            f"{recovery}"
         )
     if st.st_uid != os.geteuid():
         _usage_exit(
-            f"--check-staging-dir: {path!r} is owned by uid {st.st_uid}, not "
-            f"the invoking user (uid {os.geteuid()}). {STAGING_DIR_RECOVERY}"
+            f"{prefix}{path!r} is owned by uid {st.st_uid}, not "
+            f"the invoking user (uid {os.geteuid()}). {recovery}"
         )
     mode = stat.S_IMODE(st.st_mode)
     if mode & 0o077:
         _usage_exit(
-            f"--check-staging-dir: {path!r} is mode {mode:04o}, not private "
+            f"{prefix}{path!r} is mode {mode:04o}, not private "
             f"0700 — not the private mode `mktemp -d` produces. Files "
             f"already written here may have been readable by other local "
-            f"users. {STAGING_DIR_RECOVERY}"
+            f"users. {recovery}"
         )
     return path
+
+
+def _usage_exit_unless_parent_private(arg_name, path, recovery):
+    """Launch-side privacy gate on a staged input's LEXICAL parent.
+
+    dirname(abspath(...)) on purpose — never realpath before the check:
+    resolving first would launder a symlink parent into its (possibly
+    private) target before _check_private_dir lstats it. Realpath
+    comparison happens only AFTER both lexical parents validate (the
+    same-directory rule).
+    """
+    parent = os.path.dirname(os.path.abspath(path)) or "."
+    _check_private_dir(parent, prefix=f"{arg_name}: ", recovery=recovery)
 
 
 def _check_staging_dir(path):
@@ -1595,7 +2189,8 @@ def _check_staging_dir(path):
     max_parallel = _max_parallel_roles()
     print(
         f"[codex-council] staging OK: {os.path.abspath(path)} "
-        f"({len(roles)} roles; max parallel {max_parallel})"
+        f"({len(roles)} roles; max parallel {max_parallel}) "
+        f"version={_plugin_version()}"
     )
 
 
@@ -1659,11 +2254,26 @@ def main():
         _check_staging_dir(args.check_staging_dir)
         return
 
+    # Launch-side privacy gate: validate each on-disk input's LEXICAL parent
+    # BEFORE any content read or parse — a public directory holding bad roles
+    # must produce "abandon this exposed directory", never "rewrite roles".
+    # In stdin mode only roles.json is on disk; piped context has no directory
+    # and is validated below as UTF-8/non-empty only.
+    if args.roles_file is not None:
+        recovery = (
+            STAGING_DIR_RECOVERY if args.context_file is not None
+            else STDIN_DIR_RECOVERY
+        )
+        _usage_exit_unless_parent_private("--roles-file", args.roles_file, recovery)
+    if args.context_file is not None:
+        _usage_exit_unless_parent_private(
+            "--context-file", args.context_file, STAGING_DIR_RECOVERY
+        )
+    _usage_exit_if_staging_dirs_differ(args.roles_file, args.context_file)
     _usage_exit_if_file_arg_problems(
         ("--roles-file", args.roles_file),
         ("--context-file", args.context_file),
     )
-    _usage_exit_if_staging_dirs_differ(args.roles_file, args.context_file)
 
     # Parse and validate staged inputs before requiring Codex. This catches
     # temp-path mismatches without launching or depending on any Codex state.
@@ -1687,12 +2297,12 @@ def main():
 
     _usage_exit_if_codex_missing("")
     max_parallel = _max_parallel_roles()
+    _stall_secs()  # fail fast on an invalid watchdog override (usage exit 2)
 
-    print(
+    _diag(
         f"[codex-council] dispatching {len(roles)} roles "
         f"with max parallel {max_parallel} "
-        f"({', '.join(r.id for r in roles)}).",
-        file=sys.stderr,
+        f"({', '.join(r.id for r in roles)}); version={_plugin_version()}."
     )
 
     started = time.monotonic()
@@ -1701,16 +2311,24 @@ def main():
             _run_council_with_signals(roles, body, max_parallel)
         )
     except KeyboardInterrupt:
-        print("\n[codex-council] interrupted by user", file=sys.stderr)
+        _diag("\n[codex-council] interrupted by user")
         sys.exit(130)
     if signum is not None:
         signame = signal.Signals(signum).name
-        print(f"\n[codex-council] interrupted by {signame}", file=sys.stderr)
+        _diag(f"\n[codex-council] interrupted by {signame}")
         sys.exit(128 + int(signum))
 
     elapsed = time.monotonic() - started
-    print(_format_report(results, elapsed), end="")
-    sys.stdout.flush()
+    try:
+        print(_format_report(results, elapsed), end="")
+        sys.stdout.flush()
+    except (OSError, ValueError):
+        # stdout is dead: the report was not delivered, so no sentinel may
+        # claim it was. Close stdout so an interpreter-shutdown flush of the
+        # broken stream cannot rewrite the exit code (never exit 120).
+        with contextlib.suppress(Exception):
+            sys.stdout.close()
+        sys.exit(1)
 
     successes = sum(1 for r in results if r.ok)
     total = len(results)
@@ -1719,10 +2337,11 @@ def main():
     # Final, uniquely-shaped, LAST stderr line. Its presence means the stdout
     # report is fully written; it carries the exit status so a lost/orphaned but
     # redirected run is fully recoverable from `err.log` (tail until this line).
-    print(
+    # Best-effort by design: a dead stderr loses the sentinel but must not
+    # change the exit code.
+    _diag(
         f"[codex-council] CODEX_COUNCIL_DONE ok={successes} total={total} "
-        f"elapsed={elapsed:.1f}s exit={exit_code}",
-        file=sys.stderr, flush=True,
+        f"elapsed={elapsed:.1f}s exit={exit_code} version={_plugin_version()}"
     )
 
     if exit_code:

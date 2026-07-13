@@ -17,6 +17,7 @@ import io
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -42,9 +43,17 @@ def _env_without_session_key():
         codex_council.SESSION_KEY_ENV,
         codex_council.DISABLE_AUTO_SESSION_KEY_ENV,
         codex_council.MAX_PARALLEL_ENV,
+        codex_council.STALL_SECS_ENV,
         *codex_council.AUTO_SESSION_ENV_VARS,
     }
     return {k: v for k, v in os.environ.items() if k not in excluded}
+
+
+def _codex_run(rc, stdout, stderr, **flags):
+    """Structured subprocess result for fake _run_codex_subprocess doubles."""
+    return codex_council.CodexRun(
+        returncode=rc, stdout=stdout, stderr=stderr, **flags
+    )
 
 
 def _assert_usage_exit(test, callable_, *, expect_in_stderr):
@@ -792,6 +801,70 @@ class StructuredStatusClassifierTests(unittest.TestCase):
             "rate-limit")
 
 
+class ObservedCodexStringClassifierTests(unittest.TestCase):
+    """Regression pins for exact strings observed from current codex-cli,
+    in both directions (tagged when genuine, suppressed when echoed in a
+    non-retriable body)."""
+
+    def test_model_at_capacity_rewrite_is_5xx(self):
+        # codex rewrites an HTTP 503 server_is_overloaded/slow_down to this
+        # exact code-less sentence.
+        self.assertEqual(
+            codex_council._retriable_class(
+                "Selected model is at capacity. Please try a different model."),
+            "5xx",
+        )
+
+    def test_request_was_throttled_stream_message_is_rate_limit(self):
+        # codex SSE response.failed handling discards code/status_code/
+        # statusCode and keeps only the message.
+        self.assertEqual(
+            codex_council._retriable_class(
+                "stream disconnected before completion: Request was throttled"),
+            "rate-limit",
+        )
+
+    def test_bare_throttled_is_not_a_marker(self):
+        self.assertIsNone(
+            codex_council._retriable_class("the deploy was throttled by CI"))
+        self.assertNotIn("throttled", codex_council.RATE_LIMIT_MARKERS)
+
+    def test_raw_400_body_with_status_code_key_is_suppressed(self):
+        # Observed raw HTTP-400 surface: the transport status only appears as
+        # a status_code JSON key; the message echoes "service unavailable".
+        # The anchored 400 must suppress the 5xx phrase fallback.
+        raw = ('{"error":{"status_code":400,"message":"Plugin service '
+               'unavailable for this account tier","type":"bad_request"}}')
+        self.assertEqual(codex_council._extract_statuses(raw), [400])
+        self.assertIsNone(codex_council._retriable_class(raw))
+
+    def test_status_code_spelling_variants_are_anchored(self):
+        self.assertEqual(
+            codex_council._extract_statuses('{"statusCode":503,"x":1}'), [503])
+        self.assertEqual(
+            codex_council._extract_statuses("status-code 429 returned"), [429])
+        self.assertEqual(
+            codex_council._extract_statuses("status_code: 429"), [429])
+        self.assertEqual(
+            codex_council._extract_statuses("status code 429 returned"), [429])
+
+    def test_error_code_prefix_is_not_anchored(self):
+        # "Error code:" is SDK wording, not current codex wording; adding it
+        # would misread SDK errors quoted inside raw 400 bodies.
+        self.assertEqual(codex_council._extract_statuses("Error code: 429"), [])
+
+    def test_refresh_token_failure_is_auth(self):
+        msg = ("Your access token could not be refreshed because your "
+               "refresh token has expired. Please run codex login.")
+        self.assertTrue(codex_council._is_auth_error(msg))
+        self.assertTrue(
+            codex_council._classify_failure(msg, 1, "exec").startswith("[auth]"))
+
+    def test_no_bad_request_suppression_marker(self):
+        self.assertNotIn(
+            "bad_request", codex_council.NONRETRIABLE_ERROR_TYPE_MARKERS)
+
+
 # ---------- prompt composition ----------
 
 class ComposePromptTests(unittest.TestCase):
@@ -930,8 +1003,8 @@ class RunRoleAsyncTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_fresh_success_saves_session(self):
         role = _make_role("architect", "Architect")
-        async def fake_subproc(cmd, prompt):
-            return 0, _fresh_jsonl("new-sid", "All good."), ""
+        async def fake_subproc(cmd, prompt, role_id=""):
+            return _codex_run(0, _fresh_jsonl("new-sid", "All good."), "")
         with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
             result = await codex_council._run_role_once(role, "prompt", attempt=1)
         self.assertTrue(result.ok)
@@ -942,8 +1015,8 @@ class RunRoleAsyncTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_codex_fails_returns_classified_error(self):
         role = _make_role("architect", "Architect")
-        async def fake_subproc(cmd, prompt):
-            return 1, "", "401 unauthorized: incorrect api key sk-..."
+        async def fake_subproc(cmd, prompt, role_id=""):
+            return _codex_run(1, "", "401 unauthorized: incorrect api key sk-...")
         with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
             result = await codex_council._run_role_once(role, "prompt", attempt=1)
         self.assertFalse(result.ok)
@@ -951,8 +1024,8 @@ class RunRoleAsyncTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_rate_limit_tagged_for_retry(self):
         role = _make_role("architect", "Architect")
-        async def fake_subproc(cmd, prompt):
-            return 1, "", "HTTP 429 too many requests"
+        async def fake_subproc(cmd, prompt, role_id=""):
+            return _codex_run(1, "", "HTTP 429 too many requests")
         with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
             result = await codex_council._run_role_once(role, "prompt", attempt=1)
         self.assertFalse(result.ok)
@@ -960,8 +1033,8 @@ class RunRoleAsyncTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_5xx_tagged_for_retry(self):
         role = _make_role("architect", "Architect")
-        async def fake_subproc(cmd, prompt):
-            return 1, "", "502 bad gateway"
+        async def fake_subproc(cmd, prompt, role_id=""):
+            return _codex_run(1, "", "502 bad gateway")
         with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
             result = await codex_council._run_role_once(role, "prompt", attempt=1)
         self.assertFalse(result.ok)
@@ -970,8 +1043,8 @@ class RunRoleAsyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_stdout_error_jsonl_classifies_auth(self):
         role = _make_role("architect", "Architect")
         stdout = json.dumps({"type": "error", "message": "401 unauthorized"})
-        async def fake_subproc(cmd, prompt):
-            return 1, stdout, ""
+        async def fake_subproc(cmd, prompt, role_id=""):
+            return _codex_run(1, stdout, "")
         with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
             result = await codex_council._run_role_once(role, "prompt", attempt=1)
         self.assertFalse(result.ok)
@@ -983,8 +1056,8 @@ class RunRoleAsyncTests(unittest.IsolatedAsyncioTestCase):
             "type": "turn.failed",
             "error": {"message": "HTTP 429 Too Many Requests"},
         })
-        async def fake_subproc(cmd, prompt):
-            return 1, stdout, ""
+        async def fake_subproc(cmd, prompt, role_id=""):
+            return _codex_run(1, stdout, "")
         with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
             result = await codex_council._run_role_once(role, "prompt", attempt=1)
         self.assertFalse(result.ok)
@@ -998,8 +1071,8 @@ class RunRoleAsyncTests(unittest.IsolatedAsyncioTestCase):
             "error": {"message": "The model is unsupported."},
         })
         stdout = json.dumps({"type": "turn.failed", "error": {"message": inner}})
-        async def fake_subproc(cmd, prompt):
-            return 1, stdout, ""
+        async def fake_subproc(cmd, prompt, role_id=""):
+            return _codex_run(1, stdout, "")
         with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
             result = await codex_council._run_role_once(role, "prompt", attempt=1)
         self.assertFalse(result.ok)
@@ -1007,8 +1080,8 @@ class RunRoleAsyncTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_no_agent_message_returns_failure_without_saving(self):
         role = _make_role("architect", "Architect")
-        async def fake_subproc(cmd, prompt):
-            return 0, json.dumps({"type": "thread.started", "thread_id": "x"}), ""
+        async def fake_subproc(cmd, prompt, role_id=""):
+            return _codex_run(0, json.dumps({"type": "thread.started", "thread_id": "x"}), "")
         with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
             result = await codex_council._run_role_once(role, "prompt", attempt=1)
         self.assertFalse(result.ok)
@@ -1020,11 +1093,11 @@ class RunRoleAsyncTests(unittest.IsolatedAsyncioTestCase):
         role = _make_role("architect", "Architect")
         codex_council.save_session("architect", "stale-sid")
         calls = []
-        async def fake_subproc(cmd, prompt):
+        async def fake_subproc(cmd, prompt, role_id=""):
             calls.append(cmd)
             if "resume" in cmd:
-                return 1, "", "Error: thread/resume failed: no rollout found for thread id stale-sid (code -32600)"
-            return 0, _fresh_jsonl("brand-new-sid", "fresh ok"), ""
+                return _codex_run(1, "", "Error: thread/resume failed: no rollout found for thread id stale-sid (code -32600)")
+            return _codex_run(0, _fresh_jsonl("brand-new-sid", "fresh ok"), "")
         with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
             result = await codex_council._run_role_once(role, "prompt", attempt=1)
         self.assertTrue(result.ok)
@@ -1037,14 +1110,14 @@ class RunRoleAsyncTests(unittest.IsolatedAsyncioTestCase):
         role = _make_role("architect", "Architect")
         codex_council.save_session("architect", "stale-429-sid")
         calls = []
-        async def fake_subproc(cmd, prompt):
+        async def fake_subproc(cmd, prompt, role_id=""):
             calls.append(cmd)
             if "resume" in cmd:
-                return (
+                return _codex_run(
                     1, "",
                     "Error: no rollout found for thread id stale-429-sid",
                 )
-            return 0, _fresh_jsonl("brand-new-sid", "fresh ok"), ""
+            return _codex_run(0, _fresh_jsonl("brand-new-sid", "fresh ok"), "")
         with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
             result = await codex_council._run_role_once(role, "prompt", attempt=1)
         self.assertTrue(result.ok)
@@ -1060,11 +1133,11 @@ class RunRoleAsyncTests(unittest.IsolatedAsyncioTestCase):
             "type": "turn.failed",
             "error": {"message": "no rollout found for thread id stale-sid"},
         })
-        async def fake_subproc(cmd, prompt):
+        async def fake_subproc(cmd, prompt, role_id=""):
             calls.append(cmd)
             if "resume" in cmd:
-                return 1, stdout, ""
-            return 0, _fresh_jsonl("brand-new-sid", "fresh ok"), ""
+                return _codex_run(1, stdout, "")
+            return _codex_run(0, _fresh_jsonl("brand-new-sid", "fresh ok"), "")
         with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
             result = await codex_council._run_role_once(role, "prompt", attempt=1)
         self.assertTrue(result.ok)
@@ -1078,9 +1151,9 @@ class RunRoleAsyncTests(unittest.IsolatedAsyncioTestCase):
         role = _make_role("architect", "Architect")
         codex_council.save_session("architect", "expected-sid")
         calls = []
-        async def fake_subproc(cmd, prompt):
+        async def fake_subproc(cmd, prompt, role_id=""):
             calls.append(cmd)
-            return 0, _fresh_jsonl("DIFFERENT-sid", "happened anyway"), ""
+            return _codex_run(0, _fresh_jsonl("DIFFERENT-sid", "happened anyway"), "")
         with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
             result = await codex_council._run_role_once(role, "prompt", attempt=1)
         self.assertTrue(result.ok)
@@ -1102,8 +1175,8 @@ class RunRoleAsyncTests(unittest.IsolatedAsyncioTestCase):
         stdout = json.dumps(
             {"type": "thread.started", "thread_id": "DIFFERENT-sid"}
         )
-        async def fake_subproc(cmd, prompt):
-            return 0, stdout, ""
+        async def fake_subproc(cmd, prompt, role_id=""):
+            return _codex_run(0, stdout, "")
         with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
             result = await codex_council._run_role_once(role, "prompt", attempt=1)
         self.assertFalse(result.ok)
@@ -1116,8 +1189,8 @@ class RunRoleAsyncTests(unittest.IsolatedAsyncioTestCase):
         """Codex may omit thread.started on resume; treat as a normal resume."""
         role = _make_role("architect", "Architect")
         codex_council.save_session("architect", "kept-sid")
-        async def fake_subproc(cmd, prompt):
-            return 0, _resume_jsonl_no_thread_event("resumed text"), ""
+        async def fake_subproc(cmd, prompt, role_id=""):
+            return _codex_run(0, _resume_jsonl_no_thread_event("resumed text"), "")
         with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
             result = await codex_council._run_role_once(role, "prompt", attempt=1)
         self.assertTrue(result.ok)
@@ -1130,8 +1203,8 @@ class RunRoleAsyncTests(unittest.IsolatedAsyncioTestCase):
         can't resume), but the user still gets the answer for this turn."""
         role = _make_role("architect", "Architect")
         # No saved session, so this goes the fresh path; stdout has no thread.started.
-        async def fake_subproc(cmd, prompt):
-            return 0, _resume_jsonl_no_thread_event("answer without id"), ""
+        async def fake_subproc(cmd, prompt, role_id=""):
+            return _codex_run(0, _resume_jsonl_no_thread_event("answer without id"), "")
         with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
             result = await codex_council._run_role_once(role, "prompt", attempt=1)
         self.assertTrue(result.ok)
@@ -1174,8 +1247,8 @@ class RunRoleStructuredStatusTests(unittest.IsolatedAsyncioTestCase):
         '429' must NOT be tagged retriable (status suppresses the substring)."""
         role = _make_role("architect", "Architect")
         stdout = _status_turn_failed_stdout(400, "branch revision 429 is invalid")
-        async def fake_subproc(cmd, prompt):
-            return 1, stdout, ""
+        async def fake_subproc(cmd, prompt, role_id=""):
+            return _codex_run(1, stdout, "")
         with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
             result = await codex_council._run_role_once(role, "prompt", attempt=1)
         self.assertFalse(result.ok)
@@ -1184,8 +1257,8 @@ class RunRoleStructuredStatusTests(unittest.IsolatedAsyncioTestCase):
     async def test_fresh_status529_tagged_retriable_5xx(self):
         role = _make_role("architect", "Architect")
         stdout = _status_turn_failed_stdout(529, "backend overloaded")
-        async def fake_subproc(cmd, prompt):
-            return 1, stdout, ""
+        async def fake_subproc(cmd, prompt, role_id=""):
+            return _codex_run(1, stdout, "")
         with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
             result = await codex_council._run_role_once(role, "prompt", attempt=1)
         self.assertFalse(result.ok)
@@ -1194,8 +1267,8 @@ class RunRoleStructuredStatusTests(unittest.IsolatedAsyncioTestCase):
     async def test_run_role_attempts_retries_on_structured_5xx(self):
         role = _make_role("architect", "Architect")
         stdout = _status_turn_failed_stdout(503, "temporarily down")
-        async def fake_subproc(cmd, prompt):
-            return 1, stdout, ""
+        async def fake_subproc(cmd, prompt, role_id=""):
+            return _codex_run(1, stdout, "")
         with patch.object(codex_council.asyncio, "sleep", AsyncMock(return_value=None)):
             with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
                 result = await codex_council._run_role_attempts(role, "prompt")
@@ -1209,8 +1282,8 @@ class RunRoleStructuredStatusTests(unittest.IsolatedAsyncioTestCase):
         role = _make_role("architect", "Architect")
         codex_council.save_session("architect", "live-sid")
         stdout = _status_turn_failed_stdout(503, "temporarily down")
-        async def fake_subproc(cmd, prompt):
-            return 1, stdout, ""
+        async def fake_subproc(cmd, prompt, role_id=""):
+            return _codex_run(1, stdout, "")
         with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
             result = await codex_council._run_role_once(role, "prompt", attempt=1)
         self.assertFalse(result.ok)
@@ -1226,8 +1299,8 @@ class RunRoleStructuredStatusTests(unittest.IsolatedAsyncioTestCase):
         nested = json.dumps({"type": "error", "status": 429,
                              "error": {"message": "401 unauthorized; thread not found"}})
         stdout = json.dumps({"type": "turn.failed", "error": {"message": nested}})
-        async def fake_subproc(cmd, prompt):
-            return 1, stdout, ""
+        async def fake_subproc(cmd, prompt, role_id=""):
+            return _codex_run(1, stdout, "")
         with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
             result = await codex_council._run_role_once(role, "prompt", attempt=1)
         self.assertFalse(result.ok)
@@ -1241,8 +1314,8 @@ class RunRoleStructuredStatusTests(unittest.IsolatedAsyncioTestCase):
         because anchored-status retriable is checked before the stale branch."""
         role = _make_role("architect", "Architect")
         codex_council.save_session("architect", "live-sid")
-        async def fake_subproc(cmd, prompt):
-            return 1, "", "HTTP 429 Too Many Requests while resuming; thread not found in cache"
+        async def fake_subproc(cmd, prompt, role_id=""):
+            return _codex_run(1, "", "HTTP 429 Too Many Requests while resuming; thread not found in cache")
         with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
             result = await codex_council._run_role_once(role, "prompt", attempt=1)
         self.assertFalse(result.ok)
@@ -1568,8 +1641,8 @@ class RunTeamAsyncTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_lock_probe_backoff_grows_and_is_capped(self):
         """A same-role continuity-lock waiter must not poll at a fixed 0.1s
-        forever: the other council holds the lock with no wall-clock cap, so
-        the probe interval doubles up to LOCK_PROBE_MAX_BACKOFF_SECS."""
+        forever: the other council holds the lock with no run-level deadline,
+        so the probe interval doubles up to LOCK_PROBE_MAX_BACKOFF_SECS."""
         role = self._roles("architect")[0]
         held_box = [codex_council._try_role_state_lock(role.id)]
         self.assertIsNotNone(held_box[0])
@@ -1659,14 +1732,14 @@ class RunTeamAsyncTests(unittest.IsolatedAsyncioTestCase):
         release = asyncio.Event()
         active = {"count": 0, "max": 0}
 
-        async def fake_subproc(cmd, prompt):
+        async def fake_subproc(cmd, prompt, role_id=""):
             active["count"] += 1
             active["max"] = max(active["max"], active["count"])
             if active["count"] == 2:
                 both_started.set()
             try:
                 await release.wait()
-                return 0, _fresh_jsonl(f"sid-{len(prompt)}", "ok"), ""
+                return _codex_run(0, _fresh_jsonl(f"sid-{len(prompt)}", "ok"), "")
             finally:
                 active["count"] -= 1
 
@@ -1768,7 +1841,8 @@ class RunCouncilProgressTests(unittest.IsolatedAsyncioTestCase):
 
         buf = io.StringIO()
         with patch.object(codex_council, "_run_role_attempts", side_effect=fake_role):
-            with patch.object(codex_council, "PROGRESS_HEARTBEAT_SECS", 0.01):
+            with patch.object(codex_council, "PROGRESS_HEARTBEAT_SECS", 0.01), \
+                 patch.object(codex_council, "HEARTBEAT_FLOOR_SECS", 0):
                 with contextlib.redirect_stderr(buf):
                     releaser = asyncio.create_task(release_after_heartbeats())
                     await codex_council.run_council(
@@ -1784,8 +1858,46 @@ class RunCouncilProgressTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertGreaterEqual(len(heartbeats), 2)
         self.assertIn("completed=0/2", heartbeats[0])
-        self.assertIn("active=1 (architect)", heartbeats[0])
+        self.assertRegex(heartbeats[0], r"active=1 \(architect quiet=\d+s\)")
         self.assertIn("queued=1", heartbeats[0])
+        self.assertIn("watchdog=1800s", heartbeats[0])
+        self.assertIn("version=", heartbeats[0])
+
+    async def test_heartbeat_reports_watchdog_disabled_when_env_is_zero(self):
+        release = asyncio.Event()
+
+        async def fake_role(role, prompt):
+            await release.wait()
+            return codex_council.RoleResult(
+                role=role, ok=True, text="ok", elapsed_seconds=0.1,
+            )
+
+        async def release_after_heartbeat():
+            await asyncio.sleep(0.03)
+            release.set()
+
+        buf = io.StringIO()
+        os.environ[codex_council.STALL_SECS_ENV] = "0"
+        try:
+            with patch.object(
+                codex_council, "_run_role_attempts", side_effect=fake_role
+            ):
+                with patch.object(codex_council, "PROGRESS_HEARTBEAT_SECS", 0.01):
+                    with contextlib.redirect_stderr(buf):
+                        releaser = asyncio.create_task(release_after_heartbeat())
+                        await codex_council.run_council(
+                            self._roles("architect"), "body", max_parallel=1,
+                        )
+                        await releaser
+        finally:
+            os.environ.pop(codex_council.STALL_SECS_ENV, None)
+
+        heartbeats = [
+            line for line in buf.getvalue().splitlines()
+            if "still running after" in line
+        ]
+        self.assertGreaterEqual(len(heartbeats), 1)
+        self.assertIn("watchdog=disabled", heartbeats[0])
 
 
 # ---------- roles JSON parsing (--roles-file contents) ----------
@@ -1972,10 +2084,10 @@ class ParseRolesJsonTests(unittest.TestCase):
 
 
 class UnknownRoleKeyTests(unittest.TestCase):
-    """Stray keys are the corruption signature of a glitched LLM write
-    (GH issue #2: '"_": ""', '"instruction_note": ""'); they must be
-    rejected with a rewrite-the-whole-file recovery message, never
-    silently accepted."""
+    """Stray filler keys ('"_": ""', '"instruction_note": ""') are the
+    corruption signature of a glitched LLM write; they must be rejected
+    with a rewrite-the-whole-file recovery message, never silently
+    accepted."""
 
     def _entry_with(self, extra_keys):
         entry = _role_json("alpha", "A")
@@ -2008,7 +2120,7 @@ class UnknownRoleKeyTests(unittest.TestCase):
         _assert_usage_exit(
             self,
             lambda: codex_council._parse_roles_json(self._entry_with({"_": ""})),
-            expect_in_stderr="Rewrite the whole roles.json file",
+            expect_in_stderr="rewrite the entire file passed to --roles-file",
         )
 
     def test_unknown_key_reported_before_missing_field(self):
@@ -2030,7 +2142,8 @@ class UnknownRoleKeyTests(unittest.TestCase):
 class InstructionListFormTests(unittest.TestCase):
     """List-form instruction: sentence-sized items the script joins into
     the single paragraph Codex sees. Exists so the LLM writer never has
-    to emit a multi-KB single-line JSON string (GH issue #2)."""
+    to emit a multi-KB single-line JSON string literal, the shape where
+    file-Write corruption concentrates."""
 
     def _roles(self, items):
         return codex_council._parse_roles_json(
@@ -2117,14 +2230,14 @@ class InstructionListFormTests(unittest.TestCase):
     def test_list_item_error_names_full_rewrite_recovery(self):
         _assert_usage_exit(
             self, lambda: self._roles(["ok", 7]),
-            expect_in_stderr="rewrite the whole roles.json",
+            expect_in_stderr="rewrite the entire file passed to --roles-file",
         )
 
     def test_string_form_rejected_with_array_recovery(self):
         raw = json.dumps([{"id": "x", "label": "L", "instruction": "one two"}])
         _assert_usage_exit(
             self, lambda: codex_council._parse_roles_json(raw),
-            expect_in_stderr="rewrite the whole roles.json file using the array form",
+            expect_in_stderr="rewrite the entire file passed to --roles-file",
         )
 
 
@@ -2310,8 +2423,8 @@ class CheckStagingDirTests(unittest.TestCase):
 
     def test_missing_codex_fails_preflight(self):
         """'staging OK' while the codex binary is missing defers the
-        failure to a background launch whose error lands only in err.log
-        (GH issue #1's suspected nvm-switch failure class)."""
+        failure to a background launch whose error lands only in
+        err.log."""
         self._write_valid_roles()
         self._write_context()
         out = io.StringIO()
@@ -2347,9 +2460,9 @@ class CheckStagingDirTests(unittest.TestCase):
         )
 
     def test_mode_failure_recovery_forbids_chmod_and_reuse(self):
-        """GH issue #1: the old hint ('Create it with mktemp -d') was
-        satisfiable by chmod/mkdir on the same predictable path; the
-        recovery must demand abandoning the dir for a NEW mktemp one."""
+        """A hint like 'Create it with mktemp -d' is satisfiable by
+        chmod/mkdir on the same predictable path; the recovery must
+        demand abandoning the dir for a NEW mktemp one."""
         os.chmod(self.tmp.name, 0o775)
         self.addCleanup(lambda: os.chmod(self.tmp.name, 0o700))
         buf = io.StringIO()
@@ -2425,8 +2538,9 @@ class CheckStagingDirTests(unittest.TestCase):
             )
 
     def test_nonexistent_path_does_not_invite_mkdir(self):
-        """The old 'is not a directory' wording plausibly invited
-        `mkdir <same path>` — recreating exactly issue #1's 0775 dir."""
+        """A missing-path error must demand a fresh mktemp -d, never a
+        mkdir of the same predictable path (which would defeat the
+        private-staging guarantee)."""
         missing = os.path.join(self.tmp.name, "missing")
         buf = io.StringIO()
         with contextlib.redirect_stderr(buf):
@@ -2577,6 +2691,16 @@ class ArgParseTests(unittest.TestCase):
         self.assertIn("implementation, research, or problem-solving", help_text)
         self.assertIn("there is no built-in catalog", help_text)
 
+    def test_help_documents_the_launch_privacy_behavior_change(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            with self.assertRaises(SystemExit):
+                codex_council._parse_args(["--help"])
+        help_text = out.getvalue()
+        self.assertIn("v0.9.0 behavior change", help_text)
+        self.assertIn("mktemp -d", help_text)
+        self.assertIn("--skill-contract", help_text)
+
     def test_roles_file_parses_to_namespace(self):
         args = codex_council._parse_args(["--roles-file", "x.json"])
         self.assertEqual(args.roles_file, "x.json")
@@ -2617,6 +2741,36 @@ class ArgParseTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 2)
 
 
+class _FakeEofStream:
+    async def read(self, n):
+        return b""
+
+
+class _FakeStdin:
+    def write(self, data):
+        pass
+
+    async def drain(self):
+        pass
+
+    def close(self):
+        pass
+
+
+def _fake_proc(wait_exc):
+    class FakeProc:
+        pid = 424242
+        returncode = None
+        stdout = _FakeEofStream()
+        stderr = _FakeEofStream()
+        stdin = _FakeStdin()
+
+        async def wait(self):
+            raise wait_exc
+
+    return FakeProc()
+
+
 class RunCodexSubprocessTests(unittest.IsolatedAsyncioTestCase):
     """Spawn/encode/reap behavior of the real _run_codex_subprocess."""
 
@@ -2634,16 +2788,9 @@ class RunCodexSubprocessTests(unittest.IsolatedAsyncioTestCase):
         create_mock.assert_not_called()
 
     async def test_reaps_child_on_non_cancel_error(self):
-        """communicate() raising anything (not just CancelledError) after the
+        """proc.wait() raising anything (not just CancelledError) after the
         child exists must tear down the process group, not leak it."""
-        class FakeProc:
-            pid = 424242
-            returncode = None
-
-            async def communicate(self, data):
-                raise RuntimeError("boom")
-
-        proc = FakeProc()
+        proc = _fake_proc(RuntimeError("boom"))
         terminate_mock = AsyncMock()
         with patch.object(
             codex_council.asyncio, "create_subprocess_exec",
@@ -2658,16 +2805,9 @@ class RunCodexSubprocessTests(unittest.IsolatedAsyncioTestCase):
         terminate_mock.assert_awaited_once()
 
     async def test_cancellation_still_reaps_child(self):
-        """The original cancellation reap path still fires under the broadened
-        BaseException handler."""
-        class FakeProc:
-            pid = 424243
-            returncode = None
-
-            async def communicate(self, data):
-                raise asyncio.CancelledError()
-
-        proc = FakeProc()
+        """The cancellation reap path converges on the same single
+        termination owner."""
+        proc = _fake_proc(asyncio.CancelledError())
         terminate_mock = AsyncMock()
         with patch.object(
             codex_council.asyncio, "create_subprocess_exec",
@@ -2716,10 +2856,14 @@ class ForceUtf8StreamsTests(unittest.TestCase):
             codex_council._force_utf8_streams()  # must not raise
 
 
-class NoTimeoutTests(unittest.TestCase):
-    """No timeout, by design: the codex commands carry no timeout/retry
-    config overrides (those live in the user's provider-scoped codex
-    config), and the script enforces no wall-clock deadline."""
+class NoRunLevelDeadlineTests(unittest.TestCase):
+    """The council has no total elapsed-time or run-level deadline: a role
+    may run indefinitely while its codex subprocess keeps producing output
+    bytes. The only wall-clock mechanism is the per-subprocess
+    OUTPUT-INACTIVITY watchdog, which is deliberately hand-rolled
+    (asyncio.sleep + time.monotonic). The codex commands carry no
+    timeout/retry config overrides (those live in the user's
+    provider-scoped codex config)."""
 
     def test_commands_have_no_config_overrides(self):
         for cmd in (codex_council._fresh_cmd("/r"),
@@ -2728,15 +2872,15 @@ class NoTimeoutTests(unittest.TestCase):
             self.assertFalse(any("timeout" in a or "retries" in a for a in cmd))
 
     def test_source_uses_no_run_level_timeout_primitive(self):
-        """No run-level/wall-clock timeout, by design: pin the absence of any
-        named timeout primitive so adding one is a conscious choice (this test
+        """No run-level deadline, by design: pin the absence of any named
+        timeout primitive so adding one is a conscious choice (this test
         fails) rather than a silent regression. Scans executable code only —
         comment and string/docstring spans are masked out, since this file is
-        deliberately comment-heavy about NOT having a timeout. This catches the
-        named-API timeouts below; it cannot catch a hand-rolled deadline (an
-        asyncio.sleep watchdog or a time.monotonic cancel-loop), which has no
-        fixed spelling to pin — that boundary is held by code review plus
-        test_commands_have_no_config_overrides above."""
+        deliberately comment-heavy about the deadline it does NOT have. The
+        output-inactivity watchdog must stay hand-rolled (an asyncio.sleep
+        loop over time.monotonic): the named APIs below would impose a
+        deadline on the subprocess await itself, which is exactly what the
+        design forbids."""
         import io as _io
         import re as _re
         import tokenize as _tokenize
@@ -2770,6 +2914,761 @@ class NoTimeoutTests(unittest.TestCase):
         self.assertEqual(found, [], f"unexpected timeout primitive(s): {found}")
 
 
+# ---------- output-inactivity watchdog (env, flags, policy) ----------
+
+class StallSecsEnvTests(unittest.TestCase):
+    def setUp(self):
+        self.env_patcher = patch.dict(
+            os.environ, _env_without_session_key(), clear=True
+        )
+        self.env_patcher.start()
+        self.addCleanup(self.env_patcher.stop)
+
+    def test_unset_defaults_to_1800(self):
+        self.assertEqual(codex_council._stall_secs(), 1800)
+        self.assertEqual(codex_council.DEFAULT_STALL_SECS, 1800)
+
+    def test_zero_disables(self):
+        os.environ[codex_council.STALL_SECS_ENV] = "0"
+        self.assertEqual(codex_council._stall_secs(), 0)
+
+    def test_positive_integer_override(self):
+        os.environ[codex_council.STALL_SECS_ENV] = "42"
+        self.assertEqual(codex_council._stall_secs(), 42)
+
+    def test_negative_is_a_usage_error(self):
+        os.environ[codex_council.STALL_SECS_ENV] = "-5"
+        _assert_usage_exit(
+            self, codex_council._stall_secs,
+            expect_in_stderr="must be a positive integer",
+        )
+
+    def test_nonnumeric_is_a_usage_error(self):
+        os.environ[codex_council.STALL_SECS_ENV] = "soon"
+        _assert_usage_exit(
+            self, codex_council._stall_secs,
+            expect_in_stderr="must be a positive integer",
+        )
+
+    def test_heartbeat_cadence_adapts_with_floor(self):
+        # Enabled: min(PROGRESS_HEARTBEAT_SECS, stall // 3), floored at 300.
+        self.assertEqual(codex_council._heartbeat_secs(1800), 600)
+        self.assertEqual(codex_council._heartbeat_secs(600), 300)
+        self.assertEqual(codex_council._heartbeat_secs(90), 300)
+        self.assertEqual(
+            codex_council._heartbeat_secs(10**9),
+            codex_council.PROGRESS_HEARTBEAT_SECS,
+        )
+        # Disabled: unchanged 30-minute cadence.
+        self.assertEqual(
+            codex_council._heartbeat_secs(0),
+            codex_council.PROGRESS_HEARTBEAT_SECS,
+        )
+
+    def test_watchdog_desc_rendering(self):
+        self.assertEqual(codex_council._watchdog_desc(1800), "1800s")
+        self.assertEqual(codex_council._watchdog_desc(0), "disabled")
+
+
+class EventFlagScannerTests(unittest.TestCase):
+    def _feed(self, scanner, text):
+        scanner.feed(text.encode("utf-8"))
+
+    def test_turn_completed_detected(self):
+        s = codex_council._EventFlagScanner()
+        self._feed(s, '{"type":"turn.completed","usage":{}}\n')
+        self.assertTrue(s.turn_completed)
+        self.assertFalse(s.unsafe_to_replay)
+
+    def test_agent_message_and_reasoning_are_replay_safe(self):
+        s = codex_council._EventFlagScanner()
+        self._feed(
+            s,
+            '{"type":"item.completed","item":{"type":"agent_message","text":"x"}}\n'
+            '{"type":"item.started","item":{"type":"reasoning"}}\n',
+        )
+        self.assertFalse(s.unsafe_to_replay)
+
+    def test_command_execution_started_is_unsafe(self):
+        s = codex_council._EventFlagScanner()
+        self._feed(
+            s,
+            '{"type":"item.started","item":{"type":"command_execution"}}\n',
+        )
+        self.assertTrue(s.unsafe_to_replay)
+
+    def test_unknown_item_type_is_unsafe_conservatively(self):
+        s = codex_council._EventFlagScanner()
+        self._feed(
+            s,
+            '{"type":"item.completed","item":{"type":"future_gizmo_call"}}\n',
+        )
+        self.assertTrue(s.unsafe_to_replay)
+
+    def test_flags_survive_chunk_boundaries_inside_a_line(self):
+        line = '{"type":"item.started","item":{"type":"mcp_tool_call"}}\n'
+        s = codex_council._EventFlagScanner()
+        for i in range(0, len(line), 7):
+            self._feed(s, line[i:i + 7])
+        self.assertTrue(s.unsafe_to_replay)
+
+    def test_finish_scans_unterminated_final_line(self):
+        s = codex_council._EventFlagScanner()
+        self._feed(s, '{"type":"turn.completed"}')  # no trailing newline
+        self.assertFalse(s.turn_completed)
+        s.finish()
+        self.assertTrue(s.turn_completed)
+
+    def test_garbage_lines_are_ignored(self):
+        s = codex_council._EventFlagScanner()
+        self._feed(s, "not json\n[]\nnull\n\xff\n")
+        self.assertFalse(s.turn_completed)
+        self.assertFalse(s.unsafe_to_replay)
+
+
+def _stalled_run(stdout="", stderr="", turn_completed=False,
+                 unsafe_to_replay=False):
+    return codex_council.CodexRun(
+        returncode=-15, stdout=stdout, stderr=stderr, stalled=True,
+        turn_completed=turn_completed, unsafe_to_replay=unsafe_to_replay,
+    )
+
+
+class StallPolicyTests(unittest.IsolatedAsyncioTestCase):
+    """Role-layer stall policy: the structured stall verdict is handled
+    before any text classification."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.project_patcher = patch.object(
+            codex_council, "_project_root", return_value=FIXED_PROJECT_ROOT
+        )
+        self.project_patcher.start()
+        self.addCleanup(self.project_patcher.stop)
+        self.state_patcher = patch.object(codex_council, "STATE_DIR", self.tmp.name)
+        self.state_patcher.start()
+        self.addCleanup(self.state_patcher.stop)
+        self.env_patcher = patch.dict(os.environ, _env_without_session_key(), clear=True)
+        self.env_patcher.start()
+        self.addCleanup(self.env_patcher.stop)
+
+    async def test_wedged_after_completed_turn_is_success_with_warning(self):
+        role = _make_role("architect", "Architect")
+        stdout = _fresh_jsonl("wedged-sid", "the full reply") + "\n" + json.dumps(
+            {"type": "turn.completed", "usage": {}}
+        )
+        async def fake_subproc(cmd, prompt, role_id=""):
+            return _stalled_run(stdout=stdout, turn_completed=True)
+        with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
+            result = await codex_council._run_role_attempts(role, "prompt")
+        self.assertTrue(result.ok)
+        self.assertEqual(result.text, "the full reply")
+        self.assertEqual(result.attempts, 1)  # never retried
+        self.assertIn("wedged after completing its turn", result.warning)
+        sid, _ = codex_council.load_session("architect")
+        self.assertEqual(sid, "wedged-sid")
+
+    async def test_replay_safe_stall_is_retriable_then_terminal(self):
+        role = _make_role("architect", "Architect")
+        calls = {"count": 0}
+        async def fake_subproc(cmd, prompt, role_id=""):
+            calls["count"] += 1
+            return _stalled_run()
+        with patch.object(codex_council, "INITIAL_BACKOFF_SECS", 0), \
+             patch.object(codex_council.asyncio, "sleep", AsyncMock(return_value=None)), \
+             patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
+            result = await codex_council._run_role_attempts(role, "prompt")
+        self.assertFalse(result.ok)
+        self.assertTrue(result.error.startswith("[retriable:stall]"))
+        self.assertIn("no tool work had begun", result.error)
+        self.assertEqual(result.attempts, codex_council.MAX_RETRY_ATTEMPTS)
+        self.assertEqual(calls["count"], codex_council.MAX_RETRY_ATTEMPTS)
+
+    async def test_unsafe_stall_is_terminal_after_one_attempt(self):
+        role = _make_role("architect", "Architect")
+        calls = {"count": 0}
+        stdout = json.dumps(
+            {"type": "item.started", "item": {"type": "command_execution"}}
+        )
+        async def fake_subproc(cmd, prompt, role_id=""):
+            calls["count"] += 1
+            return _stalled_run(stdout=stdout, unsafe_to_replay=True)
+        with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
+            result = await codex_council._run_role_attempts(role, "prompt")
+        self.assertFalse(result.ok)
+        self.assertTrue(result.error.startswith("[stall]"))
+        self.assertIn("tool work had begun", result.error)
+        self.assertIn("re-invoke the role manually", result.error)
+        self.assertEqual(calls["count"], 1)
+
+    async def test_unsafe_stall_quotes_incomplete_message_without_promoting(self):
+        role = _make_role("architect", "Architect")
+        stdout = "\n".join([
+            json.dumps({"type": "item.started",
+                        "item": {"type": "command_execution"}}),
+            json.dumps({"type": "item.completed",
+                        "item": {"type": "agent_message", "text": "partial"}}),
+        ])
+        async def fake_subproc(cmd, prompt, role_id=""):
+            return _stalled_run(stdout=stdout, unsafe_to_replay=True)
+        with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
+            result = await codex_council._run_role_once(role, "prompt", attempt=1)
+        self.assertFalse(result.ok)  # no turn.completed -> never auto-promoted
+        self.assertIn("partial", result.error)
+
+    async def test_stalled_resume_with_stale_looking_stderr_keeps_state(self):
+        """Partial stale/auth text in a killed run's stderr must not clear
+        resume state: the structured stall verdict outranks text sniffing."""
+        role = _make_role("architect", "Architect")
+        codex_council.save_session("architect", "live-sid")
+        async def fake_subproc(cmd, prompt, role_id=""):
+            return _stalled_run(stderr="no rollout found for thread id live-sid")
+        with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
+            result = await codex_council._run_role_once(role, "prompt", attempt=1)
+        self.assertFalse(result.ok)
+        self.assertTrue(result.error.startswith("[retriable:stall]"))
+        sid, _ = codex_council.load_session("architect")
+        self.assertEqual(sid, "live-sid")
+
+
+class StallWatchdogIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    """Real subprocesses under a tiny CODEX_COUNCIL_STALL_SECS: the hand-
+    rolled watchdog kills silent children, spares chatty ones, and derives
+    the event flags from the buffered JSONL."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        env = _env_without_session_key()
+        env[codex_council.STALL_SECS_ENV] = "1"
+        self.env_patcher = patch.dict(os.environ, env, clear=True)
+        self.env_patcher.start()
+        self.addCleanup(self.env_patcher.stop)
+
+    def _script(self, name, body):
+        path = os.path.join(self.tmp.name, name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(body)
+        return [sys.executable, path]
+
+    _PREAMBLE = (
+        "import json, sys, time\n"
+        "def emit(obj):\n"
+        "    sys.stdout.write(json.dumps(obj) + '\\n')\n"
+        "    sys.stdout.flush()\n"
+    )
+
+    async def test_silent_hang_is_stalled_and_replay_safe(self):
+        cmd = self._script("hang.py", self._PREAMBLE + "time.sleep(300)\n")
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            run = await codex_council._run_codex_subprocess(cmd, "p", role_id="r1")
+        self.assertTrue(run.stalled)
+        self.assertFalse(run.turn_completed)
+        self.assertFalse(run.unsafe_to_replay)
+        err = buf.getvalue()
+        self.assertIn("[codex-council:r1] stall threshold reached", err)
+        self.assertRegex(err, r"quiet=\d+s, watchdog=1s\); terminating attempt")
+
+    async def test_completed_turn_then_hang_flags_turn_completed(self):
+        cmd = self._script("wedge.py", self._PREAMBLE + (
+            "emit({'type': 'thread.started', 'thread_id': 'sid-w'})\n"
+            "emit({'type': 'item.completed',"
+            " 'item': {'type': 'agent_message', 'text': 'done reply'}})\n"
+            "emit({'type': 'turn.completed', 'usage': {}})\n"
+            "time.sleep(300)\n"
+        ))
+        with contextlib.redirect_stderr(io.StringIO()):
+            run = await codex_council._run_codex_subprocess(cmd, "p")
+        self.assertTrue(run.stalled)
+        self.assertTrue(run.turn_completed)
+        self.assertEqual(
+            codex_council.extract_final_message(run.stdout), "done reply")
+
+    async def test_tool_start_then_hang_is_unsafe_to_replay(self):
+        cmd = self._script("tool.py", self._PREAMBLE + (
+            "emit({'type': 'thread.started', 'thread_id': 'sid-t'})\n"
+            "emit({'type': 'item.started',"
+            " 'item': {'type': 'command_execution', 'command': 'sleep'}})\n"
+            "time.sleep(300)\n"
+        ))
+        with contextlib.redirect_stderr(io.StringIO()):
+            run = await codex_council._run_codex_subprocess(cmd, "p")
+        self.assertTrue(run.stalled)
+        self.assertFalse(run.turn_completed)
+        self.assertTrue(run.unsafe_to_replay)
+
+    async def test_slow_but_chatty_child_never_trips(self):
+        # Emits a byte every 0.3s for ~2.4s — far past the 1s threshold in
+        # quiet-time terms only if bytes stopped; they don't, so no stall.
+        cmd = self._script("chatty.py", self._PREAMBLE + (
+            "for _ in range(8):\n"
+            "    sys.stdout.write('\\n'); sys.stdout.flush()\n"
+            "    time.sleep(0.3)\n"
+            "emit({'type': 'thread.started', 'thread_id': 'sid-c'})\n"
+            "emit({'type': 'item.completed',"
+            " 'item': {'type': 'agent_message', 'text': 'chatty ok'}})\n"
+        ))
+        run = await codex_council._run_codex_subprocess(cmd, "p")
+        self.assertFalse(run.stalled)
+        self.assertEqual(run.returncode, 0)
+        self.assertEqual(
+            codex_council.extract_final_message(run.stdout), "chatty ok")
+
+    async def test_zero_disables_the_watchdog(self):
+        os.environ[codex_council.STALL_SECS_ENV] = "0"
+        cmd = self._script("hang0.py", self._PREAMBLE + "time.sleep(300)\n")
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            task = asyncio.create_task(
+                codex_council._run_codex_subprocess(cmd, "p")
+            )
+            # Well past the smallest possible threshold: still running.
+            await asyncio.sleep(1.3)
+            self.assertFalse(task.done())
+            # Explicit teardown: cancellation reaps the hung child.
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertNotIn("stall threshold reached", buf.getvalue())
+
+
+class StartLineTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.project_patcher = patch.object(
+            codex_council, "_project_root", return_value=FIXED_PROJECT_ROOT
+        )
+        self.project_patcher.start()
+        self.addCleanup(self.project_patcher.stop)
+        self.state_patcher = patch.object(codex_council, "STATE_DIR", self.tmp.name)
+        self.state_patcher.start()
+        self.addCleanup(self.state_patcher.stop)
+        self.env_patcher = patch.dict(os.environ, _env_without_session_key(), clear=True)
+        self.env_patcher.start()
+        self.addCleanup(self.env_patcher.stop)
+
+    async def test_fresh_start_line_format(self):
+        role = _make_role("architect", "Architect")
+        async def fake_subproc(cmd, prompt, role_id=""):
+            return _codex_run(0, _fresh_jsonl(), "")
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
+                await codex_council._run_role_once(role, "prompt", attempt=1)
+        self.assertIn(
+            "[codex-council] architect: started (fresh) attempt=1/2 "
+            "watchdog=1800s",
+            buf.getvalue(),
+        )
+
+    async def test_resume_start_line_reports_watchdog_disabled(self):
+        role = _make_role("architect", "Architect")
+        codex_council.save_session("architect", "sid-1")
+        os.environ[codex_council.STALL_SECS_ENV] = "0"
+        async def fake_subproc(cmd, prompt, role_id=""):
+            return _codex_run(0, _resume_jsonl_no_thread_event(), "")
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
+                await codex_council._run_role_once(role, "prompt", attempt=2)
+        self.assertIn(
+            "[codex-council] architect: started (resume) attempt=2/2 "
+            "watchdog=disabled",
+            buf.getvalue(),
+        )
+
+
+class RoleLivenessDescTests(unittest.TestCase):
+    def tearDown(self):
+        codex_council._ROLE_LIVENESS.clear()
+
+    def test_quiet_seconds_since_last_output(self):
+        codex_council._ROLE_LIVENESS["r"] = 100.0
+        self.assertEqual(
+            codex_council._role_liveness_desc("r", 142.4), "r quiet=42s")
+
+    def test_retry_wait_replaces_stale_quiet(self):
+        codex_council._ROLE_LIVENESS["r"] = "retry-wait"
+        self.assertEqual(
+            codex_council._role_liveness_desc("r", 500.0), "r retry-wait")
+
+    def test_unknown_state_degrades_to_bare_id(self):
+        self.assertEqual(codex_council._role_liveness_desc("r", 1.0), "r")
+
+
+# ---------- best-effort diagnostics (advisory stderr) ----------
+
+class DiagnosticsHelperTests(unittest.TestCase):
+    def setUp(self):
+        self._real_stderr = sys.stderr
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        sys.stderr = self._real_stderr
+        codex_council._diagnostics["stream"] = None
+
+    def _fail_stream(self, exc):
+        class Failing:
+            encoding = "utf-8"
+
+            def __init__(self):
+                self.writes = 0
+
+            def write(self, s):
+                self.writes += 1
+                raise exc
+
+            def flush(self):
+                pass
+
+            def close(self):
+                pass
+
+        return Failing()
+
+    def test_broken_pipe_redirects_permanently(self):
+        failing = self._fail_stream(BrokenPipeError())
+        sys.stderr = failing
+        codex_council._diag("one")
+        self.assertIsNotNone(codex_council._diagnostics["stream"])
+        # Subsequent writes are no-ops against the retired stream.
+        codex_council._diag("two")
+        self.assertEqual(failing.writes, 1)
+
+    def test_closed_stream_valueerror_redirects_permanently(self):
+        sys.stderr = self._fail_stream(ValueError("I/O operation on closed file"))
+        codex_council._diag("one")
+        self.assertIsNotNone(codex_council._diagnostics["stream"])
+
+    def test_ebadf_redirects_permanently(self):
+        sys.stderr = self._fail_stream(OSError(9, "Bad file descriptor"))
+        codex_council._diag("one")
+        self.assertIsNotNone(codex_council._diagnostics["stream"])
+
+    def test_transient_oserror_is_suppressed_but_stream_stays_live(self):
+        failing = self._fail_stream(OSError(11, "Resource temporarily unavailable"))
+        sys.stderr = failing
+        codex_council._diag("one")  # suppressed, no redirect
+        self.assertIsNone(codex_council._diagnostics["stream"])
+        codex_council._diag("two")  # the stream is still being used
+        self.assertEqual(failing.writes, 2)
+
+    def test_retry_still_happens_when_stderr_dies_before_the_notice(self):
+        async def scenario():
+            role = _make_role("architect", "Architect")
+            attempts = {"count": 0}
+
+            async def fake_once(r, prompt, attempt):
+                attempts["count"] += 1
+                if attempt == 1:
+                    return codex_council.RoleResult(
+                        role=r, ok=False, error="[retriable:5xx] 503",
+                        elapsed_seconds=0.1, attempts=attempt,
+                    )
+                return codex_council.RoleResult(
+                    role=r, ok=True, text="recovered", elapsed_seconds=0.1,
+                    attempts=attempt,
+                )
+
+            with patch.object(codex_council.asyncio, "sleep",
+                              AsyncMock(return_value=None)):
+                with patch.object(codex_council, "_run_role_once",
+                                  side_effect=fake_once):
+                    return await codex_council._run_role_attempts(role, "p")
+
+        sys.stderr = self._fail_stream(BrokenPipeError())
+        result = asyncio.run(scenario())
+        self.assertTrue(result.ok)
+        self.assertEqual(result.text, "recovered")
+        self.assertEqual(result.attempts, 2)
+
+
+# ---------- reply preservation / warning composition ----------
+
+class AppendWarningTests(unittest.TestCase):
+    def test_none_plus_new_returns_new(self):
+        self.assertEqual(codex_council._append_warning(None, "b"), "b")
+
+    def test_existing_kept_first_never_overwritten(self):
+        self.assertEqual(
+            codex_council._append_warning("continuity lost", "save failed"),
+            "continuity lost; save failed",
+        )
+
+    def test_empty_new_keeps_existing(self):
+        self.assertEqual(codex_council._append_warning("a", None), "a")
+        self.assertEqual(codex_council._append_warning("a", ""), "a")
+
+
+class ReplyPreservationTests(unittest.IsolatedAsyncioTestCase):
+    """A completed reply outranks session continuity: persistence failures
+    downgrade to warnings, never to failures."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.project_patcher = patch.object(
+            codex_council, "_project_root", return_value=FIXED_PROJECT_ROOT
+        )
+        self.project_patcher.start()
+        self.addCleanup(self.project_patcher.stop)
+        self.state_patcher = patch.object(codex_council, "STATE_DIR", self.tmp.name)
+        self.state_patcher.start()
+        self.addCleanup(self.state_patcher.stop)
+        self.env_patcher = patch.dict(os.environ, _env_without_session_key(), clear=True)
+        self.env_patcher.start()
+        self.addCleanup(self.env_patcher.stop)
+
+    async def test_fresh_save_failure_keeps_reply_with_warning(self):
+        role = _make_role("architect", "Architect")
+        async def fake_subproc(cmd, prompt, role_id=""):
+            return _codex_run(0, _fresh_jsonl("sid-x", "the reply"), "")
+        with patch.object(codex_council, "save_session",
+                          side_effect=OSError(13, "Permission denied")):
+            with patch.object(codex_council, "_run_codex_subprocess",
+                              side_effect=fake_subproc):
+                result = await codex_council._run_role_once(role, "p", attempt=1)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.text, "the reply")
+        self.assertIn("reply completed; session state could not be persisted",
+                      result.warning)
+
+    async def test_matching_resume_save_failure_keeps_reply(self):
+        role = _make_role("architect", "Architect")
+        codex_council.save_session("architect", "sid-1")
+        stdout = "\n".join([
+            json.dumps({"type": "thread.started", "thread_id": "sid-1"}),
+            json.dumps({"type": "item.completed",
+                        "item": {"type": "agent_message", "text": "resumed"}}),
+        ])
+        async def fake_subproc(cmd, prompt, role_id=""):
+            return _codex_run(0, stdout, "")
+        with patch.object(codex_council, "save_session",
+                          side_effect=OSError(28, "No space left on device")):
+            with patch.object(codex_council, "_run_codex_subprocess",
+                              side_effect=fake_subproc):
+                result = await codex_council._run_role_once(role, "p", attempt=1)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.text, "resumed")
+        self.assertIn("could not be persisted", result.warning)
+
+    async def test_adoption_save_failure_clears_proven_wrong_state(self):
+        role = _make_role("architect", "Architect")
+        codex_council.save_session("architect", "expected-sid")
+        cleared = []
+        async def fake_subproc(cmd, prompt, role_id=""):
+            return _codex_run(0, _fresh_jsonl("DIFFERENT-sid", "reply"), "")
+        with patch.object(codex_council, "save_session",
+                          side_effect=OSError(13, "Permission denied")):
+            with patch.object(codex_council, "clear_session",
+                              side_effect=lambda rid: cleared.append(rid)):
+                with patch.object(codex_council, "_run_codex_subprocess",
+                                  side_effect=fake_subproc):
+                    result = await codex_council._run_role_once(role, "p", attempt=1)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.text, "reply")
+        self.assertIn("prior continuity lost", result.warning)
+        self.assertIn("could not be persisted", result.warning)
+        self.assertEqual(cleared, ["architect"])
+
+    async def test_adoption_save_and_clear_both_failing_warns_of_repeat(self):
+        role = _make_role("architect", "Architect")
+        codex_council.save_session("architect", "expected-sid")
+        async def fake_subproc(cmd, prompt, role_id=""):
+            return _codex_run(0, _fresh_jsonl("DIFFERENT-sid", "reply"), "")
+        with patch.object(codex_council, "save_session",
+                          side_effect=OSError(13, "Permission denied")):
+            with patch.object(codex_council, "clear_session",
+                              side_effect=OSError(13, "Permission denied")):
+                with patch.object(codex_council, "_run_codex_subprocess",
+                                  side_effect=fake_subproc):
+                    result = await codex_council._run_role_once(role, "p", attempt=1)
+        self.assertTrue(result.ok)
+        self.assertIn("may repeat adoption next invocation", result.warning)
+
+    async def test_stale_clear_failure_healed_by_fresh_save_needs_no_warning(self):
+        role = _make_role("architect", "Architect")
+        codex_council.save_session("architect", "stale-sid")
+        async def fake_subproc(cmd, prompt, role_id=""):
+            if "resume" in cmd:
+                return _codex_run(1, "", "no rollout found for thread id stale-sid")
+            return _codex_run(0, _fresh_jsonl("new-sid", "fresh reply"), "")
+        with patch.object(codex_council, "clear_session",
+                          side_effect=OSError(13, "Permission denied")):
+            with patch.object(codex_council, "_run_codex_subprocess",
+                              side_effect=fake_subproc):
+                result = await codex_council._run_role_once(role, "p", attempt=1)
+        self.assertTrue(result.ok)
+        # The atomic fresh save replaced the stale file: self-healed.
+        self.assertIsNone(result.warning)
+        sid, _ = codex_council.load_session("architect")
+        self.assertEqual(sid, "new-sid")
+
+    async def test_stale_clear_failure_without_new_id_warns_stale_remains(self):
+        role = _make_role("architect", "Architect")
+        codex_council.save_session("architect", "stale-sid")
+        async def fake_subproc(cmd, prompt, role_id=""):
+            if "resume" in cmd:
+                return _codex_run(1, "", "no rollout found for thread id stale-sid")
+            # Fresh success WITHOUT a thread.started: nothing to save.
+            return _codex_run(0, _resume_jsonl_no_thread_event("fresh reply"), "")
+        with patch.object(codex_council, "clear_session",
+                          side_effect=OSError(13, "Permission denied")):
+            with patch.object(codex_council, "_run_codex_subprocess",
+                              side_effect=fake_subproc):
+                result = await codex_council._run_role_once(role, "p", attempt=1)
+        self.assertTrue(result.ok)
+        self.assertIn("stale session state could not be cleared", result.warning)
+
+    async def test_stale_clear_failure_carries_warning_through_fresh_failure(self):
+        role = _make_role("architect", "Architect")
+        codex_council.save_session("architect", "stale-sid")
+        async def fake_subproc(cmd, prompt, role_id=""):
+            if "resume" in cmd:
+                return _codex_run(1, "", "no rollout found for thread id stale-sid")
+            return _codex_run(1, "", "fresh exec blew up")
+        with patch.object(codex_council, "clear_session",
+                          side_effect=OSError(13, "Permission denied")):
+            with patch.object(codex_council, "_run_codex_subprocess",
+                              side_effect=fake_subproc):
+                result = await codex_council._run_role_once(role, "p", attempt=1)
+        self.assertFalse(result.ok)
+        self.assertIn("stale session state could not be cleared", result.warning)
+
+    def test_clear_session_ignores_only_missing_file(self):
+        with patch.dict(os.environ, _env_without_session_key(), clear=True):
+            codex_council.clear_session("architect")  # missing: no raise
+            codex_council.save_session("architect", "sid")
+            os.chmod(self.tmp.name, 0o500)
+            self.addCleanup(lambda: os.chmod(self.tmp.name, 0o700))
+            with self.assertRaises(OSError):
+                codex_council.clear_session("architect")
+
+
+# ---------- report metadata escaping (full splitlines boundary set) ----------
+
+class ReportInlineBoundaryTests(unittest.TestCase):
+    _BOUNDARY_CHARS = (
+        "\r", "\n", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e",
+        "\x85", "\u2028", "\u2029",
+    )
+
+    def test_linebreak_chars_constant_covers_full_boundary_set(self):
+        self.assertEqual(
+            tuple(codex_council.LINEBREAK_CHARS), self._BOUNDARY_CHARS)
+
+    def test_every_boundary_char_is_escaped_to_one_line(self):
+        for ch in self._BOUNDARY_CHARS:
+            with self.subTest(char=hex(ord(ch))):
+                out = codex_council._report_inline(f"left{ch}right")
+                self.assertEqual(len(out.splitlines()), 1)
+                self.assertNotIn(ch, out)
+
+    def test_warning_and_failed_lines_stay_single_report_lines(self):
+        for ch in self._BOUNDARY_CHARS:
+            with self.subTest(char=hex(ord(ch))):
+                role = _make_role("architect", "Architect")
+                results = [
+                    codex_council.RoleResult(
+                        role=role, ok=True, text="body",
+                        warning=f"warn{ch}tail", elapsed_seconds=0.1,
+                    ),
+                    codex_council.RoleResult(
+                        role=_make_role("security", "Security"), ok=False,
+                        error=f"boom{ch}tail", elapsed_seconds=0.1,
+                    ),
+                ]
+                report = codex_council._format_report(results, 0.2)
+                warn_lines = [
+                    ln for ln in report.splitlines()
+                    if ln.startswith("_Warning: ")
+                ]
+                fail_lines = [
+                    ln for ln in report.splitlines()
+                    if ln.startswith("_Failed: ")
+                ]
+                self.assertEqual(len(warn_lines), 1)
+                self.assertEqual(len(fail_lines), 1)
+                self.assertTrue(warn_lines[0].endswith("tail_"))
+                self.assertTrue(fail_lines[0].endswith("tail_"))
+
+    def test_label_with_nel_is_rejected(self):
+        raw = json.dumps([_role_json("x", "Good\x85Forged")])
+        _assert_usage_exit(
+            self, lambda: codex_council._parse_roles_json(raw),
+            expect_in_stderr="label must not contain newlines",
+        )
+
+
+# ---------- uniform roles-file rewrite recovery ----------
+
+class RolesRewriteRecoveryTests(unittest.TestCase):
+    """Every roles-file validation failure carries the identical full-rewrite
+    recovery sentence exactly once."""
+
+    _CORE = "rewrite the entire file passed to --roles-file"
+
+    def _invalid_payloads(self):
+        ok = _valid_instruction("review")
+        return {
+            "invalid-json": "{not json",
+            "non-list-top-level": json.dumps({"id": "x"}),
+            "empty-panel": json.dumps([]),
+            "non-object-entry": json.dumps(["nope"]),
+            "unknown-field": json.dumps([{**_role_json("a", "A"), "_": ""}]),
+            "missing-field": json.dumps([{"label": "L", "instruction": [ok]}]),
+            "empty-id": json.dumps([_role_json("", "A")]),
+            "non-string-label": json.dumps(
+                [{"id": "a", "label": 3, "instruction": [ok]}]),
+            "bad-id-regex": json.dumps([_role_json("Bad ID", "A")]),
+            "label-linebreak": json.dumps([_role_json("a", "A\nB")]),
+            "wrong-instruction-type": json.dumps(
+                [{"id": "a", "label": "A", "instruction": "string form"}]),
+            "empty-instruction-list": json.dumps(
+                [{"id": "a", "label": "A", "instruction": []}]),
+            "blank-instruction-item": json.dumps(
+                [{"id": "a", "label": "A", "instruction": ["   "]}]),
+            "missing-scope-phrase": json.dumps([_role_json(
+                "a", "A", ["Review only.", "Thoroughness beats speed."])]),
+            "missing-cadence-sentence": json.dumps([_role_json(
+                "a", "A", ["Review; if nothing material, say so clearly."])]),
+            "duplicate-id": json.dumps(
+                [_role_json("a", "A"), _role_json("a", "A2")]),
+        }
+
+    def test_every_invalid_class_names_the_shared_recovery_exactly_once(self):
+        for name, raw in self._invalid_payloads().items():
+            with self.subTest(defect=name):
+                buf = io.StringIO()
+                with contextlib.redirect_stderr(buf):
+                    with self.assertRaises(SystemExit) as ctx:
+                        codex_council._parse_roles_json(raw)
+                self.assertEqual(ctx.exception.code, 2)
+                err = buf.getvalue()
+                self.assertEqual(err.count(self._CORE), 1, err)
+                self.assertIn("do not patch, append, or replace", err)
+
+
+# ---------- version visibility ----------
+
+class PluginVersionTests(unittest.TestCase):
+    def test_resolves_manifest_three_levels_above_scripts(self):
+        manifest = os.path.abspath(os.path.join(
+            os.path.dirname(codex_council.__file__),
+            "..", "..", "..", ".claude-plugin", "plugin.json",
+        ))
+        with open(manifest, encoding="utf-8") as f:
+            expected = json.load(f)["version"]
+        self.assertEqual(codex_council._plugin_version(), expected)
+
+    def test_unknown_on_unresolvable_manifest(self):
+        with patch.object(codex_council, "__file__", "/x.py"):
+            self.assertEqual(codex_council._plugin_version(), "unknown")
+
+
 class DocsContractTests(unittest.TestCase):
     def _repo_file(self, *parts):
         return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", *parts))
@@ -2799,6 +3698,31 @@ class DocsContractTests(unittest.TestCase):
             "git diff --cached",
         ):
             self.assertIn(required, reference)
+        # Every recipe follows the fail-closed skeleton: pre-clean both files,
+        # extract to tmp, refuse empty output, publish atomically, and remove
+        # both files on any failure via the EXIT trap.
+        recipes = re.findall(r"```bash\n(.*?)```", reference, re.S)
+        self.assertGreaterEqual(len(recipes), 5)
+        for recipe in recipes:
+            for required in (
+                "set -euo pipefail",
+                "out='ABS_RUNDIR/context.md'",
+                "tmp='ABS_RUNDIR/context.md.tmp'",
+                'rm -f "$out" "$tmp"',
+                "trap 'rc=$?; if [ \"$rc\" -ne 0 ]; then "
+                'rm -f "$out" "$tmp"; fi; exit "$rc"\' EXIT',
+                '[ -s "$tmp" ]',
+                'mv -f "$tmp" "$out"',
+                "trap - EXIT",
+            ):
+                self.assertIn(required, recipe)
+            self.assertNotIn("|| true", recipe)
+            # Placeholder discipline: no recipe references an undefined
+            # variable from an earlier tool call; artifact/log paths and
+            # statuses are pasted literals (the prose may NAME the banned
+            # variables while forbidding them).
+            for stale_var in ('"$file"', "$exit_status", "$log_file"):
+                self.assertNotIn(stale_var, recipe)
 
     def test_runtime_and_skill_have_no_stale_size_or_panel_caps(self):
         script_path = self._repo_file(
@@ -2842,9 +3766,8 @@ class DocsContractTests(unittest.TestCase):
             "Older durable context as a faithful summary",
             "CODEX_COUNCIL_MAX_PARALLEL",
             "in-process queue",
-            "status heartbeat every 30 minutes",
-            "one-shot 30-minute wake-up",
-            "TaskOutput",
+            "status heartbeat",
+            "wake-up",
         ):
             self.assertIn(required, text)
         self.assertNotIn("every role is launched in parallel", text)
@@ -3061,6 +3984,117 @@ class DocsContractTests(unittest.TestCase):
         with open(path, encoding="utf-8") as f:
             text = f.read()
         self.assertIn("Usage/quota-limit", text)
+
+    def test_docs_distinguish_output_inactivity_watchdog_from_run_level_deadline(self):
+        """The v0.9.0 liveness contract must be stated the same way on every
+        surface: an OUTPUT-INACTIVITY watchdog (CODEX_COUNCIL_STALL_SECS,
+        default 1800, 0 disables) is NOT a run-level deadline, and the old
+        absolute no-timeout phrasing is banned (the watchdog IS wall-clock
+        based)."""
+        surfaces = {
+            "SKILL.md": self._read_repo_file(
+                "plugins", "codex-council", "skills", "codex-council",
+                "SKILL.md"),
+            "README.md": self._read_repo_file("README.md"),
+            "DESIGN.md": self._read_repo_file("DESIGN.md"),
+            "runtime-behavior.md": self._read_repo_file(
+                "plugins", "codex-council", "skills", "codex-council",
+                "references", "runtime-behavior.md"),
+            "module docstring": codex_council.__doc__,
+        }
+        for name, text in surfaces.items():
+            flat = self._flat(text).lower()
+            with self.subTest(surface=name):
+                self.assertIn("codex_council_stall_secs".upper(),
+                              self._flat(text))
+                self.assertIn("output-inactivity", flat.replace(
+                    "output inactivity", "output-inactivity"))
+                self.assertIn("no total elapsed-time or run-level deadline",
+                              flat)
+                self.assertIn("1800", flat)
+                self.assertIn("0 disables", flat.replace(
+                    "`0` disables", "0 disables"))
+                for banned in (
+                    "no wall-clock timeout",
+                    "no wall-clock cap",
+                    "applies no wall-clock timeout",
+                    "no wall-clock timeout is enforced",
+                ):
+                    self.assertNotIn(banned, flat)
+
+
+class ContextRecipeBehaviorTests(unittest.TestCase):
+    """Execute the documented fail-closed skeleton and pin its semantics.
+
+    The skeleton is extracted from context-staging.md itself, so the doc and
+    the verified behavior cannot drift apart: a failed extraction leaves
+    neither file (and removes an older accepted context.md), an empty success
+    publishes nothing, and a successful extraction publishes atomically.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        path = os.path.abspath(os.path.join(
+            os.path.dirname(__file__), "..",
+            "plugins", "codex-council", "skills", "codex-council",
+            "references", "context-staging.md",
+        ))
+        with open(path, encoding="utf-8") as f:
+            doc = f.read()
+        match = re.search(
+            r"## The fail-closed skeleton.*?```bash\n(.*?)```", doc, re.S
+        )
+        assert match, "context-staging.md lost its fail-closed skeleton block"
+        cls.skeleton = match.group(1)
+
+    def _run_skeleton(self, extractor, pre_existing_final=None):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        rundir = tmp.name
+        out_path = os.path.join(rundir, "context.md")
+        tmp_path = os.path.join(rundir, "context.md.tmp")
+        if pre_existing_final is not None:
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write(pre_existing_final)
+        script = self.skeleton.replace("ABS_RUNDIR", rundir).replace(
+            "git diff HEAD", extractor
+        )
+        proc = subprocess.run(
+            ["/bin/bash", "-c", script], capture_output=True, text=True
+        )
+        return proc, out_path, tmp_path
+
+    def test_failed_extraction_leaves_neither_file(self):
+        proc, out_path, tmp_path = self._run_skeleton("echo partial; false")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse(os.path.exists(out_path))
+        self.assertFalse(os.path.exists(tmp_path))
+
+    def test_failed_rewrite_removes_older_accepted_context(self):
+        proc, out_path, tmp_path = self._run_skeleton(
+            "echo partial; false", pre_existing_final="OLD ACCEPTED CONTEXT"
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse(os.path.exists(out_path))
+        self.assertFalse(os.path.exists(tmp_path))
+
+    def test_empty_success_publishes_nothing(self):
+        proc, out_path, tmp_path = self._run_skeleton(
+            "true", pre_existing_final="OLD ACCEPTED CONTEXT"
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse(os.path.exists(out_path))
+        self.assertFalse(os.path.exists(tmp_path))
+
+    def test_success_publishes_atomically(self):
+        proc, out_path, tmp_path = self._run_skeleton(
+            "printf 'fresh context\\n'", pre_existing_final="OLD"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(os.path.exists(out_path))
+        self.assertFalse(os.path.exists(tmp_path))
+        with open(out_path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "fresh context\n")
 
 
 if __name__ == "__main__":

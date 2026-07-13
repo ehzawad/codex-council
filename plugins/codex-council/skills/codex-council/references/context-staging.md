@@ -5,9 +5,42 @@ diffs, or diagnostic output. The actual council launch remains the background
 flow in `SKILL.md`; these recipes only create `ABS_RUNDIR/context.md`.
 
 Use the exact private `ABS_RUNDIR` printed by the single `mktemp -d` call in
-`SKILL.md`. Start every pipeline in the same Bash invocation with
-`set -euo pipefail`; shell options do not persist across Claude Code Bash calls.
-Do not add `|| true`: a failed extractor must not leave stale or partial context.
+`SKILL.md`. Each recipe must run inside ONE Bash invocation: shell options and
+variables do **not** persist across Claude Code Bash calls, so every recipe
+re-assigns its own paths. Placeholder discipline: paste concrete values for
+every `<angle-bracket>` placeholder and for the literal `ABS_RUNDIR` prefix
+before running — never leave an undefined `$file`-style variable from an
+earlier tool call in the command.
+
+## The fail-closed skeleton
+
+Every extraction uses this exact shape. It pre-cleans BOTH the final file and
+the temp file, extracts into the temp file, refuses to publish empty output,
+publishes atomically with `mv`, and removes both files if anything fails — so
+a failed, partial, or empty extraction can never leave stale or previously
+accepted context behind for the launch to pick up:
+
+```bash
+set -euo pipefail
+out='ABS_RUNDIR/context.md'
+tmp='ABS_RUNDIR/context.md.tmp'
+rm -f "$out" "$tmp"
+trap 'rc=$?; if [ "$rc" -ne 0 ]; then rm -f "$out" "$tmp"; fi; exit "$rc"' EXIT
+{
+  git diff HEAD
+} >"$tmp"
+[ -s "$tmp" ]
+mv -f "$tmp" "$out"
+trap - EXIT
+```
+
+Do not add `|| true` anywhere: a failed extractor must fail the recipe so the
+trap removes both files. The `[ -s "$tmp" ]` guard fails the recipe when the
+extractor produced nothing, so an empty success publishes nothing — write a
+self-contained question to `context.md` instead (see `SKILL.md`). A bare
+`tmp`-then-`mv` without the leading `rm -f` would leave an older accepted
+`context.md` behind when extraction fails; the pre-clean plus the trap make
+failure leave no file at all.
 
 `git diff HEAD` includes staged and unstaged tracked changes. Use `git diff
 --cached` for staged-only work or `git diff` for unstaged-only work. None of
@@ -15,16 +48,21 @@ those commands include untracked files.
 
 ## Tracked changes
 
-```bash
-set -euo pipefail
-git diff HEAD > 'ABS_RUNDIR/context.md'
-```
-
-Staged only:
+The skeleton above already extracts `git diff HEAD`. Staged only — same
+skeleton, different extractor:
 
 ```bash
 set -euo pipefail
-git diff --cached > 'ABS_RUNDIR/context.md'
+out='ABS_RUNDIR/context.md'
+tmp='ABS_RUNDIR/context.md.tmp'
+rm -f "$out" "$tmp"
+trap 'rc=$?; if [ "$rc" -ne 0 ]; then rm -f "$out" "$tmp"; fi; exit "$rc"' EXIT
+{
+  git diff --cached
+} >"$tmp"
+[ -s "$tmp" ]
+mv -f "$tmp" "$out"
+trap - EXIT
 ```
 
 ## Changes plus relevant untracked files
@@ -33,6 +71,10 @@ Keep binary, symlink, and encoding guards while preserving filenames safely:
 
 ```bash
 set -euo pipefail
+out='ABS_RUNDIR/context.md'
+tmp='ABS_RUNDIR/context.md.tmp'
+rm -f "$out" "$tmp"
+trap 'rc=$?; if [ "$rc" -ne 0 ]; then rm -f "$out" "$tmp"; fi; exit "$rc"' EXIT
 {
   git diff HEAD
   git ls-files -z --others --exclude-standard -- |
@@ -53,35 +95,57 @@ set -euo pipefail
       printf '\n=== untracked file: %q ===\n' "$f"
       cat <"$f"
     done
-} > 'ABS_RUNDIR/context.md'
+} >"$tmp"
+[ -s "$tmp" ]
+mv -f "$tmp" "$out"
+trap - EXIT
 ```
 
 ## Artifact plus a question
 
-Write the complete relevant artifact and the decision the council should make:
+Write the complete relevant artifact and the decision the council should make.
+Paste the artifact's literal absolute path (for example
+`/Users/you/project/src/parser.py`) where the recipe shows one — never a
+`$file` variable from an earlier Bash call:
 
 ```bash
 set -euo pipefail
+out='ABS_RUNDIR/context.md'
+tmp='ABS_RUNDIR/context.md.tmp'
+rm -f "$out" "$tmp"
+trap 'rc=$?; if [ "$rc" -ne 0 ]; then rm -f "$out" "$tmp"; fi; exit "$rc"' EXIT
 {
   printf 'Question: %s\n\n' '<what should the council decide or produce?>'
-  cat <"$file"
-} > 'ABS_RUNDIR/context.md'
+  cat <'/abs/path/to/artifact'
+} >"$tmp"
+[ -s "$tmp" ]
+mv -f "$tmp" "$out"
+trap - EXIT
 ```
 
 ## Diagnostic transcript
 
-Preserve the failing command, status, and complete output. Append guarded source
-artifacts when diagnosis depends on them.
+Preserve the failing command, status, and complete output. Paste the literal
+exit status (for example `1`) and the literal absolute log path (for example
+`ABS_RUNDIR/build.log`) — never `$exit_status` or `$log_file` variables from
+earlier tool calls:
 
 ```bash
 set -euo pipefail
+out='ABS_RUNDIR/context.md'
+tmp='ABS_RUNDIR/context.md.tmp'
+rm -f "$out" "$tmp"
+trap 'rc=$?; if [ "$rc" -ne 0 ]; then rm -f "$out" "$tmp"; fi; exit "$rc"' EXIT
 {
   printf 'Question: %s\n\n' '<what should the council diagnose?>'
   printf 'Command: %s\n' '<the failing command>'
-  printf 'Exit status: %s\n\n' "$exit_status"
+  printf 'Exit status: %s\n\n' '<pasted exit status, e.g. 1>'
   echo 'Output:'
-  cat <"$log_file"
-} > 'ABS_RUNDIR/context.md'
+  cat <'/abs/path/to/command.log'
+} >"$tmp"
+[ -s "$tmp" ]
+mv -f "$tmp" "$out"
+trap - EXIT
 ```
 
 `context.md` is UTF-8 text because it is sent to `codex exec` on stdin. For a
