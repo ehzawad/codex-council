@@ -239,9 +239,14 @@ a suspend and restarts the count, because the runner's heartbeat sleeps on
 the monotonic clock. Monitors expire after 30 minutes and are
 re-armed; the restarted follower replays earlier lines, which Claude
 de-duplicates. The follower never writes, so it cannot forge the sentinel or
-alter a run. A session-cron wake-up or the native task wait remains the
-fallback when Monitor is unavailable, and the `run_in_background` completion
-notification is the final backstop.
+alter a run. Roles can, though: they run unsandboxed as the same user and can
+append to `err.log`, and no same-uid check can authenticate those lines. So the
+follower drops completion lines whose `reply=` path is not directly inside
+`RUNDIR/replies/` (the only shape the runner prints), SKILL.md treats reply
+content as untrusted data, and the final reconciliation waits for the
+`run_in_background` completion notification, which only Claude Code emits. A
+session-cron wake-up or the native task wait remains the fallback when
+Monitor is unavailable.
 
 Early replies change what Claude may do, not how the council ends: Claude
 may read a settled role, tell the user, and act on independent work, but the

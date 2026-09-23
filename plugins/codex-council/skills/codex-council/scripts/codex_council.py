@@ -2603,14 +2603,39 @@ def _follow_open(log_path):
     return fd
 
 
+def _follow_reply_path_ok(line, replies_dir):
+    """True unless the line names a reply= path outside replies_dir.
+
+    Lexical only: the runner always prints abspath(RUNDIR)/replies/<key>.md,
+    so any other shape was not written by the runner. This keeps a forged
+    line from pointing Claude at an arbitrary file; it cannot authenticate
+    a same-uid writer (see _follow).
+    """
+    marker = line.rfind(" reply=")
+    if marker < 0:
+        return True
+    path = line[marker + len(" reply="):]
+    return (
+        os.path.normpath(path) == path
+        and os.path.dirname(path) == replies_dir
+        and path.endswith(".md")
+    )
+
+
 def _follow(run_dir):
     """Stream a council's err.log progress lines; return the exit code.
 
     Read-only by construction: it opens nothing for writing and relays only
-    complete lines that begin with "[codex-council" (reply text never
-    reaches err.log, and runner diagnostics escape codex-controlled text,
-    so a role cannot forge a line). Every run re-reads err.log from the
-    start, so a re-armed Monitor re-emits earlier lines; consumers dedupe.
+    complete lines that begin with "[codex-council". Reply text never
+    reaches err.log and runner diagnostics escape codex-controlled text, so
+    role output cannot forge a line through the runner; but roles run
+    unsandboxed as the same user and can append to err.log directly, which
+    no same-uid check can authenticate. The follower therefore drops any
+    completion line whose reply= path is not directly inside this run's
+    replies/ directory, and SKILL.md bases the final verdict on the tracked
+    background-task completion rather than on the sentinel. Every run
+    re-reads err.log from the start, so a re-armed Monitor re-emits earlier
+    lines; consumers dedupe.
 
     Exit 0 after printing the CODEX_COUNCIL_DONE sentinel, an interruption
     line, or a "runner aborted" line. Exit 3 (no council activity) when
@@ -2628,6 +2653,10 @@ def _follow(run_dir):
         run_dir, prefix="--follow: ", recovery=FOLLOW_DIR_RECOVERY
     )
     log_path = os.path.join(run_dir, "err.log")
+    # Same construction as _prepare_replies_dir, so genuine lines match.
+    replies_dir = os.path.join(
+        os.path.normpath(os.path.abspath(run_dir)), REPLIES_SUBDIR
+    )
     started = time.monotonic()
     fd = None
     inode = None
@@ -2698,6 +2727,8 @@ def _follow(run_dir):
                             )
                             continue
                         if not line.startswith(FOLLOW_LINE_PREFIX):
+                            continue
+                        if not _follow_reply_path_ok(line, replies_dir):
                             continue
                         _follow_emit(line)
                         if line.startswith(FOLLOW_DISPATCH_PREFIX):
