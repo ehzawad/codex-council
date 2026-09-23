@@ -1,12 +1,89 @@
-# Context staging recipes
+# Context staging
 
-Read this reference when `context.md` should be assembled from workspace files,
-diffs, or diagnostic output. The actual council launch remains the background
-flow in `SKILL.md`; these recipes only create `ABS_RUNDIR/context.md`.
+Read this reference when assembling `context.md`: what belongs in it, how to
+order it for a long session, and fail-closed recipes for extracting files,
+diffs, or diagnostic output from disk. The launch itself stays in `SKILL.md`;
+these recipes only create `ABS_RUNDIR/context.md`.
+
+## Contents
+
+- What goes into context.md
+- Extraction rules
+- The fail-closed skeleton
+- Tracked changes
+- Changes plus relevant untracked files
+- Artifact plus a question
+- Diagnostic transcript
+
+## What goes into context.md
+
+Context comes from one or both sources:
+
+- **Claude-composed context** — prose written with the Write tool when you
+  already understand the situation and Codex does not need raw source.
+  Preserve every materially relevant fact, decision, uncertainty, and artifact
+  reference; remove only irrelevant or duplicated material.
+- **Shell-extracted context** — raw artifacts from disk, using the recipes
+  below.
+
+Build a decision-complete working set, not a transcript dump. The script has
+no byte ceiling on `context.md`, stdin, role fields, or the composed prompt,
+and it never truncates them; relevance selection is your job. For a long
+session, assemble context in this order:
+
+1. **Problem, project, trajectory, and immediate objective:** what the user
+   is solving or implementing, the result needed now, the current
+   branch/worktree/runtime state, and whether the work is goal-directed,
+   blocked, or exploratory.
+2. **In-flight work:** files, modules, features, drafts, datasets, queries,
+   experiments, deployments, tests, and research being changed or validated.
+3. **Active problems and hypotheses:** bugs, errors, symptoms, regressions,
+   security or performance failures, failing commands, attempted fixes,
+   working theories, and the evidence for or against them.
+4. **Recent working context at high fidelity:** recent user constraints,
+   decisions, actions, outputs, and artifacts that led to the current state.
+   Keep exact wording or raw material when details matter.
+5. **Current primary evidence:** files, diffs, diagnostics, data, sources, or
+   command output verified live rather than recalled.
+6. **Older durable context as a faithful summary:** decisions, rejected
+   approaches and why, invariants, preferences, earlier evidence, and
+   dependencies that still constrain the work. Include an old fact whenever
+   removing it could change the recommendation; age alone is never a reason
+   to drop it.
+7. **Unknowns, assumptions, and provenance:** separate verified current state
+   from summaries and inference; name known unknowns, likely blind spots,
+   missing evidence, possibly wrong assumptions, and what observation would
+   resolve each.
+
+Leave out superseded state, conversational repetition, stale intermediate
+output, and unrelated history. If the host conversation was compacted, treat
+the compaction summary as an index, re-check live state, and carry forward
+the older details that still matter. Do not compress merely to fit this
+plugin; there is no plugin size budget. The model, provider, OS, and memory
+still have real limits: if one is hit, keep the staged material and surface
+the actual downstream error.
+
+Common scopes:
+
+- **Project context** — what the codebase is: purpose, architecture, key
+  modules, conventions, direction, and constraints. For evaluating the
+  project as a whole.
+- **Live problem-solving and implementation map** — what the user is doing
+  now, in-flight artifacts, observed bugs and hypotheses, what has been
+  tried, unknowns, blockers, ownership, and the next decision.
+- **Session retrospective** — what this session did: goal, files touched,
+  decisions, open questions, and branch state.
+
+Mark uncertainty explicitly, and verify state live (for example
+`git status --short --branch`) instead of recalling it. Never write an empty
+context file; when there is nothing to extract, write a self-contained
+question to `ABS_RUNDIR/context.md` instead.
+
+## Extraction rules
 
 Use the exact private `ABS_RUNDIR` printed by the single `mktemp -d` call in
-`SKILL.md`. Each recipe must run inside ONE Bash invocation: shell options and
-variables do **not** persist across Claude Code Bash calls, so every recipe
+`SKILL.md`. Each recipe must run inside one Bash invocation: shell options and
+variables do not persist across Claude Code Bash calls, so every recipe
 re-assigns its own paths. Placeholder discipline: paste concrete values for
 every `<angle-bracket>` placeholder and for the literal `ABS_RUNDIR` prefix
 before running — never leave an undefined `$file`-style variable from an
@@ -14,7 +91,7 @@ earlier tool call in the command.
 
 ## The fail-closed skeleton
 
-Every extraction uses this exact shape. It pre-cleans BOTH the final file and
+Every extraction uses this exact shape. It pre-cleans both the final file and
 the temp file, extracts into the temp file, refuses to publish empty output,
 publishes atomically with `mv`, and removes both files if anything fails — so
 a failed, partial, or empty extraction can never leave stale or previously
@@ -37,7 +114,7 @@ trap - EXIT
 Do not add `|| true` anywhere: a failed extractor must fail the recipe so the
 trap removes both files. The `[ -s "$tmp" ]` guard fails the recipe when the
 extractor produced nothing, so an empty success publishes nothing — write a
-self-contained question to `context.md` instead (see `SKILL.md`). A bare
+self-contained question to `context.md` instead (see above). A bare
 `tmp`-then-`mv` without the leading `rm -f` would leave an older accepted
 `context.md` behind when extraction fails; the pre-clean plus the trap make
 failure leave no file at all.

@@ -3,7 +3,10 @@
 Runs without the Codex CLI installed. Covers helper behavior:
 key/state per role, JSONL parsing, error classifiers, prompt
 composition, command shape, the resume-thread-id mismatch footgun,
-retry-on-retriable, fan-out aggregation.
+retry-on-retriable, fan-out aggregation, and (DocsContractTests) the
+documentation contract of SKILL.md, its references, README, and DESIGN.
+v0.10.0 surfaces (reply files, --follow, model/effort) are covered in
+tests/test_codex_council_v010.py.
 
 Lives outside the plugin subtree so end-user installs don't bundle it.
 Run from repo root:
@@ -876,16 +879,21 @@ class ComposePromptTests(unittest.TestCase):
         self.assertTrue(out.endswith("\n\n" + role.instruction))
         self.assertIn(codex_council.COLLABORATION_BRIEF, out)
         self.assertIn("## Shared working context\n\nBODY", out)
+        # v0.10.0 brief: count-neutral, non-interactive, evidence-first.
         for concept in (
-            "actual problem",
-            "in-flight artifacts and modules",
-            "active bugs, errors, and tests",
-            "known unknowns",
-            "possibly wrong assumptions",
-            "converging or still exploratory",
-            "reconcile with the other roles toward the same goal",
+            "you may be the only role, or one of several",
+            "source of truth",
+            "read the workspace yourself to verify it",
+            "non-interactive",
+            "do not ask the user",
+            "Do not spawn subagents unless your role instruction asks",
+            "verified evidence",
+            "Size any testing to the change",
+            "the result first",
+            "open questions",
         ):
             self.assertIn(concept, out)
+        self.assertNotIn("the other roles", codex_council.COLLABORATION_BRIEF)
         self.assertIn("BODY", out)
 
     def test_different_roles_produce_different_prompts(self):
@@ -1759,7 +1767,8 @@ class RunCouncilProgressTests(unittest.IsolatedAsyncioTestCase):
     """run_council emits a per-role completion line to stderr as each role
     settles (in completion order), while stdout stays the report. The final
     CODEX_COUNCIL_DONE line is NOT emitted here — main() owns it (covered by
-    the E2E happy-path test)."""
+    the E2E happy-path test). No replies_dir is passed, so these lines carry
+    no ` reply=` suffix; reply files are covered in test_codex_council_v010."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -2134,7 +2143,7 @@ class UnknownRoleKeyTests(unittest.TestCase):
             expect_in_stderr="unknown field(s) '_'",
         )
 
-    def test_exact_three_keys_still_accepted(self):
+    def test_required_keys_alone_still_accepted(self):
         roles = codex_council._parse_roles_json(json.dumps([_role_json("a", "A")]))
         self.assertEqual(roles[0].id, "a")
 
@@ -3670,6 +3679,28 @@ class PluginVersionTests(unittest.TestCase):
 
 
 class DocsContractTests(unittest.TestCase):
+    """Pin the v0.10.0 documentation contract.
+
+    SKILL.md is the compaction-surviving core (Claude Code re-attaches only
+    the first ~5k tokens of a skill), so these tests pin its ordering and
+    size as well as the exact low-freedom launch rules; detail lives in the
+    one-level-deep references and is pinned there.
+    """
+
+    SKILL_PARTS = ("plugins", "codex-council", "skills", "codex-council",
+                   "SKILL.md")
+    REF_PARTS = ("plugins", "codex-council", "skills", "codex-council",
+                 "references")
+    # Assembled so a repo-wide grep for the retired keyword finds nothing.
+    RETIRED_THINKING_KEYWORD = "ultra" + "think"
+
+    CANONICAL_DESCRIPTION = (
+        "Adaptive, context-driven Codex council for project implementation, "
+        "computer science, software/ML engineering, DevSecOps, research, and "
+        "other complex work — Claude orchestrates role-framed agents to "
+        "collaborate and reconcile toward one shared goal."
+    )
+
     def _repo_file(self, *parts):
         return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", *parts))
 
@@ -3677,18 +3708,27 @@ class DocsContractTests(unittest.TestCase):
         with open(self._repo_file(*parts), encoding="utf-8") as f:
             return f.read()
 
+    def _skill(self):
+        return self._read_repo_file(*self.SKILL_PARTS)
+
+    def _ref(self, name):
+        return self._read_repo_file(*self.REF_PARTS, name)
+
+    def _section(self, start, end):
+        text = self._skill()
+        self.assertIn(start, text)
+        self.assertIn(end, text)
+        return self._flat(text.split(start, 1)[1].split(end, 1)[0])
+
     @staticmethod
     def _flat(text):
         return " ".join(text.split())
 
+    # ---------- context staging ----------
+
     def test_skill_context_pipelines_are_fail_closed_and_filename_safe(self):
-        skill = self._read_repo_file(
-            "plugins", "codex-council", "skills", "codex-council", "SKILL.md"
-        )
-        reference = self._read_repo_file(
-            "plugins", "codex-council", "skills", "codex-council",
-            "references", "context-staging.md",
-        )
+        skill = self._skill()
+        reference = self._ref("context-staging.md")
         self.assertIn("references/context-staging.md", skill)
         for required in (
             "set -euo pipefail",
@@ -3718,24 +3758,42 @@ class DocsContractTests(unittest.TestCase):
                 self.assertIn(required, recipe)
             self.assertNotIn("|| true", recipe)
             # Placeholder discipline: no recipe references an undefined
-            # variable from an earlier tool call; artifact/log paths and
-            # statuses are pasted literals (the prose may NAME the banned
-            # variables while forbidding them).
+            # variable from an earlier tool call.
             for stale_var in ('"$file"', "$exit_status", "$log_file"):
                 self.assertNotIn(stale_var, recipe)
 
+    def test_context_working_set_is_summarized_in_skill_and_detailed_in_reference(self):
+        skill = self._flat(self._skill())
+        for required in (
+            "decision-complete working set",
+            "recent working context at high fidelity",
+            "older durable context as a faithful summary",
+            "Never write an empty context file",
+        ):
+            self.assertIn(required, skill)
+        ref = self._flat(self._ref("context-staging.md"))
+        for required in (
+            "Problem, project, trajectory, and immediate objective",
+            "In-flight work",
+            "bugs, errors, symptoms, regressions",
+            "attempted fixes, working theories",
+            "Recent working context at high fidelity",
+            "Current primary evidence",
+            "Older durable context as a faithful summary",
+            "known unknowns",
+            "possibly wrong assumptions",
+            "Live problem-solving and implementation map",
+            "compaction summary as an index",
+            "never truncates",
+        ):
+            self.assertIn(required, ref)
+
     def test_runtime_and_skill_have_no_stale_size_or_panel_caps(self):
-        script_path = self._repo_file(
+        script = self._read_repo_file(
             "plugins", "codex-council", "skills", "codex-council",
             "scripts", "codex_council.py",
         )
-        skill_path = self._repo_file(
-            "plugins", "codex-council", "skills", "codex-council", "SKILL.md"
-        )
-        with open(script_path, encoding="utf-8") as f:
-            script = f.read()
-        with open(skill_path, encoding="utf-8") as f:
-            skill = f.read()
+        skill = self._skill()
         for stale_name in (
             "\nMAX_PARALLEL =", "MAX_STDIN_BYTES", "MAX_PROMPT_BYTES",
             "ROLE_ID_MAX_LEN", "ROLE_LABEL_MAX_BYTES",
@@ -3750,20 +3808,13 @@ class DocsContractTests(unittest.TestCase):
             self.assertNotIn(stale_contract, skill)
         self.assertIn(
             "no plugin-imposed content-size or panel-count caps",
-            skill,
+            self._flat(skill),
         )
-        self.assertIn("never truncates", skill)
+        self.assertIn("never truncates", self._flat(skill))
 
-    def test_skill_documents_adaptive_context_concurrency_and_progress(self):
-        path = self._repo_file(
-            "plugins", "codex-council", "skills", "codex-council", "SKILL.md"
-        )
-        with open(path, encoding="utf-8") as f:
-            text = f.read()
+    def test_skill_documents_concurrency_and_progress(self):
+        text = self._flat(self._skill())
         for required in (
-            "decision-complete working set",
-            "Recent working context at high fidelity",
-            "Older durable context as a faithful summary",
             "CODEX_COUNCIL_MAX_PARALLEL",
             "in-process queue",
             "status heartbeat",
@@ -3772,11 +3823,76 @@ class DocsContractTests(unittest.TestCase):
             self.assertIn(required, text)
         self.assertNotIn("every role is launched in parallel", text)
 
-    def test_skill_frontmatter_uses_contextual_programmatic_routing(self):
-        text = self._read_repo_file(
-            "plugins", "codex-council", "skills", "codex-council", "SKILL.md"
+    # ---------- structure, tone, and compaction survival ----------
+
+    def test_skill_sections_are_ordered_for_compaction_survival(self):
+        """The whole workflow, including early consumption and
+        reconciliation, must come before reference pointers would be lost
+        after compaction: sections appear in workflow order."""
+        text = self._skill()
+        headings = (
+            "## Disambiguation when the requested agent workflow is unclear",
+            "## Step 1 — Read the work",
+            "## Step 2 — Size and compose the panel",
+            "## Step 3 — Write the role JSON",
+            "## Step 4 — Announce and launch",
+            "## Step 5 — Follow the run and use replies as they land",
+            "## Step 6 — Reconcile",
         )
+        positions = [text.index(h) for h in headings]
+        self.assertEqual(positions, sorted(positions))
+
+    def test_skill_core_stays_compact(self):
+        """Claude Code re-attaches only the first ~5,000 tokens of a skill
+        after compaction; keep the whole core within that (about 20k
+        characters) and well under the 500-line guidance."""
+        text = self._skill()
+        self.assertLessEqual(len(text.splitlines()), 350)
+        self.assertLessEqual(len(text), 20000)
+
+    def test_skill_uses_calm_language(self):
+        text = self._skill()
+        lowered = text.lower()
+        for banned in (
+            self.RETIRED_THINKING_KEYWORD, "load-bearing", "lives or dies",
+            "agi-style",
+            "critical:", "**never**", "**do not**", "**not**",
+            "auto-use only", "otherwise stop", "only if all three",
+            "only proceed past this gate",
+        ):
+            self.assertNotIn(banned, lowered)
+        self.assertNotIn("agi", re.findall(r"[a-z]+", lowered))
         frontmatter = text.split("---", 2)[1]
+        self.assertNotIn("effort:", frontmatter)
+
+    def test_no_shipped_surface_uses_the_retired_thinking_keyword(self):
+        """Effort follows the session (adaptive thinking); no shipped file
+        may carry the old magic thinking keyword."""
+        surfaces = [self.SKILL_PARTS, ("README.md",), ("DESIGN.md",),
+                    (".claude-plugin", "marketplace.json"),
+                    ("plugins", "codex-council", ".claude-plugin",
+                     "plugin.json"),
+                    ("plugins", "codex-council", "skills", "codex-council",
+                     "scripts", "codex_council.py")]
+        ref_dir = self._repo_file(*self.REF_PARTS)
+        surfaces += [self.REF_PARTS + (name,)
+                     for name in sorted(os.listdir(ref_dir))]
+        for parts in surfaces:
+            with self.subTest(surface="/".join(parts)):
+                self.assertNotIn(self.RETIRED_THINKING_KEYWORD,
+                                 self._read_repo_file(*parts).lower())
+
+    def test_skill_links_one_level_deep_references_that_exist(self):
+        text = self._skill()
+        for name in ("panel-design.md", "context-staging.md",
+                     "runtime-behavior.md"):
+            self.assertIn(f"references/{name}", text)
+            self.assertTrue(os.path.isfile(self._repo_file(*self.REF_PARTS, name)))
+
+    # ---------- routing ----------
+
+    def test_skill_frontmatter_routes_on_triggers_and_domains(self):
+        frontmatter = self._skill().split("---", 2)[1]
         flat = self._flat(frontmatter)
         for required in (
             "codex council",
@@ -3787,25 +3903,20 @@ class DocsContractTests(unittest.TestCase):
             "computer science",
             "software/ML engineering",
             "DevSecOps",
-            "autonomously ask and answer contextual working questions",
+            "no built-in catalog",
+            "one role is often enough",
+            "without an approval gate",
+            "Claude Code's built-in Agent subagents",
         ):
             self.assertIn(required, flat)
-        for stale in (
-            "Auto-use ONLY",
-            "Otherwise stop",
-            "only if all three",
-            "Only proceed past this gate",
-        ):
-            self.assertNotIn(stale, text)
+        self.assertTrue(flat.lstrip().startswith("name: codex-council"))
+        self.assertLessEqual(len(flat), 1024)
 
     def test_disambiguation_prefers_codex_before_claude_ultracode(self):
-        text = self._read_repo_file(
-            "plugins", "codex-council", "skills", "codex-council", "SKILL.md"
+        flat = self._section(
+            "## Disambiguation when the requested agent workflow is unclear",
+            "## Step 1",
         )
-        section = text.split(
-            "## Disambiguation when the requested agent workflow is unclear", 1
-        )[1].split("## Step 1", 1)[0]
-        flat = self._flat(section)
         self.assertIn(
             "Question: \"Did you mean Claude's built-in Agent subagents, "
             "or the Codex council/coterie/team?\"",
@@ -3821,56 +3932,203 @@ class DocsContractTests(unittest.TestCase):
         self.assertIn("Claude Code's built-in Agent subagents", flat)
         self.assertIn("never an automatic stop", flat)
         self.assertIn("Do not ask merely because an exact trigger name is absent", flat)
-        self.assertNotIn("Claude Agent subagents (Recommended)", section)
+        self.assertNotIn("Claude Agent subagents (Recommended)", flat)
 
-    def test_step1_synthesizes_roles_from_the_full_live_situation(self):
-        text = self._read_repo_file(
-            "plugins", "codex-council", "skills", "codex-council", "SKILL.md"
-        )
-        section = text.split("## Step 1", 1)[1].split("## Step 2", 1)[0]
-        flat = self._flat(section)
+    def test_step1_reads_the_work_briefly(self):
+        flat = self._section("## Step 1", "## Step 2")
         for required in (
-            "Privately ask and answer",
-            "larger problem",
-            "project are they implementing",
-            "files, modules, features, objects, drafts, datasets, queries",
-            "bugs, errors, symptoms, regressions",
-            "hypotheses and evidence",
-            "known unknowns",
-            "unknown unknowns or blind spots",
-            "unstated, contradictory, outdated, or possibly wrong",
-            "converging on a defined goal",
-            "zigzagging through exploratory unknowns",
+            "what is in flight",
+            "what is failing or uncertain",
+            "assumptions might be wrong",
             "Ask the user only when a missing choice would materially change",
+            "on every invocation",
+            "use it as given",
         ):
             self.assertIn(required, flat)
+        # Short by design: no multi-bullet self-interrogation in the core.
+        self.assertLessEqual(len(flat.split()), 200)
+        self.assertNotIn("Privately ask and answer", flat)
 
-    def test_context_working_set_passes_the_full_situational_map(self):
-        text = self._read_repo_file(
-            "plugins", "codex-council", "skills", "codex-council", "SKILL.md"
-        )
-        section = text.split("## Building the context", 1)[1].split(
-            "## Runtime continuity", 1
-        )[0]
-        flat = self._flat(section)
+    # ---------- panel sizing and role contract ----------
+
+    def test_panel_is_sized_by_complexity_with_no_default_count(self):
+        skill = self._skill()
+        flat = self._section("## Step 2", "## Step 3")
         for required in (
-            "Problem, project, trajectory, and immediate objective",
-            "exploratory/zigzagging through unknowns",
-            "files, modules, features, objects, drafts",
-            "bugs, errors, symptoms, regressions",
-            "attempted fixes, working theories",
-            "Recent working context at high fidelity",
-            "Current primary evidence",
-            "Older durable context as a faithful summary",
-            "known unknowns, plausible blind spots",
-            "unstated or possibly wrong assumptions",
-            "Live problem-solving and implementation map",
+            "Scale the panel to the complexity of the work",
+            "There is no default count",
+            "→ 1 role",
+            "A single well-briefed role is a complete council",
+            "→ 2–3 roles",
+            "4–5 or more",
+            "Add a role only when it would find things the other roles would not",
+            "costs a full Codex run",
+            "not a form to fill in",
         ):
             self.assertIn(required, flat)
+        for stale in ("default 3", "2–6", "2-6 ", "N bounded-parallel"):
+            self.assertNotIn(stale, skill)
+        ref = self._flat(self._ref("panel-design.md"))
+        self.assertIn("There is no default role count", ref)
+        self.assertIn("not for filling in", ref)
+
+    def test_single_writer_rule_is_conditional_on_several_roles(self):
+        flat = self._section("## Step 2", "## Step 3")
+        self.assertIn("When there are several roles and they share one workspace", flat)
+        self.assertIn("let one role own writes", flat)
+        self.assertIn("serialized phases", flat)
+        self.assertIn("Retries can repeat side effects", flat)
+
+    def test_role_json_contract_is_exact(self):
+        flat = self._section("## Step 3", "## Step 4")
+        for required in (
+            "`id`", "`label`", "`instruction`",
+            "optionally `model` and `effort`",
+            "rejects any other key",
+            "rewrite the whole file",
+            "`^[a-z0-9_-]+$`",
+            "JSON array of short strings, one sentence per item",
+            '"nothing material"',
+            'exactly "Thoroughness beats speed."',
+            "Omit it to inherit",
+            "`gpt-6-luna`", "`gpt-6-sol`", "`gpt-6-astra`",
+            "never invent one",
+            "Codex validates the value",
+        ):
+            self.assertIn(required, flat)
+        # The template's example instruction satisfies the runner's checks.
+        skill = self._skill()
+        template = skill.split("```bash", 1)[1].split("```", 1)[0]
+        self.assertIn('"If nothing material falls in your lens, say so clearly."',
+                      template)
+        self.assertIn('"Thoroughness beats speed."', template)
+        self.assertIn(codex_council.REQUIRED_SCOPE_PHRASE, template)
+        self.assertIn(codex_council.REQUIRED_CADENCE_SENTENCE, template)
+
+    def test_model_and_effort_guidance_lives_in_panel_reference(self):
+        ref = self._flat(self._ref("panel-design.md"))
+        for required in (
+            "`gpt-6-luna`", "`gpt-6-sol`", "`gpt-6-astra`",
+            "never invent an id",
+            "`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`",
+            "Codex validates the value, not the plugin",
+            "-m <model>",
+            'model_reasoning_effort="<effort>"',
+            "slowest role",
+        ):
+            self.assertIn(required, ref)
+
+    # ---------- launch safety ----------
+
+    def test_launch_rules_keep_private_staging_and_one_background_layer(self):
+        flat = self._section("## Step 4", "## Step 5")
+        for required in (
+            "Do not wait for approval",
+            "Run `mktemp -d` exactly once",
+            "paste it literally into every later Write and Bash call",
+            "`run_in_background: true`",
+            "keep the command itself in the foreground",
+            "stdout and stderr redirected to files",
+            "false \"completed\"",
+            "abandon that directory",
+            "Do not chmod it, mkdir it, or reuse its name",
+        ):
+            self.assertIn(required, flat)
+        for forbidden in (
+            "trailing `&`", "`&!`", "`&|`", "`nohup`", "`setsid`",
+            "`disown`", "`bg`", "`coproc`", "`( ... ) &`", "`{ ...; } &`",
+            "`sh -c '... &'`", "bare `>/dev/null`", "`launchctl`",
+            "`tmux new -d`", "`screen -dm`", "`at`", "`batch`",
+            "`daemonize`",
+        ):
+            self.assertIn(forbidden, flat)
+
+    def test_templates_use_skill_contract_epoch_2_everywhere(self):
+        epoch = str(codex_council.SKILL_CONTRACT_EPOCH)
+        self.assertEqual(epoch, "2")
+        surfaces = {
+            "SKILL.md": self._skill(),
+            "README.md": self._read_repo_file("README.md"),
+            "runtime-behavior.md": self._ref("runtime-behavior.md"),
+        }
+        for name, text in surfaces.items():
+            with self.subTest(surface=name):
+                values = re.findall(r"--skill-contract (\d+)", text)
+                self.assertTrue(values)
+                self.assertEqual(set(values), {epoch})
+        skill = self._skill()
+        for fragment in (
+            "--check-staging-dir 'ABS_RUNDIR' --skill-contract 2",
+            "--roles-file 'ABS_RUNDIR/roles.json'",
+            "--context-file 'ABS_RUNDIR/context.md'",
+            "> 'ABS_RUNDIR/out.md'",
+            "2> 'ABS_RUNDIR/err.log'",
+            "--follow 'ABS_RUNDIR' --skill-contract 2",
+        ):
+            self.assertIn(fragment, skill)
+
+    # ---------- early consumption ----------
+
+    def test_skill_consumes_replies_as_they_land_with_explicit_limits(self):
+        flat = self._section("## Step 5", "## Step 6")
+        for required in (
+            "ABS_RUNDIR/replies/",
+            "reply=",
+            "Use the path printed after `reply=`",
+            "Monitor tool",
+            "1800000",
+            "re-arm the same command only on that expiry",
+            "replays earlier lines",
+            "one-shot 30-minute wake-up",
+            "Never use a shell `sleep` loop",
+            "completion notification is the backstop",
+            "Read that role's reply file and tell the user in one line",
+            "act on work that does not depend on other roles",
+            "Wait for the full report before the final verdict",
+            "overlap a still-running writer role",
+            "Never present a partial synthesis as final",
+            "A running role cannot be steered",
+            "`ok=N total=M exit=X`",
+            "recovery triage",
+        ):
+            self.assertIn(required, flat)
+        self.assertRegex(
+            flat,
+            r"\[codex-council\] \d+/\d+ <id>: ok \([\d.]+s\) reply=\S+",
+        )
+
+    def test_runtime_reference_documents_follow_replies_and_triage(self):
+        ref = self._flat(self._ref("runtime-behavior.md"))
+        for required in (
+            "--follow 'ABS_RUNDIR' --skill-contract 2",
+            "read-only",
+            "[codex-council-follow]",
+            "no council activity",
+            "runner presumed gone",
+            "Stop re-arming",
+            "runner aborted",
+            "Re-arm the same command on that expiry, and only then",
+            "`crashed (<ExcType>)`",
+            "replays earlier lines",
+            "replies/<key>.md",
+            "mode 0600",
+            "survive Ctrl+C or SIGTERM",
+            "Wait for the full report before the final verdict",
+            "Recovery triage",
+            "the first match wins",
+            "`CODEX_COUNCIL_DONE` present → finished",
+            "`watchdog=disabled`",
+            "`[orchestrator-exception]`",
+            "exactly one backgrounding layer",
+            "launchd",
+        ):
+            self.assertIn(required, ref)
+
+    # ---------- synced positioning ----------
 
     def test_programmatic_domain_lean_is_synced_without_a_role_catalog(self):
         paths = (
-            ("plugins", "codex-council", "skills", "codex-council", "SKILL.md"),
+            self.SKILL_PARTS,
             ("README.md",),
             ("DESIGN.md",),
         )
@@ -3886,120 +4144,91 @@ class DocsContractTests(unittest.TestCase):
                 "technical research",
             ):
                 self.assertIn(required, flat, f"missing {required!r} in {parts}")
+            self.assertNotIn("agi", re.findall(r"[a-z]+", flat))
+            self.assertNotIn("agi-style", flat)
         combined = "\n".join(self._read_repo_file(*parts) for parts in paths)
         self.assertIn("no built-in role catalog", combined.lower())
 
-    def test_skill_core_stays_within_progressive_disclosure_budget(self):
-        text = self._read_repo_file(
-            "plugins", "codex-council", "skills", "codex-council", "SKILL.md"
-        )
-        self.assertLessEqual(len(text.splitlines()), 500)
-
     def test_plugin_copy_is_synced_on_adaptive_general_purpose_collaboration(self):
-        canonical = (
-            "Adaptive, context-driven Codex council for project implementation, "
-            "computer science, software/ML engineering, DevSecOps, research, and "
-            "other complex work — Claude orchestrates role-framed agents to "
-            "collaborate and reconcile toward one shared goal."
-        )
-        marketplace_path = self._repo_file(".claude-plugin", "marketplace.json")
-        manifest_path = self._repo_file(
-            "plugins", "codex-council", ".claude-plugin", "plugin.json"
-        )
-        skill_path = self._repo_file(
-            "plugins", "codex-council", "skills", "codex-council", "SKILL.md"
-        )
-        readme_path = self._repo_file("README.md")
-        with open(marketplace_path, encoding="utf-8") as f:
+        with open(self._repo_file(".claude-plugin", "marketplace.json"),
+                  encoding="utf-8") as f:
             marketplace = json.load(f)
-        with open(manifest_path, encoding="utf-8") as f:
+        with open(self._repo_file("plugins", "codex-council",
+                                  ".claude-plugin", "plugin.json"),
+                  encoding="utf-8") as f:
             manifest = json.load(f)
-        self.assertEqual(marketplace["metadata"]["description"], canonical)
-        self.assertEqual(marketplace["plugins"][0]["description"], canonical)
-        self.assertEqual(manifest["description"], canonical)
-        with open(skill_path, encoding="utf-8") as f:
-            skill = f.read()
-        with open(readme_path, encoding="utf-8") as f:
-            readme = f.read()
-        combined = skill + "\n" + readme
+        self.assertEqual(marketplace["metadata"]["description"],
+                         self.CANONICAL_DESCRIPTION)
+        self.assertEqual(marketplace["plugins"][0]["description"],
+                         self.CANONICAL_DESCRIPTION)
+        self.assertEqual(manifest["description"], self.CANONICAL_DESCRIPTION)
+        combined = self._skill() + "\n" + self._read_repo_file("README.md")
         self.assertIn("adaptive", combined.lower())
         self.assertIn("general-purpose", combined)
-        self.assertIn("AGI-style", combined)
-        self.assertIn("not a claim", combined)
         self.assertNotIn("Multi-perspective parallel Codex review —", combined)
 
     def test_skill_and_readme_share_all_explicit_codex_trigger_names(self):
-        paths = (
-            self._repo_file(
-                "plugins", "codex-council", "skills", "codex-council",
-                "SKILL.md",
-            ),
-            self._repo_file("README.md"),
-        )
-        for path in paths:
-            with open(path, encoding="utf-8") as f:
-                text = f.read().lower()
+        for text in (self._skill(), self._read_repo_file("README.md")):
+            lowered = text.lower()
             for trigger in ("codex council", "codex coterie", "codex team"):
-                self.assertIn(trigger, text)
+                self.assertIn(trigger, lowered)
+
+    def test_readme_and_design_document_v010_surfaces(self):
+        for name in ("README.md", "DESIGN.md"):
+            flat = self._flat(self._read_repo_file(name))
+            with self.subTest(doc=name):
+                for required in (
+                    "--follow", "replies/", "reply=", "`model`", "`effort`",
+                    "model_reasoning_effort", "epoch", "no default",
+                ):
+                    self.assertIn(required, flat)
+        readme = self._flat(self._read_repo_file("README.md"))
+        self.assertIn("v0.10.0", readme)
+        self.assertIn("`personality`", readme)
+        self.assertIn("inert", readme)
+        self.assertIn("one or more role-framed OpenAI Codex agents",
+                      readme.replace("**", ""))
+
+    # ---------- other docs ----------
 
     def test_readme_dev_hook_keeps_diagnostics(self):
-        path = self._repo_file("README.md")
-        with open(path, encoding="utf-8") as f:
-            text = f.read()
+        text = self._read_repo_file("README.md")
         self.assertIn("codex-council-dev-link.log", text)
         self.assertNotIn(">/dev/null 2>&1 || true", text)
 
     def test_design_md_resume_footgun_describes_uuid_error_path(self):
-        """T2a: the corrected wording must describe the real current codex-cli behavior
-        (unknown UUID errors; only a non-UUID name silently spawns), not the
-        old inaccurate 'bogus_or_invalid_uuid silently falls through' claim."""
-        path = self._repo_file("DESIGN.md")
-        with open(path, encoding="utf-8") as f:
-            text = f.read()
+        """The wording must describe the real codex-cli behavior (unknown
+        UUID errors; only a non-UUID name silently spawns)."""
+        text = self._read_repo_file("DESIGN.md")
         self.assertIn("no rollout found", text)
         self.assertIn("thread *name*", text)
         self.assertNotIn("bogus_or_invalid_uuid", text)
 
     def test_design_md_documents_structured_status_classification(self):
-        path = self._repo_file("DESIGN.md")
-        with open(path, encoding="utf-8") as f:
-            text = f.read()
+        text = self._read_repo_file("DESIGN.md")
         self.assertIn("_extract_statuses", text)
         self.assertIn("500", text)
         self.assertIn("Usage/quota", text)
 
-    def test_skill_md_documents_vscode_pid_caveat(self):
-        path = self._repo_file(
-            "plugins", "codex-council", "skills", "codex-council",
-            "references", "runtime-behavior.md")
-        with open(path, encoding="utf-8") as f:
-            text = f.read()
+    def test_runtime_reference_documents_vscode_pid_caveat(self):
+        text = self._ref("runtime-behavior.md")
         self.assertIn("same VS Code window", text)
         self.assertIn("CODEX_COUNCIL_SESSION_KEY", text)
 
-    def test_skill_md_documents_usage_limit_nonretriable(self):
-        path = self._repo_file(
-            "plugins", "codex-council", "skills", "codex-council",
-            "references", "runtime-behavior.md")
-        with open(path, encoding="utf-8") as f:
-            text = f.read()
-        self.assertIn("Usage/quota-limit", text)
+    def test_runtime_reference_documents_usage_limit_nonretriable(self):
+        self.assertIn("Usage/quota-limit", self._ref("runtime-behavior.md"))
 
     def test_docs_distinguish_output_inactivity_watchdog_from_run_level_deadline(self):
-        """The v0.9.0 liveness contract must be stated the same way on every
+        """The liveness contract must be stated the same way on every
         surface: an OUTPUT-INACTIVITY watchdog (CODEX_COUNCIL_STALL_SECS,
         default 1800, 0 disables) is NOT a run-level deadline, and the old
         absolute no-timeout phrasing is banned (the watchdog IS wall-clock
         based)."""
         surfaces = {
-            "SKILL.md": self._read_repo_file(
-                "plugins", "codex-council", "skills", "codex-council",
-                "SKILL.md"),
+            "SKILL.md": self._skill(),
             "README.md": self._read_repo_file("README.md"),
             "DESIGN.md": self._read_repo_file("DESIGN.md"),
-            "runtime-behavior.md": self._read_repo_file(
-                "plugins", "codex-council", "skills", "codex-council",
-                "references", "runtime-behavior.md"),
+            "runtime-behavior.md": self._ref("runtime-behavior.md"),
             "module docstring": codex_council.__doc__,
         }
         for name, text in surfaces.items():

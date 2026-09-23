@@ -6,7 +6,8 @@ Implementation details for contributors. User-facing docs live in
 ## No catalog, no defaults
 
 The script accepts roles **only** via `--roles-file` (a path to a JSON
-file holding the list of `{id, label, instruction}` objects), and the
+file holding the list of `{id, label, instruction}` objects, each with
+optional `model` and `effort`), and the
 preferred launch path supplies context via `--context-file` in the same
 private staging directory. `instruction` is a **list of sentence-sized
 strings** — the only accepted form — that the script
@@ -51,10 +52,9 @@ an arbitrary content cap.
 The reasoning: every hardcoded catalog is a bias. A fixed set of coding
 roles biases Claude toward coding panels, and even a broad thematic
 shelf still biases Claude toward "pick-from-this-shelf" rather than
-"compose-from-context." Leaving the catalog out entirely forces Claude
-(the orchestrator) to
-ultrathink about the user's task, design role ids/labels/instructions
-on-the-fly, announce the composed panel, and then fan out. The
+"compose-from-context." Leaving the catalog out entirely makes Claude (the orchestrator) read the
+user's task, design role ids/labels/instructions on the fly, announce the
+composed panel, and then fan out. The
 script's job is fan-out, retry, and aggregation — Claude owns reconciliation
 into the user's shared goal rather than relaying disconnected role opinions.
 
@@ -72,10 +72,10 @@ the full role JSON. That's more tokens per panel proposal, but it
 matches the actual design intent (adaptive in-context selection) and
 removes any pull toward formulaic coding-flavored panels.
 
-The intended product shape is an adaptive, general-purpose, AGI-style
-collaboration pattern, not a claim that the active model is proven AGI. Claude
-derives roles from the current goal and orchestrates them through shared
-context, workspace access, persisted role threads, and final reconciliation.
+The intended product shape is an adaptive, general-purpose collaboration
+pattern. Claude derives roles from the current goal and orchestrates them
+through shared context, workspace access, persisted role threads, and final
+reconciliation.
 The same machinery can support implementation, diagnosis, creation, planning,
 research, review, or other domains as far as the active model and tools allow.
 It deliberately leans toward programmatic problem-solving—computer science,
@@ -83,8 +83,25 @@ software and ML/AI engineering, DevSecOps, platform/security automation,
 debugging/testing, project implementation, and evidence-based technical
 research—without reinstating a domain catalog or fixed role shelf.
 
-Codex itself now has a stable in-process `multi_agent` capability and a
-separate under-development `multi_agent_v2` feature. The council deliberately
+There is also no default role count. The runner accepts a panel of one, and
+the skill sizes panels to the work: one role for a focused bug, review, or
+question; more only when each added role brings a lens the others would not.
+Every role costs a full Codex run and reconciliation effort, and the council
+waits on its slowest role, so over-composed panels are slower without being
+better. The collaboration brief the runner adds to each prompt is
+count-neutral for the same reason ("you may be the only role, or one of
+several").
+
+Optional per-role `model` and `effort` keys are validated only for shape
+(`model` matches `^[A-Za-z0-9][A-Za-z0-9._:/-]*$`, `effort` is a lowercase
+word) and passed as parent `codex exec` options, `-m <model>` and
+`-c model_reasoning_effort="<effort>"`, ahead of `resume` so fresh and resumed
+attempts use the same settings. Codex owns the list of valid values; the
+plugin hardcodes none. Omitted keys inherit `~/.codex/config.toml`.
+
+Codex itself has a stable in-process `multi_agent` capability (on by
+default) and a `multi_agent_v2` feature (stable but off by default, as of
+codex-cli 0.156.1). The council deliberately
 uses external `codex exec` fan-out because each role needs an independently
 persisted thread id and process-level failure/cancellation isolation. Codex's
 documented `agents.max_threads` setting (default 6) is still used as a
@@ -95,9 +112,10 @@ A single fan-out is parallel contribution, not direct peer messaging. Claude
 mediates collaboration by giving every role the same situational context,
 reconciling the report, and staging material findings into selective follow-up
 rounds. Because all subprocesses share the working directory, implementation
-panels assign one write-owning executor/integrator by default; multiple writers
-must use isolated worktrees or serialized phases. This also limits duplicate
-side effects when a transient failure causes a role retry.
+panels with several roles assign one write-owning role; multiple writers must
+use serialized phases (the runner does not yet use Codex's `--worktree`). This
+also limits duplicate side effects when a transient failure causes a role
+retry.
 
 ## End-to-end fan-out
 
@@ -127,6 +145,8 @@ sequenceDiagram
     end
     R-->>T: buffered JSONL events per role
     T->>T: per-role extract_final_message
+    T->>T: write replies/role-id.md, then log K/N completion with reply=path
+    T-->>C: follower event per progress line (--follow)
     T-->>C: aggregated markdown report
     C-->>C: reconcile across roles
 ```
@@ -180,8 +200,62 @@ the watchdog — `min(1800, stall_secs // 3)` with a 300s floor while enabled
 (600s at the default threshold), 1800s when disabled — and each line records
 completed/active/queued counts, per-active-role `quiet=Ns` (or `retry-wait`
 during backoff), the `watchdog=` threshold, and the plugin `version=`.
-Claude Code redirects it to `err.log` and uses native task notifications plus
-a one-shot session cron when available.
+Claude Code redirects it to `err.log`. Per-role completion lines keep the
+`[codex-council] K/N <id>: ok|FAILED (<secs>s)` prefix and append
+` reply=<abs path>` when the reply file was written.
+
+## Per-role reply files and the follower
+
+Before v0.10.0 no reply reached disk until every role finished, so Claude
+waited on the slowest role and an interrupted run lost all finished work.
+Now, as each role settles (ok, failed, or crashed), the runner writes
+`<RUNDIR>/replies/<key>.md`, where `RUNDIR` is the directory of
+`--context-file` (or of `--roles-file` in stdin mode), both already
+privacy-checked at launch. `<key>` reuses the state-file role component: the
+literal id when it is a short safe filename, a deterministic SHA-256 key
+otherwise. The file body is produced by the same per-role section renderer
+as `out.md`, so an early read and the final report cannot drift, preceded by
+a one-line status header. Writes are atomic: an `O_CREAT|O_EXCL` 0600 temp
+file in the same directory, fsync, then `os.replace`. `replies/` is created
+0700; if it already exists it must be a real, user-owned, private directory,
+otherwise the runner skips reply files with one warning rather than failing
+the council. The file is written before the completion line is logged, so a
+`reply=` path always points at a complete file, and files survive
+SIGINT/SIGTERM even though the sentinel does not.
+
+`--follow DIR` is a read-only companion for Claude Code's Monitor tool. It
+validates `DIR` with the same private-dir check, polls `DIR/err.log`, prints
+every `[codex-council` line with a flush per line, and exits 0 after the
+`CODEX_COUNCIL_DONE` sentinel, an interruption line, or a `runner aborted`
+line (the runner logs one when stdout is dead at report time or an unhandled
+exception escapes). It exits 3 with a `[codex-council-follow] no council
+activity` line when, 120s after it starts, `err.log` is absent or has no
+dispatch line, so a monitor on a mistyped path or a launch that failed
+validation does not sit silent. It exits 4 (`runner presumed gone`) when a
+dispatched run's `err.log` stays byte-silent for 2 x `PROGRESS_HEARTBEAT_SECS`
++ 60s, measured from the file mtime so the check survives a re-arm; a
+wall-clock jump well beyond the monotonic advance between polls is treated as
+a suspend and restarts the count, because the runner's heartbeat sleeps on
+the monotonic clock. Monitors expire after 30 minutes and are
+re-armed; the restarted follower replays earlier lines, which Claude
+de-duplicates. The follower never writes, so it cannot forge the sentinel or
+alter a run. Roles can, though: they run unsandboxed as the same user and can
+append to `err.log`, and no same-uid check can authenticate those lines. So the
+follower drops completion lines whose `reply=` path is not directly inside
+`RUNDIR/replies/` (the only shape the runner prints), SKILL.md treats reply
+content as untrusted data, and the final reconciliation waits for the
+`run_in_background` completion notification, which only Claude Code emits. A
+session-cron wake-up or the native task wait remains the fallback when
+Monitor is unavailable.
+
+Early replies change what Claude may do, not how the council ends: Claude
+may read a settled role, tell the user, and act on independent work, but the
+final verdict, cross-role conflicts, and writes that overlap a running writer
+role wait for the full report. The runner has no partial-cancellation
+feature.
+
+The SKILL templates depend on `--follow` and reply files, so the skill
+contract epoch is 2.
 
 ## Staging validation
 
@@ -282,6 +356,7 @@ unrecognized failures carry the raw stderr untagged:
 | `[retriable:stall]` | Output-inactivity watchdog fired before any side-effect-capable tool work began; replay is safe, so it retries through the same shared budget as rate-limit/5xx |
 | `[stall]` | Watchdog fired after tool work began — terminal, because an automatic replay could duplicate side effects; a buffered agent_message without turn completion is quoted but never auto-promoted to success |
 | `[orchestrator-exception]` | A role's coroutine raised — siblings still complete via `gather(..., return_exceptions=True)` |
+| `[orchestrator-bug]` | A role task returned something other than a `RoleResult`; reported as a failure instead of crashing the report |
 | (untagged stale) | Detected via `STALE_RESUME_MARKERS`; that role's state is cleared and a fresh thread is started for it only |
 
 A stall verdict is structured (from the watchdog), not text-sniffed, and is
@@ -357,5 +432,5 @@ other cancellation) sends SIGTERM, waits briefly, then sends SIGKILL
 to the group; any shell commands codex itself spawned for tool calls
 are also reaped. SIGINT/SIGTERM/SIGHUP to the council process cancel
 the fan-out first, then exit without emitting the final
-`CODEX_COUNCIL_DONE` sentinel.
+`CODEX_COUNCIL_DONE` sentinel; reply files already written stay on disk.
 POSIX-only.

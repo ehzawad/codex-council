@@ -11,18 +11,36 @@ Results are aggregated into one structured markdown report on stdout
 for Claude to reconcile.
 
 This script is a pure runner — there is no built-in role catalog and no
-default council. Claude reconstructs the user's live problem, project state,
-implementation or research trajectory, active failures and uncertainties,
-then composes the contextual role panel on-the-fly. Roles arrive via
-`--roles-file` (a path to a JSON file holding the panel), which keeps a large
-role array out of the shell entirely.
+default council or role count; one role is as valid as many. Claude
+reconstructs the user's live problem and project state, then composes the
+roles the work actually needs. Roles arrive via `--roles-file` (a path to a
+JSON file holding the panel), which keeps a large role array out of the shell
+entirely. Each role object has `id`, `label`, and `instruction`, plus the
+optional `model` and `effort` keys; omitted, the role inherits the Codex
+config (~/.codex/config.toml) as before. When present they are passed as
+`-m <model>` and `-c model_reasoning_effort="<effort>"` on every invocation of
+that role (fresh and resume alike; they are not sticky across calls).
 
 The orchestrator imposes no size or count ceiling on role panels, role
 fields, context, stdin, or composed prompts, and never truncates them.
 Downstream model/provider limits and physical memory remain external.
 
+Early results: as each role settles (ok, FAILED, or crashed) the launch
+path writes that role's report section atomically to
+`<RUNDIR>/replies/<key>.md` (RUNDIR = the private directory holding the
+staged inputs; <key> = the role id, or a fixed-size hash for long ids) and
+only then emits its completion progress line, which ends in
+` reply=<absolute path>` when the file was written. Reply files already on
+disk survive an interruption. `--follow RUNDIR` is a read-only follower for
+a Claude Code Monitor: it streams the `[codex-council` lines of
+RUNDIR/err.log and exits 0 after the CODEX_COUNCIL_DONE sentinel, an
+interruption line, or a `runner aborted` line (3 = no council activity
+appeared, 4 = the runner is presumed gone; see _follow).
+
 Usage:
+    python3 codex_council.py --check-staging-dir RUNDIR
     python3 codex_council.py --roles-file roles.json --context-file context.md
+    python3 codex_council.py --follow RUNDIR
 
 Env vars:
     CODEX_COUNCIL_SESSION_KEY     explicit council thread scope override
@@ -122,7 +140,8 @@ RATE_LIMIT_MARKERS = (
     "request was throttled",
     # NB: "quota exceeded" / usage caps are deliberately NOT retriable markers —
     # a plan/usage cap does not clear within a 5s backoff, so it is surfaced
-    # terminal (see the Retries note in SKILL.md / DESIGN.md). Genuine transient
+    # terminal (see "Retries and long runs" in references/runtime-behavior.md
+    # and DESIGN.md). Genuine transient
     # 429s are caught by the anchored parser or the rate-limit phrases above.
 )
 TRANSIENT_5XX_MARKERS = (
@@ -193,8 +212,42 @@ PROGRESS_HEARTBEAT_SECS = 30 * 60
 HEARTBEAT_FLOOR_SECS = 300
 # Contract epoch for the optional --skill-contract handshake. Bump only when
 # SKILL.md's launch/preflight command contract changes incompatibly.
-SKILL_CONTRACT_EPOCH = 1
+SKILL_CONTRACT_EPOCH = 2
 _READ_CHUNK_BYTES = 65536
+# Per-role reply files live in this subdirectory of the private RUNDIR.
+REPLIES_SUBDIR = "replies"
+# --follow: poll cadence, how long to wait for a council to show any sign of
+# launching (err.log present AND a dispatch line), and how long a dispatched
+# council's err.log may stay byte-silent before the follower concludes the
+# runner died. A live runner emits a status heartbeat at least every
+# PROGRESS_HEARTBEAT_SECS, so twice that plus a margin is never reached by a
+# healthy council.
+FOLLOW_POLL_SECS = 0.5
+FOLLOW_START_SECS = 120
+FOLLOW_SILENCE_SECS = 2 * PROGRESS_HEARTBEAT_SECS + 60
+# Follower exit codes: 0 = terminal line seen (sentinel, interruption, or
+# runner aborted);
+# 2 = usage error; 3 = no council activity; 4 = the runner appears to have
+# died without a terminal line.
+FOLLOW_EXIT_NO_ACTIVITY = 3
+FOLLOW_EXIT_RUNNER_GONE = 4
+FOLLOW_LINE_PREFIX = "[codex-council"
+FOLLOW_DONE_PATTERN = re.compile(
+    r"^\[codex-council\] CODEX_COUNCIL_DONE ok=\d+ total=\d+ "
+    r"elapsed=[\d.]+s exit=\d+ version=\S+\Z"
+)
+FOLLOW_INTERRUPTED_PATTERN = re.compile(
+    r"^\[codex-council\] interrupted by \S+\Z"
+)
+# Printed when the runner exits after dispatch without a report: stdout was
+# dead at report time, or an unhandled exception escaped the council.
+FOLLOW_ABORTED_PATTERN = re.compile(
+    r"^\[codex-council\] runner aborted exit=\d+: \S.*\Z"
+)
+FOLLOW_DISPATCH_PREFIX = "[codex-council] dispatching "
+# A wall-clock jump this much larger than the monotonic advance between two
+# follower polls is treated as a system suspend (see _follow).
+FOLLOW_SUSPEND_SLACK_SECS = 60
 REQUIRED_SCOPE_PHRASE = "nothing material"
 REQUIRED_CADENCE_SENTENCE = "Thoroughness beats speed."
 # Every line-boundary character str.splitlines() recognizes (beyond the plain
@@ -204,17 +257,24 @@ LINEBREAK_CHARS = (
     "\r", "\n", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e",
     "\x85", "\u2028", "\u2029",
 )
+# Count-neutral on purpose: a council may have exactly one role. The role
+# instruction bookends the prompt (see _compose_prompt), so this brief stays
+# short and the lens-specific instruction is the last thing the model reads.
 COLLABORATION_BRIEF = (
-    "You are one contributor in a Claude-orchestrated Codex council. Treat the "
-    "shared working context as the source of truth: reconstruct the user's "
-    "actual problem, project and implementation or research trajectory, "
-    "in-flight artifacts and modules, active bugs, errors, and tests, known "
-    "unknowns and plausible blind spots, unstated or possibly wrong "
-    "assumptions, and whether the work is converging or still exploratory. "
-    "Distinguish evidence from inference, stay within your assigned lens, and "
-    "return concrete work, findings, decisions, dependencies, and open "
-    "questions that Claude can reconcile with the other roles toward the same "
-    "goal."
+    "You are working as one role in a Claude-orchestrated Codex council; you "
+    "may be the only role, or one of several covering other lenses in "
+    "parallel. The shared working context below is the source of truth for "
+    "the goal, the project state, and what has already been tried; read the "
+    "workspace yourself to verify it or fill gaps it leaves. This run "
+    "is non-interactive: do not ask the user questions or wait for input; "
+    "state the assumptions you make and list any decision that needs the "
+    "user as an open question. Do not spawn subagents unless your role "
+    "instruction asks for them. Stay within your role's lens, and stop when "
+    "its deliverable is complete. Keep verified evidence (file:line "
+    "references, command output) separate from "
+    "inference. Size any testing to the change. Finish with plain paragraphs "
+    "Claude can reconcile: the result first, then the evidence, dependencies "
+    "on other work, risks, and open questions."
 )
 STAGING_PATH_HINT = (
     "Staging hint: use the exact directory printed by `mktemp -d` for "
@@ -271,6 +331,9 @@ class Role:
     id: str
     label: str
     instruction: str
+    # Optional per-role Codex overrides; None inherits ~/.codex/config.toml.
+    model: Optional[str] = None
+    effort: Optional[str] = None
 
 
 @dataclass
@@ -324,7 +387,8 @@ class _NullDiagnostics:
 
 
 # Diagnostics path for every advisory stderr write (progress, notices, stall
-# diagnostics, interruption messages, and the CODEX_COUNCIL_DONE sentinel).
+# diagnostics, interruption and runner-aborted messages, and the
+# CODEX_COUNCIL_DONE sentinel).
 # None means "use the live sys.stderr"; a dead stderr swaps in the no-op sink.
 _diagnostics = {"stream": None}
 
@@ -450,8 +514,9 @@ def _state_role_component(role_id):
     """Return a filename-safe, bounded component for an unrestricted role ID.
 
     IDs of 32 characters or fewer keep the literal ID (existing state paths
-    stay valid); longer IDs are hashed to a fixed-size component so the state
-    filename never exceeds the platform's per-component limit.
+    stay valid); longer IDs are hashed to a fixed-size component so the
+    filename never exceeds the platform's per-component limit. Used for both
+    the continuity state file and the per-role reply file.
     """
     if len(role_id) <= 32:
         return role_id
@@ -716,6 +781,32 @@ def extract_final_message(jsonl_output):
     return last_message
 
 
+def extract_item_errors(jsonl_output):
+    """Pull non-fatal ``item.completed`` error items from Codex JSONL stdout.
+
+    Codex reports some advisories this way on runs that still succeed, e.g.
+    "This session was recorded with model X but is resuming with Y" when a
+    resumed thread runs under a different model override.
+    """
+    messages = []
+    for event in _iter_json_objects(jsonl_output):
+        if event.get("type") != "item.completed":
+            continue
+        item = event.get("item")
+        if isinstance(item, dict) and item.get("type") == "error":
+            message = item.get("message")
+            if isinstance(message, str) and message.strip():
+                messages.append(message.strip())
+    return _dedupe_preserve_order(messages)
+
+
+def _with_item_error_warning(warning, jsonl_output):
+    """Append any codex item-level error advisories to a role warning."""
+    for message in extract_item_errors(jsonl_output):
+        warning = _append_warning(warning, f"codex reported: {message}")
+    return warning
+
+
 def extract_error_messages(jsonl_output):
     """Pull structured error messages from Codex JSONL stdout."""
     messages = []
@@ -914,19 +1005,40 @@ def _compose_prompt(role, body):
 
 # ---------- async codex invocation ----------
 
-def _resume_cmd(root, session_id):
-    # `-C` is a parent option of `codex exec` and must precede `resume`.
+def _model_overrides(model=None, effort=None):
+    """Parent `codex exec` options for a role's optional model/effort.
+
+    Empty when neither is set, so a role without overrides keeps inheriting
+    ~/.codex/config.toml exactly as before. Placed with `-C` BEFORE any
+    `resume` subcommand (verified against codex-cli 0.156.1: parent-placed
+    `-m`/`-c` apply to both fresh and resumed turns). The overrides are
+    per-invocation, not sticky: a resumed turn without them runs on the
+    config default again. `effort` is validated to ^[a-z]+$ at parse time,
+    so the TOML string literal cannot be broken out of.
+    """
+    opts = []
+    if model:
+        opts += ["-m", model]
+    if effort:
+        opts += ["-c", f'model_reasoning_effort="{effort}"']
+    return opts
+
+
+def _resume_cmd(root, session_id, model=None, effort=None):
+    # `-C` is a parent option of `codex exec` and must precede `resume`; the
+    # optional model/effort overrides sit with it on the parent.
     return [
-        "codex", "exec", "-C", root, "resume", session_id,
+        "codex", "exec", "-C", root, *_model_overrides(model, effort),
+        "resume", session_id,
         "--dangerously-bypass-approvals-and-sandbox",
         "--skip-git-repo-check",
         "--json", "-",
     ]
 
 
-def _fresh_cmd(root):
+def _fresh_cmd(root, model=None, effort=None):
     return [
-        "codex", "exec", "-C", root,
+        "codex", "exec", "-C", root, *_model_overrides(model, effort),
         "--dangerously-bypass-approvals-and-sandbox",
         "--json", "--skip-git-repo-check", "-",
     ]
@@ -938,8 +1050,8 @@ class _EventFlagScanner:
     Splits strictly on b"\\n" (JSONL's record separator) for the same reason
     as _iter_json_objects: U+2028/U+2029/U+0085 are legal unescaped inside a
     JSON string. Item types other than the pure-text agent_message/reasoning
-    (command executions, MCP tool calls, file changes, web searches, collab,
-    and any unknown/future type) mark the attempt unsafe to replay —
+    (command executions, MCP tool calls, file changes, web searches, to-do
+    lists, collab tool calls, and any unknown/future type) mark the attempt unsafe to replay —
     conservative by default, since replaying such a turn could duplicate
     side effects.
     """
@@ -1255,7 +1367,8 @@ async def _run_role_once(role, prompt, attempt):
     if session_id:
         _diag(_start_line(role, "resume", attempt, stall_secs))
         run = await _run_codex_subprocess(
-            _resume_cmd(root, session_id), prompt, role_id=role.id
+            _resume_cmd(root, session_id, role.model, role.effort), prompt,
+            role_id=role.id,
         )
         # The structured stall verdict is handled BEFORE any text
         # classification: a killed run's partial stderr could look stale or
@@ -1288,7 +1401,9 @@ async def _run_role_once(role, prompt, attempt):
                     f"resume returned thread_id {emitted_id} != stored "
                     f"{session_id}; adopted new id (prior continuity lost)"
                 )
-                _diag(f"[codex-council:{role.id}] {warning}")
+                # emitted_id is codex-controlled text: escape linebreaks so
+                # it cannot start a forged err.log line (--follow reads it).
+                _diag(f"[codex-council:{role.id}] {_report_inline(warning)}")
                 session_id = emitted_id
             # ONE save covers both the reply-success case and the adoption
             # case. An adoption is persisted even without an agent_message:
@@ -1324,6 +1439,7 @@ async def _run_role_once(role, prompt, attempt):
                             )
             elapsed = time.monotonic() - started
             if msg:
+                warning = _with_item_error_warning(warning, run.stdout)
                 return RoleResult(
                     role=role, ok=True, text=msg, thread_id=session_id,
                     elapsed_seconds=elapsed, attempts=attempt, warning=warning,
@@ -1366,8 +1482,9 @@ async def _run_role_once(role, prompt, attempt):
         # on disk (a later successful save atomically replaces it anyway).
         updated = (meta or {}).get("updated_at", "unknown")
         _diag(
-            f"[codex-council:{role.id}] session {session_id} (last used {updated}) "
-            f"is stale ({failure_text}) — starting fresh."
+            f"[codex-council:{role.id}] session {_report_inline(session_id)} "
+            f"(last used {_report_inline(updated)}) "
+            f"is stale ({_report_inline(failure_text)}) — starting fresh."
         )
         stale_clear_error = None
         current_id, _ = load_session(role.id)
@@ -1391,7 +1508,9 @@ async def _run_role_once(role, prompt, attempt):
 
     # Fresh path.
     _diag(_start_line(role, "fresh", attempt, stall_secs))
-    run = await _run_codex_subprocess(_fresh_cmd(root), prompt, role_id=role.id)
+    run = await _run_codex_subprocess(
+        _fresh_cmd(root, role.model, role.effort), prompt, role_id=role.id
+    )
     if run.stalled:
         return _stalled_role_result(
             role, run, None, attempt, started,
@@ -1427,6 +1546,7 @@ async def _run_role_once(role, prompt, attempt):
                 warning = _with_stale_clear_warning(warning)
         else:
             warning = _with_stale_clear_warning(warning)
+        warning = _with_item_error_warning(warning, run.stdout)
         return RoleResult(
             role=role, ok=True, text=msg, thread_id=new_id,
             elapsed_seconds=elapsed, attempts=attempt, warning=warning,
@@ -1463,8 +1583,21 @@ async def _run_role_attempts(role, prompt):
     return last_result  # type: ignore[return-value]
 
 
-async def run_council(roles, body, max_parallel=None):
-    """Fan out N roles in parallel and wait for all to finish.
+def _exception_result(role, exc, elapsed):
+    """The RoleResult a crashed role task is reported as.
+
+    Shared by the completion callback (reply file) and the post-gather
+    assembly (out.md) so both render the identical section.
+    """
+    return RoleResult(
+        role=role, ok=False,
+        error=f"[orchestrator-exception] {type(exc).__name__}: {exc}",
+        elapsed_seconds=elapsed, attempts=1,
+    )
+
+
+async def run_council(roles, body, max_parallel=None, replies_dir=None):
+    """Fan out the roles (one or many) in parallel and wait for all to finish.
 
     `roles` is an unrestricted-size list of Role objects supplied by the
     caller via --roles-file. There is no built-in role registry. At most
@@ -1476,7 +1609,11 @@ async def run_council(roles, body, max_parallel=None):
     keeps producing output bytes (see the output-inactivity watchdog).
 
     Per-role completion progress is emitted to stderr (in completion
-    order) as each role settles; stdout stays the report.
+    order) as each role settles; stdout stays the report. When
+    `replies_dir` is given (only main()'s launch path passes it), each
+    settled role's report section is first written atomically to
+    `<replies_dir>/<key>.md` and its completion line then ends in
+    ` reply=<path>`; a failed write only costs the file, never the result.
     """
     total = len(roles)
     counter = {"done": 0}
@@ -1543,6 +1680,14 @@ async def run_council(roles, body, max_parallel=None):
                 f"version={_plugin_version()}."
             )
 
+    def _reply_suffix(result):
+        # The reply file is written BEFORE the completion line, so a reader
+        # that reacts to the line always finds the finished file.
+        if replies_dir is None:
+            return ""
+        path = _write_reply_file(replies_dir, result)
+        return f" reply={path}" if path else ""
+
     def _on_role_done(role, task):
         # Fires on the single event loop thread as each role settles, in
         # COMPLETION order. No await between increment and print, so the
@@ -1553,16 +1698,21 @@ async def run_council(roles, body, max_parallel=None):
             return
         exc = task.exception()
         if exc is not None:
+            suffix = _reply_suffix(_exception_result(
+                role, exc, time.monotonic() - started
+            ))
             _diag(
-                f"[codex-council] {n}/{total} {role.id}: crashed ({type(exc).__name__})"
+                f"[codex-council] {n}/{total} {role.id}: crashed "
+                f"({type(exc).__name__}){suffix}"
             )
             return
         res = task.result()
         if isinstance(res, RoleResult):
             status = "ok" if res.ok else "FAILED"
+            suffix = _reply_suffix(res)
             _diag(
                 f"[codex-council] {n}/{total} {role.id}: {status} "
-                f"({res.elapsed_seconds:.1f}s)"
+                f"({res.elapsed_seconds:.1f}s){suffix}"
             )
         else:
             _diag(f"[codex-council] {n}/{total} {role.id}: done")
@@ -1593,11 +1743,7 @@ async def run_council(roles, body, max_parallel=None):
         if isinstance(r, RoleResult):
             out.append(r)
         elif isinstance(r, BaseException):
-            out.append(RoleResult(
-                role=role, ok=False,
-                error=f"[orchestrator-exception] {type(r).__name__}: {r}",
-                elapsed_seconds=elapsed, attempts=1,
-            ))
+            out.append(_exception_result(role, r, elapsed))
         else:
             out.append(RoleResult(
                 role=role, ok=False,
@@ -1608,6 +1754,35 @@ async def run_council(roles, body, max_parallel=None):
 
 
 # ---------- report ----------
+
+def _role_overrides_note(role):
+    """Summary-line note for a role's optional model/effort overrides."""
+    parts = []
+    if role.model:
+        parts.append(f"model: {role.model}")
+    if role.effort:
+        parts.append(f"effort: {role.effort}")
+    return f" ({', '.join(parts)})" if parts else ""
+
+
+def _format_role_section(r):
+    """Render one role's report section (heading, warning, reply/failure).
+
+    The single renderer for both out.md and the per-role reply files, so the
+    two can never drift apart.
+    """
+    label = _report_inline(r.role.label)
+    lines = [f"## {label} ({r.role.id})", ""]
+    if r.warning:
+        lines.append(f"_Warning: {_report_inline(r.warning)}_")
+        lines.append("")
+    if r.ok:
+        lines.append((r.text or "").rstrip())
+    else:
+        lines.append(f"_Failed: {_report_inline(r.error)}_")
+    lines.append("")
+    return lines
+
 
 def _format_report(results, total_elapsed):
     """Render results as a single markdown report for Claude to reconcile."""
@@ -1624,28 +1799,150 @@ def _format_report(results, total_elapsed):
     for r in results:
         status = "ok" if r.ok else "FAILED"
         attempts = f" (attempts: {r.attempts})" if r.attempts > 1 else ""
+        overrides = _role_overrides_note(r.role)
         warn_note = " — WARNING" if r.warning else ""
         label = _report_inline(r.role.label)
         lines.append(
-            f"- **{label}** [{r.role.id}]: {status}{attempts}{warn_note} — "
-            f"{r.elapsed_seconds:.1f}s"
+            f"- **{label}** [{r.role.id}]: {status}{attempts}{overrides}"
+            f"{warn_note} — {r.elapsed_seconds:.1f}s"
         )
     lines.append("")
 
     for r in results:
-        label = _report_inline(r.role.label)
-        lines.append(f"## {label} ({r.role.id})")
-        lines.append("")
-        if r.warning:
-            lines.append(f"_Warning: {_report_inline(r.warning)}_")
-            lines.append("")
-        if r.ok:
-            lines.append((r.text or "").rstrip())
-        else:
-            lines.append(f"_Failed: {_report_inline(r.error)}_")
-        lines.append("")
+        lines.extend(_format_role_section(r))
 
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _format_reply_file(r):
+    """One role's reply file: a one-line status header plus its section."""
+    status = "ok" if r.ok else "FAILED"
+    fields = [
+        f"id={r.role.id}",
+        f"status={status}",
+        f"elapsed={r.elapsed_seconds:.1f}s",
+        f"attempts={r.attempts}",
+    ]
+    if r.role.model:
+        fields.append(f"model={r.role.model}")
+    if r.role.effort:
+        fields.append(f"effort={r.role.effort}")
+    if r.warning:
+        fields.append("warning=yes")
+    header = f"<!-- codex-council reply {' '.join(fields)} -->"
+    body = "\n".join(_format_role_section(r)).rstrip()
+    return f"{header}\n\n{body}\n"
+
+
+def _reply_file_path(replies_dir, role_id):
+    """Deterministic reply-file path; long ids reuse the state-file hash."""
+    return os.path.join(replies_dir, f"{_state_role_component(role_id)}.md")
+
+
+def _write_reply_file(replies_dir, result):
+    """Atomically write one settled role's reply file; return its path.
+
+    Temp file in the same directory (O_CREAT|O_EXCL|O_NOFOLLOW, mode 0600),
+    full write, fsync, then os.replace — a reader never sees a partial file.
+    Advisory by design: any failure returns None with one diagnostic and
+    never changes the role's result (out.md still carries the section).
+    """
+    path = _reply_file_path(replies_dir, result.role.id)
+    tmp_path = None
+    try:
+        data = _format_reply_file(result).encode("utf-8", errors="replace")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        for _ in range(8):
+            candidate = os.path.join(
+                replies_dir,
+                f".{os.path.basename(path)}.{os.getpid()}."
+                f"{os.urandom(6).hex()}.tmp",
+            )
+            try:
+                fd = os.open(candidate, flags, 0o600)
+            except FileExistsError:
+                continue
+            tmp_path = candidate
+            break
+        else:
+            raise FileExistsError("could not allocate a unique temp file")
+        try:
+            view = memoryview(data)
+            while view:
+                written = os.write(fd, view)
+                view = view[written:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp_path, path)
+        tmp_path = None
+        return path
+    except Exception as e:  # advisory: never let a reply file cost a result
+        _diag(
+            f"[codex-council:{result.role.id}] reply file not written "
+            f"({_report_inline(e)}); the section is still in the final report"
+        )
+        return None
+    finally:
+        if tmp_path is not None:
+            with contextlib.suppress(OSError):
+                os.remove(tmp_path)
+
+
+def _prepare_replies_dir(run_dir):
+    """Create (or accept) RUNDIR/replies; return its path or None.
+
+    run_dir is the lexical, launch-validated private staging directory. The
+    replies directory is created 0700 with os.mkdir; an existing entry is
+    accepted only if lstat shows a real directory (not a symlink) owned by
+    this user with no group/other bits. Anything else skips reply files for
+    this run with one diagnostic — early results are a convenience and must
+    never fail the council. A path containing a line-break character is
+    also refused, since it is printed inside single-line progress output.
+    """
+    path = os.path.join(os.path.normpath(os.path.abspath(run_dir)),
+                        REPLIES_SUBDIR)
+    if any(ch in path for ch in LINEBREAK_CHARS):
+        _diag(
+            "[codex-council] reply files disabled: run directory path "
+            "contains a line break; the final report is unaffected"
+        )
+        return None
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    except OSError as e:
+        _diag(
+            f"[codex-council] reply files disabled: cannot create {path!r} "
+            f"({_report_inline(e)}); the final report is unaffected"
+        )
+        return None
+    try:
+        st = os.lstat(path)
+    except OSError as e:
+        _diag(
+            f"[codex-council] reply files disabled: cannot inspect {path!r} "
+            f"({_report_inline(e)}); the final report is unaffected"
+        )
+        return None
+    problem = None
+    if stat.S_ISLNK(st.st_mode):
+        problem = "is a symlink"
+    elif not stat.S_ISDIR(st.st_mode):
+        problem = "is not a directory"
+    elif st.st_uid != os.geteuid():
+        problem = f"is owned by uid {st.st_uid}"
+    elif stat.S_IMODE(st.st_mode) & 0o077:
+        problem = f"is mode {stat.S_IMODE(st.st_mode):04o}, not private"
+    if problem:
+        _diag(
+            f"[codex-council] reply files disabled: {path!r} {problem}; "
+            "the final report is unaffected"
+        )
+        return None
+    return path
 
 
 # Escapes for the FULL str.splitlines() boundary set beyond the plain space:
@@ -1688,7 +1985,12 @@ def _parse_args(argv):
             "must be private (0700, user-owned, non-symlink) at LAUNCH as "
             "well as preflight. Direct CLI users must stage roles.json (and "
             "context.md when used) in a private directory, e.g. one created "
-            "by `mktemp -d`."
+            "by `mktemp -d`.\n\n"
+            "v0.10.0: each settled role's section is also written to "
+            "<RUNDIR>/replies/<key>.md before its completion line (which "
+            "then ends in ' reply=<path>'); --follow RUNDIR streams the "
+            "council's err.log progress for a Monitor; role objects accept "
+            "optional 'model' and 'effort' keys; SKILL contract epoch 2."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1696,7 +1998,9 @@ def _parse_args(argv):
         "--roles-file", default=None, metavar="PATH",
         help=(
             "Path to a JSON file holding the role panel: a list of "
-            "[{\"id\":..,\"label\":..,\"instruction\":..}] objects. Keeping "
+            "[{\"id\":..,\"label\":..,\"instruction\":..}] objects, each "
+            "optionally with \"model\" (passed as -m) and \"effort\" "
+            "(passed as -c model_reasoning_effort=...). Keeping "
             "the panel in a file (not an inline argument) means a large "
             "role array never has to survive shell quoting, where a stray "
             "quote or brace would break the call. Claude (the orchestrator) "
@@ -1720,6 +2024,20 @@ def _parse_args(argv):
         ),
     )
     parser.add_argument(
+        "--follow", default=None, metavar="RUNDIR",
+        help=(
+            "Read-only follower: stream every '[codex-council' line of "
+            "RUNDIR/err.log to stdout (one line per event, flushed) and exit "
+            "0 after the CODEX_COUNCIL_DONE sentinel, an interruption "
+            "line, or a 'runner aborted' line. Exits 3 if no council "
+            f"activity appears within {FOLLOW_START_SECS}s and 4 if a "
+            "dispatched council's err.log stays byte-silent for "
+            f"{FOLLOW_SILENCE_SECS}s (runner presumed gone). "
+            "Restarting it re-emits earlier lines. Cannot be combined with "
+            "--roles-file, --context-file, or --check-staging-dir."
+        ),
+    )
+    parser.add_argument(
         "--skill-contract", default=None, type=int, metavar="EPOCH",
         help=(
             "Contract epoch the invoking SKILL text was written against. "
@@ -1740,6 +2058,16 @@ def _parse_args(argv):
         parser.error("--check-staging-dir cannot be combined with --roles-file")
     if args.check_staging_dir is not None and args.context_file is not None:
         parser.error("--check-staging-dir cannot be combined with --context-file")
+    if args.follow == "":
+        parser.error("--follow must be non-empty")
+    if args.follow is not None:
+        for flag, value in (
+            ("--roles-file", args.roles_file),
+            ("--context-file", args.context_file),
+            ("--check-staging-dir", args.check_staging_dir),
+        ):
+            if value is not None:
+                parser.error(f"--follow cannot be combined with {flag}")
     if (
         args.skill_contract is not None
         and args.skill_contract != SKILL_CONTRACT_EPOCH
@@ -1889,6 +2217,27 @@ def _validate_role_label(label, ctx):
 
 
 ROLE_FIELDS = ("id", "label", "instruction")
+# Optional per-role Codex overrides; omitted keys inherit the Codex config.
+OPTIONAL_ROLE_FIELDS = ("model", "effort")
+# Shape checks only — codex itself validates that the model exists and that
+# the effort value is one it supports, so no value list is hardcoded here.
+# \Z (not $) for the same trailing-newline reason as ROLE_ID_PATTERN.
+ROLE_MODEL_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*\Z")
+ROLE_EFFORT_PATTERN = re.compile(r"^[a-z]+\Z")
+
+
+def _validate_optional_role_field(entry, field, pattern, ctx):
+    """Return a validated optional override value, or None when omitted."""
+    if field not in entry:
+        return None
+    value = entry[field]
+    if not isinstance(value, str) or not pattern.match(value):
+        _roles_usage_exit(
+            f"--roles-file {ctx}: optional field {field!r} must be a "
+            f"non-empty string matching {pattern.pattern} (got {value!r}); "
+            "omit the key to inherit the Codex config."
+        )
+    return value
 
 
 def _normalize_instruction_list(value, ctx):
@@ -1941,10 +2290,11 @@ def _validate_role_instruction(instruction, ctx):
 def _parse_roles_json(raw):
     """Parse the --roles-file blob into a list of Role objects.
 
-    Validates each entry has exactly the id/label/instruction fields
-    (instruction is a list of sentence-sized strings, normalized and
-    joined to one paragraph), id is well-formed, instructions follow the
-    documented contract, and ids are unique within the JSON. Unknown
+    Validates each entry has exactly the id/label/instruction fields plus
+    the optional model/effort overrides (instruction is a list of
+    sentence-sized strings, normalized and joined to one paragraph), id is
+    well-formed, model/effort (when present) are well-shaped, instructions
+    follow the documented contract, and ids are unique within the JSON. Unknown
     keys are rejected, not ignored: stray filler fields like '"_": ""'
     are the signature of a corrupted LLM write, so surfacing them forces
     a clean rewrite instead of silently launching from a file that
@@ -1965,13 +2315,15 @@ def _parse_roles_json(raw):
         ctx = f"entry {idx}"
         if not isinstance(entry, dict):
             _roles_usage_exit(f"--roles-file {ctx}: each entry must be an object.")
-        unknown = sorted(set(entry) - set(ROLE_FIELDS))
+        unknown = sorted(
+            set(entry) - set(ROLE_FIELDS) - set(OPTIONAL_ROLE_FIELDS)
+        )
         if unknown:
             _roles_usage_exit(
                 f"--roles-file {ctx}: unknown field(s) "
                 f"{', '.join(repr(k) for k in unknown)}. Each role object "
-                "must have exactly 'id', 'label', and 'instruction' — no "
-                "filler keys."
+                "must have exactly 'id', 'label', and 'instruction', plus "
+                "optionally 'model' and 'effort' — no filler keys."
             )
         for field in ROLE_FIELDS:
             if field not in entry:
@@ -1995,12 +2347,18 @@ def _parse_roles_json(raw):
         _validate_role_id(rid, ctx)
         _validate_role_label(label, ctx)
         _validate_role_instruction(instruction, ctx)
+        model = _validate_optional_role_field(
+            entry, "model", ROLE_MODEL_PATTERN, ctx
+        )
+        effort = _validate_optional_role_field(
+            entry, "effort", ROLE_EFFORT_PATTERN, ctx
+        )
         if rid in seen:
             _roles_usage_exit(
                 f"--roles-file {ctx}: duplicate id {rid!r} within JSON payload."
             )
         seen.add(rid)
-        roles.append(Role(rid, label, instruction))
+        roles.append(Role(rid, label, instruction, model, effort))
     return roles
 
 
@@ -2108,9 +2466,10 @@ def _check_private_dir(path, prefix="--check-staging-dir: ",
     lstat (not stat) so a symlink final component is rejected instead of
     silently followed, and ownership is checked so a foreign-owned dir
     that happens to be mode 0700 does not pass. Every rejection carries
-    the action-first recovery text: the caller is an LLM, and the one
-    correct move is always a NEW `mktemp -d` directory — never chmod,
-    mkdir, or reuse of the rejected path. `prefix` names the actual
+    action-first recovery text: the caller is an LLM, and for a staging
+    rejection the one correct move is always a NEW `mktemp -d` directory —
+    never chmod, mkdir, or reuse of the rejected path (for --follow it is
+    pointing at the real run directory). `prefix` names the actual
     entrypoint (a direct-launch rejection must not claim it came from
     --check-staging-dir) and `recovery` is mode-specific.
     """
@@ -2194,11 +2553,236 @@ def _check_staging_dir(path):
     )
 
 
-async def _run_council_with_signals(roles, body, max_parallel):
+# Recovery for a rejected --follow directory. The follower only reads, so
+# the fix is always "point it at the real run directory", never chmod/mkdir.
+FOLLOW_DIR_RECOVERY = (
+    "Recovery: pass the exact absolute mktemp directory the council was "
+    "launched from (the directory holding roles.json, out.md, and err.log). "
+    "--follow only reads DIR/err.log; do not chmod or mkdir anything for it."
+)
+
+
+def _follow_emit(line):
+    """Print one follower event (one stdout line = one Monitor event).
+
+    A dead stdout means nobody is listening any more: stop quietly with
+    exit 1 rather than raising a traceback.
+    """
+    try:
+        print(line, flush=True)
+    except (OSError, ValueError):
+        with contextlib.suppress(Exception):
+            sys.stdout.close()
+        raise SystemExit(1)
+
+
+def _follow_open(log_path):
+    """Open err.log read-only if it exists; None while it does not.
+
+    O_NONBLOCK so a FIFO planted at the path cannot hang the open, and
+    O_NOFOLLOW so a symlink is refused; anything but a regular file is a
+    usage error (the run directory is not a council run directory).
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(log_path, flags)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        _usage_exit(
+            f"--follow: cannot open {log_path!r} ({e.strerror or e}). "
+            f"{FOLLOW_DIR_RECOVERY}"
+        )
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        _usage_exit(
+            f"--follow: {log_path!r} is not a regular file. "
+            f"{FOLLOW_DIR_RECOVERY}"
+        )
+    return fd
+
+
+def _follow_reply_path_ok(line, replies_dir):
+    """True unless the line names a reply= path outside replies_dir.
+
+    Lexical only: the runner always prints abspath(RUNDIR)/replies/<key>.md,
+    so any other shape was not written by the runner. This keeps a forged
+    line from pointing Claude at an arbitrary file; it cannot authenticate
+    a same-uid writer (see _follow).
+    """
+    marker = line.rfind(" reply=")
+    if marker < 0:
+        return True
+    path = line[marker + len(" reply="):]
+    return (
+        os.path.normpath(path) == path
+        and os.path.dirname(path) == replies_dir
+        and path.endswith(".md")
+    )
+
+
+def _follow(run_dir):
+    """Stream a council's err.log progress lines; return the exit code.
+
+    Read-only by construction: it opens nothing for writing and relays only
+    complete lines that begin with "[codex-council". Reply text never
+    reaches err.log and runner diagnostics escape codex-controlled text, so
+    role output cannot forge a line through the runner; but roles run
+    unsandboxed as the same user and can append to err.log directly, which
+    no same-uid check can authenticate. The follower therefore drops any
+    completion line whose reply= path is not directly inside this run's
+    replies/ directory, and SKILL.md bases the final verdict on the tracked
+    background-task completion rather than on the sentinel. Every run
+    re-reads err.log from the start, so a re-armed Monitor re-emits earlier
+    lines; consumers dedupe.
+
+    Exit 0 after printing the CODEX_COUNCIL_DONE sentinel, an interruption
+    line, or a "runner aborted" line. Exit 3 (no council activity) when
+    err.log is absent, or holds no dispatch line, FOLLOW_START_SECS after
+    the follower started — a typo'd path or a launch that failed validation
+    must not leave a Monitor silently stuck. Exit 4 when a dispatched
+    council's err.log has been byte-silent for FOLLOW_SILENCE_SECS (measured
+    from the file mtime, so it survives re-arming; a detected system suspend
+    restarts the count): a live runner heartbeats far more often, so the
+    runner is presumed dead. A Python traceback in err.log is reported once
+    as an advisory event but is not terminal, since the runner can log a
+    traceback and keep going. Usage errors exit 2.
+    """
+    run_dir = _check_private_dir(
+        run_dir, prefix="--follow: ", recovery=FOLLOW_DIR_RECOVERY
+    )
+    log_path = os.path.join(run_dir, "err.log")
+    # Same construction as _prepare_replies_dir, so genuine lines match.
+    replies_dir = os.path.join(
+        os.path.normpath(os.path.abspath(run_dir)), REPLIES_SUBDIR
+    )
+    started = time.monotonic()
+    fd = None
+    inode = None
+    offset = 0
+    pending = b""
+    dispatched = False
+    traceback_noted = False
+    # Silence is measured on the wall clock (err.log mtime), but the
+    # runner's heartbeat sleeps on the monotonic clock, which stops while
+    # the machine is suspended. After a detected suspend, count silence
+    # from the resume instead of from the pre-suspend mtime.
+    silence_floor = 0.0
+    last_wall = time.time()
+    last_mono = time.monotonic()
+    try:
+        while True:
+            now_wall = time.time()
+            now_mono = time.monotonic()
+            if (now_wall - last_wall) - (now_mono - last_mono) > (
+                FOLLOW_SUSPEND_SLACK_SECS
+            ):
+                silence_floor = now_wall
+            last_wall, last_mono = now_wall, now_mono
+            if fd is None:
+                fd = _follow_open(log_path)
+                if fd is not None:
+                    inode = os.fstat(fd).st_ino
+                    offset = 0
+                    pending = b""
+            else:
+                # A relaunch into the same directory replaces or truncates
+                # err.log; start over on the new content.
+                try:
+                    current = os.lstat(log_path)
+                except FileNotFoundError:
+                    current = None
+                if current is not None and current.st_ino != inode:
+                    os.close(fd)
+                    fd = None
+                    continue
+                if os.fstat(fd).st_size < offset:
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    offset = 0
+                    pending = b""
+            if fd is not None:
+                while True:
+                    data = os.read(fd, _READ_CHUNK_BYTES)
+                    if not data:
+                        break
+                    offset += len(data)
+                    # Only complete lines: a read can land mid-write.
+                    lines = (pending + data).split(b"\n")
+                    pending = lines.pop()
+                    for raw in lines:
+                        line = raw.decode("utf-8", errors="replace")
+                        line = line.rstrip("\r")
+                        if (
+                            not traceback_noted
+                            and line.startswith(
+                                "Traceback (most recent call last):"
+                            )
+                        ):
+                            traceback_noted = True
+                            _follow_emit(
+                                "[codex-council-follow] err.log shows a "
+                                "Python traceback; the runner may have "
+                                f"crashed — read {log_path}"
+                            )
+                            continue
+                        if not line.startswith(FOLLOW_LINE_PREFIX):
+                            continue
+                        if not _follow_reply_path_ok(line, replies_dir):
+                            continue
+                        _follow_emit(line)
+                        if line.startswith(FOLLOW_DISPATCH_PREFIX):
+                            dispatched = True
+                        if (
+                            FOLLOW_DONE_PATTERN.match(line)
+                            or FOLLOW_INTERRUPTED_PATTERN.match(line)
+                            or FOLLOW_ABORTED_PATTERN.match(line)
+                        ):
+                            return 0
+            if not dispatched:
+                if time.monotonic() - started >= FOLLOW_START_SECS:
+                    if fd is None:
+                        detail = (
+                            f"{log_path} did not appear within "
+                            f"{FOLLOW_START_SECS}s; check the run directory "
+                            "path"
+                        )
+                    else:
+                        detail = (
+                            f"{log_path} has no dispatch line after "
+                            f"{FOLLOW_START_SECS}s; the launch may have "
+                            "failed — read err.log"
+                        )
+                    _follow_emit(
+                        f"[codex-council-follow] no council activity: {detail}"
+                    )
+                    return FOLLOW_EXIT_NO_ACTIVITY
+            elif fd is not None:
+                silent = time.time() - max(
+                    os.fstat(fd).st_mtime, silence_floor
+                )
+                if silent >= FOLLOW_SILENCE_SECS:
+                    _follow_emit(
+                        "[codex-council-follow] runner presumed gone: "
+                        f"{log_path} silent for {silent:.0f}s with no "
+                        "CODEX_COUNCIL_DONE line — check the background "
+                        "task and err.log"
+                    )
+                    return FOLLOW_EXIT_RUNNER_GONE
+            time.sleep(FOLLOW_POLL_SECS)
+    finally:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+
+async def _run_council_with_signals(roles, body, max_parallel, replies_dir=None):
     """Run the council and translate POSIX termination signals into cleanup."""
     loop = asyncio.get_running_loop()
     council_task = asyncio.create_task(
-        run_council(roles, body, max_parallel=max_parallel)
+        run_council(
+            roles, body, max_parallel=max_parallel, replies_dir=replies_dir
+        )
     )
     interrupted = {"signum": None}
     registered = []
@@ -2254,6 +2838,13 @@ def main():
         _check_staging_dir(args.check_staging_dir)
         return
 
+    if args.follow is not None:
+        try:
+            code = _follow(args.follow)
+        except KeyboardInterrupt:
+            code = 130
+        sys.exit(code)
+
     # Launch-side privacy gate: validate each on-disk input's LEXICAL parent
     # BEFORE any content read or parse — a public directory holding bad roles
     # must produce "abandon this exposed directory", never "rewrite roles".
@@ -2299,6 +2890,15 @@ def main():
     max_parallel = _max_parallel_roles()
     _stall_secs()  # fail fast on an invalid watchdog override (usage exit 2)
 
+    # Per-role reply files go under the launch-validated private directory
+    # of the on-disk inputs (context.md's in staged mode, roles.json's in
+    # stdin mode — the same directory when both exist). Lexical parent, as
+    # validated above; a problem here only disables reply files.
+    run_dir = os.path.dirname(os.path.abspath(
+        args.context_file if args.context_file is not None else args.roles_file
+    ))
+    replies_dir = _prepare_replies_dir(run_dir)
+
     _diag(
         f"[codex-council] dispatching {len(roles)} roles "
         f"with max parallel {max_parallel} "
@@ -2308,11 +2908,21 @@ def main():
     started = time.monotonic()
     try:
         results, signum = asyncio.run(
-            _run_council_with_signals(roles, body, max_parallel)
+            _run_council_with_signals(
+                roles, body, max_parallel, replies_dir=replies_dir
+            )
         )
     except KeyboardInterrupt:
         _diag("\n[codex-council] interrupted by user")
         sys.exit(130)
+    except Exception as e:
+        # Leave a terminal line so --follow stops instead of waiting out
+        # the silence threshold; the traceback follows on stderr.
+        _diag(
+            "\n[codex-council] runner aborted exit=1: unhandled "
+            f"{type(e).__name__}; no report was written"
+        )
+        raise
     if signum is not None:
         signame = signal.Signals(signum).name
         _diag(f"\n[codex-council] interrupted by {signame}")
@@ -2328,6 +2938,10 @@ def main():
         # broken stream cannot rewrite the exit code (never exit 120).
         with contextlib.suppress(Exception):
             sys.stdout.close()
+        _diag(
+            "[codex-council] runner aborted exit=1: stdout unavailable; "
+            "the report was not delivered"
+        )
         sys.exit(1)
 
     successes = sum(1 for r in results if r.ok)
