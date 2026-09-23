@@ -104,6 +104,10 @@ A council takes as long as its slowest role. When one role is narrow (a
 single-file check, a mechanical scan), a lower effort or a faster model keeps
 it from holding the whole run open while broader roles keep their full
 effort. Do not lower effort on the role that carries the hardest judgment.
+A low-effort "nothing material" is weak evidence: in a live test a
+`gpt-6-luna`/`low` round-trip check declared CSV persistence correct while
+missing carriage-return corruption. Spot-check such a verdict before relying
+on it, or give that lens more effort when a miss would be costly.
 
 The runner passes these as `codex exec -m <model>` and
 `-c model_reasoning_effort="<effort>"` on every invocation, including a

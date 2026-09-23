@@ -883,6 +883,7 @@ class ComposePromptTests(unittest.TestCase):
         for concept in (
             "you may be the only role, or one of several",
             "source of truth",
+            "read the workspace yourself to verify it",
             "non-interactive",
             "do not ask the user",
             "Do not spawn subagents unless your role instruction asks",

@@ -125,7 +125,8 @@ Write call instead of patching part of it.
   user's Codex setup actually has; never invent one.
 - `effort` (optional) — a reasoning effort such as `low`, `medium`, `high`,
   or `max`; Codex validates the value. Omit it to inherit. A lower effort on
-  narrow roles keeps them from becoming the straggler the whole run waits on.
+  narrow roles keeps them from becoming the straggler the whole run waits on;
+  treat a low-effort "nothing material" as weak evidence and spot-check it.
 
 The panel may contain any number of roles; there are no plugin-imposed
 content-size or panel-count caps. Active concurrency defaults to 6, follows a
