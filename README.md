@@ -1,7 +1,7 @@
 # codex-council
 
-An adaptive, context-driven Claude Code plugin that coordinates **N role-framed
-OpenAI Codex agents** around one shared goal. It is general-purpose with a
+An adaptive, context-driven Claude Code plugin that coordinates **one or more
+role-framed OpenAI Codex agents** around one shared goal. It is general-purpose with a
 programmatic center of gravity—project implementation, computer science,
 software and ML/AI engineering, DevSecOps, debugging/testing, and technical
 research—while adapting beyond those domains. Agents investigate, build,
@@ -40,14 +40,16 @@ documented in the changelog. If the slash command is not available on your
 version, invoke the skill with the natural-language triggers below instead;
 they work on any plugin-capable release.
 
-Claude reconstructs the live task model before composing roles: the problem and
-project being implemented, what the user has edited or asked, in-flight files,
-modules, objects, drafts, queries, tests, deployments, and research, active
-bugs/errors and hypotheses, known unknowns and blind spots, unstated or possibly
-wrong assumptions, and whether the work is converging or still exploratory.
-It answers those contextual questions from conversation and workspace evidence,
-asks the user only when a missing choice materially changes the work, announces
-the resulting panel, and launches without a manual approval gate.
+Claude reads the live work before composing roles: what the user is trying to
+achieve, what is in flight, what is failing or uncertain, and which
+assumptions might be wrong. It asks the user only when a missing choice
+materially changes the work, announces the resulting panel, and launches
+without a manual approval gate.
+
+The panel is sized to the work, with no default count. A focused bug, a single
+review, or one research question usually gets one role; two separable concerns
+get two or three; broad work with several independent tracks gets four, five,
+or more. A role is added only when it brings a lens the others would not.
 
 Strong natural-language triggers are:
 
@@ -80,12 +82,18 @@ instructions, staged context, stdin, or composed prompts, and it never
 truncates them. Actual model/provider context windows and available machine
 memory remain external constraints and are surfaced as downstream failures.
 
-Collaboration is shared-context and Claude-mediated: parallel roles do not
-secretly chat with one another, so Claude reconciles each round and can feed
-material findings into a focused follow-up round. For implementation in one
-workspace, one executor/integrator owns writes by default while other roles
-inspect, test, research, or propose; multiple writers require isolated
-worktrees or serialized phases.
+Collaboration is shared-context and Claude-mediated: roles do not chat with one
+another during a run, so Claude reconciles each round and can feed material
+findings into a focused follow-up round. Each role's reply is written to
+`replies/<role>.md` in the run directory the moment that role settles (long
+ids are hashed; use the path printed after `reply=`), and Claude follows the
+run with the read-only `codex_council.py --follow` command (one Claude Code
+Monitor event per progress line). Claude can therefore read a
+finished role, update the user, and act on independent work while slower
+roles continue; the final verdict and anything that crosses roles still wait
+for the full report. When several roles share one workspace, one role owns
+writes while the others inspect, test, research, or propose; multiple writers
+need serialized phases.
 
 For long Claude Code sessions, "full context" means a decision-complete
 working set rather than a raw transcript dump: the project/problem and current
@@ -94,17 +102,17 @@ research; recent work in high fidelity; live primary evidence; known unknowns,
 blind spots, assumptions, and provenance; plus older still-relevant history
 summarized with its decisions, rejected paths, and invariants.
 
-**General-purpose, with honest capability bounds.** The council uses an
-AGI-style adaptive collaboration pattern: Claude derives roles from the actual
-work instead of selecting from a domain catalog. Its strongest lean is complex
-programmatic problem-solving—implementation, software/ML systems, DevSecOps,
-testing, diagnosis, and evidence-based technical research—but the role synthesis
-remains situational across other work. This is not a claim that the underlying
-models are proven AGI; results still depend on the active Codex model, tools,
-evidence, and task.
+**General-purpose, with honest capability bounds.** Claude derives roles from
+the actual work instead of selecting from a domain catalog. The strongest lean
+is complex programmatic problem-solving—implementation, software/ML systems,
+DevSecOps, testing, diagnosis, and evidence-based technical research—but role
+synthesis stays situational across other work. Results depend on the active
+Codex model, tools, evidence, and task.
 
-The JSON role spec, retries, and panel-proposal flow are documented in
-[`plugins/codex-council/skills/codex-council/SKILL.md`](plugins/codex-council/skills/codex-council/SKILL.md).
+The JSON role spec and launch flow are documented in
+[`plugins/codex-council/skills/codex-council/SKILL.md`](plugins/codex-council/skills/codex-council/SKILL.md);
+panel sizing, context assembly, following a run, and recovery live in its
+`references/` directory.
 
 ## Architecture
 
@@ -144,7 +152,9 @@ flowchart LR
     ExecB --> JSONL
     ExecN --> JSONL
     JSONL --> Parse["Extract thread.started<br/>Extract final agent_message"]
+    Parse --> Replies["Per-role reply files<br/>replies/role-id.md as each settles"]
     Parse --> Report["Aggregated markdown report"]
+    Replies --> Claude
     Report --> Claude
     Claude --> Reconcile["Claude reconciles results<br/>for the user"]
 ```
@@ -164,9 +174,10 @@ sequenceDiagram
     C->>U: Announce panel
     C->>F: mktemp -d once
     C->>F: Write roles.json and context.md
-    C->>S: --check-staging-dir F --skill-contract 1
+    C->>S: --check-staging-dir F --skill-contract 2
     S-->>C: staging OK or precise staging error
-    C->>S: --roles-file F/roles.json --context-file F/context.md --skill-contract 1
+    C->>S: --roles-file F/roles.json --context-file F/context.md --skill-contract 2
+    C->>S: Monitor: --follow F --skill-contract 2
     S->>S: launch privacy gate re-validates each input's parent dir
     par role fan-out
         S->>X: codex exec role A
@@ -180,6 +191,9 @@ sequenceDiagram
         S->>S: success-with-warning, retriable retry, or terminal stall
     end
     X-->>S: JSONL events
+    S->>F: replies/role-id.md as each role settles
+    S-->>C: follower event: K/N role ok reply=path
+    C->>U: one-line update, independent work
     S->>F: out.md report
     S->>F: err.log progress + CODEX_COUNCIL_DONE
     C->>F: Read out.md and err.log
@@ -238,7 +252,7 @@ approval prompts, no filesystem sandbox. This gives every Codex
 sub-agent full read/write access to your machine so it can thoroughly
 inspect the project. Do not use this plugin on untrusted projects or
 with untrusted input — a prompt injection inside reviewed content can
-steer all N agents.
+steer every agent.
 
 The same bypass applies when reviewing any non-code material — a
 prompt injection inside a Markdown draft, a CSV column header, or a
@@ -252,6 +266,17 @@ The script uses your Codex CLI defaults — model, reasoning effort, and
 other settings come from `~/.codex/config.toml`. No model is hardcoded.
 Sandbox and approval settings are overridden by the plugin (see
 Security above).
+
+A role may optionally set `model` and `effort` in `roles.json`; the runner
+passes them as `codex exec -m <model>` and
+`-c model_reasoning_effort="<effort>"`. Omitted keys inherit your config.
+Claude uses them sparingly, for example a faster model or lower effort on a
+narrow check so it does not become the straggler, and only with model ids your
+Codex setup offers. Codex validates both values.
+
+Codex CLI 0.156.0 deprecated the `personality` setting (it no longer selects
+a response style), so a `personality = ...` line in `~/.codex/config.toml` is
+inert. You can leave it or remove it.
 
 Active role concurrency defaults to 6, matching the current
 [Codex configuration default](https://developers.openai.com/codex/config-reference)
@@ -284,10 +309,19 @@ heartbeat to the staged `err.log` — cadence adapts to the watchdog
 (`stall_secs / 3`, bounded 300–1800s; every 600s at the default watchdog,
 every 1800s when disabled) and each line carries per-role `quiet=Ns` (or
 `retry-wait` during backoff), the `watchdog=` threshold, and the plugin
-`version=`. The skill uses Claude Code's native
+`version=`. Each completion line ends with `reply=<path>` pointing at that
+role's reply file. The skill follows the run with a Claude Code Monitor on
+`codex_council.py --follow <run dir>`, re-armed whenever a monitor expires
+(at most every 30 minutes), and falls
+back to a one-shot session-cron wake-up or the native
 [background-task mechanism](https://code.claude.com/docs/en/interactive-mode)
-and, where available, [session-cron state](https://code.claude.com/docs/en/hooks)
-to surface progress without a shell polling loop.
+when Monitor is unavailable, so progress surfaces without a shell polling loop.
+
+**v0.10.0 behavior changes.** Per-role reply files under `replies/` and the
+`reply=` suffix on completion lines; the read-only `--follow` command; optional
+per-role `model` and `effort`; a count-neutral collaboration brief; and skill
+contract epoch 2 (`--skill-contract 2`). Panel size now scales with the work,
+and a single role is a normal council.
 
 **v0.9.0 behavior change — launch-side privacy gate.** The launch path now
 re-validates what the preflight validates: every on-disk input's parent
@@ -315,13 +349,13 @@ claude plugins install codex-council@codex-council       # skip if already insta
 2. Rewrites `~/.claude/plugins/installed_plugins.json` so the harness's `installPath` and `version` fields point at the symlinked version.
 3. Prunes any stale sibling entries in the cache dir for other versions, so bumping `plugin.json` and re-running dev-link doesn't leave old directories or symlinks behind.
 
-Step 2 is load-bearing: the harness loads whichever `installPath` the manifest declares, **not** whichever symlinks exist in the cache. Without the manifest rewrite, bumping the version in `plugin.json` and re-running dev-link creates a new symlink that the harness will happily ignore.
+Step 2 is the one that matters: the harness loads whichever `installPath` the manifest declares, **not** whichever symlinks exist in the cache. Without the manifest rewrite, bumping the version in `plugin.json` and re-running dev-link creates a new symlink that the harness will happily ignore.
 
 Two skew guards help here. The runner prints `version=<plugin version>` in the
 preflight "staging OK" line, the dispatch line, the heartbeat, and the
 `CODEX_COUNCIL_DONE` sentinel — postmortem **visibility** into which plugin
 version actually ran, not skew prevention. And `SKILL.md`'s command templates
-pass `--skill-contract 1`: if the linked script's contract epoch differs, the
+pass `--skill-contract 2`: if the linked script's contract epoch differs, the
 invocation is refused (exit 2) as a stale SKILL/script pair — re-run
 `scripts/dev-link.sh` (or reinstall the plugin) and restart the session.
 

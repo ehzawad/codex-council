@@ -28,5 +28,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.14'
+      # Pinned: ruff 0.16 widened its default rule set, so an unpinned
+      # `pipx run ruff` fails on code this repo's gate (0.15.x) accepts.
+      # Bump deliberately together with any fixes the new rules demand.
       - name: Ruff
-        run: pipx run ruff check .
+        run: pipx run --spec 'ruff==0.15.21' ruff check .

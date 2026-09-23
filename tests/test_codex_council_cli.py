@@ -328,6 +328,16 @@ class HappyPathTests(CouncilCLITestCase):
         # final sentinel as the LAST non-empty line.
         self.assertIn("[codex-council] dispatching 2 roles", proc.stderr)
         self.assertRegex(proc.stderr, r"\[codex-council\] \d+/2 .+: ok \(")
+        # v0.10.0: the completion line ends in the absolute reply-file path
+        # (stdin mode: RUNDIR is the roles file's private directory).
+        replies = os.path.join(self.workdir.name, "replies")
+        for rid in ("architect", "security"):
+            self.assertRegex(
+                proc.stderr,
+                r"(?m)^\[codex-council\] \d+/2 " + rid
+                + r": ok \([\d.]+s\) reply="
+                + re.escape(os.path.join(replies, rid + ".md")) + r"$",
+            )
         self.assertRegex(
             self._last_nonempty_stderr_line(proc.stderr),
             r"\[codex-council\] CODEX_COUNCIL_DONE ok=2 total=2 "
@@ -645,7 +655,7 @@ class SkillContractTests(CouncilCLITestCase):
         ])
         proc = self._run(
             input="please review\n",
-            args=("--roles-file", roles_path, "--skill-contract", "1"),
+            args=("--roles-file", roles_path, "--skill-contract", "2"),
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("# Codex Council", proc.stdout)
@@ -655,10 +665,25 @@ class SkillContractTests(CouncilCLITestCase):
         proc = self._run(
             input="",
             args=("--check-staging-dir", self.workdir.name,
-                  "--skill-contract", "1"),
+                  "--skill-contract", "2"),
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("staging OK", proc.stdout)
+
+    def test_previous_epoch_1_is_now_a_stale_pair(self):
+        """v0.10.0 bumped the epoch to 2 (SKILL templates rely on --follow
+        and reply files); an epoch-1 SKILL must be refused, not run."""
+        roles_path = self._write_roles([
+            _role("architect", "Architect", _instruction("Review")),
+        ])
+        proc = self._run(
+            input="please review\n",
+            args=("--roles-file", roles_path, "--skill-contract", "1"),
+        )
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn("contract epoch 2", proc.stderr)
+        self.assertIn("stale SKILL/script pair", proc.stderr)
+        self.assertEqual(proc.stdout, "")
 
     def test_mismatched_epoch_is_a_usage_error(self):
         roles_path = self._write_roles([

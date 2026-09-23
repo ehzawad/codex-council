@@ -1,8 +1,166 @@
-# Runtime continuity and failure behavior
+# Runtime behavior
 
-Read this reference when deciding whether to reuse role IDs, isolating sessions,
-or diagnosing retry, quota, authentication, liveness/stall, or continuity
-behavior.
+Read this reference when following a long run, deciding what to do with a
+reply that arrived early, recovering a lost or stuck run, reusing role IDs,
+or diagnosing retries, quota, authentication, stalls, or continuity.
+
+## Contents
+
+- Launch mechanics and why they are strict
+- Reply files and the completion line
+- Following a run
+- Recovery triage
+- Exit code, report, and failure tags
+- Session continuity
+- Retries and long runs
+- Output-inactivity watchdog and stall policy
+- Progress lines, heartbeat, and version visibility
+
+## Launch mechanics and why they are strict
+
+The run directory comes from one `mktemp -d` call and is private (mode 0700,
+owned by the user). The report and context can hold sensitive reviewed
+content, and predictable `/tmp/council_*` names are world-readable under a
+typical umask and can be pre-created or symlinked by another local user, who
+could then read the report or plant a fake `CODEX_COUNCIL_DONE` line. The
+pre-flight (`--check-staging-dir`) and the launch both check that each
+input's parent directory is private, and that `roles.json` and `context.md`
+are regular, non-symlink files, before reading any content. A rejected
+directory is abandoned, never repaired with chmod or mkdir.
+
+The launch uses exactly one backgrounding layer, the Bash tool's
+`run_in_background: true`. That wrapper is a shell Claude Code tracks; any
+inner detach (`&`, `nohup`, `setsid`, `disown`, a supervisor, and so on)
+makes the wrapper exit immediately with empty output, reparents
+`codex_council.py` to `launchd` or PID 1, and loses the real completion
+notification. Redirecting stdout and stderr to files in the run directory
+keeps the run observable and recoverable from disk.
+
+Bare invocation (no `--roles-file`) exits 2, as a guard against accidental
+fan-out.
+
+## Reply files and the completion line
+
+When a role settles (ok, failed, or crashed), the runner writes that role's
+report section to `ABS_RUNDIR/replies/<key>.md` and only then logs its
+completion line:
+
+```
+[codex-council] 2/5 architect: ok (812.4s) reply=/abs/run/dir/replies/architect.md
+```
+
+The status is `ok (<secs>s)`, `FAILED (<secs>s)`, or `crashed (<ExcType>)`.
+Any of them can carry `reply=`; a failed or crashed role's file carries its
+failure tag, so read it rather than waiting for `out.md`. A line without
+`reply=` means no file was written for that role (see the best-effort note
+below).
+
+`<key>` is the role id when it is a short safe filename and a deterministic
+hash otherwise, so always use the path printed after `reply=`. Each file
+starts with a one-line status header and then holds exactly the section
+`out.md` will contain for that role, so reading it early and reading the
+final report cannot disagree. Files are written atomically (temporary file,
+fsync, rename) with mode 0600 inside a `replies/` directory of mode 0700.
+
+Reply files are best-effort: if `replies/` cannot be created safely (for
+example it already exists as a symlink or with loose permissions), the runner
+logs one warning, omits the `reply=` suffix, and the council still completes
+with the full `out.md`. Files already written survive Ctrl+C or SIGTERM, so
+finished work is not lost when a run is interrupted; an interrupted run
+still has no `CODEX_COUNCIL_DONE` sentinel and no report in `out.md`.
+
+## Following a run
+
+The follower is a read-only command designed for Claude Code's Monitor tool:
+
+```
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
+  --follow 'ABS_RUNDIR' --skill-contract 2
+```
+
+It checks that `ABS_RUNDIR` is a private directory, waits for `err.log` to
+appear, and prints every `[codex-council` line (start, completion, retry,
+stall, heartbeat, sentinel, interruption) as it is written, one line per
+event. It only reads, so it cannot change the run or forge its output. Its
+exit codes:
+
+| Exit | Last line | Meaning and action |
+|---|---|---|
+| 0 | `CODEX_COUNCIL_DONE`, `interrupted by ...`, or `runner aborted exit=N: ...` | The run ended. Read `out.md` (absent after an interruption or abort) and `err.log`. |
+| 2 | usage error on stderr | `ABS_RUNDIR` is wrong or not private. Fix the path; do not re-arm unchanged. |
+| 3 | `[codex-council-follow] no council activity: ...` | Within 120s either `err.log` never appeared or it has no dispatch line. The launch failed or never happened: read `err.log` and the background task output. |
+| 4 | `[codex-council-follow] runner presumed gone: ...` | A dispatched run's `err.log` has not changed for about an hour (3660s: twice the 30-minute maximum heartbeat interval plus 60s, measured from the file's mtime). Stop re-arming: a new follower would exit 4 again at once. Check the background task, then use the recovery triage below. |
+
+When `err.log` shows a Python traceback, the follower also prints one
+advisory `[codex-council-follow]` line and keeps following, since the runner
+may continue. A system suspend is detected and restarts the silence count.
+
+Monitors expire after at most 30 minutes (`timeout_ms` 1800000). Re-arm the
+same command on that expiry, and only then. A re-armed follower starts from
+the top of `err.log` and replays earlier lines; skip completions already
+handled.
+
+Without the Monitor tool, schedule a one-shot 30-minute wake-up (session
+cron) whose prompt names the background task id and the exact `ABS_RUNDIR`.
+At each wake-up, read the new lines of `err.log`, read any new reply files,
+update the user (completed, active, queued), and schedule another wake-up
+only if the run continues. If crons are unavailable too, use the native
+background-task wait (`TaskOutput` when exposed) with its supported horizon.
+Never poll with a shell `sleep` loop. In every mode the `run_in_background`
+completion notification is the final backstop.
+
+What to do with an early reply:
+
+- Read it and give the user a one-line update.
+- Act on independent work: verify its claims read-only, or make edits that
+  cannot collide with a still-running role that may write.
+- Wait for the full report before the final verdict, before resolving a
+  question another pending role could answer differently, and before writes
+  that overlap a running writer role.
+- Present early findings as provisional until reconciliation.
+
+## Recovery triage
+
+If a run is lost, orphaned, or looks stuck, recover from disk:
+
+```
+pgrep -fl 'codex_council[.]py'      # any council alive?
+pgrep -fl 'ABS_RUNDIR/roles.json'   # this run specifically
+tail -n 40 'ABS_RUNDIR/err.log'     # last line CODEX_COUNCIL_DONE -> finished
+ls 'ABS_RUNDIR/replies'             # replies that already settled
+```
+
+Work through these in order; the first match wins. `active` is scheduling
+state, not proof of health, and `quiet=Ns` measures time since the last
+output byte, not semantic progress, so do not describe a role as healthy only
+because it is active or quiet is low.
+
+1. `CODEX_COUNCIL_DONE` present → finished; read `out.md`; do not re-invoke.
+2. A `[retriable:stall]` or stall-termination line present → the runner is
+   handling it; do not launch another council.
+3. Active roles with `quiet` below the printed `watchdog=` value → keep
+   following; report the run as "output-active", not healthy.
+4. `quiet` at or past the watchdog with no stall line after a short grace and
+   a fresh read → the watchdog itself is suspect: stop the tracked background
+   task, confirm the council process is gone, inspect `err.log`, then
+   re-invoke once. Replies already in `replies/` are still valid.
+5. `watchdog=disabled` → no automatic liveness recovery; rising quiet is
+   indeterminate; ask the user before acting.
+6. No sentinel and no process → it crashed or was interrupted; read
+   `err.log`, any reply files, and any partial `out.md` before re-invoking
+   only the roles that did not finish.
+
+## Exit code, report, and failure tags
+
+The exit code is council-level and tolerant of partial failure: `0` when at
+least one role responds, `1` only when every role fails, `2` for usage or
+staging errors. Treat the shell status as transport status and read the
+report Summary and the sentinel's `ok=N total=M exit=X` fields.
+
+Failed-role messages for recognized classes start with a bracketed tag:
+`[auth]`, `[retriable:rate-limit]`, `[retriable:5xx]`, `[retriable:stall]`,
+`[stall]`, `[orchestrator-exception]`, or `[orchestrator-bug]`. Unrecognized
+failures carry the raw stderr untagged.
 
 ## Session continuity
 
@@ -96,7 +254,7 @@ seconds with a 300s floor while the watchdog is enabled (600s at the default
 threshold; 1800s when disabled):
 
 ```
-[codex-council] still running after 1240s: completed=1/3; active=2 (architect quiet=41s, prober retry-wait); queued=0; watchdog=1800s; version=0.9.0.
+[codex-council] still running after 1240s: completed=1/3; active=2 (architect quiet=41s, prober retry-wait); queued=0; watchdog=1800s; version=0.10.0.
 ```
 
 `active` is scheduling state, not proof of health. `quiet=Ns` measures time
