@@ -120,7 +120,7 @@ panel sizing, context assembly, following a run, and recovery live in its
 flowchart LR
     User["User"] --> Claude["Claude Code"]
     Claude --> Skill["codex-council skill<br/>SKILL.md"]
-    Skill --> Panel["Compose task-specific role panel<br/>Announce and launch"]
+    Skill --> Panel["Size the panel to the work: 1..N roles<br/>optional per-role model + effort<br/>Announce and launch"]
     Panel --> Script["codex_council.py<br/>--roles-file + --context-file"]
 
     subgraph Plugin["codex-council plugin"]
@@ -143,20 +143,22 @@ flowchart LR
     end
 
     subgraph Codex["Codex CLI subprocesses"]
-        Live --> ExecA["codex exec resume or fresh"]
-        Live --> ExecB["codex exec resume or fresh"]
-        Live --> ExecN["codex exec resume or fresh"]
+        Live --> ExecA["codex exec [-m model] [effort]<br/>resume or fresh"]
+        Live --> ExecB["codex exec [-m model] [effort]<br/>resume or fresh"]
+        Live --> ExecN["codex exec [-m model] [effort]<br/>resume or fresh"]
     end
 
     ExecA --> JSONL["JSONL events"]
     ExecB --> JSONL
     ExecN --> JSONL
     JSONL --> Parse["Extract thread.started<br/>Extract final agent_message"]
-    Parse --> Replies["Per-role reply files<br/>replies/role-id.md as each settles"]
-    Parse --> Report["Aggregated markdown report"]
-    Replies --> Claude
-    Report --> Claude
-    Claude --> Reconcile["Claude reconciles results<br/>for the user"]
+    Parse --> Replies["Per-role reply files<br/>replies/role-id.md as each settles<br/>then K/N completion line in err.log"]
+    Parse --> Report["Aggregated markdown report<br/>out.md"]
+    Replies --> Follow["--follow via Monitor<br/>relays progress lines<br/>drops reply= paths outside replies/"]
+    Follow --> Early["Claude reads each reply as it lands<br/>acts on independent work"]
+    Report --> Done["Background-task completion<br/>notification"]
+    Early --> Reconcile["Claude reconciles results<br/>for the user"]
+    Done --> Reconcile
 ```
 
 ## Launch Flow
@@ -176,8 +178,8 @@ sequenceDiagram
     C->>F: Write roles.json and context.md
     C->>S: --check-staging-dir F --skill-contract 2
     S-->>C: staging OK or precise staging error
-    C->>S: --roles-file F/roles.json --context-file F/context.md --skill-contract 2
-    C->>S: Monitor: --follow F --skill-contract 2
+    C->>S: run_in_background: --roles-file F/roles.json --context-file F/context.md --skill-contract 2
+    C->>S: Monitor: --follow F --skill-contract 2 (separate read-only process)
     S->>S: launch privacy gate re-validates each input's parent dir
     par role fan-out
         S->>X: codex exec role A
@@ -191,12 +193,16 @@ sequenceDiagram
         S->>S: success-with-warning, retriable retry, or terminal stall
     end
     X-->>S: JSONL events
-    S->>F: replies/role-id.md as each role settles
-    S-->>C: follower event: K/N role ok reply=path
-    C->>U: one-line update, independent work
+    loop as each role settles
+        S->>F: replies/role-id.md, then K/N completion line in err.log
+        S-->>C: follower event: K/N role ok reply=path
+        C->>F: Read that reply (untrusted data)
+        C->>U: one-line update, independent work
+    end
     S->>F: out.md report
-    S->>F: err.log progress + CODEX_COUNCIL_DONE
-    C->>F: Read out.md and err.log
+    S->>F: err.log CODEX_COUNCIL_DONE (progress signal)
+    S-->>C: background-task completion notification
+    C->>F: Read out.md
     C->>U: Reconciled answer
 ```
 

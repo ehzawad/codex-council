@@ -122,18 +122,20 @@ retry.
 ```mermaid
 sequenceDiagram
     participant C as Claude Code
+    participant F as --follow (Monitor)
     participant T as codex_council.py
     participant R as per-subprocess readers + watchdog
     participant A as codex exec (role A)
     participant B as codex exec (role B)
     participant N as codex exec (role N)
 
-    C->>T: Staged context via --context-file + --roles-file
+    C->>T: run_in_background: --context-file + --roles-file
+    C->>F: Monitor: --follow RUNDIR
     T->>T: launch privacy gate on each input's lexical parent
     par up to effective max_parallel
-        T->>A: role framing + collaboration brief + shared context
-        T->>B: role framing + collaboration brief + shared context
-        T->>N: role framing + collaboration brief + shared context
+        T->>A: role framing + collaboration brief + shared context (-m / effort per role)
+        T->>B: role framing + collaboration brief + shared context (-m / effort per role)
+        T->>N: role framing + collaboration brief + shared context (-m / effort per role)
     end
     A-->>R: stdout/stderr chunks reset the shared quiet clock
     B-->>R: stdout/stderr chunks reset the shared quiet clock
@@ -145,9 +147,15 @@ sequenceDiagram
     end
     R-->>T: buffered JSONL events per role
     T->>T: per-role extract_final_message
-    T->>T: write replies/role-id.md, then log K/N completion with reply=path
-    T-->>C: follower event per progress line (--follow)
-    T-->>C: aggregated markdown report
+    loop as each role settles
+        T->>T: write replies/role-id.md, then log K/N completion with reply=path
+        T-->>F: err.log line
+        F-->>C: event (reply= paths outside replies/ dropped)
+        C-->>C: read reply as untrusted data, act on independent work
+    end
+    T-->>C: aggregated markdown report in out.md
+    T-->>F: CODEX_COUNCIL_DONE (progress signal, follower exits 0)
+    T-->>C: background-task completion notification
     C-->>C: reconcile across roles
 ```
 
@@ -266,6 +274,7 @@ flowchart TD
     Rundir --> Context["context.md"]
     Rundir --> Out["out.md"]
     Rundir --> Err["err.log"]
+    Rundir --> Replies["replies/ (0700)<br/>per-role files (0600)"]
 
     Roles --> Preflight["--check-staging-dir<br/>private-dir gate: lstat, owner, 0700"]
     Context --> Preflight
@@ -279,8 +288,10 @@ flowchart TD
     LaunchGate -->|"public, symlinked, or foreign-owned parent"| StageError
     LaunchGate -->|private| Launch["launch fan-out"]
 
+    Launch --> Replies
     Launch --> Out
     Launch --> Err
+    Err --> Follow["--follow relays [codex-council lines<br/>drops reply= paths outside replies/"]
     Err --> Sentinel["CODEX_COUNCIL_DONE"]
 ```
 
