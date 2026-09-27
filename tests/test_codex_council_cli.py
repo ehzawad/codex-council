@@ -153,6 +153,7 @@ class CouncilCLITestCase(unittest.TestCase):
         self.env.pop("CODEX_COUNCIL_SESSION_KEY", None)
         self.env.pop("CODEX_COUNCIL_MAX_PARALLEL", None)
         self.env.pop("CODEX_COUNCIL_STALL_SECS", None)
+        self.env.pop("CODEX_COUNCIL_MODEL_ROUTING", None)
 
     def _write_roles(self, roles):
         path = os.path.join(self.workdir.name, "roles.json")
@@ -655,7 +656,7 @@ class SkillContractTests(CouncilCLITestCase):
         ])
         proc = self._run(
             input="please review\n",
-            args=("--roles-file", roles_path, "--skill-contract", "2"),
+            args=("--roles-file", roles_path, "--skill-contract", "3"),
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("# Codex Council", proc.stdout)
@@ -665,23 +666,24 @@ class SkillContractTests(CouncilCLITestCase):
         proc = self._run(
             input="",
             args=("--check-staging-dir", self.workdir.name,
-                  "--skill-contract", "2"),
+                  "--skill-contract", "3"),
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("staging OK", proc.stdout)
 
-    def test_previous_epoch_1_is_now_a_stale_pair(self):
-        """v0.10.0 bumped the epoch to 2 (SKILL templates rely on --follow
-        and reply files); an epoch-1 SKILL must be refused, not run."""
+    def test_previous_epoch_2_is_now_a_stale_pair(self):
+        """v1.0.0 bumped the epoch to 3 (SKILL templates rely on --discover
+        and the selection object); an epoch-2 SKILL must be refused, not
+        run."""
         roles_path = self._write_roles([
             _role("architect", "Architect", _instruction("Review")),
         ])
         proc = self._run(
             input="please review\n",
-            args=("--roles-file", roles_path, "--skill-contract", "1"),
+            args=("--roles-file", roles_path, "--skill-contract", "2"),
         )
         self.assertEqual(proc.returncode, 2, proc.stderr)
-        self.assertIn("contract epoch 2", proc.stderr)
+        self.assertIn("contract epoch 3", proc.stderr)
         self.assertIn("stale SKILL/script pair", proc.stderr)
         self.assertEqual(proc.stdout, "")
 

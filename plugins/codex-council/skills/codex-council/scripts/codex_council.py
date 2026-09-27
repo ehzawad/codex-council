@@ -16,10 +16,36 @@ reconstructs the user's live problem and project state, then composes the
 roles the work actually needs. Roles arrive via `--roles-file` (a path to a
 JSON file holding the panel), which keeps a large role array out of the shell
 entirely. Each role object has `id`, `label`, and `instruction`, plus the
-optional `model` and `effort` keys; omitted, the role inherits the Codex
-config (~/.codex/config.toml) as before. When present they are passed as
-`-m <model>` and `-c model_reasoning_effort="<effort>"` on every invocation of
-that role (fresh and resume alike; they are not sticky across calls).
+optional `model`, `effort`, and `selection` keys.
+
+Model and effort: a role that omits all three inherits Codex's native
+configuration in the worker's execution context, and the runner sends no
+model or effort override at all. Codex resolves that configuration itself
+from its layers (CLI flags, a trusted project `.codex/config.toml` found
+from the project root, the user's `$CODEX_HOME/config.toml`, cloud, system,
+and managed layers, and any managed new-thread defaults). The runner
+forwards no profile, runs every worker as `codex exec -C <git toplevel of
+the launch directory, else the launch directory>`, and lets workers inherit
+its own cwd and environment. A role's `selection` object declares where its
+values came from: "user" is an explicit pin, forwarded unchanged and never
+replaced; "routed" (a model and effort pair) and "native_effort" (an effort
+on the proven native model, which the runner pins) are runtime-grounded
+choices validated against this run's discovery snapshot and revalidated by
+one fresh discovery at launch; evidence that no longer supports them
+resolves the role to native inheritance with a recorded reason. The values
+actually sent are passed as `-m <model>` and
+`-c model_reasoning_effort="<effort>"` on every invocation of that role
+(fresh and resume alike; they are not sticky across calls). codex exec does
+not report which model or effort served a turn, so reports describe what
+the council sent. A model Codex rejects fails the role as [model-rejected]
+(no substitute is tried and the saved thread is kept), and a usage or
+credit limit fails it as [quota]; neither is retried.
+
+`--discover RUNDIR` runs bounded, metadata-only discovery against
+`codex app-server` (no thread or turn is started), writes
+RUNDIR/model-snapshot.json, and prints a compact summary Claude reads
+before writing roles.json. CODEX_COUNCIL_MODEL_ROUTING=off disables
+automatic selection; explicit user pins still apply.
 
 The orchestrator imposes no size or count ceiling on role panels, role
 fields, context, stdin, or composed prompts, and never truncates them.
@@ -38,6 +64,7 @@ interruption line, or a `runner aborted` line (3 = no council activity
 appeared, 4 = the runner is presumed gone; see _follow).
 
 Usage:
+    python3 codex_council.py --discover RUNDIR
     python3 codex_council.py --check-staging-dir RUNDIR
     python3 codex_council.py --roles-file roles.json --context-file context.md
     python3 codex_council.py --follow RUNDIR
@@ -50,6 +77,9 @@ Env vars:
                                    otherwise use Codex agents.max_threads or 6
     CODEX_COUNCIL_STALL_SECS      output-inactivity watchdog threshold in
                                    seconds (default 1800; 0 disables)
+    CODEX_COUNCIL_MODEL_ROUTING   auto (default when unset or empty) or off;
+                                   off disables automatic per-role model and
+                                   effort selection (explicit pins still apply)
 
 The council has no total elapsed-time or run-level deadline. A role may run
 indefinitely while its codex subprocess continues producing output bytes.
@@ -64,7 +94,10 @@ process group.
 
 The optional `--skill-contract <int>` flag pins the SKILL/script contract
 epoch: absent it is ignored; present it must equal this script's epoch or
-the launch is refused as a stale SKILL/script pair. The staging-OK,
+the launch is refused as a stale SKILL/script pair. It also marks the skill
+path, where a model or effort without a `selection` object is refused;
+direct CLI use without it keeps treating such a pin as an explicit user
+pin. The staging-OK,
 dispatch, heartbeat, and CODEX_COUNCIL_DONE lines carry
 `version=<plugin version>` for postmortem visibility (it does not prevent
 skew; the contract epoch does).
@@ -74,6 +107,7 @@ POSIX-only: uses start_new_session and process-group signals.
 
 import argparse
 import asyncio
+import collections
 import contextlib
 import errno
 import fcntl
@@ -81,6 +115,8 @@ import hashlib
 import json
 import os
 import re
+import secrets
+import selectors
 import shutil
 import signal
 import stat
@@ -88,7 +124,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cache
 from pathlib import Path
 from typing import Optional
@@ -105,13 +141,17 @@ STATE_DIR = os.path.join(
 
 # Substring markers (matched case-insensitively) classifying failure modes.
 # These are the FALLBACK signal; the primary signal is the numeric HTTP status
-# parsed out of the JSONL error body (see _extract_statuses). Order of check on
-# the resume path: auth first (never clear state), then ANCHORED-status retriable
-# (a real API 429/5xx — by JSON status, `HTTP NNN`, or a reason phrase — beats a
-# stale-looking message), then stale-resume (clear and restart), then the
-# SUBSTRING retriable fallback — kept last so a stale error that merely contains
-# a bare digit run (e.g. "...stale-429-sid") still restarts fresh instead of
-# being mistaken for a rate limit.
+# parsed out of the JSONL error body (see _extract_statuses) and, for quota
+# and model rejection, the structured failure records (_failure_records).
+# Order of check, identical on the fresh and resume paths (see
+# _failure_verdict): auth first (never clear state), then quota (terminal,
+# even when it carries HTTP 429), then ANCHORED-status retriable (a real API
+# 429/5xx — by JSON status, `HTTP NNN`, or a reason phrase — beats a
+# stale-looking message), then model rejection (terminal; never clears
+# state), then stale-resume (resume only: clear and restart), then the
+# SUBSTRING retriable fallback — kept last so a stale error that merely
+# contains a bare digit run (e.g. "...stale-429-sid") still restarts fresh
+# instead of being mistaken for a rate limit.
 AUTH_ERROR_MARKERS = (
     "401 unauthorized",
     "incorrect api key",
@@ -141,7 +181,8 @@ RATE_LIMIT_MARKERS = (
     # NB: "quota exceeded" / usage caps are deliberately NOT retriable markers —
     # a plan/usage cap does not clear within a 5s backoff, so it is surfaced
     # terminal (see "Retries and long runs" in references/runtime-behavior.md
-    # and DESIGN.md). Genuine transient
+    # and DESIGN.md); the recognized quota forms are tagged [quota] ahead of
+    # the anchored parser (QUOTA_ERROR_CODES). Genuine transient
     # 429s are caught by the anchored parser or the rate-limit phrases above.
 )
 TRANSIENT_5XX_MARKERS = (
@@ -184,6 +225,32 @@ NONRETRIABLE_ERROR_TYPE_MARKERS = (
     "invalid_request_error",
 )
 
+# Terminal quota/billing failures, matched against a structured failure
+# record's error code or type (never retried, never clearing state). They
+# are checked BEFORE the anchored parser because the provider can send them
+# with HTTP 429, which would otherwise read as a transient rate limit.
+QUOTA_ERROR_CODES = frozenset({
+    "insufficient_quota",
+    "usage_limit_reached",
+    "usage_limit_exceeded",
+    "credit_balance_exhausted",
+    "organization_spend_limit_exceeded",
+    "project_spend_limit_exceeded",
+    "organization_usage_limit_exceeded",
+})
+# current codex-cli rewrites a ChatGPT plan usage cap to code-less prose
+# ("You've hit your usage limit. ...").
+QUOTA_MARKERS = (
+    "hit your usage limit",
+)
+# A failure naming one of these parameters is about the effort or service
+# tier, not the model, so it is never read as a model rejection.
+MODEL_REJECTION_EXCLUDED_PARAMS = (
+    "reasoning.effort",
+    "model_reasoning_effort",
+    "service_tier",
+)
+
 SESSION_KEY_ENV = "CODEX_COUNCIL_SESSION_KEY"
 DISABLE_AUTO_SESSION_KEY_ENV = "CODEX_COUNCIL_DISABLE_AUTO_SESSION_KEY"
 AUTO_SESSION_ENV_VARS = (
@@ -211,8 +278,9 @@ PROGRESS_HEARTBEAT_SECS = 30 * 60
 # report a rising quiet value before the watchdog threshold.
 HEARTBEAT_FLOOR_SECS = 300
 # Contract epoch for the optional --skill-contract handshake. Bump only when
-# SKILL.md's launch/preflight command contract changes incompatibly.
-SKILL_CONTRACT_EPOCH = 2
+# SKILL.md's launch/preflight command contract changes incompatibly (3: the
+# `selection` object and --discover).
+SKILL_CONTRACT_EPOCH = 3
 _READ_CHUNK_BYTES = 65536
 # Per-role reply files live in this subdirectory of the private RUNDIR.
 REPLIES_SUBDIR = "replies"
@@ -248,6 +316,29 @@ FOLLOW_DISPATCH_PREFIX = "[codex-council] dispatching "
 # A wall-clock jump this much larger than the monotonic advance between two
 # follower polls is treated as a system suspend (see _follow).
 FOLLOW_SUSPEND_SLACK_SECS = 60
+# Model discovery (--discover; see the "model discovery" section). Routing
+# is on unless this is "off"; any value other than auto/off is a usage error.
+MODEL_ROUTING_ENV = "CODEX_COUNCIL_MODEL_ROUTING"
+# ONE monotonic budget covers the `codex --version` probe (itself capped),
+# the app-server spawn, the handshake, and every request; interleaved
+# notifications never extend it. Teardown then adds at most three
+# DISCOVERY_CLOSE_GRACE_SECS waits (stdin EOF, SIGTERM, SIGKILL).
+DISCOVERY_TIMEOUT_SECS = 20
+DISCOVERY_VERSION_TIMEOUT_SECS = 5
+DISCOVERY_CLOSE_GRACE_SECS = 0.5
+# Council-side resource bounds, not Codex guarantees: reaching a catalog bound
+# with more pages outstanding marks the catalog incomplete (never "absent").
+DISCOVERY_MAX_LINE_BYTES = 8 * 1024 * 1024
+DISCOVERY_MAX_STDOUT_BYTES = 32 * 1024 * 1024
+DISCOVERY_MAX_UNSOLICITED = 10000
+DISCOVERY_PAGE_LIMIT = 100
+DISCOVERY_MAX_PAGES = 10
+DISCOVERY_MAX_MODELS = 1000
+DISCOVERY_STDERR_TAIL_BYTES = 4096
+DISCOVERY_STDERR_EXCERPT_CHARS = 200
+SNAPSHOT_FILENAME = "model-snapshot.json"
+SNAPSHOT_SCHEMA = "codex-council/model-snapshot@1"
+SNAPSHOT_MAX_BYTES = 64 * 1024 * 1024
 REQUIRED_SCOPE_PHRASE = "nothing material"
 REQUIRED_CADENCE_SENTENCE = "Thoroughness beats speed."
 # Every line-boundary character str.splitlines() recognizes (beyond the plain
@@ -257,24 +348,29 @@ LINEBREAK_CHARS = (
     "\r", "\n", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e",
     "\x85", "\u2028", "\u2029",
 )
-# Count-neutral on purpose: a council may have exactly one role. The role
+# Count-neutral on purpose: a council may have exactly one role. Verifier
+# framing: the user's requirements are authoritative, while Claude's account
+# of the work is a set of claims to check against the workspace. The role
 # instruction bookends the prompt (see _compose_prompt), so this brief stays
 # short and the lens-specific instruction is the last thing the model reads.
 COLLABORATION_BRIEF = (
-    "You are working as one role in a Claude-orchestrated Codex council; you "
-    "may be the only role, or one of several covering other lenses in "
-    "parallel. The shared working context below is the source of truth for "
-    "the goal, the project state, and what has already been tried; read the "
-    "workspace yourself to verify it or fill gaps it leaves. This run "
-    "is non-interactive: do not ask the user questions or wait for input; "
+    "You are working as one role in a Claude-orchestrated Codex council, an "
+    "independent cross-model check on Claude Code's work; you may be the "
+    "only role, or one of several covering other lenses in parallel. In the "
+    "shared working context below, the user's goal, requirements, and "
+    "constraints are authoritative; Claude's account of the project state, "
+    "its conclusions, and what has already been tried are claims to verify "
+    "against the workspace, not facts to accept. This run is "
+    "non-interactive: do not ask the user questions or wait for input; "
     "state the assumptions you make and list any decision that needs the "
     "user as an open question. Do not spawn subagents unless your role "
     "instruction asks for them. Stay within your role's lens, and stop when "
     "its deliverable is complete. Keep verified evidence (file:line "
-    "references, command output) separate from "
-    "inference. Size any testing to the change. Finish with plain paragraphs "
-    "Claude can reconcile: the result first, then the evidence, dependencies "
-    "on other work, risks, and open questions."
+    "references, command output) separate from inference, and say what you "
+    "checked and what remains unverified. Size any testing to the change. "
+    "Finish with plain paragraphs Claude can reconcile: the result first, "
+    "then the evidence, dependencies on other work, risks, and open "
+    "questions."
 )
 STAGING_PATH_HINT = (
     "Staging hint: use the exact directory printed by `mktemp -d` for "
@@ -321,9 +417,43 @@ ROLES_REWRITE_RECOVERY = (
 # token/exec-output deltas, so a healthy role can be byte-silent for long
 # stretches. codex's own per-PROVIDER stream-idle timeout
 # (`model_providers.<id>.stream_idle_timeout_ms`, 5 min default, bounded
-# retries) is a separate provider-side control left to the user's
-# ~/.codex/config.toml: it is provider-scoped and the active provider id
-# varies, so the council cannot target it portably.
+# retries) is a separate provider-side control left to the user's Codex
+# configuration: it is provider-scoped and the active provider id varies,
+# so the council cannot target it portably.
+
+
+@dataclass(frozen=True)
+class Selection:
+    """A role's validated `selection` object (see _parse_selection).
+
+    mode "user" is an explicit user pin; "routed" and "native_effort" are
+    runtime-grounded choices bound to this run's discovery snapshot.
+    """
+    mode: str
+    snapshot_id: Optional[str] = None
+    reason: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class SelectionDecision:
+    """How one role's model and effort resolve (see _resolve_selection).
+
+    `mode` is what the role asked for (inherit, user, routed,
+    native_effort); `provenance` is what the council does (native, user,
+    routed, native_effort, or fallback when an automatic request resolved
+    to native inheritance). Dispatch uses ONLY dispatch_model and
+    dispatch_effort (None = that override is not sent); the requested
+    values are kept for reporting. `note` is a fallback reason or a user-pin
+    advisory.
+    """
+    mode: str
+    provenance: str
+    requested_model: Optional[str] = None
+    requested_effort: Optional[str] = None
+    dispatch_model: Optional[str] = None
+    dispatch_effort: Optional[str] = None
+    reason: Optional[str] = None
+    note: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -331,9 +461,15 @@ class Role:
     id: str
     label: str
     instruction: str
-    # Optional per-role Codex overrides; None inherits ~/.codex/config.toml.
+    # Requested per-role Codex overrides exactly as authored (None = not
+    # requested; omitting model, effort, and selection inherits Codex's
+    # native configuration) and the selection object declaring their
+    # provenance. What is actually sent is `decision`, resolved once at
+    # launch before fan-out (see _role_decision).
     model: Optional[str] = None
     effort: Optional[str] = None
+    selection: Optional[Selection] = None
+    decision: Optional[SelectionDecision] = None
 
 
 @dataclass
@@ -869,6 +1005,105 @@ def _failure_text(stdout, stderr):
     return "\n".join(parts)
 
 
+@dataclass(frozen=True)
+class FailureRecord:
+    """One structured failure from a codex `error` / `turn.failed` event.
+
+    Fields are None when absent; `status` is the HTTP status of the nearest
+    enclosing level that carried one.
+    """
+    status: Optional[int] = None
+    type: Optional[str] = None
+    code: Optional[str] = None
+    param: Optional[str] = None
+    message: Optional[str] = None
+
+
+# codex exec reports a failed request as a message string that is often
+# itself JSON ({"type":"error","status":400,"error":{"type":..,"code":..,
+# "param":..,"message":..}}), whose error.message can nest JSON again. At
+# most this many JSON-in-message levels are decoded.
+_FAILURE_JSON_DEPTH = 3
+
+
+def _json_object(text):
+    """text decoded as a JSON object, or None."""
+    if not text.lstrip().startswith("{"):
+        return None
+    try:
+        value = json.loads(text)
+    except (ValueError, RecursionError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _str_or_none(value):
+    return value if isinstance(value, str) else None
+
+
+def _failure_status(obj, inherited):
+    for key in ("status", "status_code", "statusCode"):
+        value = obj.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return inherited
+
+
+def _collect_failure_records(value, status, depth, records):
+    """Append the records one failure payload (text or object) carries."""
+    if isinstance(value, str):
+        decoded = _json_object(value) if depth < _FAILURE_JSON_DEPTH else None
+        if decoded is None:
+            if value.strip():
+                records.append(FailureRecord(status, message=value.strip()))
+            return
+        value, depth = decoded, depth + 1
+    if not isinstance(value, dict):
+        return
+    status = _failure_status(value, status)
+    error = value.get("error")
+    if isinstance(error, str):
+        _collect_failure_records(error, status, depth, records)
+        return
+    fields = error if isinstance(error, dict) else value
+    message = _str_or_none(fields.get("message"))
+    nested = (
+        message is not None and depth < _FAILURE_JSON_DEPTH
+        and _json_object(message) is not None
+    )
+    record = FailureRecord(
+        status, _str_or_none(fields.get("type")),
+        _str_or_none(fields.get("code")), _str_or_none(fields.get("param")),
+        None if nested or message is None else message.strip() or None,
+    )
+    if any((record.type, record.code, record.param, record.message)):
+        records.append(record)
+    if nested:
+        _collect_failure_records(message, status, depth, records)
+
+
+def _failure_records(jsonl_output):
+    """Structured failure records from codex `error` / `turn.failed` events.
+
+    Only those two event types are read — never agent_message, reasoning,
+    or tool output — and JSON-in-message forms are decoded up to
+    _FAILURE_JSON_DEPTH levels. Duplicates (codex repeats one failure in
+    both events) collapse.
+    """
+    records = []
+    for event in _iter_json_objects(jsonl_output):
+        kind = event.get("type")
+        if kind == "error":
+            payloads = (event.get("message"), event.get("error"))
+        elif kind == "turn.failed":
+            payloads = (event.get("error"),)
+        else:
+            continue
+        for payload in payloads:
+            _collect_failure_records(payload, None, 0, records)
+    return _dedupe_preserve_order(records)
+
+
 # ---------- error classifiers ----------
 
 def _stderr_contains(stderr_text, markers):
@@ -991,6 +1226,91 @@ def _retriable_class(text):
     return None
 
 
+def _is_quota_error(failure_text, records):
+    """True for a terminal quota/billing failure: a recognized structured
+    code (error.code or error.type) or codex's usage-limit prose."""
+    for record in records:
+        if record.code in QUOTA_ERROR_CODES or record.type in QUOTA_ERROR_CODES:
+            return True
+    return _stderr_contains(failure_text, QUOTA_MARKERS)
+
+
+def _names_excluded_param(text):
+    """True when text names reasoning effort or service tier."""
+    lowered = text.lower()
+    return any(name in lowered for name in MODEL_REJECTION_EXCLUDED_PARAMS)
+
+
+def _model_rejection_patterns(requested_model):
+    """Codex's complete rejection sentences for the model this invocation
+    sent (regex-escaped), or for any model when none was sent."""
+    model = re.escape(requested_model) if requested_model else r"[^']+"
+    return (
+        # ChatGPT sign-in; the trailing account wording varies.
+        re.compile(
+            rf"The '{model}' model is not supported when using Codex with"
+        ),
+        # API wording: unavailable or inaccessible (the two are not told apart).
+        re.compile(
+            rf"The model '{model}' does not exist or you do not have access to it"
+        ),
+    )
+
+
+def _model_rejection(failure_text, records, requested_model):
+    """Codex's own message when it rejected this invocation's model, or None.
+
+    Positive evidence only: a structured `model_not_found` code (status
+    400, 404, or absent), or one of Codex's complete rejection sentences.
+    Bare "not found" / "not supported", the "Model metadata for ... not
+    found" advisory, and "Selected model is at capacity" (transient) never
+    qualify. A structured failure naming reasoning effort or service tier
+    is about that setting, so none of its text counts; neither does a
+    text line naming one.
+    """
+    if any(
+        _names_excluded_param(f"{record.param or ''} {record.message or ''}")
+        for record in records
+    ):
+        return None
+    for record in records:
+        if record.code == "model_not_found" and record.status in (
+            None, 400, 404,
+        ):
+            return record.message or "model_not_found"
+    candidates = [record.message for record in records if record.message]
+    candidates += failure_text.splitlines()
+    patterns = _model_rejection_patterns(requested_model)
+    for text in candidates:
+        if _names_excluded_param(text):
+            continue
+        if any(pattern.search(text) for pattern in patterns):
+            return text.strip()
+    return None
+
+
+def _failure_verdict(failure_text, records, requested_model, resume=False):
+    """Classify a non-zero codex exit; the stall verdict is decided earlier.
+
+    Precedence, identical on the fresh and resume paths: auth -> quota ->
+    anchored 429/5xx -> model rejected -> stale (resume only) -> substring
+    retriable fallback -> None (untagged). Returns "auth", "quota",
+    "rate-limit", "5xx", "model-rejected", "stale", or None.
+    """
+    if _is_auth_error(failure_text):
+        return "auth"
+    if _is_quota_error(failure_text, records):
+        return "quota"
+    anchored = _structured_retriable_class(failure_text)
+    if anchored:
+        return anchored
+    if _model_rejection(failure_text, records, requested_model) is not None:
+        return "model-rejected"
+    if resume and _is_stale_resume_error(failure_text):
+        return "stale"
+    return _retriable_class(failure_text)
+
+
 # ---------- prompt composition ----------
 
 def _compose_prompt(role, body):
@@ -1006,15 +1326,21 @@ def _compose_prompt(role, body):
 # ---------- async codex invocation ----------
 
 def _model_overrides(model=None, effort=None):
-    """Parent `codex exec` options for a role's optional model/effort.
+    """Parent `codex exec` options for one invocation's dispatched values.
 
-    Empty when neither is set, so a role without overrides keeps inheriting
-    ~/.codex/config.toml exactly as before. Placed with `-C` BEFORE any
-    `resume` subcommand (verified against codex-cli 0.156.1: parent-placed
-    `-m`/`-c` apply to both fresh and resumed turns). The overrides are
-    per-invocation, not sticky: a resumed turn without them runs on the
-    config default again. `effort` is validated to ^[a-z]+$ at parse time,
-    so the TOML string literal cannot be broken out of.
+    Callers pass only a SelectionDecision's dispatch_model/dispatch_effort.
+    Empty when neither is sent, so an inheriting role gets no override at
+    all and Codex resolves its native configuration in the worker's
+    execution context. Placed with `-C` BEFORE any `resume` subcommand
+    (verified against codex-cli 0.157.1: parent-placed `-m`/`-c` apply to
+    both fresh and resumed turns). The overrides are per-invocation, not
+    sticky: a resumed turn without them runs on the current native
+    configuration, not the thread's recorded model. Both values match
+    SELECTION_VALUE_PATTERN (checked at parse time, and for a pinned native
+    model at resolution), so neither can start with "-" or hold whitespace,
+    quotes, backslashes, or control characters: `-m <model>` stays one argv
+    value, and the TOML basic string in model_reasoning_effort="<effort>"
+    needs no escaping and cannot be broken out of.
     """
     opts = []
     if model:
@@ -1026,7 +1352,8 @@ def _model_overrides(model=None, effort=None):
 
 def _resume_cmd(root, session_id, model=None, effort=None):
     # `-C` is a parent option of `codex exec` and must precede `resume`; the
-    # optional model/effort overrides sit with it on the parent.
+    # dispatched model/effort overrides (none when the role inherits) sit
+    # with it on the parent, so they apply to the resumed turn.
     return [
         "codex", "exec", "-C", root, *_model_overrides(model, effort),
         "resume", session_id,
@@ -1336,16 +1663,59 @@ def _stalled_role_result(role, run, stored_id, attempt, started, warning=None):
     )
 
 
-def _classify_failure(stderr_stripped, rc, phase):
-    """Return a tagged error string for a non-zero codex exit."""
-    if _is_auth_error(stderr_stripped):
-        return f"[auth] {stderr_stripped or f'codex {phase} exited {rc}'}"
-    cls = _retriable_class(stderr_stripped)
-    if cls == "rate-limit":
-        return f"[retriable:rate-limit] {stderr_stripped or f'codex {phase} exited {rc}'}"
-    if cls == "5xx":
-        return f"[retriable:5xx] {stderr_stripped or f'codex {phase} exited {rc}'}"
-    return stderr_stripped or f"codex {phase} exited {rc}"
+# One recovery action per provenance for a [model-rejected] failure. The
+# runner never substitutes or replays: the host re-runs the role.
+_MODEL_REJECTED_ACTIONS = {
+    "routed": "Re-run this role with model, effort, and selection omitted "
+              "to inherit native configuration.",
+    "native_effort": "Re-run this role with model, effort, and selection "
+                     "omitted to inherit native configuration.",
+    "user": "Change or remove the explicit pin.",
+    "native": "Update the Codex configuration (model) or pin an available "
+              "model.",
+    "fallback": "Update the Codex configuration (model) or pin an available "
+                "model.",
+}
+
+
+def _model_rejected_error(decision, provider_message, phase):
+    """The terminal [model-rejected] text: what was rejected, Codex's own
+    message, and one action for this role's provenance."""
+    if decision.dispatch_model:
+        subject = f"requested model '{decision.dispatch_model}'"
+    else:
+        subject = "natively configured model"
+    # Only a resume has a saved thread this failure could have touched.
+    kept = " and the saved thread was kept" if phase == "resume" else ""
+    return (
+        f"[model-rejected] Codex rejected the {subject} for this invocation: "
+        f"{provider_message.rstrip(' .')}. No substitute model was "
+        f"tried{kept}. {_MODEL_REJECTED_ACTIONS[decision.provenance]}"
+    )
+
+
+def _classify_failure(failure_text, rc, phase, records=(), decision=None):
+    """Return a tagged error string for a non-zero codex exit.
+
+    `records` are the attempt's _failure_records and `decision` the role's
+    SelectionDecision (inheritance when omitted). A stale resume is never
+    formatted here: the resume path consults _failure_verdict first and
+    restarts fresh; every other verdict is the same on both paths.
+    """
+    decision = decision or _INHERIT_DECISION
+    verdict = _failure_verdict(failure_text, records, decision.dispatch_model)
+    detail = failure_text or f"codex {phase} exited {rc}"
+    if verdict in ("auth", "quota"):
+        return f"[{verdict}] {detail}"
+    if verdict in ("rate-limit", "5xx"):
+        return f"[retriable:{verdict}] {detail}"
+    if verdict == "model-rejected":
+        return _model_rejected_error(
+            decision,
+            _model_rejection(failure_text, records, decision.dispatch_model),
+            phase,
+        )
+    return detail
 
 
 def _start_line(role, phase, attempt, stall_secs):
@@ -1357,17 +1727,23 @@ def _start_line(role, phase, attempt, stall_secs):
 
 
 async def _run_role_once(role, prompt, attempt):
-    """One codex invocation for one role. No retry logic here."""
+    """One codex invocation for one role. No retry logic here.
+
+    The command carries only the role's resolved dispatch values; the
+    requested values and the selection never reach codex or saved state.
+    """
     started = time.monotonic()
     root = _project_root()
     stall_secs = _stall_secs()
+    decision = _role_decision(role)
+    model, effort = decision.dispatch_model, decision.dispatch_effort
     session_id, meta = load_session(role.id)
     warning = None
 
     if session_id:
         _diag(_start_line(role, "resume", attempt, stall_secs))
         run = await _run_codex_subprocess(
-            _resume_cmd(root, session_id, role.model, role.effort), prompt,
+            _resume_cmd(root, session_id, model, effort), prompt,
             role_id=role.id,
         )
         # The structured stall verdict is handled BEFORE any text
@@ -1451,27 +1827,21 @@ async def _run_role_once(role, prompt, attempt):
                 warning=warning,
             )
 
-        # rc != 0 on resume. Order: auth (never clear state) -> ANCHORED-status
+        # rc != 0 on resume. Order (_failure_verdict): auth (never clear
+        # state) -> quota (terminal even with HTTP 429) -> ANCHORED-status
         # retriable (a real API 429/5xx, by JSON status / `HTTP NNN` / reason
-        # phrase, beats a stale-looking message) -> stale-resume (clear + restart
-        # fresh) -> SUBSTRING retriable fallback (inside _classify_failure). The
+        # phrase, beats a stale-looking message) -> model rejected (terminal;
+        # keeps state even when its text also looks stale) -> stale-resume
+        # (clear + restart fresh) -> SUBSTRING retriable fallback. The
         # substring fallback sits after the stale check so a stale error that
         # merely contains a bare digit run (e.g. "...thread id stale-429-sid")
         # still restarts fresh.
-        if _is_auth_error(failure_text):
-            err = _classify_failure(failure_text, run.returncode, "resume")
-            return RoleResult(
-                role=role, ok=False, error=err,
-                elapsed_seconds=time.monotonic() - started, attempts=attempt,
+        records = _failure_records(run.stdout)
+        verdict = _failure_verdict(failure_text, records, model, resume=True)
+        if verdict != "stale":
+            err = _classify_failure(
+                failure_text, run.returncode, "resume", records, decision
             )
-        if _structured_retriable_class(failure_text):
-            err = _classify_failure(failure_text, run.returncode, "resume")
-            return RoleResult(
-                role=role, ok=False, error=err,
-                elapsed_seconds=time.monotonic() - started, attempts=attempt,
-            )
-        if not _is_stale_resume_error(failure_text):
-            err = _classify_failure(failure_text, run.returncode, "resume")
             return RoleResult(
                 role=role, ok=False, error=err,
                 elapsed_seconds=time.monotonic() - started, attempts=attempt,
@@ -1509,7 +1879,7 @@ async def _run_role_once(role, prompt, attempt):
     # Fresh path.
     _diag(_start_line(role, "fresh", attempt, stall_secs))
     run = await _run_codex_subprocess(
-        _fresh_cmd(root, role.model, role.effort), prompt, role_id=role.id
+        _fresh_cmd(root, model, effort), prompt, role_id=role.id
     )
     if run.stalled:
         return _stalled_role_result(
@@ -1519,9 +1889,13 @@ async def _run_role_once(role, prompt, attempt):
     failure_text = _failure_text(run.stdout, run.stderr)
 
     if run.returncode != 0:
+        # Same order as the resume path, minus the stale branch.
         return RoleResult(
             role=role, ok=False,
-            error=_classify_failure(failure_text, run.returncode, "exec"),
+            error=_classify_failure(
+                failure_text, run.returncode, "exec",
+                _failure_records(run.stdout), decision,
+            ),
             elapsed_seconds=time.monotonic() - started, attempts=attempt,
             warning=_with_stale_clear_warning(warning),
         )
@@ -1755,24 +2129,101 @@ async def run_council(roles, body, max_parallel=None, replies_dir=None):
 
 # ---------- report ----------
 
-def _role_overrides_note(role):
-    """Summary-line note for a role's optional model/effort overrides."""
+# The report states only what the council SENT: codex exec's JSON stream
+# names neither the model nor the effort that served a turn.
+NO_AUTOMATIC_SELECTIONS = "no runtime-grounded selections"
+MODEL_SELECTION_CAVEAT = (
+    "codex exec does not report the model or effort that served a turn; "
+    "values above are what the council sent, and \"native inheritance\" "
+    "means no override was sent."
+)
+
+
+def _sent_values(model, effort):
+    """"model X, effort Y" for whichever of the two is present."""
     parts = []
-    if role.model:
-        parts.append(f"model: {role.model}")
-    if role.effort:
-        parts.append(f"effort: {role.effort}")
-    return f" ({', '.join(parts)})" if parts else ""
+    if model:
+        parts.append(f"model {model}")
+    if effort:
+        parts.append(f"effort {effort}")
+    return ", ".join(parts)
+
+
+def _selection_summary_note(decision):
+    """The Summary-line note for what one role sent ("" = inherited)."""
+    sent = _sent_values(decision.dispatch_model, decision.dispatch_effort)
+    if decision.provenance == "user":
+        return f" (explicit: {sent})"
+    if decision.provenance == "routed":
+        return f" (routed: {sent})"
+    if decision.provenance == "native_effort":
+        return (f" (routed effort: {decision.dispatch_effort} on native "
+                f"model {decision.dispatch_model})")
+    if decision.provenance == "fallback":
+        return " (native inheritance; routing fell back)"
+    return ""
+
+
+def _selection_section_text(decision):
+    """The `_Model selection: ..._` text every role section carries."""
+    sent = _sent_values(decision.dispatch_model, decision.dispatch_effort)
+    if decision.provenance == "user":
+        text = f"explicit override — sent {sent}"
+    elif decision.provenance == "routed":
+        text = f"routed — sent {sent}"
+    elif decision.provenance == "native_effort":
+        text = (
+            "routed effort on the native model — sent model "
+            f"{decision.dispatch_model} (pinned native model), effort "
+            f"{decision.dispatch_effort}"
+        )
+    elif decision.provenance == "fallback":
+        requested = _sent_values(
+            decision.requested_model, decision.requested_effort
+        )
+        return (f"native inheritance — routing fell back: {decision.note}; "
+                f"requested {requested}")
+    else:
+        return "native inheritance (no model or effort override sent)"
+    if decision.reason:
+        text += f"; reason: {decision.reason}"
+    if decision.note:  # a user-pin advisory
+        text += f"; {decision.note}"
+    return text
+
+
+def _selection_plan_text(decision):
+    """One role's preflight plan; automatic choices are revalidated."""
+    sent = _sent_values(decision.dispatch_model, decision.dispatch_effort)
+    if decision.provenance == "user":
+        text = f"explicit override ({sent})"
+        return f"{text}; {decision.note}" if decision.note else text
+    if decision.provenance == "routed":
+        return f"routed ({sent}); revalidated at launch"
+    if decision.provenance == "native_effort":
+        return (f"native-model effort (effort {decision.dispatch_effort} on "
+                f"native model {decision.dispatch_model}); revalidated at "
+                "launch")
+    if decision.provenance == "fallback":
+        if decision.note == ROUTING_OFF_NOTE:
+            return "native inheritance (routing off)"
+        return f"native inheritance (routing fell back: {decision.note})"
+    return "native inheritance"
 
 
 def _format_role_section(r):
-    """Render one role's report section (heading, warning, reply/failure).
+    """Render one role's report section (heading, model selection, warning,
+    reply/failure).
 
     The single renderer for both out.md and the per-role reply files, so the
     two can never drift apart.
     """
     label = _report_inline(r.role.label)
-    lines = [f"## {label} ({r.role.id})", ""]
+    selection = _selection_section_text(_role_decision(r.role))
+    lines = [
+        f"## {label} ({r.role.id})", "",
+        f"_Model selection: {_report_inline(selection)}_", "",
+    ]
     if r.warning:
         lines.append(f"_Warning: {_report_inline(r.warning)}_")
         lines.append("")
@@ -1784,8 +2235,13 @@ def _format_role_section(r):
     return lines
 
 
-def _format_report(results, total_elapsed):
-    """Render results as a single markdown report for Claude to reconcile."""
+def _format_report(results, total_elapsed, discovery_sentence=None):
+    """Render results as a single markdown report for Claude to reconcile.
+
+    `discovery_sentence` describes launch discovery for the Model selection
+    paragraph (see _discovery_sentence); None means it did not run because
+    no role carried a runtime-grounded selection.
+    """
     ok = [r for r in results if r.ok]
     n = len(results)
 
@@ -1799,13 +2255,20 @@ def _format_report(results, total_elapsed):
     for r in results:
         status = "ok" if r.ok else "FAILED"
         attempts = f" (attempts: {r.attempts})" if r.attempts > 1 else ""
-        overrides = _role_overrides_note(r.role)
+        note = _report_inline(_selection_summary_note(_role_decision(r.role)))
         warn_note = " — WARNING" if r.warning else ""
         label = _report_inline(r.role.label)
         lines.append(
-            f"- **{label}** [{r.role.id}]: {status}{attempts}{overrides}"
+            f"- **{label}** [{r.role.id}]: {status}{attempts}{note}"
             f"{warn_note} — {r.elapsed_seconds:.1f}s"
         )
+    lines.append("")
+    sentence = discovery_sentence or (
+        f"discovery not run ({NO_AUTOMATIC_SELECTIONS})"
+    )
+    lines.append(_report_inline(
+        f"Model selection: {sentence}. {MODEL_SELECTION_CAVEAT}"
+    ))
     lines.append("")
 
     for r in results:
@@ -1815,18 +2278,29 @@ def _format_report(results, total_elapsed):
 
 
 def _format_reply_file(r):
-    """One role's reply file: a one-line status header plus its section."""
+    """One role's reply file: a one-line status header plus its section.
+
+    model=/effort= are the values SENT (omitted when not sent); selection=
+    is the role's provenance; a fallback also names what was requested.
+    """
     status = "ok" if r.ok else "FAILED"
+    decision = _role_decision(r.role)
     fields = [
         f"id={r.role.id}",
         f"status={status}",
         f"elapsed={r.elapsed_seconds:.1f}s",
         f"attempts={r.attempts}",
+        f"selection={decision.provenance}",
     ]
-    if r.role.model:
-        fields.append(f"model={r.role.model}")
-    if r.role.effort:
-        fields.append(f"effort={r.role.effort}")
+    if decision.dispatch_model:
+        fields.append(f"model={decision.dispatch_model}")
+    if decision.dispatch_effort:
+        fields.append(f"effort={decision.dispatch_effort}")
+    if decision.provenance == "fallback":
+        if decision.requested_model:
+            fields.append(f"requested_model={decision.requested_model}")
+        if decision.requested_effort:
+            fields.append(f"requested_effort={decision.requested_effort}")
     if r.warning:
         fields.append("warning=yes")
     header = f"<!-- codex-council reply {' '.join(fields)} -->"
@@ -1839,23 +2313,22 @@ def _reply_file_path(replies_dir, role_id):
     return os.path.join(replies_dir, f"{_state_role_component(role_id)}.md")
 
 
-def _write_reply_file(replies_dir, result):
-    """Atomically write one settled role's reply file; return its path.
+def _atomic_write_private(path, data):
+    """Atomically replace `path` with the bytes `data` as a 0600 file.
 
     Temp file in the same directory (O_CREAT|O_EXCL|O_NOFOLLOW, mode 0600),
     full write, fsync, then os.replace — a reader never sees a partial file.
-    Advisory by design: any failure returns None with one diagnostic and
-    never changes the role's result (out.md still carries the section).
+    Any failure removes the temp file and propagates; each caller owns its
+    failure policy (reply files are advisory, a snapshot must not go stale).
     """
-    path = _reply_file_path(replies_dir, result.role.id)
+    directory = os.path.dirname(path)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     tmp_path = None
     try:
-        data = _format_reply_file(result).encode("utf-8", errors="replace")
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
         for _ in range(8):
             candidate = os.path.join(
-                replies_dir,
+                directory,
                 f".{os.path.basename(path)}.{os.getpid()}."
                 f"{os.urandom(6).hex()}.tmp",
             )
@@ -1877,6 +2350,24 @@ def _write_reply_file(replies_dir, result):
             os.close(fd)
         os.replace(tmp_path, path)
         tmp_path = None
+    finally:
+        if tmp_path is not None:
+            with contextlib.suppress(OSError):
+                os.remove(tmp_path)
+
+
+def _write_reply_file(replies_dir, result):
+    """Atomically write one settled role's reply file; return its path.
+
+    Uses _atomic_write_private (0600 temp file, fsync, os.replace), so a
+    reader never sees a partial file. Advisory by design: any failure
+    returns None with one diagnostic and never changes the role's result
+    (out.md still carries the section).
+    """
+    path = _reply_file_path(replies_dir, result.role.id)
+    try:
+        data = _format_reply_file(result).encode("utf-8", errors="replace")
+        _atomic_write_private(path, data)
         return path
     except Exception as e:  # advisory: never let a reply file cost a result
         _diag(
@@ -1884,10 +2375,6 @@ def _write_reply_file(replies_dir, result):
             f"({_report_inline(e)}); the section is still in the final report"
         )
         return None
-    finally:
-        if tmp_path is not None:
-            with contextlib.suppress(OSError):
-                os.remove(tmp_path)
 
 
 def _prepare_replies_dir(run_dir):
@@ -1970,6 +2457,1689 @@ def _report_inline(value):
     return str(value).translate(_REPORT_INLINE_ESCAPES)
 
 
+# ---------- model discovery (codex app-server; metadata only) ----------
+#
+# --discover asks the installed Codex which models this account is shown and
+# how native configuration resolves for the project, without ever starting a
+# thread or a turn. The adapter is deliberately narrow: stdio JSON-RPC to
+# `codex app-server`, five read-only methods, one monotonic deadline, and a
+# strict projection into a small snapshot. Wire-format names stay inside the
+# _normalize_* helpers; everything downstream reads only the snapshot. Any
+# failure yields status "unavailable", which always means "inherit".
+
+
+class _DiscoveryFailure(Exception):
+    """The app-server session cannot continue; `problem` is machine-safe."""
+
+    def __init__(self, problem, detail=None):
+        super().__init__(problem)
+        self.problem = problem
+        # Sanitized last stderr line of a server that went away, or None.
+        self.detail = detail
+
+
+class _RpcError(Exception):
+    """One request drew a JSON-RPC error; the session itself stays usable."""
+
+    def __init__(self, method, code):
+        self.problem = f"rpc_error:{method}:{code}"
+        super().__init__(self.problem)
+
+
+def _model_routing_mode():
+    """Return "auto" or "off" from CODEX_COUNCIL_MODEL_ROUTING.
+
+    Unset or empty means "auto": per-role routing is the skill's default.
+    "off" disables automatic selection (explicit user pins still apply).
+    Any other value is a usage error (exit 2), never a silent default.
+    """
+    raw = os.environ.get(MODEL_ROUTING_ENV, "")
+    value = raw.strip()
+    if value in ("", "auto"):
+        return "auto"
+    if value == "off":
+        return "off"
+    _usage_exit(f"{MODEL_ROUTING_ENV} must be 'auto' or 'off'; got {raw!r}.")
+
+
+def _execution_context():
+    """The process context discovery shares with every worker.
+
+    Workers run the PATH-resolved `codex` with this process's cwd and
+    environment and `-C <project root>`; discovery spawns the app-server the
+    same way (no cwd or env override) and passes the project root as
+    config/read's cwd, the parameter that selects project config layers.
+    The runner forwards no profile, so `profile` is always null.
+    CODEX_API_KEY is recorded as presence only: `codex exec` honors it but
+    the app-server does not, so the catalog may not match exec's auth.
+    """
+    executable = shutil.which("codex")
+    return {
+        "project_root": _project_root(),
+        "launch_cwd": os.getcwd(),
+        "codex_executable": os.path.abspath(executable) if executable else None,
+        "codex_cli_version": None,
+        "codex_home": None,
+        "profile": None,
+        "exec_api_key_env": bool(os.environ.get("CODEX_API_KEY", "").strip()),
+    }
+
+
+# Snapshot context for a discovery that failed before observing anything.
+_EMPTY_DISCOVERY_CONTEXT = {
+    "project_root": None,
+    "launch_cwd": None,
+    "codex_executable": None,
+    "codex_cli_version": None,
+    "codex_home": None,
+    "profile": None,
+    "exec_api_key_env": False,
+}
+
+
+def _read_until_eof(stream, until, limit):
+    """Read a pipe until EOF, `limit` bytes, or the monotonic time `until`."""
+    fd = stream.fileno()
+    os.set_blocking(fd, False)
+    data = bytearray()
+    with selectors.DefaultSelector() as selector:
+        selector.register(fd, selectors.EVENT_READ)
+        while len(data) < limit:
+            remaining = until - time.monotonic()
+            if remaining <= 0 or not selector.select(remaining):
+                break
+            try:
+                chunk = os.read(fd, _READ_CHUNK_BYTES)
+            except BlockingIOError:
+                continue
+            except OSError:
+                break
+            if not chunk:
+                break
+            data += chunk
+    return bytes(data[:limit])
+
+
+def _process_group_gone(proc, grace):
+    """Wait up to `grace` seconds for proc AND its whole process group.
+
+    The leader is reaped as soon as it exits; the group is then probed with
+    signal 0, so a descendant still holding a pipe keeps it "alive".
+    """
+    until = time.monotonic() + grace
+    while True:
+        if proc.poll() is not None:
+            try:
+                os.killpg(proc.pid, 0)
+            except OSError:  # ESRCH: no member left (EPERM: not ours)
+                return True
+        if time.monotonic() >= until:
+            return False
+        time.sleep(0.01)
+
+
+def _stop_process_group(proc):
+    """Close stdin, then escalate SIGTERM -> SIGKILL over the process group.
+
+    start_new_session=True made proc a group leader (pgid == pid). Each step
+    waits DISCOVERY_CLOSE_GRACE_SECS for the WHOLE group, so neither a
+    grandchild holding a pipe nor a server ignoring SIGTERM outlives
+    discovery. Best effort; never raises.
+    """
+    if proc.stdin is not None:
+        with contextlib.suppress(OSError, ValueError):
+            proc.stdin.close()
+    for sig in (None, signal.SIGTERM, signal.SIGKILL):
+        if sig is not None:
+            with contextlib.suppress(OSError):
+                os.killpg(proc.pid, sig)
+        if _process_group_gone(proc, DISCOVERY_CLOSE_GRACE_SECS):
+            return
+
+
+_CODEX_VERSION_RE = re.compile(r"codex-cli ([0-9][0-9A-Za-z.+-]{0,63})")
+
+
+def _parse_codex_version(output):
+    """The <ver> of `codex --version` output ("codex-cli <ver>"), or None."""
+    lines = output.decode("utf-8", errors="replace").strip().splitlines()
+    match = _CODEX_VERSION_RE.fullmatch(lines[0].strip()) if lines else None
+    return match.group(1) if match else None
+
+
+def _probe_codex_version(executable, deadline):
+    """Run `codex --version` inside the discovery deadline; None if unknown.
+
+    Capped at DISCOVERY_VERSION_TIMEOUT_SECS of its own. An unparsable or
+    missing version is informational, never a discovery failure.
+    """
+    budget = min(DISCOVERY_VERSION_TIMEOUT_SECS, deadline - time.monotonic())
+    if budget <= 0:
+        return None
+    try:
+        proc = subprocess.Popen(
+            [executable, "--version"], stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except (OSError, ValueError):
+        return None
+    try:
+        output = _read_until_eof(proc.stdout, time.monotonic() + budget, 4096)
+    finally:
+        _stop_process_group(proc)
+        with contextlib.suppress(OSError):
+            proc.stdout.close()
+    return _parse_codex_version(output)
+
+
+_EMAIL_LIKE_RE = re.compile(r"[^\s@]+@[^\s@]+")
+
+
+def _stderr_excerpt(tail):
+    """Sanitized last non-empty line of a stderr tail, or None.
+
+    Single-line (non-printable characters become spaces), bounded, and with
+    email-like tokens redacted: it reaches the snapshot and --discover's
+    stdout, which must never carry account identity.
+    """
+    text = bytes(tail).decode("utf-8", errors="replace")
+    lines = [line for line in text.split("\n") if line.strip()]
+    if not lines:
+        return None
+    line = "".join(ch if ch.isprintable() else " " for ch in lines[-1])
+    line = _EMAIL_LIKE_RE.sub("<redacted>", line).strip()
+    return line[:DISCOVERY_STDERR_EXCERPT_CHARS] or None
+
+
+_PROBLEM_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,63}")
+
+
+def _problem_token(value):
+    """A server-supplied name as a machine-safe problem fragment."""
+    if isinstance(value, str) and _PROBLEM_TOKEN_RE.fullmatch(value):
+        return value
+    return "unrecognized"
+
+
+def _rpc_error_code(error):
+    """The integer code of a JSON-RPC error object, or "malformed"."""
+    code = error.get("code") if isinstance(error, dict) else None
+    if isinstance(code, int) and not isinstance(code, bool):
+        return code
+    return "malformed"
+
+
+class _AppServerTransport:
+    """Newline-delimited JSON-RPC over a running app-server's stdio pipes.
+
+    Synchronous and deadline-bound: every wait is one selector poll against
+    the shared monotonic deadline, so a hung, chatty, or hostile server can
+    cost at most the remaining budget. Responses are matched by id while
+    unsolicited messages interleave: notifications are counted and dropped;
+    a server-to-client request is answered with JSON-RPC -32601 and its
+    method recorded in server_requests (discovery is then inconclusive).
+    """
+
+    def __init__(self, proc, deadline):
+        self.server_requests = []
+        self.stderr_tail = bytearray()
+        self._deadline = deadline
+        self._next_id = 0
+        self._stdin_fd = proc.stdin.fileno()
+        self._stdout_fd = proc.stdout.fileno()
+        self._stderr_fd = proc.stderr.fileno()
+        self._outbox = bytearray()
+        self._partial = bytearray()
+        self._inbox = collections.deque()
+        self._stdout_bytes = 0
+        self._unsolicited = 0
+        self._stdout_open = True
+        self._stderr_open = True
+        self._writing = False
+        for fd in (self._stdin_fd, self._stdout_fd, self._stderr_fd):
+            os.set_blocking(fd, False)
+        self._selector = selectors.DefaultSelector()
+        self._selector.register(self._stdout_fd, selectors.EVENT_READ)
+        self._selector.register(self._stderr_fd, selectors.EVENT_READ)
+
+    def close(self):
+        self._selector.close()
+
+    def notify(self, method):
+        """Send a parameterless notification."""
+        self._send({"method": method}, method)
+
+    def request(self, method, params):
+        """Send one request and return its result.
+
+        Raises _RpcError for a JSON-RPC error response and _DiscoveryFailure
+        when the session fails (deadline, exit, protocol violation, bound).
+        """
+        self._next_id += 1
+        request_id = self._next_id
+        self._send(
+            {"id": request_id, "method": method, "params": params}, method
+        )
+        while True:
+            message = self._receive(method)
+            if "method" in message:
+                self._count_unsolicited()
+                if "id" in message:
+                    self.server_requests.append(
+                        _problem_token(message["method"])
+                    )
+                    self._send({"id": message["id"], "error": {
+                        "code": -32601,
+                        "message": "codex-council discovery does not "
+                                   "handle server requests",
+                    }}, method)
+                continue
+            response_id = message.get("id")
+            if isinstance(response_id, bool) or response_id != request_id:
+                self._count_unsolicited()
+                continue
+            if message.get("error") is not None:
+                raise _RpcError(method, _rpc_error_code(message["error"]))
+            if "result" not in message:
+                raise _DiscoveryFailure(f"schema_unsupported:{method}:result")
+            return message["result"]
+
+    def _count_unsolicited(self):
+        self._unsolicited += 1
+        if self._unsolicited > DISCOVERY_MAX_UNSOLICITED:
+            raise _DiscoveryFailure("protocol_error:notification_limit")
+
+    def _send(self, message, method):
+        """Queue one message and write whatever the pipe accepts now.
+
+        The rest (if the pipe is full) is flushed by later selector rounds,
+        always ahead of anything queued after it.
+        """
+        # json.dumps escapes to ASCII by default, so even a lone surrogate
+        # in an echoed server value (cursor, request id) stays encodable.
+        self._outbox += json.dumps(message).encode("ascii") + b"\n"
+        self._write_some(method)
+
+    def _set_write_interest(self, wanted):
+        if wanted and not self._writing:
+            self._selector.register(self._stdin_fd, selectors.EVENT_WRITE)
+        elif self._writing and not wanted:
+            self._selector.unregister(self._stdin_fd)
+        self._writing = wanted
+
+    def _receive(self, method):
+        while not self._inbox:
+            if not self._stdout_open:
+                raise _DiscoveryFailure(
+                    f"server_exited:{method}", self._drain_stderr()
+                )
+            self._pump(method)
+        return self._inbox.popleft()
+
+    def _pump(self, method):
+        """One selector round: flush queued stdin bytes, read stdout/stderr."""
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise _DiscoveryFailure(f"timeout:{method}")
+        for key, _ in self._selector.select(remaining):
+            if key.fd == self._stdin_fd:
+                self._write_some(method)
+            elif key.fd == self._stdout_fd:
+                self._read_stdout()
+            else:
+                self._read_stderr()
+
+    def _write_some(self, method):
+        try:
+            written = os.write(self._stdin_fd, self._outbox)
+        except BlockingIOError:
+            written = 0
+        except OSError:  # EPIPE: the server closed stdin or exited
+            self._outbox.clear()
+            self._set_write_interest(False)
+            raise _DiscoveryFailure(
+                f"server_exited:{method}", self._drain_stderr()
+            ) from None
+        del self._outbox[:written]
+        self._set_write_interest(bool(self._outbox))
+
+    def _read_stdout(self):
+        try:
+            chunk = os.read(self._stdout_fd, _READ_CHUNK_BYTES)
+        except BlockingIOError:
+            return
+        except OSError:
+            chunk = b""
+        if not chunk:
+            self._stdout_open = False
+            self._selector.unregister(self._stdout_fd)
+            return
+        self._stdout_bytes += len(chunk)
+        if self._stdout_bytes > DISCOVERY_MAX_STDOUT_BYTES:
+            raise _DiscoveryFailure("protocol_error:stdout_limit")
+        # Scan only the new bytes: the buffered prefix holds no newline.
+        scan_from = len(self._partial)
+        self._partial += chunk
+        while True:
+            newline = self._partial.find(b"\n", scan_from)
+            if newline < 0:
+                break
+            line = bytes(self._partial[:newline])
+            del self._partial[:newline + 1]
+            scan_from = 0
+            self._accept_line(line)
+        if len(self._partial) > DISCOVERY_MAX_LINE_BYTES:
+            raise _DiscoveryFailure("protocol_error:line_limit")
+
+    def _accept_line(self, line):
+        """Decode one stdout line; anything but a JSON object is fatal."""
+        if len(line) > DISCOVERY_MAX_LINE_BYTES:
+            raise _DiscoveryFailure("protocol_error:line_limit")
+        try:
+            text = line.decode("utf-8")
+        except UnicodeDecodeError:
+            raise _DiscoveryFailure("protocol_error:invalid_utf8") from None
+        if not text.strip():
+            return
+        try:
+            message = json.loads(text)
+        except (ValueError, RecursionError):
+            raise _DiscoveryFailure("protocol_error:malformed_line") from None
+        if not isinstance(message, dict):
+            raise _DiscoveryFailure("protocol_error:malformed_line")
+        self._inbox.append(message)
+
+    def _read_stderr(self):
+        try:
+            chunk = os.read(self._stderr_fd, _READ_CHUNK_BYTES)
+        except BlockingIOError:
+            return
+        except OSError:
+            chunk = b""
+        if not chunk:
+            self._stderr_open = False
+            self._selector.unregister(self._stderr_fd)
+            return
+        self.stderr_tail += chunk
+        del self.stderr_tail[:-DISCOVERY_STDERR_TAIL_BYTES]
+
+    def _drain_stderr(self):
+        """Briefly collect a departing server's stderr; return the excerpt."""
+        until = min(
+            self._deadline, time.monotonic() + DISCOVERY_CLOSE_GRACE_SECS
+        )
+        with selectors.DefaultSelector() as selector:
+            if self._stderr_open:
+                selector.register(self._stderr_fd, selectors.EVENT_READ)
+            while self._stderr_open:
+                remaining = until - time.monotonic()
+                if remaining <= 0 or not selector.select(remaining):
+                    break
+                self._read_stderr()
+        return _stderr_excerpt(self.stderr_tail)
+
+
+@contextlib.contextmanager
+def _app_server_session(executable, deadline):
+    """Spawn `codex app-server --listen stdio://` and yield its transport.
+
+    Launched like a worker — the same PATH-resolved binary, the inherited
+    cwd and environment, no --profile — in its own process group, and
+    always torn down (_stop_process_group) however the session ends.
+    """
+    try:
+        proc = subprocess.Popen(
+            [executable, "app-server", "--listen", "stdio://"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, start_new_session=True,
+        )
+    except (OSError, ValueError) as e:
+        name = errno.errorcode.get(getattr(e, "errno", None), type(e).__name__)
+        raise _DiscoveryFailure(f"spawn_failed:{name}") from None
+    transport = None
+    try:
+        transport = _AppServerTransport(proc, deadline)
+        yield transport
+    finally:
+        if transport is not None:
+            transport.close()
+        _stop_process_group(proc)
+        for stream in (proc.stdout, proc.stderr):
+            with contextlib.suppress(OSError):
+                stream.close()
+
+
+# ----- pure normalization of app-server results (the only wire-name code) -----
+
+def _nonempty_str(value):
+    return isinstance(value, str) and bool(value)
+
+
+def _normalize_initialize(result):
+    """initialize -> (codexHome or None, problem or None)."""
+    if not isinstance(result, dict):
+        return None, "schema_unsupported:initialize:result"
+    codex_home = result.get("codexHome")
+    return (codex_home if _nonempty_str(codex_home) else None), None
+
+
+def _normalize_account(result):
+    """account/read -> ({type, requires_openai_auth}, None) or (None, problem).
+
+    Reads exactly two fields. Email, plan, account ids, workspace routing,
+    and tokens are never read, so they cannot reach the snapshot or output.
+    """
+    if not isinstance(result, dict):
+        return None, "schema_unsupported:account/read:result"
+    requires = result.get("requiresOpenaiAuth")
+    if not isinstance(requires, bool):
+        return None, "schema_unsupported:account/read:requiresOpenaiAuth"
+    account = result.get("account")
+    if account is None:
+        kind = None
+    elif isinstance(account, dict) and _nonempty_str(account.get("type")):
+        kind = account["type"]
+    else:
+        return None, "schema_unsupported:account/read:account.type"
+    return {"type": kind, "requires_openai_auth": requires}, None
+
+
+# (wire key, snapshot key) of the config/read values the snapshot records;
+# the first two also record the KIND of layer that supplied them.
+_CONFIG_FIELDS = (
+    ("model", "model"),
+    ("model_reasoning_effort", "effort"),
+    ("model_provider", "provider"),
+)
+
+
+def _normalize_config(result):
+    """config/read -> (configured values, None) or (None, problem).
+
+    The merged values Codex resolved for the project root (null stays null)
+    plus the layer kind (user, project, system, ...) each came from — never
+    a file path or layer contents.
+    """
+    if not isinstance(result, dict):
+        return None, "schema_unsupported:config/read:result"
+    config, origins = result.get("config"), result.get("origins")
+    if not isinstance(config, dict):
+        return None, "schema_unsupported:config/read:config"
+    if not isinstance(origins, dict):
+        return None, "schema_unsupported:config/read:origins"
+    values = {}
+    for wire, key in _CONFIG_FIELDS:
+        value = config.get(wire)
+        if value is not None and not isinstance(value, str):
+            return None, f"schema_unsupported:config/read:config.{wire}"
+        values[key] = value
+    for wire, key in _CONFIG_FIELDS[:2]:
+        origin, kind = origins.get(wire), None
+        if origin is not None:
+            name = origin.get("name") if isinstance(origin, dict) else None
+            kind = name.get("type") if isinstance(name, dict) else None
+            if not _nonempty_str(kind):
+                return None, f"schema_unsupported:config/read:origins.{wire}"
+        values[f"{key}_origin"] = kind
+    return values, None
+
+
+def _normalize_requirements(result):
+    """configRequirements/read -> (managed observation, None) or (None, problem).
+
+    requirements null means none are managed ("absent"). A non-null
+    models.newThread model or effort is "present": Codex applies it to new
+    threads and drops BOTH when either is overridden, so neither routing
+    nor native-model effort adjustment is safe. provider_keys names managed
+    settings that can make the catalog describe a different provider.
+    """
+    problem = "schema_unsupported:configRequirements/read:requirements"
+    if not isinstance(result, dict) or "requirements" not in result:
+        return None, problem
+    requirements = result["requirements"]
+    observed = {"status": "absent", "model": None, "effort": None,
+                "provider_keys": []}
+    if requirements is None:
+        return observed, None
+    if not isinstance(requirements, dict):
+        return None, problem
+    models = requirements.get("models")
+    if models is not None and not isinstance(models, dict):
+        return None, f"{problem}.models"
+    new_thread = (models or {}).get("newThread")
+    if new_thread is not None and not isinstance(new_thread, dict):
+        return None, f"{problem}.models.newThread"
+    for wire, key in (("model", "model"), ("modelReasoningEffort", "effort")):
+        value = (new_thread or {}).get(wire)
+        if value is not None and not isinstance(value, str):
+            return None, f"{problem}.models.newThread.{wire}"
+        observed[key] = value
+    if observed["model"] is not None or observed["effort"] is not None:
+        observed["status"] = "present"
+    provider = requirements.get("modelProvider")
+    providers = requirements.get("modelProviders")
+    catalog_json = requirements.get("modelCatalogJson")
+    for wire, value, kind in (
+        ("modelProvider", provider, str),
+        ("modelProviders", providers, dict),
+        ("modelCatalogJson", catalog_json, str),
+    ):
+        if value is not None and not isinstance(value, kind):
+            return None, f"{problem}.{wire}"
+    if provider is not None and provider != "openai":
+        observed["provider_keys"].append("modelProvider")
+    if providers:
+        observed["provider_keys"].append("modelProviders")
+    if catalog_json is not None:
+        observed["provider_keys"].append("modelCatalogJson")
+    return observed, None
+
+
+def _utc_iso(seconds):
+    """Unix seconds as "YYYY-MM-DDTHH:MM:SSZ", or None when out of range."""
+    try:
+        parts = time.gmtime(seconds)
+    except (OverflowError, OSError, ValueError):
+        return None
+    if not 1 <= parts.tm_year <= 9999:
+        return None
+    return "%04d-%02d-%02dT%02d:%02d:%02dZ" % tuple(parts[:6])
+
+
+def _normalize_efforts(value):
+    """supportedReasoningEfforts -> [{effort, description}], or None.
+
+    Effort values are an open vocabulary (any non-empty string); a
+    malformed option or a repeated value makes the whole list unusable.
+    """
+    if not isinstance(value, list):
+        return None
+    efforts = []
+    for option in value:
+        if not isinstance(option, dict):
+            return None
+        effort = option.get("reasoningEffort")
+        description = option.get("description")
+        if not _nonempty_str(effort) or not isinstance(description, str):
+            return None
+        if any(known["effort"] == effort for known in efforts):
+            return None
+        efforts.append({"effort": effort, "description": description})
+    return efforts
+
+
+def _normalize_upgrade(value):
+    """upgradeInfo -> ({model, retirement_at} or None, bad field or None)."""
+    if value is None:
+        return None, None
+    if not isinstance(value, dict):
+        return None, "upgradeInfo"
+    if not _nonempty_str(value.get("model")):
+        return None, "upgradeInfo.model"
+    seconds = value.get("retirementAt")
+    retirement_at = None
+    if seconds is not None:
+        # bool is an int subclass; true is not a timestamp.
+        if isinstance(seconds, bool) or not isinstance(seconds, int):
+            return None, "upgradeInfo.retirementAt"
+        retirement_at = _utc_iso(seconds)
+        if retirement_at is None:
+            return None, "upgradeInfo.retirementAt"
+    return {"model": value["model"], "retirement_at": retirement_at}, None
+
+
+def _normalize_model_entry(item):
+    """One wire model record -> (entry, None) or (None, first bad field).
+
+    Additive fields are ignored; wrong types are rejected, never coerced
+    (hidden "false" or a boolean retirementAt make the entry unusable). The
+    dispatch identity is `model` — what `-m` receives — kept distinct from
+    the picker `id`, which is recorded as catalog_id.
+    """
+    if not isinstance(item, dict):
+        return None, "entry"
+    for field in ("id", "displayName", "description"):
+        if not isinstance(item.get(field), str):
+            return None, field
+    for field in ("model", "defaultReasoningEffort"):
+        if not _nonempty_str(item.get(field)):
+            return None, field
+    for field in ("hidden", "isDefault"):
+        if not isinstance(item.get(field), bool):
+            return None, field
+    efforts = _normalize_efforts(item.get("supportedReasoningEfforts"))
+    if efforts is None:
+        return None, "supportedReasoningEfforts"
+    upgrade, bad_field = _normalize_upgrade(item.get("upgradeInfo"))
+    if bad_field:
+        return None, bad_field
+    return {
+        "model": item["model"],
+        "catalog_id": item["id"],
+        "display_name": item["displayName"],
+        "description": item["description"],
+        "hidden": item["hidden"],
+        "recommended": item["isDefault"],
+        "default_effort": item["defaultReasoningEffort"],
+        "efforts": efforts,
+        "upgrade": upgrade,
+    }, None
+
+
+def _normalize_model_page(result):
+    """One model/list result -> ({entries, next_cursor}, None) or (None, problem).
+
+    entries holds (entry, bad_field, model) triples: a normalized entry, or
+    None with the first malformed field and the raw dispatch id when one is
+    readable (so a malformed record can still disqualify its model).
+    """
+    if not isinstance(result, dict):
+        return None, "schema_unsupported:model/list:result"
+    data, next_cursor = result.get("data"), result.get("nextCursor")
+    if not isinstance(data, list):
+        return None, "schema_unsupported:model/list:data"
+    if next_cursor is not None and not isinstance(next_cursor, str):
+        return None, "schema_unsupported:model/list:nextCursor"
+    entries = []
+    for item in data:
+        entry, bad_field = _normalize_model_entry(item)
+        model = item.get("model") if isinstance(item, dict) else None
+        entries.append((entry, bad_field, model if _nonempty_str(model) else None))
+    return {"entries": entries, "next_cursor": next_cursor}, None
+
+
+def _new_catalog():
+    """Empty catalog accumulator: usable entries by dispatch id, models made
+    unusable (malformed or conflicting) with the reason, and gaps that make
+    the catalog incomplete."""
+    return {"models": {}, "unusable": {}, "gaps": [], "count": 0}
+
+
+def _catalog_gap(catalog, problems, code, text):
+    problems.append(f"catalog_incomplete:{code}")
+    catalog["gaps"].append(text)
+
+
+def _mark_unusable(catalog, model, why):
+    catalog["models"].pop(model, None)
+    catalog["unusable"].setdefault(model, why)
+
+
+def _merge_model_page(catalog, page, problems):
+    """Fold one normalized page into the catalog accumulator.
+
+    A malformed entry or a conflicting duplicate makes that model unusable
+    and the catalog incomplete; identical duplicates collapse. Returns False
+    when DISCOVERY_MAX_MODELS cut the page short.
+    """
+    for entry, bad_field, model in page["entries"]:
+        if catalog["count"] >= DISCOVERY_MAX_MODELS:
+            _catalog_gap(catalog, problems, "entry_bound",
+                         f"stopped at the {DISCOVERY_MAX_MODELS}-entry bound")
+            return False
+        catalog["count"] += 1
+        if entry is None:
+            problems.append(f"schema_unsupported:model/list:{bad_field}")
+            catalog["gaps"].append(f"malformed entries ({bad_field})")
+            if model is not None:
+                _mark_unusable(catalog, model, "malformed")
+            continue
+        model = entry["model"]
+        existing = catalog["models"].get(model)
+        if model in catalog["unusable"] or existing == entry:
+            continue
+        if existing is None:
+            catalog["models"][model] = entry
+            continue
+        problems.append("catalog_conflict")
+        catalog["gaps"].append("conflicting duplicate entries")
+        _mark_unusable(catalog, model, "conflicting duplicate entries")
+    return True
+
+
+# ----- discovery orchestration (I/O) and the pure snapshot builder -----
+
+def _collect_catalog(session, problems):
+    """Page through model/list within the discovery bounds.
+
+    Returns None when the catalog is unavailable (an RPC error or an
+    unusable page), otherwise the merged accumulator, whose gaps say why it
+    is incomplete. The exact opaque cursor is echoed back; a repeated
+    cursor is a cycle. An incomplete catalog never implies that a model it
+    lacks is unavailable.
+    """
+    catalog = _new_catalog()
+    sent = set()
+    cursor = None
+    for _ in range(DISCOVERY_MAX_PAGES):
+        params = {"limit": DISCOVERY_PAGE_LIMIT, "includeHidden": True}
+        if cursor is not None:
+            params["cursor"] = cursor
+        try:
+            page, problem = _normalize_model_page(
+                session.request("model/list", params)
+            )
+        except _RpcError as e:
+            page, problem = None, e.problem
+        if problem:
+            problems.append(problem)
+            return None
+        if not _merge_model_page(catalog, page, problems):
+            return catalog
+        cursor = page["next_cursor"]
+        if cursor is None:
+            return catalog
+        if cursor in sent:
+            _catalog_gap(catalog, problems, "cursor_cycle",
+                         "pagination cursor repeated")
+            return catalog
+        if catalog["count"] >= DISCOVERY_MAX_MODELS:
+            _catalog_gap(catalog, problems, "entry_bound",
+                         f"stopped at the {DISCOVERY_MAX_MODELS}-entry bound")
+            return catalog
+        sent.add(cursor)
+    _catalog_gap(catalog, problems, "page_bound",
+                 f"stopped at the {DISCOVERY_MAX_PAGES}-page bound")
+    return catalog
+
+
+def _request_source(session, method, params, normalize, problems):
+    """One metadata request, normalized; None (plus a problem) if unusable."""
+    try:
+        value, problem = normalize(session.request(method, params))
+    except _RpcError as e:
+        value, problem = None, e.problem
+    if problem:
+        problems.append(problem)
+    return value
+
+
+def _observe_codex(deadline):
+    """Run the discovery I/O; return raw observations for _build_snapshot.
+
+    Sends only initialize/initialized, account/read, config/read,
+    configRequirements/read, and model/list — never thread/start,
+    thread/resume, turn/start, or any login or account-changing method. A
+    session failure keeps what was already observed and ends the session.
+    """
+    context = _execution_context()
+    observed = {
+        "context": context, "problems": [], "conclusive": False,
+        "account": None, "configured": None, "managed": None, "catalog": None,
+    }
+    problems = observed["problems"]
+    executable = context["codex_executable"]
+    if executable is None:
+        problems.append("codex_missing")
+        return observed
+    context["codex_cli_version"] = _probe_codex_version(executable, deadline)
+    if context["codex_cli_version"] is None:
+        problems.append("codex_version_unavailable")
+    session = None
+    try:
+        with _app_server_session(executable, deadline) as session:
+            codex_home, problem = _normalize_initialize(session.request(
+                "initialize", {
+                    "clientInfo": {
+                        "name": "codex-council", "title": "Codex Council",
+                        "version": _plugin_version(),
+                    },
+                    "capabilities": {"experimentalApi": False},
+                },
+            ))
+            if problem:
+                raise _DiscoveryFailure(problem)
+            context["codex_home"] = codex_home
+            session.notify("initialized")
+            observed["account"] = _request_source(
+                session, "account/read", {"refreshToken": False},
+                _normalize_account, problems,
+            )
+            observed["configured"] = _request_source(
+                session, "config/read",
+                {"cwd": context["project_root"], "includeLayers": False},
+                _normalize_config, problems,
+            )
+            observed["managed"] = _request_source(
+                session, "configRequirements/read", None,
+                _normalize_requirements, problems,
+            )
+            observed["catalog"] = _collect_catalog(session, problems)
+    except (_RpcError, _DiscoveryFailure) as failure:
+        problems.append(failure.problem)
+        detail = getattr(failure, "detail", None)
+        if detail:
+            problems.append(f"stderr: {detail}")
+    server_requests = session.server_requests if session is not None else []
+    problems.extend(f"server_request:{method}" for method in server_requests)
+    observed["conclusive"] = not server_requests and all(
+        observed[key] is not None
+        for key in ("account", "configured", "managed", "catalog")
+    )
+    return observed
+
+
+_EXEC_API_KEY_REASON = (
+    "CODEX_API_KEY is set for codex exec but not visible to discovery"
+)
+
+
+def _provider_mismatch(configured, provider_keys):
+    """Why the catalog may not describe the provider workers use, or None."""
+    provider = configured["provider"]
+    if provider not in (None, "openai"):
+        return f"configured provider {provider!r} has no verified catalog"
+    if provider_keys:
+        return (
+            f"managed requirements set {', '.join(provider_keys)}; "
+            "provider correspondence unverified"
+        )
+    return None
+
+
+def _routing_reasons(routing_mode, status_ok, problems, account, mismatch,
+                     api_key_env, managed_status, catalog):
+    """Every reason automatic routing is unavailable (empty = eligible)."""
+    reasons = []
+    if routing_mode == "off":
+        reasons.append(f"{MODEL_ROUTING_ENV}=off")
+    if not status_ok:
+        reasons.append("discovery unavailable: " + ", ".join(problems))
+        return reasons
+    if catalog["gaps"]:
+        reasons.append(
+            "catalog incomplete: "
+            + "; ".join(_dedupe_preserve_order(catalog["gaps"]))
+        )
+    if account["type"] is None:
+        reasons.append("not signed in: catalog is not account-grounded")
+    if mismatch:
+        reasons.append(mismatch)
+    if api_key_env:
+        reasons.append(_EXEC_API_KEY_REASON)
+    if managed_status != "absent":
+        reasons.append(f"managed new-thread defaults {managed_status}")
+    return reasons
+
+
+def _native_resolution(status_ok, configured, managed_status, mismatch,
+                       api_key_env, catalog):
+    """Whether the model an override-free worker runs is proven, and which.
+
+    Proven only when nothing can divert Codex from the configured model
+    (no managed new-thread defaults, a corresponding provider, no exec-only
+    API key) AND a well-formed catalog entry for that exact model exists
+    (hidden allowed), so its advertised efforts are known.
+    """
+    model = configured["model"]
+    if not status_ok:
+        reason = "discovery unavailable"
+    elif managed_status != "absent":
+        reason = f"managed new-thread defaults {managed_status}"
+    elif mismatch:
+        reason = mismatch
+    elif api_key_env:
+        reason = _EXEC_API_KEY_REASON
+    elif model is None:
+        reason = ("no model is configured; Codex's built-in default is not "
+                  "observable")
+    elif model in catalog["unusable"]:
+        reason = (f"the catalog entry for configured model {model!r} is "
+                  f"{catalog['unusable'][model]}")
+    elif model not in catalog["models"]:
+        reason = f"configured model {model!r} is not in the discovered catalog"
+        if catalog["gaps"]:
+            reason += " (catalog incomplete)"
+    else:
+        return {"resolution": "proven", "model": model, "reason": None}
+    return {"resolution": "unknown", "model": None, "reason": reason}
+
+
+def _build_snapshot(*, snapshot_id, created_at, plugin_version, routing_mode,
+                    context, problems, conclusive, account, configured,
+                    managed, catalog):
+    """Assemble the run's model snapshot from discovery observations (pure).
+
+    Routing eligibility and native resolution are decided once, here, so
+    the --discover summary, preflight, and launch read the same verdicts
+    and reasons. An unavailable source becomes explicit nulls or "unknown";
+    a missing observation never defaults to a permissive value.
+    """
+    problems = _dedupe_preserve_order(problems)
+    account = account or {"type": None, "requires_openai_auth": None}
+    configured = configured or dict.fromkeys(
+        ("model", "effort", "provider", "model_origin", "effort_origin")
+    )
+    managed = managed or {"status": "unknown", "model": None, "effort": None,
+                          "provider_keys": []}
+    complete = catalog is not None and not catalog["gaps"]
+    catalog = catalog or _new_catalog()
+    mismatch = _provider_mismatch(configured, managed["provider_keys"])
+    api_key_env = bool(context["exec_api_key_env"])
+    reasons = _routing_reasons(
+        routing_mode, conclusive, problems, account, mismatch, api_key_env,
+        managed["status"], catalog,
+    )
+    return {
+        "schema": SNAPSHOT_SCHEMA,
+        "snapshot_id": snapshot_id,
+        "created_at": created_at,
+        "plugin_version": plugin_version,
+        "status": "ok" if conclusive else "unavailable",
+        "problems": problems,
+        "context": dict(context),
+        "account": dict(account),
+        "configured": dict(configured),
+        "managed_defaults": {
+            key: managed[key] for key in ("status", "model", "effort")
+        },
+        "native": _native_resolution(
+            conclusive, configured, managed["status"], mismatch, api_key_env,
+            catalog,
+        ),
+        "routing": {
+            "mode": routing_mode, "eligible": not reasons, "reasons": reasons,
+        },
+        "catalog": {
+            "complete": complete, "models": list(catalog["models"].values()),
+        },
+    }
+
+
+def _discover(routing_mode):
+    """Run bounded, metadata-only model discovery; return the snapshot dict.
+
+    Never raises (Ctrl+C aside): codex missing, spawn errors, timeouts,
+    protocol violations, RPC errors, and server requests all yield status
+    "unavailable" with machine-safe problems, which every caller treats as
+    "inherit native configuration". Routing mode "off" still discovers
+    (the summary stays informative) but records routing as ineligible.
+    """
+    deadline = time.monotonic() + DISCOVERY_TIMEOUT_SECS
+    try:
+        observed = _observe_codex(deadline)
+    except Exception as e:  # a discovery bug must never cost a council
+        observed = {
+            "context": dict(_EMPTY_DISCOVERY_CONTEXT),
+            "problems": [f"internal_error:{type(e).__name__}"],
+            "conclusive": False, "account": None, "configured": None,
+            "managed": None, "catalog": None,
+        }
+    return _build_snapshot(
+        snapshot_id=secrets.token_hex(8),
+        created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        plugin_version=_plugin_version(),
+        routing_mode=routing_mode,
+        **observed,
+    )
+
+
+# ----- the snapshot file and the --discover summary -----
+
+def _write_snapshot(run_dir, snapshot):
+    """Atomically write RUNDIR/model-snapshot.json (0600); return its path.
+
+    On any failure the previous snapshot, if one exists, is removed (best
+    effort) before the error propagates: evidence from an earlier discovery
+    must never be read back as this run's.
+    """
+    path = os.path.join(run_dir, SNAPSHOT_FILENAME)
+    try:
+        # ASCII JSON: even a lone surrogate in catalog text stays writable.
+        data = (json.dumps(snapshot, indent=2) + "\n").encode("ascii")
+        _atomic_write_private(path, data)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(path)
+        raise
+    return path
+
+
+def _reject_duplicate_keys(pairs):
+    """json object_pairs_hook: build the object, refusing a repeated key."""
+    obj = {}
+    for key, value in pairs:
+        if key in obj:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        obj[key] = value
+    return obj
+
+
+def _reject_non_finite(name):
+    """json parse_constant hook: refuse NaN, Infinity, and -Infinity."""
+    raise ValueError(f"non-finite number {name}")
+
+
+def _strict_json_loads(text):
+    """json.loads that rejects duplicate keys and non-finite numbers."""
+    return json.loads(
+        text, object_pairs_hook=_reject_duplicate_keys,
+        parse_constant=_reject_non_finite,
+    )
+
+
+_MISSING = object()
+_ISO_UTC_RE = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
+_SNAPSHOT_ID_RE = re.compile(r"[0-9a-f]{16}")
+
+
+def _dotted(data, path):
+    """data["a"]["b"] for path "a.b", or _MISSING when a level is absent."""
+    for key in path.split("."):
+        if not isinstance(data, dict) or key not in data:
+            return _MISSING
+        data = data[key]
+    return data
+
+
+def _is_str_or_none(value):
+    return value is None or isinstance(value, str)
+
+
+def _is_bool_or_none(value):
+    return value is None or isinstance(value, bool)
+
+
+def _is_str_list(value):
+    return isinstance(value, list) and all(isinstance(v, str) for v in value)
+
+
+def _one_of(*allowed):
+    return lambda value: isinstance(value, str) and value in allowed
+
+
+def _matches(pattern):
+    return lambda value: isinstance(value, str) and bool(pattern.fullmatch(value))
+
+
+# Every snapshot field a reader relies on, with its required shape.
+_SNAPSHOT_CHECKS = (
+    ("schema", _one_of(SNAPSHOT_SCHEMA)),
+    ("snapshot_id", _matches(_SNAPSHOT_ID_RE)),
+    ("created_at", _matches(_ISO_UTC_RE)),
+    ("plugin_version", lambda value: isinstance(value, str)),
+    ("status", _one_of("ok", "unavailable")),
+    ("problems", _is_str_list),
+    *((f"context.{key}", _is_str_or_none) for key in (
+        "project_root", "launch_cwd", "codex_executable",
+        "codex_cli_version", "codex_home", "profile",
+    )),
+    ("context.exec_api_key_env", lambda value: isinstance(value, bool)),
+    ("account.type", _is_str_or_none),
+    ("account.requires_openai_auth", _is_bool_or_none),
+    *((f"configured.{key}", _is_str_or_none) for key in (
+        "model", "effort", "provider", "model_origin", "effort_origin",
+    )),
+    ("managed_defaults.status", _one_of("present", "absent", "unknown")),
+    ("managed_defaults.model", _is_str_or_none),
+    ("managed_defaults.effort", _is_str_or_none),
+    ("native.resolution", _one_of("proven", "unknown")),
+    ("native.model", _is_str_or_none),
+    ("native.reason", _is_str_or_none),
+    ("routing.mode", _one_of("auto", "off")),
+    ("routing.eligible", lambda value: isinstance(value, bool)),
+    ("routing.reasons", _is_str_list),
+    ("catalog.complete", lambda value: isinstance(value, bool)),
+    ("catalog.models", lambda value: isinstance(value, list)),
+)
+
+
+def _is_snapshot_model(entry):
+    """True when a snapshot catalog entry has the normalized shape."""
+    if not isinstance(entry, dict):
+        return False
+    if not all(_nonempty_str(entry.get(k)) for k in ("model", "default_effort")):
+        return False
+    if not all(isinstance(entry.get(k), str)
+               for k in ("catalog_id", "display_name", "description")):
+        return False
+    if not all(isinstance(entry.get(k), bool) for k in ("hidden", "recommended")):
+        return False
+    efforts = entry.get("efforts")
+    if not isinstance(efforts, list) or not all(
+        isinstance(option, dict) and _nonempty_str(option.get("effort"))
+        and isinstance(option.get("description"), str)
+        for option in efforts
+    ):
+        return False
+    upgrade = entry.get("upgrade", _MISSING)
+    if upgrade is None:
+        return True
+    if not isinstance(upgrade, dict) or not _nonempty_str(upgrade.get("model")):
+        return False
+    retirement_at = upgrade.get("retirement_at", _MISSING)
+    return retirement_at is None or _matches(_ISO_UTC_RE)(retirement_at)
+
+
+def _snapshot_shape_problem(snapshot):
+    """The first field of a parsed snapshot that breaks the schema, or None."""
+    for path, valid in _SNAPSHOT_CHECKS:
+        if not valid(_dotted(snapshot, path)):
+            return path
+    models = snapshot["catalog"]["models"]
+    if not all(_is_snapshot_model(entry) for entry in models):
+        return "catalog.models"
+    if len({entry["model"] for entry in models}) != len(models):
+        return "catalog.models"
+    native = snapshot["native"]
+    if native["resolution"] == "proven" and not any(
+        entry["model"] == native["model"] for entry in models
+    ):
+        return "native.model"
+    return None
+
+
+def _snapshot_file_problem(st):
+    """Why a stat result is not the private file --discover writes, or None."""
+    if stat.S_ISLNK(st.st_mode):
+        return f"{SNAPSHOT_FILENAME} is a symlink"
+    if not stat.S_ISREG(st.st_mode):
+        return f"{SNAPSHOT_FILENAME} is not a regular file"
+    if st.st_uid != os.geteuid():
+        return f"{SNAPSHOT_FILENAME} is owned by uid {st.st_uid}"
+    mode = stat.S_IMODE(st.st_mode)
+    if mode & 0o077:
+        return (f"{SNAPSHOT_FILENAME} is mode {mode:04o}, not the private "
+                "0600 file --discover writes")
+    return None
+
+
+def _read_snapshot(run_dir):
+    """Load RUNDIR/model-snapshot.json: (snapshot, None) or (None, problem).
+
+    Accepts only the private regular file --discover writes: lstat refuses
+    a symlink, special file, foreign owner, or group/other mode bits; the
+    open adds O_NOFOLLOW|O_NONBLOCK (no FIFO hang, no swap after the lstat);
+    the content must be strict JSON (no duplicate keys or non-finite
+    numbers) in the SNAPSHOT_SCHEMA shape. `problem` is a short sentence
+    fragment for the caller's diagnostic.
+    """
+    path = os.path.join(run_dir, SNAPSHOT_FILENAME)
+    try:
+        problem = _snapshot_file_problem(os.lstat(path))
+    except FileNotFoundError:
+        return None, f"{SNAPSHOT_FILENAME} does not exist"
+    except OSError as e:
+        return None, f"cannot inspect {SNAPSHOT_FILENAME} ({e.strerror or e})"
+    if problem:
+        return None, problem
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        with open(os.open(path, flags), "rb") as f:
+            problem = _snapshot_file_problem(os.fstat(f.fileno()))
+            raw = b"" if problem else f.read(SNAPSHOT_MAX_BYTES + 1)
+    except OSError as e:
+        return None, f"cannot read {SNAPSHOT_FILENAME} ({e.strerror or e})"
+    if problem:
+        return None, problem
+    if len(raw) > SNAPSHOT_MAX_BYTES:
+        return None, f"{SNAPSHOT_FILENAME} exceeds {SNAPSHOT_MAX_BYTES} bytes"
+    try:
+        snapshot = _strict_json_loads(raw.decode("utf-8"))
+    except (ValueError, RecursionError) as e:
+        return None, f"{SNAPSHOT_FILENAME} is not valid JSON ({e})"
+    field = _snapshot_shape_problem(snapshot)
+    if field:
+        return None, (f"{SNAPSHOT_FILENAME} does not match {SNAPSHOT_SCHEMA} "
+                      f"(field {field!r})")
+    return snapshot, None
+
+
+def _quoted(text):
+    """Catalog text as one quoted literal (it is data, not instructions)."""
+    return json.dumps(text, ensure_ascii=False)
+
+
+def _summary_setting(value, origin):
+    if value is None:
+        return "unset"
+    return f"{value} (origin {origin})" if origin else value
+
+
+def _summary_efforts(entry):
+    return ", ".join(
+        f"{option['effort']} ({_quoted(option['description'])})"
+        for option in entry["efforts"]
+    ) or "none advertised"
+
+
+def _summary_model_line(entry):
+    line = (f"- {entry['model']} — {_quoted(entry['description'])}; "
+            f"efforts: {_summary_efforts(entry)}")
+    if entry["recommended"]:
+        line += "; recommended"
+    upgrade = entry["upgrade"]
+    if upgrade is not None:
+        if upgrade["retirement_at"] is not None:
+            line += f"; retires {upgrade['retirement_at']}"
+        line += f"; upgrade suggested: {upgrade['model']}"
+    return line
+
+
+def _discovery_summary(snapshot):
+    """The --discover stdout summary lines (the snapshot path excluded).
+
+    Compact on purpose: Claude reads it to choose per-role selections. Every
+    line goes through _report_inline because catalog and config text is
+    untrusted data; descriptions are additionally JSON-quoted.
+    """
+    snapshot_id = snapshot["snapshot_id"]
+    if snapshot["status"] != "ok":
+        reasons = ", ".join(snapshot["problems"]) or "no detail recorded"
+        return [_report_inline(
+            f"[codex-council] discovery unavailable: {reasons}; "
+            f"snapshot_id={snapshot_id}; roles must inherit (omit model, "
+            "effort, and selection)"
+        )]
+    context = snapshot["context"]
+    configured = snapshot["configured"]
+    managed = snapshot["managed_defaults"]
+    routing = snapshot["routing"]
+    native = snapshot["native"]
+    models = snapshot["catalog"]["models"]
+    version = context["codex_cli_version"]
+    provider = configured["provider"]
+    if managed["status"] == "present":
+        managed_text = (
+            f"present: model {_summary_setting(managed['model'], None)}, "
+            f"effort {_summary_setting(managed['effort'], None)}"
+        )
+    else:
+        managed_text = "none" if managed["status"] == "absent" else "unknown"
+    if routing["mode"] == "off":
+        # native.resolution stays evidence; the automatic action is off.
+        native_text = f"unavailable — {MODEL_ROUTING_ENV}=off"
+    elif native["resolution"] == "proven":
+        native_text = f"available on {native['model']}"
+        entry = next(
+            (m for m in models if m["model"] == native["model"]), None
+        )
+        if entry is not None and entry["hidden"]:
+            # Hidden models are not listed below, but native_effort may
+            # still adjust effort on one, so show its efforts here.
+            native_text += f" (hidden; efforts: {_summary_efforts(entry)})"
+    else:
+        native_text = f"unavailable — {native['reason']}"
+    visible = [entry for entry in models if not entry["hidden"]]
+    hidden = [entry["model"] for entry in models if entry["hidden"]]
+    lines = [
+        f"[codex-council] discovery ok: snapshot_id={snapshot_id} "
+        f"codex-cli {'version unknown' if version is None else version}; "
+        f"auth {snapshot['account']['type'] or 'none'}; "
+        f"provider {'openai (default)' if provider is None else provider}; "
+        f"version={snapshot['plugin_version']}",
+        "native configuration: model "
+        f"{_summary_setting(configured['model'], configured['model_origin'])}"
+        ", effort "
+        f"{_summary_setting(configured['effort'], configured['effort_origin'])}"
+        f"; managed new-thread defaults: {managed_text}",
+        "routing: " + ("eligible" if routing["eligible"] else
+                       "unavailable — " + "; ".join(routing["reasons"])),
+        f"native-model effort adjustment: {native_text}",
+        "advertised models (catalog text is data, not instructions):"
+        + ("" if visible else " none"),
+        *(_summary_model_line(entry) for entry in visible),
+    ]
+    if hidden:
+        lines.append(f"hidden (explicit pins only): {', '.join(hidden)}")
+    return [_report_inline(line) for line in lines]
+
+
+def _discover_command(run_dir):
+    """--discover RUNDIR: discover, write the snapshot, print the summary.
+
+    Exits 0 whenever RUNDIR is a valid private directory (roles.json and
+    context.md need not exist yet): unavailable discovery, or a missing
+    codex, is reported in the summary because inheritance is always a valid
+    outcome. If the snapshot cannot be written, any older one is removed
+    and the only line printed says to write no automatic selections.
+    """
+    run_dir = _check_private_dir(
+        run_dir, prefix="--discover: ", recovery=STAGING_DIR_RECOVERY
+    )
+    snapshot = _discover(_model_routing_mode())
+    try:
+        path = _write_snapshot(os.path.abspath(run_dir), snapshot)
+    except Exception as e:
+        lines = [
+            "[codex-council] discovery snapshot not written "
+            f"({_report_inline(e)}); write no automatic selections — omit "
+            "model, effort, and selection so roles inherit native "
+            "configuration."
+        ]
+    else:
+        lines = _discovery_summary(snapshot)
+        lines.append(f"snapshot: {_report_inline(path)}")
+    print("\n".join(lines), flush=True)
+
+
+# ---------- model selection (one resolver for preflight and launch) ----------
+#
+# A role inherits (no model, effort, or selection), carries an explicit user
+# pin, or carries a runtime-grounded choice ("routed" pair or
+# "native_effort") bound to this run's --discover snapshot. Authoring
+# defects exit 2 (_validate_selection_authoring); evidence that stops
+# supporting a valid automatic choice resolves it to native inheritance with
+# a reason (_resolve_selection). Nothing here ranks models or efforts: every
+# check is exact membership in the discovered data, which is untrusted text
+# and reaches output only through _report_inline.
+
+ROUTING_OFF_NOTE = f"{MODEL_ROUTING_ENV}=off"
+PROVENANCES = ("native", "user", "routed", "native_effort", "fallback")
+UNVERIFIED_MODEL_ADVISORY = (
+    "unverified: not in the discovered catalog; forwarded unchanged"
+)
+PARTIAL_PIN_ADVISORY = (
+    "partial pin: Codex ignores managed new-thread model and effort "
+    "defaults when either is overridden"
+)
+_INHERIT_DECISION = SelectionDecision("inherit", "native")
+
+
+def _is_automatic(role):
+    return role.selection is not None and role.selection.mode in AUTOMATIC_MODES
+
+
+def _role_decision(role):
+    """The decision attached at launch; without one (a Role built directly),
+    the decision its request implies when no discovery evidence exists."""
+    if role.decision is not None:
+        return role.decision
+    return _resolve_selection(role, None, None, "auto", None)
+
+
+def _catalog_entry(snapshot, model):
+    """The snapshot catalog entry whose dispatch id is exactly `model`."""
+    for entry in snapshot["catalog"]["models"]:
+        if entry["model"] == model:
+            return entry
+    return None
+
+
+def _effort_advertised(entry, effort):
+    """Exact, case-sensitive membership in the entry's advertised efforts."""
+    return any(option["effort"] == effort for option in entry["efforts"])
+
+
+def _execution_id_hint(snapshot, model):
+    """Point at the dispatch id when `model` is an entry's picker id or
+    display name (neither is what `-m` receives)."""
+    for entry in snapshot["catalog"]["models"]:
+        if model in (entry["catalog_id"], entry["display_name"]):
+            return f"; use the execution id '{entry['model']}'"
+    return ""
+
+
+def _routed_evidence_gap(snapshot, model, effort, now):
+    """Why `snapshot` does not support routing to (model, effort), or None.
+
+    Exact checks only: the dispatch id is advertised and visible, its
+    advertised retirement (if any) has not passed at `now`, and the effort
+    is one that entry advertises. Catalog order and the recommended marker
+    never matter.
+    """
+    entry = _catalog_entry(snapshot, model)
+    if entry is None:
+        return (
+            f"model '{model}' is not an advertised execution id in snapshot "
+            f"{snapshot['snapshot_id']}{_execution_id_hint(snapshot, model)}"
+        )
+    if entry["hidden"]:
+        return (f"cannot route to hidden model '{model}' (hidden models are "
+                "for explicit user pins)")
+    upgrade = entry["upgrade"]
+    retirement = upgrade["retirement_at"] if upgrade else None
+    if retirement is not None and now is not None and retirement <= now:
+        return f"model '{model}' advertised retirement passed ({retirement})"
+    if not _effort_advertised(entry, effort):
+        return f"effort '{effort}' is not advertised for model '{model}'"
+    return None
+
+
+def _native_model_gap(snapshot):
+    """Why the snapshot proves no native model the runner could pin."""
+    native = snapshot["native"]
+    model = native["model"]
+    if native["resolution"] != "proven":
+        reason = native["reason"] or "native model not proven"
+    elif not (isinstance(model, str) and SELECTION_VALUE_PATTERN.match(model)):
+        reason = (f"native model id {model!r} is not a dispatchable "
+                  "selection value")
+    else:
+        return None
+    return f"cannot adjust effort on the native model: {reason}"
+
+
+def _native_effort_gap(snapshot, effort):
+    """Why `snapshot` does not support `effort` on its proven native model."""
+    gap = _native_model_gap(snapshot)
+    if gap:
+        return gap
+    model = snapshot["native"]["model"]
+    entry = _catalog_entry(snapshot, model)
+    if entry is None or not _effort_advertised(entry, effort):
+        return f"effort '{effort}' is not advertised for model '{model}'"
+    return None
+
+
+def _user_pin_advisory(role, evidence):
+    """Advisory text for an explicit pin, or None; never a rejection.
+
+    A pin reaches Codex unchanged whatever the catalog says (a custom
+    provider's models are not in it); the snapshot only annotates it.
+    """
+    if evidence is None:
+        return None
+    notes = []
+    if evidence["status"] == "ok":
+        entry = None
+        if role.model is not None:
+            entry = _catalog_entry(evidence, role.model)
+            if entry is None:
+                notes.append(UNVERIFIED_MODEL_ADVISORY)
+        elif evidence["native"]["resolution"] == "proven":
+            entry = _catalog_entry(evidence, evidence["native"]["model"])
+        if (
+            entry is not None and role.effort is not None
+            and not _effort_advertised(entry, role.effort)
+        ):
+            notes.append(
+                f"unverified effort: '{role.effort}' is not advertised for "
+                f"model '{entry['model']}'; forwarded unchanged"
+            )
+    partial = (role.model is None) != (role.effort is None)
+    if partial and evidence["managed_defaults"]["status"] != "absent":
+        notes.append(PARTIAL_PIN_ADVISORY)
+    return "; ".join(notes) or None
+
+
+def _decision(role, mode, provenance, model=None, effort=None, note=None):
+    """A SelectionDecision that keeps the role's request for reporting."""
+    reason = role.selection.reason if role.selection else None
+    return SelectionDecision(
+        mode, provenance, role.model, role.effort, model, effort, reason, note
+    )
+
+
+def _resolve_selection(role, planning, launch, routing_mode, now):
+    """Decide what one role sends: the single resolver for preflight and
+    launch. Pure — the same inputs always give the same decision.
+
+    `planning` is this run's --discover snapshot and `launch` the fresh
+    launch-time one (either may be None; preflight passes no launch
+    snapshot, so its decisions are the plan). Launch evidence wins when
+    present. `now` ("YYYY-MM-DDTHH:MM:SSZ", or None to skip) is compared
+    with advertised retirements. Authoring defects never reach here (see
+    _validate_selection_authoring): an automatic choice that the evidence
+    does not support resolves to native inheritance, with the reason, and
+    an explicit pin is forwarded unchanged with advisories at most.
+    """
+    selection = role.selection
+    if selection is None and role.model is None and role.effort is None:
+        return _INHERIT_DECISION
+    evidence = launch if launch is not None else planning
+    if selection is None or selection.mode == "user":
+        # An untagged pin gets here only from direct CLI use.
+        return _decision(role, "user", "user", role.model, role.effort,
+                         _user_pin_advisory(role, evidence))
+    mode = selection.mode
+    if routing_mode == "off":
+        return _decision(role, mode, "fallback", note=ROUTING_OFF_NOTE)
+    if evidence is None:
+        return _decision(role, mode, "fallback",
+                         note="no discovery snapshot for this run")
+    stage = "launch discovery" if launch is not None else "discovery snapshot"
+    if evidence["status"] != "ok":
+        problems = ", ".join(evidence["problems"]) or "no detail recorded"
+        return _decision(role, mode, "fallback",
+                         note=f"{stage} unavailable: {problems}")
+    if mode == "routed":
+        if not evidence["routing"]["eligible"]:
+            reasons = "; ".join(evidence["routing"]["reasons"])
+            return _decision(
+                role, mode, "fallback",
+                note=f"{stage} reports routing unavailable: {reasons}",
+            )
+        gap = _routed_evidence_gap(evidence, role.model, role.effort, now)
+        model = role.model
+    else:
+        # native_effort pins the native model THIS evidence proves.
+        gap = _native_effort_gap(evidence, role.effort)
+        model = evidence["native"]["model"]
+    if gap:
+        if launch is not None:
+            gap = f"selection evidence changed since discovery: {gap}"
+        return _decision(role, mode, "fallback", note=gap)
+    return _decision(role, mode, mode, model, role.effort)
+
+
+def _authoring_problem(role, planning, planning_problem, now):
+    """Why an automatic selection is an authoring defect against this run's
+    planning snapshot, or None."""
+    selection = role.selection
+    if planning is None:
+        return (
+            f"selection.mode '{selection.mode}' requires this run's "
+            f"discovery snapshot ({planning_problem}); run --discover on "
+            "this run directory first, or omit model, effort, and "
+            "selection to inherit"
+        )
+    if selection.snapshot_id != planning["snapshot_id"]:
+        return (
+            f"snapshot_id '{selection.snapshot_id}' does not identify this "
+            f"run's discovery snapshot '{planning['snapshot_id']}'"
+        )
+    if selection.mode == "native_effort":
+        gap = _native_model_gap(planning)
+        if gap:
+            return f"{gap}; omit effort and selection to inherit"
+        return _native_effort_gap(planning, role.effort)
+    if not planning["routing"]["eligible"]:
+        return (
+            "discovery reported routing unavailable "
+            f"({'; '.join(planning['routing']['reasons'])}); omit model, "
+            "effort, and selection to inherit"
+        )
+    return _routed_evidence_gap(planning, role.model, role.effort, now)
+
+
+def _validate_selection_authoring(roles, planning, planning_problem,
+                                  routing_mode, now):
+    """Exit 2 (uniform rewrite recovery) on an automatic selection this
+    run's planning snapshot does not support.
+
+    Runs in preflight and at launch, before any worker. Explicit pins are
+    never checked against the catalog, and with routing off automatic roles
+    are not errors: they resolve to native inheritance.
+    """
+    if routing_mode == "off":
+        return
+    for idx, role in enumerate(roles):
+        if not _is_automatic(role):
+            continue
+        problem = _authoring_problem(role, planning, planning_problem, now)
+        if problem:
+            _roles_usage_exit(_report_inline(
+                f"--roles-file entry {idx} (id '{role.id}'): {problem}."
+            ))
+
+
+def _launch_discovery_state(routing_mode, automatic, launch):
+    """(state, reason) of launch discovery for err.log and the report.
+
+    state is "ok", "unavailable", or "not-run"; reason is None or why.
+    """
+    if launch is None:
+        if automatic and routing_mode == "off":
+            return "not-run", ROUTING_OFF_NOTE
+        return "not-run", NO_AUTOMATIC_SELECTIONS
+    if launch["status"] != "ok":
+        return "unavailable", (
+            ", ".join(launch["problems"]) or "no detail recorded"
+        )
+    if not launch["routing"]["eligible"]:
+        return "ok", launch["routing"]["reasons"][0]
+    return "ok", None
+
+
+def _discovery_sentence(state, reason, launch):
+    """The discovery half of the report's Model selection paragraph."""
+    if state == "not-run":
+        return f"discovery not run ({reason})"
+    if state == "unavailable":
+        return f"launch discovery unavailable: {reason}"
+    version = launch["context"]["codex_cli_version"] or "version unknown"
+    return f"launch discovery ok (codex-cli {version})"
+
+
+def _model_selection_lines(roles, routing_mode, state, reason):
+    """The err.log lines that follow the dispatch line: one summary, then
+    one line per role whose automatic choice fell back to inheritance."""
+    decisions = [(role.id, _role_decision(role)) for role in roles]
+    counts = collections.Counter(d.provenance for _, d in decisions)
+    discovery = f"{state} ({reason})" if reason else state
+    lines = [
+        f"[codex-council] model selection: routing={routing_mode}; "
+        f"discovery={discovery}; "
+        + " ".join(f"{name}={counts[name]}" for name in PROVENANCES)
+    ]
+    lines += [
+        f"[codex-council:{role_id}] routing fell back to native "
+        f"inheritance: {decision.note}"
+        for role_id, decision in decisions
+        if decision.provenance == "fallback"
+    ]
+    return [_report_inline(line) for line in lines]
+
+
+def _resolve_launch_selections(roles, run_dir, routing_mode):
+    """Validate authoring, discover once if needed, and attach decisions.
+
+    Returns (roles with `decision` set, the launch snapshot or None). The
+    launch snapshot is taken only when a role carries an automatic
+    selection and routing is on — councils of inherited and explicit roles
+    pay no discovery latency — and is frozen for the whole council; it is
+    never written over the planning snapshot.
+    """
+    now = _utc_iso(time.time())
+    planning, planning_problem = _read_snapshot(run_dir)
+    _validate_selection_authoring(
+        roles, planning, planning_problem, routing_mode, now
+    )
+    launch = None
+    if routing_mode == "auto" and any(_is_automatic(r) for r in roles):
+        launch = _discover(routing_mode)
+    resolved = [
+        replace(role, decision=_resolve_selection(
+            role, planning, launch, routing_mode, now
+        ))
+        for role in roles
+    ]
+    return resolved, launch
+
+
 # ---------- CLI / entry point ----------
 
 def _parse_args(argv):
@@ -1981,16 +4151,26 @@ def _parse_args(argv):
             "there is no built-in catalog."
         ),
         epilog=(
-            "v0.9.0 behavior change: every on-disk input's parent directory "
-            "must be private (0700, user-owned, non-symlink) at LAUNCH as "
-            "well as preflight. Direct CLI users must stage roles.json (and "
-            "context.md when used) in a private directory, e.g. one created "
-            "by `mktemp -d`.\n\n"
-            "v0.10.0: each settled role's section is also written to "
-            "<RUNDIR>/replies/<key>.md before its completion line (which "
-            "then ends in ' reply=<path>'); --follow RUNDIR streams the "
-            "council's err.log progress for a Monitor; role objects accept "
-            "optional 'model' and 'effort' keys; SKILL contract epoch 2."
+            "v1.0.0: --discover RUNDIR records this run's model snapshot "
+            "(metadata only; no thread or turn is started), and role "
+            "objects accept a 'selection' object next to the optional "
+            "'model' and 'effort': mode 'user' for an explicit pin "
+            "(forwarded unchanged), 'routed' or 'native_effort' for a "
+            "runtime-grounded choice validated against that snapshot and "
+            "revalidated at launch. Omit model, effort, and selection to "
+            "inherit native Codex configuration. "
+            "CODEX_COUNCIL_MODEL_ROUTING=off disables automatic selection. "
+            "A model Codex rejects fails the role as [model-rejected] and a "
+            "usage or credit limit as [quota]; neither is retried. SKILL "
+            "contract epoch 3.\n\n"
+            "Direct CLI use: every on-disk input's parent directory must be "
+            "private (0700, user-owned, non-symlink) at launch as well as "
+            "preflight, e.g. one created by `mktemp -d`. Without "
+            "--skill-contract, a model or effort with no 'selection' is "
+            "still an explicit user pin. Each settled role's section is also "
+            "written to <RUNDIR>/replies/<key>.md before its completion line "
+            "(which then ends in ' reply=<path>'); --follow RUNDIR streams "
+            "the council's err.log progress."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1999,8 +4179,11 @@ def _parse_args(argv):
         help=(
             "Path to a JSON file holding the role panel: a list of "
             "[{\"id\":..,\"label\":..,\"instruction\":..}] objects, each "
-            "optionally with \"model\" (passed as -m) and \"effort\" "
-            "(passed as -c model_reasoning_effort=...). Keeping "
+            "optionally with \"model\" (sent as -m), \"effort\" (sent as "
+            "-c model_reasoning_effort=...), and a \"selection\" object "
+            "declaring their provenance ('user', 'routed', or "
+            "'native_effort'); omit all three to inherit native Codex "
+            "configuration. Keeping "
             "the panel in a file (not an inline argument) means a large "
             "role array never has to survive shell quoting, where a stray "
             "quote or brace would break the call. Claude (the orchestrator) "
@@ -2011,7 +4194,10 @@ def _parse_args(argv):
         "--check-staging-dir", default=None, metavar="DIR",
         help=(
             "Validate DIR/roles.json and DIR/context.md, then exit without "
-            "launching Codex. Use this after writing the per-run staging "
+            "launching Codex, printing one selection-plan line per role. "
+            "Automatic selections are checked against DIR/"
+            f"{SNAPSHOT_FILENAME} here and revalidated at launch; no "
+            "discovery runs. Use this after writing the per-run staging "
             "files and before the background council launch."
         ),
     )
@@ -2034,7 +4220,23 @@ def _parse_args(argv):
             "dispatched council's err.log stays byte-silent for "
             f"{FOLLOW_SILENCE_SECS}s (runner presumed gone). "
             "Restarting it re-emits earlier lines. Cannot be combined with "
-            "--roles-file, --context-file, or --check-staging-dir."
+            "--roles-file, --context-file, --check-staging-dir, or "
+            "--discover."
+        ),
+    )
+    parser.add_argument(
+        "--discover", default=None, metavar="RUNDIR",
+        help=(
+            "Metadata-only model discovery for this run: validate RUNDIR as "
+            "a private directory (roles.json and context.md need not exist "
+            "yet), query `codex app-server` for account type, native "
+            "configuration, managed defaults, and the model catalog (no "
+            "thread or turn is started; bounded by "
+            f"{DISCOVERY_TIMEOUT_SECS}s), write RUNDIR/{SNAPSHOT_FILENAME} "
+            "atomically (0600), and print a compact summary. Exits 0 "
+            "whenever RUNDIR is valid, even when discovery is unavailable. "
+            "Cannot be combined with --roles-file, --context-file, "
+            "--check-staging-dir, or --follow."
         ),
     )
     parser.add_argument(
@@ -2044,7 +4246,8 @@ def _parse_args(argv):
             "Optional (bare/direct invocations stay valid); when present it "
             f"must equal this script's epoch ({SKILL_CONTRACT_EPOCH}), "
             "otherwise the invocation is refused as a stale SKILL/script "
-            "pair."
+            "pair, and every role's model or effort must declare a "
+            "'selection' object."
         ),
     )
     args = parser.parse_args(argv)
@@ -2068,6 +4271,17 @@ def _parse_args(argv):
         ):
             if value is not None:
                 parser.error(f"--follow cannot be combined with {flag}")
+    if args.discover == "":
+        parser.error("--discover must be non-empty")
+    if args.discover is not None:
+        for flag, value in (
+            ("--roles-file", args.roles_file),
+            ("--context-file", args.context_file),
+            ("--check-staging-dir", args.check_staging_dir),
+            ("--follow", args.follow),
+        ):
+            if value is not None:
+                parser.error(f"--discover cannot be combined with {flag}")
     if (
         args.skill_contract is not None
         and args.skill_contract != SKILL_CONTRACT_EPOCH
@@ -2217,27 +4431,144 @@ def _validate_role_label(label, ctx):
 
 
 ROLE_FIELDS = ("id", "label", "instruction")
-# Optional per-role Codex overrides; omitted keys inherit the Codex config.
-OPTIONAL_ROLE_FIELDS = ("model", "effort")
-# Shape checks only — codex itself validates that the model exists and that
-# the effort value is one it supports, so no value list is hardcoded here.
-# \Z (not $) for the same trailing-newline reason as ROLE_ID_PATTERN.
-ROLE_MODEL_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*\Z")
-ROLE_EFFORT_PATTERN = re.compile(r"^[a-z]+\Z")
+# Optional per-role selection keys; omitting all three inherits Codex's
+# native configuration.
+OPTIONAL_ROLE_FIELDS = ("model", "effort", "selection")
+# One grammar for model and effort values. Shape checks only: no value list
+# is hardcoded — whether an automatic choice is advertised comes from this
+# run's discovery snapshot, and an explicit pin reaches Codex unchanged. No
+# leading "-" and no whitespace, control characters, quotes, backslashes,
+# or angle brackets, so argv, the TOML string in
+# -c model_reasoning_effort="<effort>", report lines, and reply-file headers
+# are safe by construction. Case is preserved, never folded. \Z (not $) for
+# the same trailing-newline reason as ROLE_ID_PATTERN.
+SELECTION_VALUE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]*\Z")
+# Model values a human might mean as "inherit", but which Codex would
+# receive as a literal model id (compared case-insensitively). Inheritance
+# is omission.
+RESERVED_MODEL_VALUES = ("inherit", "default")
+SELECTION_MODES = ("user", "routed", "native_effort")
+# The runtime-grounded modes, bound to this run's --discover snapshot.
+AUTOMATIC_MODES = ("routed", "native_effort")
+INHERIT_HINT = "omit model, effort, and selection to inherit native configuration"
 
 
-def _validate_optional_role_field(entry, field, pattern, ctx):
-    """Return a validated optional override value, or None when omitted."""
+def _validate_optional_role_field(entry, field, ctx):
+    """Return a validated model/effort value, or None when omitted."""
     if field not in entry:
         return None
     value = entry[field]
-    if not isinstance(value, str) or not pattern.match(value):
+    if not isinstance(value, str) or not SELECTION_VALUE_PATTERN.match(value):
         _roles_usage_exit(
             f"--roles-file {ctx}: optional field {field!r} must be a "
-            f"non-empty string matching {pattern.pattern} (got {value!r}); "
-            "omit the key to inherit the Codex config."
+            "non-empty string matching "
+            f"{SELECTION_VALUE_PATTERN.pattern} (got {value!r}); "
+            f"{INHERIT_HINT}."
+        )
+    if field == "model" and value.lower() in RESERVED_MODEL_VALUES:
+        _roles_usage_exit(
+            f"--roles-file {ctx}: model {value!r} is not an inheritance "
+            f"value; {INHERIT_HINT}."
         )
     return value
+
+
+def _validate_selection_reason(reason, ctx):
+    """selection.reason: a non-empty, single-line string (no length cap)."""
+    if not isinstance(reason, str) or not reason.strip():
+        _roles_usage_exit(
+            f"--roles-file {ctx}: selection.reason must be a non-empty "
+            "single-line string."
+        )
+    if any(ch in reason for ch in LINEBREAK_CHARS):
+        _roles_usage_exit(
+            f"--roles-file {ctx}: selection.reason must not contain newlines."
+        )
+
+
+def _parse_selection(entry, model, effort, ctx, require_selection):
+    """Validate a role's `selection` object; return a Selection, or None to
+    inherit.
+
+    {"mode": "user"} (optionally with "reason") is an explicit pin and
+    needs model and/or effort. {"mode": "routed", "snapshot_id", "reason"}
+    needs both; {"mode": "native_effort", "snapshot_id", "reason"} needs
+    effort and forbids model (the runner pins the proven native model). A
+    model or effort with no selection is refused on the skill path
+    (require_selection, i.e. --skill-contract was passed) and read as an
+    explicit user pin in direct CLI use.
+    """
+    if "selection" not in entry:
+        if model is None and effort is None:
+            return None
+        if require_selection:
+            _roles_usage_exit(
+                f"--roles-file {ctx}: 'model'/'effort' without 'selection': "
+                "declare selection.mode: 'user' for an explicit user "
+                "request, 'routed' or 'native_effort' for a runtime-grounded "
+                f"choice; or {INHERIT_HINT}."
+            )
+        return Selection("user")
+    value = entry["selection"]
+    if not isinstance(value, dict):
+        _roles_usage_exit(
+            f"--roles-file {ctx}: 'selection' must be an object with a "
+            "'mode'."
+        )
+    mode = value.get("mode")
+    if mode not in SELECTION_MODES:
+        _roles_usage_exit(
+            f"--roles-file {ctx}: selection.mode must be 'user', 'routed', "
+            f"or 'native_effort' (got {mode!r}); to inherit, omit model, "
+            "effort, and selection."
+        )
+    if mode == "user" and "snapshot_id" in value:
+        _roles_usage_exit(
+            f"--roles-file {ctx}: selection.snapshot_id is only for 'routed' "
+            "and 'native_effort'; an explicit user pin is not bound to a "
+            "snapshot."
+        )
+    if mode == "user":
+        allowed, shape = {"mode", "reason"}, "'mode' and an optional 'reason'"
+    else:
+        allowed = {"mode", "snapshot_id", "reason"}
+        shape = "'mode', 'snapshot_id', and 'reason'"
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        _roles_usage_exit(
+            f"--roles-file {ctx}: selection has unknown field(s) "
+            f"{', '.join(repr(k) for k in unknown)}; selection.mode "
+            f"'{mode}' takes only {shape}."
+        )
+    if mode == "user" and model is None and effort is None:
+        _roles_usage_exit(
+            f"--roles-file {ctx}: selection.mode 'user' needs 'model' and/or "
+            "'effort'; to inherit, omit model, effort, and selection."
+        )
+    if mode == "routed" and (model is None or effort is None):
+        _roles_usage_exit(
+            f"--roles-file {ctx}: selection.mode 'routed' needs both 'model' "
+            "and 'effort', copied from this run's discovery snapshot."
+        )
+    if mode == "native_effort" and (model is not None or effort is None):
+        _roles_usage_exit(
+            f"--roles-file {ctx}: selection.mode 'native_effort' takes "
+            "'effort' and no 'model' (the runner pins the proven native "
+            "model at launch)."
+        )
+    snapshot_id = value.get("snapshot_id")
+    if mode in AUTOMATIC_MODES and not (
+        isinstance(snapshot_id, str) and _SNAPSHOT_ID_RE.fullmatch(snapshot_id)
+    ):
+        _roles_usage_exit(
+            f"--roles-file {ctx}: selection.mode '{mode}' needs "
+            "'snapshot_id', the snapshot_id --discover printed for this run "
+            f"(got {snapshot_id!r})."
+        )
+    reason = value.get("reason")
+    if mode in AUTOMATIC_MODES or "reason" in value:
+        _validate_selection_reason(reason, ctx)
+    return Selection(mode, snapshot_id, reason)
 
 
 def _normalize_instruction_list(value, ctx):
@@ -2287,23 +4618,28 @@ def _validate_role_instruction(instruction, ctx):
         )
 
 
-def _parse_roles_json(raw):
+def _parse_roles_json(raw, require_selection=False):
     """Parse the --roles-file blob into a list of Role objects.
 
     Validates each entry has exactly the id/label/instruction fields plus
-    the optional model/effort overrides (instruction is a list of
+    the optional model/effort/selection keys (instruction is a list of
     sentence-sized strings, normalized and joined to one paragraph), id is
-    well-formed, model/effort (when present) are well-shaped, instructions
-    follow the documented contract, and ids are unique within the JSON. Unknown
-    keys are rejected, not ignored: stray filler fields like '"_": ""'
-    are the signature of a corrupted LLM write, so surfacing them forces
-    a clean rewrite instead of silently launching from a file that
-    already glitched once. Every validation defect carries the same
-    full-rewrite recovery (ROLES_REWRITE_RECOVERY).
+    well-formed, model/effort (when present) match SELECTION_VALUE_PATTERN,
+    the selection object is well-formed for its mode (see _parse_selection;
+    require_selection is the skill path), instructions follow the
+    documented contract, and ids are unique within the JSON. A key repeated
+    at any object level is rejected too: it would hide one value behind
+    another. Unknown keys are rejected, not ignored: stray filler fields
+    like '"_": ""' are the signature of a corrupted LLM write, so surfacing
+    them forces a clean rewrite instead of silently launching from a file
+    that already glitched once. Every validation defect carries the same
+    full-rewrite recovery (ROLES_REWRITE_RECOVERY). Whether an automatic
+    selection is supported by discovery evidence is checked separately
+    (_validate_selection_authoring).
     """
     try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as e:
+        data = _strict_json_loads(raw)
+    except (ValueError, RecursionError) as e:
         _roles_usage_exit(f"--roles-file: invalid JSON ({e}).")
     if not isinstance(data, list):
         _roles_usage_exit("--roles-file: top-level value must be a JSON list.")
@@ -2323,7 +4659,8 @@ def _parse_roles_json(raw):
                 f"--roles-file {ctx}: unknown field(s) "
                 f"{', '.join(repr(k) for k in unknown)}. Each role object "
                 "must have exactly 'id', 'label', and 'instruction', plus "
-                "optionally 'model' and 'effort' — no filler keys."
+                "optionally 'model', 'effort', and 'selection' — no filler "
+                "keys."
             )
         for field in ROLE_FIELDS:
             if field not in entry:
@@ -2347,18 +4684,17 @@ def _parse_roles_json(raw):
         _validate_role_id(rid, ctx)
         _validate_role_label(label, ctx)
         _validate_role_instruction(instruction, ctx)
-        model = _validate_optional_role_field(
-            entry, "model", ROLE_MODEL_PATTERN, ctx
-        )
-        effort = _validate_optional_role_field(
-            entry, "effort", ROLE_EFFORT_PATTERN, ctx
+        model = _validate_optional_role_field(entry, "model", ctx)
+        effort = _validate_optional_role_field(entry, "effort", ctx)
+        selection = _parse_selection(
+            entry, model, effort, ctx, require_selection
         )
         if rid in seen:
             _roles_usage_exit(
                 f"--roles-file {ctx}: duplicate id {rid!r} within JSON payload."
             )
         seen.add(rid)
-        roles.append(Role(rid, label, instruction, model, effort))
+        roles.append(Role(rid, label, instruction, model, effort, selection))
     return roles
 
 
@@ -2528,8 +4864,15 @@ def _usage_exit_unless_parent_private(arg_name, path, recovery):
     _check_private_dir(parent, prefix=f"{arg_name}: ", recovery=recovery)
 
 
-def _check_staging_dir(path):
-    """Validate the per-run staging dir before launching Codex."""
+def _check_staging_dir(path, require_selection=False):
+    """Validate the per-run staging dir before launching Codex.
+
+    Prints the staging-OK line, then one selection-plan line per role. No
+    discovery runs here: automatic selections are validated against this
+    run's planning snapshot (DIR/model-snapshot.json) with the same resolver
+    the launch uses, and are revalidated by a fresh discovery at launch.
+    require_selection is the skill path (--skill-contract was passed).
+    """
     if path == "":
         _usage_exit("--check-staging-dir must be non-empty.")
     path = _check_private_dir(path)
@@ -2539,18 +4882,32 @@ def _check_staging_dir(path):
         ("--roles-file", roles_path),
         ("--context-file", context_path),
     )
-    roles = _resolve_roles(_parse_roles_json(_read_roles_file(roles_path)))
+    roles = _resolve_roles(
+        _parse_roles_json(_read_roles_file(roles_path), require_selection)
+    )
     _read_context_file(context_path)
     # The codex binary is the one hard external dependency; a preflight
     # that says "staging OK" while codex is missing defers the failure to
     # a background launch whose error lands only in err.log.
     _usage_exit_if_codex_missing("--check-staging-dir: ")
     max_parallel = _max_parallel_roles()
+    routing_mode = _model_routing_mode()
+    now = _utc_iso(time.time())
+    planning, planning_problem = _read_snapshot(path)
+    _validate_selection_authoring(
+        roles, planning, planning_problem, routing_mode, now
+    )
     print(
         f"[codex-council] staging OK: {os.path.abspath(path)} "
         f"({len(roles)} roles; max parallel {max_parallel}) "
         f"version={_plugin_version()}"
     )
+    for role in roles:
+        decision = _resolve_selection(role, planning, None, routing_mode, now)
+        print(_report_inline(
+            f"[codex-council] selection plan: {role.id}: "
+            f"{_selection_plan_text(decision)}"
+        ))
 
 
 # Recovery for a rejected --follow directory. The follower only reads, so
@@ -2833,9 +5190,16 @@ def _force_utf8_streams():
 def main():
     _force_utf8_streams()
     args = _parse_args(sys.argv[1:])
+    # --skill-contract marks the skill path, where every model or effort
+    # must declare its selection mode.
+    require_selection = args.skill_contract is not None
 
     if args.check_staging_dir is not None:
-        _check_staging_dir(args.check_staging_dir)
+        _check_staging_dir(args.check_staging_dir, require_selection)
+        return
+
+    if args.discover is not None:
+        _discover_command(args.discover)
         return
 
     if args.follow is not None:
@@ -2869,7 +5233,9 @@ def main():
     # Parse and validate staged inputs before requiring Codex. This catches
     # temp-path mismatches without launching or depending on any Codex state.
     if args.roles_file is not None:
-        custom_roles = _parse_roles_json(_read_roles_file(args.roles_file))
+        custom_roles = _parse_roles_json(
+            _read_roles_file(args.roles_file), require_selection
+        )
     else:
         custom_roles = []
     roles = _resolve_roles(custom_roles)
@@ -2889,14 +5255,27 @@ def main():
     _usage_exit_if_codex_missing("")
     max_parallel = _max_parallel_roles()
     _stall_secs()  # fail fast on an invalid watchdog override (usage exit 2)
+    routing_mode = _model_routing_mode()
 
-    # Per-role reply files go under the launch-validated private directory
-    # of the on-disk inputs (context.md's in staged mode, roles.json's in
-    # stdin mode — the same directory when both exist). Lexical parent, as
-    # validated above; a problem here only disables reply files.
+    # The run directory is the launch-validated private directory of the
+    # on-disk inputs (context.md's in staged mode, roles.json's in stdin
+    # mode — the same directory when both exist). Lexical parent, as
+    # validated above. It holds the planning snapshot and the reply files.
     run_dir = os.path.dirname(os.path.abspath(
         args.context_file if args.context_file is not None else args.roles_file
     ))
+    # Authoring defects exit 2 here, before any worker; automatic
+    # selections are then revalidated by one fresh discovery, and every
+    # role gets the decision its commands are built from.
+    try:
+        roles, launch = _resolve_launch_selections(roles, run_dir, routing_mode)
+    except KeyboardInterrupt:
+        _diag("\n[codex-council] interrupted by user")
+        sys.exit(130)
+    state, reason = _launch_discovery_state(
+        routing_mode, any(_is_automatic(r) for r in roles), launch
+    )
+    # A problem here only disables reply files.
     replies_dir = _prepare_replies_dir(run_dir)
 
     _diag(
@@ -2904,6 +5283,8 @@ def main():
         f"with max parallel {max_parallel} "
         f"({', '.join(r.id for r in roles)}); version={_plugin_version()}."
     )
+    for line in _model_selection_lines(roles, routing_mode, state, reason):
+        _diag(line)
 
     started = time.monotonic()
     try:
@@ -2930,7 +5311,9 @@ def main():
 
     elapsed = time.monotonic() - started
     try:
-        print(_format_report(results, elapsed), end="")
+        print(_format_report(
+            results, elapsed, _discovery_sentence(state, reason, launch)
+        ), end="")
         sys.stdout.flush()
     except (OSError, ValueError):
         # stdout is dead: the report was not delivered, so no sentinel may

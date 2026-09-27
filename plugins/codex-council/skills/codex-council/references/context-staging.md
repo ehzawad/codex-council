@@ -1,16 +1,19 @@
 # Context staging
 
 Read this reference when assembling `context.md`: what belongs in it, how to
-order it for a long session, and fail-closed recipes for extracting files,
-diffs, or diagnostic output from disk. The launch itself stays in `SKILL.md`;
-these recipes only create `ABS_RUNDIR/context.md`.
+order it so roles can verify rather than inherit your conclusions, and
+fail-closed recipes for extracting files, diffs, or diagnostic output from
+disk. The launch itself stays in `SKILL.md`; these recipes only create
+`ABS_RUNDIR/context.md`.
 
 ## Contents
 
 - What goes into context.md
+- Extraction is evidence, not the brief
 - Extraction rules
 - The fail-closed skeleton
 - Tracked changes
+- Verification brief plus tracked changes
 - Changes plus relevant untracked files
 - Artifact plus a question
 - Diagnostic transcript
@@ -28,29 +31,44 @@ Context comes from one or both sources:
 
 Build a decision-complete working set, not a transcript dump. The script has
 no byte ceiling on `context.md`, stdin, role fields, or the composed prompt,
-and it never truncates them; relevance selection is your job. For a long
-session, assemble context in this order:
+and it never truncates them; relevance selection is your job.
+
+The roles are an independent check on your work, so write the context the
+way a verifier needs it. The user's goal, requirements, and constraints are
+authoritative. Your account of the state, your conclusions, and what has
+already been tried are claims to check, and the runner's collaboration brief
+tells every role to treat them that way. Put what must be true before your
+explanation of why it is, label your conclusions and hypotheses as claims,
+and include the strongest evidence against them as well as the evidence for
+them. For a long session, assemble context in this order:
 
 1. **Problem, project, trajectory, and immediate objective:** what the user
-   is solving or implementing, the result needed now, the current
-   branch/worktree/runtime state, and whether the work is goal-directed,
-   blocked, or exploratory.
-2. **In-flight work:** files, modules, features, drafts, datasets, queries,
+   is solving or implementing, the result needed now, the acceptance
+   criteria and constraints that decide it, and whether the work is
+   goal-directed, blocked, or exploratory.
+2. **Verification question and reviewed state:** the specific claims,
+   changes, or results to check and what would count as done; the repository
+   or artifact location, revision, branch/worktree, relevant working-tree
+   changes, material runtime versions, and commands already run with their
+   outcomes. Separate what you observed from checks the roles must perform
+   themselves.
+3. **In-flight work:** files, modules, features, drafts, datasets, queries,
    experiments, deployments, tests, and research being changed or validated.
-3. **Active problems and hypotheses:** bugs, errors, symptoms, regressions,
+4. **Active problems and hypotheses:** bugs, errors, symptoms, regressions,
    security or performance failures, failing commands, attempted fixes,
-   working theories, and the evidence for or against them.
-4. **Recent working context at high fidelity:** recent user constraints,
+   working theories, and the evidence for or against them, each labeled as a
+   claim with its current support.
+5. **Recent working context at high fidelity:** recent user constraints,
    decisions, actions, outputs, and artifacts that led to the current state.
    Keep exact wording or raw material when details matter.
-5. **Current primary evidence:** files, diffs, diagnostics, data, sources, or
+6. **Current primary evidence:** files, diffs, diagnostics, data, sources, or
    command output verified live rather than recalled.
-6. **Older durable context as a faithful summary:** decisions, rejected
+7. **Older durable context as a faithful summary:** decisions, rejected
    approaches and why, invariants, preferences, earlier evidence, and
    dependencies that still constrain the work. Include an old fact whenever
    removing it could change the recommendation; age alone is never a reason
    to drop it.
-7. **Unknowns, assumptions, and provenance:** separate verified current state
+8. **Unknowns, assumptions, and provenance:** separate verified current state
    from summaries and inference; name known unknowns, likely blind spots,
    missing evidence, possibly wrong assumptions, and what observation would
    resolve each.
@@ -77,7 +95,22 @@ Common scopes:
 Mark uncertainty explicitly, and verify state live (for example
 `git status --short --branch`) instead of recalling it. Never write an empty
 context file; when there is nothing to extract, write a self-contained
-question to `ABS_RUNDIR/context.md` instead.
+question to `ABS_RUNDIR/context.md` instead. If the reviewed artifacts change
+while a council runs, name the affected checks before carrying their
+conclusions forward.
+
+## Extraction is evidence, not the brief
+
+The recipes below produce evidence: a diff, a file, a transcript. A
+successful, non-empty extraction proves only that the evidence was captured.
+It does not make the context decision-complete, because a raw diff carries
+no objective, acceptance criteria, verification question, or account of what
+was already tried. Pair extracted evidence with a brief. Write the brief
+with the Write tool (for example to `ABS_RUNDIR/brief.md`) and combine the
+two with the "Verification brief plus tracked changes" recipe, or use the
+"Artifact plus a question" and "Diagnostic transcript" shapes, which carry
+their question inline. Mention material non-text inputs by path even when
+their content cannot be staged.
 
 ## Extraction rules
 
@@ -138,6 +171,31 @@ trap 'rc=$?; if [ "$rc" -ne 0 ]; then rm -f "$out" "$tmp"; fi; exit "$rc"' EXIT
   git diff --cached
 } >"$tmp"
 [ -s "$tmp" ]
+mv -f "$tmp" "$out"
+trap - EXIT
+```
+
+## Verification brief plus tracked changes
+
+Write the brief first with the Write tool: the objective, acceptance
+criteria, verification question, reviewed state, and your claims with the
+evidence for and against them. Then combine it with the diff. The diff guard
+fails the recipe when there are no tracked changes to review, instead of
+publishing a brief that points at an empty diff:
+
+```bash
+set -euo pipefail
+out='ABS_RUNDIR/context.md'
+tmp='ABS_RUNDIR/context.md.tmp'
+rm -f "$out" "$tmp"
+trap 'rc=$?; if [ "$rc" -ne 0 ]; then rm -f "$out" "$tmp"; fi; exit "$rc"' EXIT
+{
+  cat <'ABS_RUNDIR/brief.md'
+  printf '\n## Tracked changes under review (git diff HEAD)\n\n'
+  git diff HEAD
+} >"$tmp"
+[ -s "$tmp" ]
+git diff HEAD --quiet && exit 1
 mv -f "$tmp" "$out"
 trap - EXIT
 ```

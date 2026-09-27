@@ -4,13 +4,13 @@
     "name": "ehzawad"
   },
   "metadata": {
-    "description": "Adaptive, context-driven Codex council for project implementation, computer science, software/ML engineering, DevSecOps, research, and other complex work — Claude orchestrates role-framed agents to collaborate and reconcile toward one shared goal."
+    "description": "Independent cross-model verification and collaboration for Claude Code: Claude briefs task-specific OpenAI Codex roles with decision-complete context, routes each role to a runtime-discovered model and reasoning effort or your native Codex configuration, checks their evidence, and reconciles the findings into one result."
   },
   "plugins": [
     {
       "name": "codex-council",
       "source": "./plugins/codex-council",
-      "description": "Adaptive, context-driven Codex council for project implementation, computer science, software/ML engineering, DevSecOps, research, and other complex work — Claude orchestrates role-framed agents to collaborate and reconcile toward one shared goal."
+      "description": "Independent cross-model verification and collaboration for Claude Code: Claude briefs task-specific OpenAI Codex roles with decision-complete context, routes each role to a runtime-discovered model and reasoning effort or your native Codex configuration, checks their evidence, and reconciles the findings into one result."
     }
   ]
 }
