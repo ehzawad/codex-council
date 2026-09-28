@@ -520,7 +520,8 @@ def _iter_json_objects(jsonl_output):
     *unescaped* inside a JSON string. codex/serde_json can emit an agent_message
     containing one of those literally, and splitting there would tear the record
     into two invalid fragments — silently dropping a completed reply and turning
-    a successful role into a failure.
+    a successful role into a failure. A line nested too deeply or holding an
+    out-of-range number is skipped like any other malformed line.
     """
     for line in jsonl_output.split("\n"):
         line = line.strip()
@@ -528,7 +529,7 @@ def _iter_json_objects(jsonl_output):
             continue
         try:
             event = json.loads(line)
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):
             continue
         if isinstance(event, dict):
             yield event

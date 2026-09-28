@@ -114,7 +114,8 @@ findings into a focused follow-up round. Each role's reply is written to
 `replies/<role>.md` in the run directory the moment that role settles (long
 ids are hashed; use the path printed after `reply=`), and Claude follows the
 run with the read-only `codex_council.py --follow` command (one Claude Code
-Monitor event per progress line). Claude can therefore read a
+Monitor event per actionable progress line, and one line if the runner dies
+or stops responding). Claude can therefore read a
 finished role, update the user, and act on independent work while slower
 roles continue; the final verdict and anything that crosses roles still wait
 for the full report. When several roles share one workspace, one role owns
@@ -191,7 +192,7 @@ flowchart LR
     JSONL --> Parse["Extract thread.started<br/>Extract final agent_message<br/>council_failures: classify failures"]
     Parse --> Replies["Per-role reply files<br/>replies/role-id.md as each settles<br/>then K/N completion line in err.log"]
     Parse --> Report["Aggregated markdown report<br/>out.md, with what each role was sent"]
-    Replies --> Follow["--follow via Monitor<br/>relays progress lines<br/>drops reply= paths outside replies/"]
+    Replies --> Follow["--follow via Monitor<br/>relays actionable lines, reports a lost runner<br/>drops reply= paths outside replies/"]
     Follow --> Early["Claude reads each reply as it lands<br/>acts on independent work"]
     Report --> Done["Background-task completion<br/>notification"]
     Early --> Reconcile["Claude checks the evidence<br/>and reconciles results for the user"]
@@ -672,11 +673,14 @@ every 1800s when disabled) and each line carries per-role `quiet=Ns` (or
 `version=`. Each completion line ends with `reply=<path>` pointing at that
 role's reply file. The skill follows the run with a Claude Code Monitor on
 `codex_council.py --follow <run dir>`, re-armed whenever a monitor expires
-while the background task is still running. Without Monitor, an interactive
-session falls back to a one-shot session-cron wake-up, while `claude -p` or
-a subagent, whose final response would end the council, keeps its turn open
-by running the same follower as a foreground command and re-running it after
-each timeout; either way progress surfaces without a shell polling loop.
+while the background task is still running; `--status <run dir>` gives a
+spot check, and `--reap <run dir>` ends the codex process groups of a runner
+that is gone. Without Monitor, an interactive session falls back to a
+one-shot 10-minute session-cron wake-up that runs `--status`, while
+`claude -p` or a subagent, whose final response would end the council, keeps
+its turn open by running the same follower as a foreground command and
+re-running it after each timeout; either way progress surfaces without a
+shell polling loop.
 
 ## 1.0.1 changes
 

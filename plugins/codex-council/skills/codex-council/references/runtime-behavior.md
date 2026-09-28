@@ -359,7 +359,15 @@ still has no `CODEX_COUNCIL_DONE` sentinel and no report in `out.md`.
 
 ## Following a run
 
-The follower is a read-only command designed for Claude Code's Monitor tool:
+The launch publishes `ABS_RUNDIR/status.json` (mode 0600, replaced
+atomically): the runner's pid and OS start time, its state (`running`, then
+`done`, `interrupted`, or `aborted` with the exit code), a tick that
+advances on every role transition and at least every 15 seconds, and each
+role's state (`queued`, `active`, `retry-wait`, `settled`), attempt, live
+codex process group, and outcome. Three read-only commands use it together
+with `err.log`; none of them changes the run.
+
+The follower is designed for Claude Code's Monitor tool:
 
 ```
 python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
@@ -367,23 +375,30 @@ python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
 ```
 
 It checks that `ABS_RUNDIR` is a private directory, waits for `err.log` to
-appear, and prints every `[codex-council` line (start, model selection,
-fallback, completion, retry, stall, heartbeat, sentinel, interruption) as it
-is written, one line per event. It only reads, so it cannot change the run.
-A completion line whose `reply=` path is not directly inside
-`ABS_RUNDIR/replies/` is dropped, because the runner never prints one. Its
-exit codes:
+appear, and relays the actionable `[codex-council` lines as they are
+written, one line per event: dispatch, model selection, fallback and other
+warnings, completion, retry, stall, and the terminal line. Per-attempt start
+lines and the heartbeat stay in `err.log`; `--verbose` relays them too. A
+completion line whose `reply=` path is not directly inside
+`ABS_RUNDIR/replies/` is dropped, because the runner never prints one. Every
+2 seconds it also checks the runner recorded in `status.json` and its own
+parent process. Its exit codes:
 
 | Exit | Last line | Meaning and action |
 |---|---|---|
-| 0 | `CODEX_COUNCIL_DONE`, `interrupted by ...`, or `runner aborted exit=N: ...` | The run ended. Read `out.md` (absent after an interruption or abort) and `err.log`. |
+| 0 | `CODEX_COUNCIL_DONE`, `interrupted by ...`, `runner aborted exit=N: ...`, or `[codex-council-follow] runner finished: ...` | The run ended. Read `out.md` (absent after an interruption or abort) and `err.log`. |
+| 1 | none | Its output has no reader any more (the watch ended). |
 | 2 | usage error on stderr | `ABS_RUNDIR` is wrong or not private. Fix the path; do not re-arm unchanged. |
 | 3 | `[codex-council-follow] no council activity: ...` | Within 120s either `err.log` never appeared or it has no dispatch line. The launch failed or never happened: read `err.log` and the background task output. |
-| 4 | `[codex-council-follow] runner presumed gone: ...` | A dispatched run's `err.log` has not changed for about an hour (3660s: twice the 30-minute maximum heartbeat interval plus 60s, measured from the file's mtime). Stop re-arming: a new follower would exit 4 again at once. Check the background task, then use the recovery triage below. |
+| 4 | `[codex-council-follow] runner gone: pid=<pid>; unfinished=<ids>; live codex groups=<pgids or none>; run --status` | The runner process is gone, or its pid now belongs to another process, and it wrote no terminal line. Stop re-arming: a new follower would exit 4 again at once. Run `--status` and follow the recovery triage below. |
+| 4 | `[codex-council-follow] runner not responding: no status tick for <N>s (pid <pid> still present); run --status` | The runner process exists but published no tick for 300s (the same line appears once at 120s, and `runner responding again` follows if it recovers): its event loop is blocked or the process is stopped. Stop re-arming; run `--status` and check the background task. Never reap a runner that is still present. |
+| 5 | none | The follower's own parent process went away (its watch or host ended). |
 
 When `err.log` shows a Python traceback, the follower also prints one
 advisory `[codex-council-follow]` line and keeps following, since the runner
-may continue. A system suspend is detected and restarts the silence count.
+may continue. Without a usable `status.json` 30s after dispatch it prints
+one note and keeps relaying `err.log` without runner checks. A system
+suspend is detected and restarts the tick age.
 
 Monitor watches end at a deadline: at most 30 minutes interactively
 (`timeout_ms` 1800000) and at most 10 minutes in a non-interactive
@@ -395,17 +410,46 @@ Monitor is not offered on every host (some cloud providers, or sessions with
 telemetry or nonessential traffic disabled), so check that it is available
 before relying on it.
 
+For a spot check at any time:
+
+```
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
+  --status 'ABS_RUNDIR' --skill-contract 3
+```
+
+It prints about ten lines at most and exits 0: the runner's state
+(`running`, `not responding`, `gone`, `done`, `interrupted`, `aborted`, or
+`unknown`) with its pid and tick age, how many roles settled, one line per
+unfinished role (state, attempt, quiet seconds, codex pid), the live codex
+process groups when the runner is gone, and one `next:` action. It states
+facts (present, gone, tick age, quiet seconds), never health.
+
+When the runner is gone and `--status` lists live codex groups, first
+confirm that the council's background task has ended, then run:
+
+```
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
+  --reap 'ABS_RUNDIR' --skill-contract 3
+```
+
+It acts only when `status.json` shows the runner gone (its pid missing or
+started at another time) and refuses with exit 1 otherwise. It sends
+SIGTERM, then SIGKILL, to each recorded codex process group whose leader is
+still this run's codex (same pid and start time), leaves any other group
+alone, prints what it did, and never touches saved threads, replies, or
+other files. Then re-run the unfinished roles in a new directory.
+
 Without the Monitor tool, what works depends on whether the end of your
 turn ends the host. Never poll with a shell `sleep` loop in either case.
 
-- **Interactive session.** Schedule a one-shot 30-minute wake-up (session
+- **Interactive session.** Schedule a one-shot 10-minute wake-up (session
   cron) whose prompt names the background task id and the exact
   `ABS_RUNDIR`. A wake-up fires only between turns while the session is
   open, so it is a convenience, not durable supervision. At each wake-up,
-  read the new lines of `err.log`, read any new reply files, update the user
+  run `--status` (not a follower), read any new reply files, update the user
   (completed, active, queued), and schedule another wake-up only if the run
-  continues; cancel a pending one once the run settles, and never let one
-  launch a new council. If scheduling is unavailable too, read `err.log`
+  continues; delete a pending one once the run settles, and never let one
+  launch a new council. If scheduling is unavailable too, run `--status`
   whenever you next act. Here the `run_in_background` completion
   notification is the final backstop.
 - **`claude -p` or a subagent.** Your final response ends the council's
@@ -414,10 +458,10 @@ turn ends the host. Never poll with a shell `sleep` loop in either case.
   completion notification can arrive after it. Keep the turn open instead:
   run the same `--follow` command as a foreground Bash call with the
   maximum `timeout` (600000). A foreground command that reaches its timeout
-  is moved to the background rather than stopped; run the command again
-  while the council's task is still running (each run replays earlier
-  lines, so skip what you already handled), and handle exits 3 and 4 as the
-  table says. The moved follower exits on its own when the run ends.
+  is moved to the background rather than stopped; stop that moved follower,
+  then run the command again while the council's task is still running
+  (each run replays earlier lines, so skip what you already handled), and
+  handle exits 3 and 4 as the table says.
 
 What to do with an early reply:
 
@@ -458,11 +502,15 @@ reply files already written survive.
 If a run is lost, orphaned, or looks stuck, recover from disk:
 
 ```
-pgrep -fl 'codex_council[.]py'      # any council alive?
-pgrep -fl 'ABS_RUNDIR/roles.json'   # this run specifically
-tail -n 40 'ABS_RUNDIR/err.log'     # last line [codex-council] CODEX_COUNCIL_DONE -> finished
-ls 'ABS_RUNDIR/replies'             # replies that already settled
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
+  --status 'ABS_RUNDIR' --skill-contract 3
+tail -n 40 'ABS_RUNDIR/err.log'
+ls 'ABS_RUNDIR/replies'
 ```
+
+`--status` decides liveness from `status.json` (the runner's pid and start
+time), and `err.log` ends in `[codex-council] CODEX_COUNCIL_DONE` when the
+run finished; `replies/` holds the roles that already settled.
 
 Work through these in order; the first match wins. Liveness is decided
 before any `err.log` pattern, so rules 3 to 6 apply only while this run's
@@ -475,10 +523,12 @@ directory.
 1. A line starting `[codex-council] CODEX_COUNCIL_DONE` (not the word inside
    other text) → finished; read `out.md`; do not re-invoke.
    (If the background task still shows as running, trust the task state.)
-2. No sentinel and no process → it crashed or was interrupted, even if
-   stall or retry lines precede the end; read `err.log`, any reply files,
-   and any partial `out.md` before re-invoking only the roles that did not
-   finish.
+2. No sentinel and no process (`--status` says `gone`, `interrupted`, or
+   `aborted`) → it crashed, was killed, or was interrupted, even if stall or
+   retry lines precede the end; read `err.log`, any reply files, and any
+   partial `out.md`. If `--status` lists live codex groups, confirm the
+   background task has ended and run `--reap`. Then re-invoke only the roles
+   that did not finish.
 3. A role's latest line is a stall termination (`[codex-council:<id>] stall
    threshold reached (...); terminating attempt`) or a retry
    (`[codex-council:<id>] retriable error on attempt N/M; sleeping Ns.`) →
@@ -488,9 +538,11 @@ directory.
 4. Active roles with `quiet` below the printed `watchdog=` value → keep
    following; report the run as "output-active", not healthy.
 5. `quiet` at or past the watchdog with no stall line after a short grace and
-   a fresh read → the watchdog itself is suspect: stop the tracked background
-   task, confirm the council process is gone, inspect `err.log`, then
-   re-invoke once. Replies already in `replies/` are still valid.
+   a fresh read, or `--status` says `not responding` → the runner itself is
+   suspect: stop the tracked background task, confirm the council process
+   is gone (run `--reap` if `--status` then lists live codex groups),
+   inspect `err.log`, then re-invoke once. Replies already in `replies/` are
+   still valid.
 6. `watchdog=disabled` → no automatic liveness recovery; rising quiet is
    indeterminate; ask the user before acting.
 
@@ -682,6 +734,15 @@ structured and handled before any text classification, so stale- or
 auth-looking fragments in a killed run's stderr neither classify the failure
 nor clear resume state.
 
+Each codex process group belongs to one attempt. Once codex exits, its
+pipes get 10 seconds to reach EOF. A descendant that still holds them open
+(for example a background process a tool call started) makes the runner
+terminate the attempt's process group; the reply already read is kept, with
+the warning `codex exited but its process group kept its output open; the
+group was terminated`. The group is swept when every attempt ends, so
+tool-started descendants never outlive their role; a descendant that moved
+into its own session is outside that sweep.
+
 The watchdog's claim is **output-inactivity recovery only**; semantic wedge
 detection is out of scope. Current codex `exec --json` suppresses
 agent-message/reasoning `item.started` events and all token/exec-output
@@ -711,7 +772,8 @@ since the last stdout/stderr byte, not semantic progress. Never describe a
 role as working normally solely because it is active or has low quiet; a
 wedged process emitting keepalive bytes resets quiet without progressing.
 Roles sleeping out a retry backoff report `retry-wait` instead of a stale
-quiet value.
+quiet value. Start lines and heartbeats are for humans reading `err.log`:
+the default follower does not relay them.
 
 The discovery summary's first line, the preflight "staging OK" line, the
 dispatch line, the heartbeat, and the final `CODEX_COUNCIL_DONE` sentinel

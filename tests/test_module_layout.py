@@ -32,7 +32,7 @@ sys.path.insert(0, SCRIPTS_DIR)
 SCRIPT = os.path.join(SCRIPTS_DIR, "codex_council.py")
 RUNNER_MODULES = (
     "codex_council", "council_common", "council_discovery",
-    "council_selection", "council_failures",
+    "council_selection", "council_failures", "council_liveness",
 )
 # The siblings each module may import (dependencies point one way).
 ALLOWED_IMPORTS = {
@@ -40,9 +40,10 @@ ALLOWED_IMPORTS = {
     "council_discovery": {"council_common"},
     "council_selection": {"council_common", "council_discovery"},
     "council_failures": {"council_common", "council_selection"},
+    "council_liveness": {"council_common"},
     "codex_council": {
         "council_common", "council_discovery", "council_selection",
-        "council_failures",
+        "council_failures", "council_liveness",
     },
 }
 
@@ -255,7 +256,7 @@ class ModuleStateTests(unittest.TestCase):
             ("_diagnostics", "council_common"),
             ("_roles_recovery_text", "council_common"),
             ("_project_root_cache", "council_common"),
-            ("_ROLE_LIVENESS", "codex_council"),
+            ("_RUN", "codex_council"),
             ("STATE_DIR", "codex_council"),
         ):
             with self.subTest(state=state):

@@ -48,6 +48,7 @@ import codex_council  # noqa: E402
 import council_common  # noqa: E402
 import council_discovery  # noqa: E402
 import council_failures  # noqa: E402
+import council_liveness  # noqa: E402
 import council_selection  # noqa: E402
 import council_testlib  # noqa: E402
 import fake_codex  # noqa: E402
@@ -2418,7 +2419,7 @@ class ReportingTests(unittest.TestCase):
                 self.assertTrue(line.isprintable())
                 self.assertNotIn(" reply=", line)
                 self.assertIn(" reply\\x3d/tmp/x", line)
-                self.assertTrue(codex_council._follow_reply_path_ok(
+                self.assertTrue(council_liveness._reply_path_ok(
                     line, replies_dir))
         self.assertIn("\\x1b]0;owned\\x07", lines[1])
 
@@ -2864,7 +2865,7 @@ class LaunchEndToEndTests(unittest.TestCase):
                     "execution id in launch discovery")
         self.assertIn(fallback, follower.stdout.splitlines())
         self.assertRegex(follower.stdout.splitlines()[-1],
-                         codex_council.FOLLOW_DONE_PATTERN)
+                         council_liveness.FOLLOW_DONE_PATTERN)
         for name in ("err.log", "out.md", os.path.join("replies",
                                                        "architect.md")):
             with open(os.path.join(self.run_dir, name),
@@ -3066,7 +3067,7 @@ class LaunchEndToEndTests(unittest.TestCase):
                 self.assertEqual(stderr.decode(),
                                  f"\n[codex-council] interrupted by {name}\n")
                 self.assertRegex(stderr.decode().strip(),
-                                 codex_council.FOLLOW_INTERRUPTED_PATTERN)
+                                 council_liveness.FOLLOW_INTERRUPTED_PATTERN)
                 for pid in children:
                     self.assertTrue(council_testlib.pid_gone(pid), pid)
                 self.assertEqual(self.argvs(), [])
@@ -3640,7 +3641,7 @@ class LaunchEndToEndTests(unittest.TestCase):
             lines[1], "[codex-council] model selection: routing=auto; "
                       "discovery=ok; native=1 user=1 routed=1 native_effort=1 "
                       "fallback=0")
-        self.assertRegex(lines[-1], codex_council.FOLLOW_DONE_PATTERN)
+        self.assertRegex(lines[-1], council_liveness.FOLLOW_DONE_PATTERN)
         with open(os.path.join(self.run_dir, "out.md"), encoding="utf-8") as f:
             report = f.read()
         for role_id in ("plain", "pin", "route", "tune"):

@@ -39,7 +39,12 @@ Subcommands:
   sentence, a quota error carrying HTTP 429, or a model rejection whose
   text also looks like a stale thread (structured, or the text-only
   ChatGPT sentence, which only names the model). A rejection names the
-  model the turn ran.
+  model the turn ran. Two sentinels drive the liveness scenarios: a
+  ``PLEASE_SLEEP_SECS=<n>`` prompt stays byte-silent for n seconds after
+  thread.started before replying, and ``PLEASE_LEAK_OUTPUT_HOLDER`` leaves
+  a sleeper in its process group that holds stdout/stderr open after the
+  fake exits. Each exec writes ``exec-<pid>.pid`` (and a holder
+  ``holder-<pid>.pid``) into FAKE_CODEX_PID_DIR.
 
 Scenario format (every key optional)::
 
@@ -340,12 +345,24 @@ def run_exec(argv, scenario):
     recorded = _recorded_thread_model(thread_id) if resumed else None
     if not resumed:
         _record_thread_model(thread_id, model)
+    _record(f"exec-{os.getpid()}.pid", str(os.getpid()))
     events = [{"type": "thread.started", "thread_id": thread_id},
               {"type": "turn.started"}]
     failure = _failure(prompt, model)
     if failure is not None:
         _emit(events + failure)
         return 1
+    silent = re.search(re.escape(SENTINELS["sleep_secs"]) + r"(\d+)", prompt)
+    if silent:
+        _emit(events)
+        events = []
+        time.sleep(int(silent.group(1)))
+    if SENTINELS["leak_output_holder"] in prompt:
+        # Same process group, inherits stdout/stderr: the pipes stay open
+        # after this fake exits.
+        holder = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(120)"])
+        _record(f"holder-{holder.pid}.pid", str(holder.pid))
     if recorded is not None and recorded != model:
         events.append({"type": "item.completed", "item": {
             "type": "error",
@@ -410,6 +427,8 @@ EXEC_SENTINELS = {
     "reject_with_stale_words": "PLEASE_REJECT_MODEL_WITH_STALE_WORDS",
     "reject_sentence_with_stale_words": "PLEASE_REJECT_SENTENCE_STALE_WORDS",
     "quota_429": "PLEASE_QUOTA_429",
+    "sleep_secs": "PLEASE_SLEEP_SECS=",
+    "leak_output_holder": "PLEASE_LEAK_OUTPUT_HOLDER",
 }
 
 

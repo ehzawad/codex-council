@@ -259,33 +259,34 @@ completion line names it. Use the path printed after `reply=`:
 [codex-council] 2/5 <id>: ok (812.4s) reply=ABS_RUNDIR/replies/<id>.md
 ```
 
-Follow the run with the Monitor tool when the host offers it, `timeout_ms`
-at its limit: 1800000 interactively, 600000 in a `claude -p` run:
+Follow the run with one Monitor when the host offers it, `timeout_ms` at
+its limit: 1800000 interactively, 600000 in a `claude -p` run:
 
 ```bash
 python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
   --follow 'ABS_RUNDIR' --skill-contract 3
 ```
 
-The follower exits 0 after the `CODEX_COUNCIL_DONE` line, an interruption
-line, or a `runner aborted` line. Watch expiry ends the follower, not the
-council: re-arm the same command only on that expiry, and only while the
-background task is still running; it replays earlier lines, so skip
-completions already handled. Never re-arm after a nonzero exit: exit 3
-(`no council activity`) means the launch likely failed, so read `err.log`;
-exit 4 (`runner presumed gone`) means check the background task, then use
-the recovery triage.
+It relays actionable lines and exits 0 when the run ends. Watch expiry ends
+the follower, not the council: re-arm the same command only on that expiry,
+and only while the background task is still running; it replays earlier
+lines, so skip completions already handled. Swap in `--status` for a spot
+check. Never re-arm after a nonzero exit: on 3 (`no council activity`) read
+`err.log`; on 4 (`runner gone` or `runner not responding`) run `--status`
+and take its `next:` action (gone: confirm its task ended, `--reap` the same
+way, re-run unfinished roles in a new directory).
 
 Never use a shell `sleep` loop. Without the Monitor tool:
 
-- Interactively, create a one-shot 30-minute wake-up (session cron) naming
-  the task id and `ABS_RUNDIR`; at each wake-up read new `err.log` lines,
-  update the user, and reschedule only while the run continues, never
-  launching a council. The completion notification is the backstop.
+- Interactively, create a one-shot 10-minute wake-up (session cron) naming
+  the task id and `ABS_RUNDIR` that runs `--status`, reads new replies,
+  updates the user, and reschedules only while the run continues, never
+  launching a council; delete it once the run settles. The completion
+  notification is the backstop.
 - In `claude -p` or a subagent, where your final response ends the council,
   run the same `--follow` command as a foreground Bash call with `timeout`
-  600000; each time it times out (it moves to the background), run it again
-  while the council's task is still running.
+  600000; each time it times out (moving to the background), stop that
+  task and run it again while the council's task is still running.
 
 When a completion line arrives (failed roles get reply files too):
 
@@ -310,9 +311,9 @@ and `1` that all failed; the report Summary and the sentinel's
 `ok=N total=M exit=X` show which. Exit `2` with no sentinel means the launch
 was refused: read `err.log`, then fix it in a new directory.
 
-If a run looks lost, orphaned, or stuck, follow the recovery triage in
+If a run looks lost or stuck, follow the recovery triage in
 [runtime-behavior.md](references/runtime-behavior.md) before re-invoking
-anything, which could duplicate a finished or self-recovering council.
+anything.
 
 ## Step 6 — Reconcile
 

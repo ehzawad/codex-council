@@ -45,6 +45,7 @@ import codex_council  # noqa: E402
 import council_common  # noqa: E402
 import council_discovery  # noqa: E402
 import council_failures  # noqa: E402
+import council_liveness  # noqa: E402
 import council_selection  # noqa: E402
 from council_testlib import assert_usage_exit as _assert_usage_exit  # noqa: E402
 
@@ -1697,9 +1698,9 @@ class RunTeamAsyncTests(unittest.IsolatedAsyncioTestCase):
         real_sleep = asyncio.sleep
 
         async def recording_sleep(delay, *args, **kwargs):
-            # The heartbeat task sleeps PROGRESS_HEARTBEAT_SECS; only the
+            # The heartbeat and the status tick sleep far longer; only the
             # short waiter probes are the subject here.
-            if delay < 100:
+            if delay <= codex_council.LOCK_PROBE_MAX_BACKOFF_SECS:
                 probe_sleeps.append(delay)
                 if len(probe_sleeps) >= 7 and held_box[0] is not None:
                     codex_council._release_role_state_lock(held_box[0])
@@ -3066,7 +3067,12 @@ class NoRunLevelDeadlineTests(unittest.TestCase):
             (".settimeout(", r"\.\s*settimeout\s*\("),
             ("timeout=", r"\btimeout\s*="),
         )
-        allowed = {("council_common.py", "timeout="): 1}
+        # Bounds that never limit a running role: the post-exit drain and
+        # the exit waits of _process_exit (codex has already exited or been
+        # killed), and council_liveness's bounded ps call.
+        allowed = {("council_common.py", "timeout="): 1,
+                   ("codex_council.py", "timeout="): 4,
+                   ("council_liveness.py", "timeout="): 1}
         modules = sorted(name for name in os.listdir(SCRIPTS_DIR)
                          if name.endswith(".py"))
         self.assertIn("codex_council.py", modules)
@@ -3508,21 +3514,21 @@ class StartLineTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RoleLivenessDescTests(unittest.TestCase):
-    def tearDown(self):
-        codex_council._ROLE_LIVENESS.clear()
+    def setUp(self):
+        self.run = council_liveness.RunStatus()
+        self.run.begin(["r"])
 
     def test_quiet_seconds_since_last_output(self):
-        codex_council._ROLE_LIVENESS["r"] = 100.0
-        self.assertEqual(
-            codex_council._role_liveness_desc("r", 142.4), "r quiet=42s")
+        self.run.output("r", 100.0)
+        self.assertEqual(self.run.describe("r", 142.4), "r quiet=42s")
 
     def test_retry_wait_replaces_stale_quiet(self):
-        codex_council._ROLE_LIVENESS["r"] = "retry-wait"
-        self.assertEqual(
-            codex_council._role_liveness_desc("r", 500.0), "r retry-wait")
+        self.run.output("r", 100.0)
+        self.run.update("r", state="retry-wait")
+        self.assertEqual(self.run.describe("r", 500.0), "r retry-wait")
 
     def test_unknown_state_degrades_to_bare_id(self):
-        self.assertEqual(codex_council._role_liveness_desc("r", 1.0), "r")
+        self.assertEqual(self.run.describe("r", 1.0), "r")
 
 
 # ---------- best-effort diagnostics (advisory stderr) ----------
@@ -3817,7 +3823,7 @@ class ReportInlineBoundaryTests(unittest.TestCase):
         line = council_common._log_inline(
             "[codex-council:r] warn reply=/tmp/x\x1b")
         self.assertEqual(line, "[codex-council:r] warn reply\\x3d/tmp/x\\x1b")
-        self.assertTrue(codex_council._follow_reply_path_ok(
+        self.assertTrue(council_liveness._reply_path_ok(
             line, "/abs/run/replies"))
 
     def test_warning_and_failed_lines_stay_single_report_lines(self):
@@ -4115,6 +4121,10 @@ class DocsContractTests(unittest.TestCase):
             return "check-staging-dir"
         if args.follow is not None:
             return "follow"
+        if args.status is not None:
+            return "status"
+        if args.reap is not None:
+            return "reap"
         if args.roles_file is not None and args.context_file is not None:
             return "launch"
         return "other"
@@ -4875,7 +4885,7 @@ class DocsContractTests(unittest.TestCase):
         expected = {
             "SKILL.md": {"discover", "check-staging-dir", "launch", "follow"},
             "README.md": {"discover"},
-            "runtime-behavior.md": {"follow"},
+            "runtime-behavior.md": {"follow", "status", "reap"},
         }
         for name, text in self._doc_surfaces().items():
             modes = set()
@@ -4885,8 +4895,8 @@ class DocsContractTests(unittest.TestCase):
                     self.assertEqual(args.skill_contract,
                                      codex_council.SKILL_CONTRACT_EPOCH)
                     for value in (args.discover, args.check_staging_dir,
-                                  args.follow, args.roles_file,
-                                  args.context_file):
+                                  args.follow, args.status, args.reap,
+                                  args.roles_file, args.context_file):
                         if value is not None:
                             self.assertTrue(value.startswith("ABS_RUNDIR"))
                     modes.add(self._command_mode(args))
@@ -4951,7 +4961,19 @@ class DocsContractTests(unittest.TestCase):
             "re-arm the same command only on that expiry",
             "only while the background task is still running",
             "replays earlier lines",
-            "one-shot 30-minute wake-up",
+            # One follower, actionable lines only; --status for spot
+            # checks; a gone runner is reaped before re-running its roles.
+            "one Monitor",
+            "relays actionable lines",
+            "Swap in `--status` for a spot check",
+            "`runner gone` or `runner not responding`",
+            "take its `next:` action",
+            "confirm its task ended, `--reap` the same way, re-run "
+            "unfinished roles in a new directory",
+            "one-shot 10-minute wake-up",
+            "that runs `--status`",
+            "delete it once the run settles",
+            "stop that task and run it again",
             "Never use a shell `sleep` loop",
             "completion notification is the backstop",
             # Where the final response ends the council, keep the turn open.
@@ -5008,7 +5030,20 @@ class DocsContractTests(unittest.TestCase):
             "read-only",
             "[codex-council-follow]",
             "no council activity",
-            "runner presumed gone",
+            "runner gone: pid=<pid>; unfinished=<ids>; live codex "
+            "groups=<pgids or none>; run --status",
+            "runner not responding: no status tick for <N>s",
+            "runner responding again",
+            "`--verbose` relays them",
+            "--status 'ABS_RUNDIR' --skill-contract 3",
+            "--reap 'ABS_RUNDIR' --skill-contract 3",
+            "Never reap a runner that is still present",
+            "never touches saved threads, replies, or other files",
+            "ABS_RUNDIR/status.json",
+            "one-shot 10-minute wake-up",
+            "run `--status` (not a follower)",
+            "stop that moved follower",
+            "kept its output open",
             "Stop re-arming",
             "runner aborted",
             "Re-arm the same command on that expiry, and only then",

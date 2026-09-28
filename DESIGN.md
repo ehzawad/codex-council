@@ -7,42 +7,47 @@ Implementation details for contributors. User-facing docs live in
 
 The runner is standard-library Python in
 `plugins/codex-council/skills/codex-council/scripts/`. `codex_council.py` is
-the only entry point; it imports four sibling modules, and nothing imports
+the only entry point; it imports five sibling modules, and nothing imports
 it:
 
 | Module | Owns |
 |---|---|
-| `codex_council.py` | CLI parsing and `main`, the staging and launch privacy gates, roles-file parsing, continuity state and locks, the `codex exec` runner with its output-inactivity watchdog and retries, fan-out, the report and reply files, and the `--follow` follower |
+| `codex_council.py` | CLI parsing and `main`, the staging and launch privacy gates, roles-file parsing, continuity state and locks, the `codex exec` runner with its output-inactivity watchdog, bounded post-exit drain, process-group sweep, and retries, fan-out, the report and reply files, and the run's live state (`_RUN`, published as `status.json`) |
 | `council_common.py` | Shared primitives: `_report_inline` (escapes the `LINEBREAK_CHARS` set and every other non-printable character) and `_log_inline` (also escapes ` reply=` in err.log diagnostics), the advisory stderr sink (`_diag`), `_print_stdout` (a dead stdout exits 1 quietly), `_usage_exit` and `_roles_usage_exit` with the uniform recovery texts, `_private_stat_problem` (the one private-path policy behind the staging and follow gate, the replies directory, and the snapshot reader) and `_check_private_dir`, `_usage_exit_if_launched` (the one-launch-per-directory gate over `LAUNCH_OUTPUTS`, which `--discover` and the preflight share), `_atomic_write_private`, strict JSON loading, JSONL record iteration, `_utc_iso` (the one UTC timestamp format), `_project_root` (a capped, cached `git rev-parse` that discovery also charges to its deadline), and `_plugin_version` |
 | `council_discovery.py` | The discovery adapter: execution context, app-server transport, the `_normalize_*` helpers, building, writing, and reading the snapshot, the `--discover` summary and command, and `CODEX_COUNCIL_MODEL_ROUTING` |
 | `council_selection.py` | `Role` with its `Selection` and `SelectionDecision`, the `selection` grammar, authoring validation, the pure `_resolve_selection`, `_resolve_run_selections` (the one orchestration behind the preflight plan and the launch), and the selection text in reports and the preflight plan |
 | `council_failures.py` | Failure records from `error` and `turn.failed` events, the marker lists, `_failure_verdict` (whose `FailureVerdict.retriable` is the retry decision), and the failure tags |
+| `council_liveness.py` | `RunStatus` (the `status.json` writer) and its tolerant reader, process identity (pid plus `ps -o lstart=` start time), and the read-only `--follow`, `--status`, and `--reap` commands |
 
 ```mermaid
 flowchart LR
-    Entry["codex_council.py<br/>the only entry point: CLI, staging gates,<br/>continuity state, codex exec and watchdog,<br/>fan-out, report, --follow"]
+    Entry["codex_council.py<br/>the only entry point: CLI, staging gates,<br/>continuity state, codex exec and watchdog,<br/>fan-out, report, run state"]
     Common["council_common<br/>escaping, diagnostics sink, private-path policy,<br/>launch gate, atomic writes, strict JSON,<br/>project root, plugin version"]
     Discovery["council_discovery<br/>app-server adapter, snapshot,<br/>--discover summary, routing mode"]
     Selection["council_selection<br/>selection contract, authoring checks,<br/>pure resolver, launch revalidation"]
     Failures["council_failures<br/>failure records, classifier order,<br/>tags and recovery actions"]
+    Liveness["council_liveness<br/>status.json, process identity,<br/>--follow, --status, --reap"]
 
     Entry --> Common
     Entry --> Discovery
     Entry --> Selection
     Entry --> Failures
+    Entry --> Liveness
     Discovery --> Common
     Selection --> Common
     Selection --> Discovery
     Failures --> Common
     Failures --> Selection
+    Liveness --> Common
 ```
 
 Imports point one way: `council_discovery` uses `council_common`,
 `council_selection` uses both, `council_failures` uses `council_common` and
-`council_selection`, and only `codex_council.py` imports all four. Module
-state has one owner and is used through it: the diagnostics sink and the
-cached project root live in `council_common`, per-role liveness and
-`STATE_DIR` in `codex_council.py`. Siblings import names directly, so a test
+`council_selection`, `council_liveness` uses `council_common`, and only
+`codex_council.py` imports all five. Module state has one owner and is used
+through it: the diagnostics sink and the cached project root live in
+`council_common`, the run's live state (`_RUN`) and `STATE_DIR` in
+`codex_council.py`. Siblings import names directly, so a test
 patches the module whose global the calling code reads (for example
 `council_discovery._project_root` for discovery's `config/read` cwd).
 `codex_council.py` puts its own directory first on `sys.path` before it
@@ -355,39 +360,64 @@ the council. The file is written before the completion line is logged, so a
 `reply=` path always points at a complete file, and files survive
 SIGINT/SIGTERM even though the sentinel does not.
 
+The launch also publishes `RUNDIR/status.json` through `RunStatus`
+(atomic 0600 replacement): the runner's pid and OS start identity, its
+state (`running`, then `done`, `interrupted`, or `aborted` with the exit
+code), a tick that advances on every role transition and every 15s from the
+event loop, and per role the scheduling state, attempt, live codex process
+group with its leader's start identity, last-output time, and outcome. A
+process identity is the pid plus its `ps -o lstart=` start time (C locale,
+UTC): the same pid with another start time is another process, so pid reuse
+never reads as a live runner. Readers are tolerant: unknown fields are
+ignored and a field of the wrong type reads as unknown.
+
 `--follow DIR` is a read-only companion for Claude Code's Monitor tool. It
-validates `DIR` with the same private-dir check, polls `DIR/err.log`, prints
-every `[codex-council` line with a flush per line, and exits 0 after the
-`CODEX_COUNCIL_DONE` sentinel, an interruption line, or a `runner aborted`
-line (the runner logs one when stdout is dead at report time or an unhandled
-exception escapes). It exits 3 with a `[codex-council-follow] no council
-activity` line when, 120s after it starts, `err.log` is absent or has no
-dispatch line, so a monitor on a mistyped path or a launch that failed
-validation does not sit silent. It exits 4 (`runner presumed gone`) when a
-dispatched run's `err.log` stays byte-silent for 2 x `PROGRESS_HEARTBEAT_SECS`
-+ 60s, measured from the file mtime so the check survives a re-arm; a
-wall-clock jump well beyond the monotonic advance between polls is treated as
-a suspend and restarts the count, because the runner's heartbeat sleeps on
-the monotonic clock. Monitors expire after at most 30 minutes (10 in
-`claude -p`) and are re-armed while the council's task is still running;
-the restarted follower replays earlier lines, which Claude de-duplicates. The follower never writes, so it cannot forge the sentinel or
-alter a run. Roles can, though: they run unsandboxed as the same user and can
-append to `err.log`, and no same-uid check can authenticate those lines. So the
-follower drops completion lines whose `reply=` path is not directly inside
-`RUNDIR/replies/` (the only shape the runner prints; a diagnostic line that
-embeds foreign text escapes ` reply=` as ` reply\x3d`, so the filter never
-hides one), SKILL.md treats reply
+validates `DIR` with the same private-dir check, polls `DIR/err.log`, and
+relays the actionable `[codex-council` lines with a flush per line:
+dispatch, model selection, warnings, completions, retries, stalls, and the
+terminal line. Per-attempt start lines and the heartbeat stay in `err.log`
+(`--verbose` relays them), so a three-role happy path is six Monitor events
+instead of nine. It exits 0 after the `CODEX_COUNCIL_DONE` sentinel, an
+interruption line, or a `runner aborted` line (the runner logs one when
+stdout is dead at report time or an unhandled exception escapes), and 3
+with a `[codex-council-follow] no council activity` line when, 120s after it
+starts, `err.log` is absent or has no dispatch line. Every 2s it checks its
+own parent (reparented: exit 5, quietly), its stdout reader (gone: exit 1),
+and, after dispatch, the runner in `status.json`: gone without a terminal
+line prints one `runner gone` line naming the unfinished roles and the live
+codex groups, then exits 4 within seconds; present but without a tick for
+120s prints one `runner not responding` line (and `runner responding again`
+on recovery), escalating to exit 4 at 300s. Tick age is measured on the
+wall clock, and a wall-clock jump well beyond the monotonic advance between
+polls is treated as a suspend and restarts it. Monitors expire after at
+most 30 minutes (10 in `claude -p`) and are re-armed while the council's
+task is still running; the restarted follower replays earlier lines, which
+Claude de-duplicates. The follower never writes, so it cannot forge the
+sentinel or alter a run. Roles can, though: they run unsandboxed as the
+same user and can append to `err.log`, and no same-uid check can
+authenticate those lines. So the follower drops completion lines whose
+`reply=` path is not directly inside `RUNDIR/replies/` (the only shape the
+runner prints; a diagnostic line that embeds foreign text escapes ` reply=`
+as ` reply\x3d`, so the filter never hides one), SKILL.md treats reply
 content as untrusted data, and the final reconciliation waits for the
 `run_in_background` completion notification, which only Claude Code emits.
+
+`--status DIR` prints about ten lines from `status.json` and one bounded
+`ps` call: the runner's state, each unfinished role, live codex groups when
+the runner is gone, and one `next:` action. `--reap DIR` acts only when the
+runner is gone and signals only groups whose leader still has the recorded
+start identity; anything it cannot verify is left alone and reported.
+
 Without Monitor, the fallback depends on the host. An interactive session
-uses a one-shot session-cron wake-up, which fires between turns. In
-`claude -p` or a subagent, the final response ends the council's background
-shell (about five seconds later in `-p`), no cron fires inside a turn, and no
-notification can arrive afterwards, so the skill keeps the turn open by
-running `--follow` as a foreground Bash call at the maximum timeout and
-re-running it while the task is still running (a timed-out foreground
-command moves to the background rather than stopping). There is no blocking
-wait on a background task to fall back to.
+uses a one-shot 10-minute session-cron wake-up that runs `--status`, which
+fires between turns. In `claude -p` or a subagent, the final response ends
+the council's background shell (about five seconds later in `-p`), no cron
+fires inside a turn, and no notification can arrive afterwards, so the skill
+keeps the turn open by running `--follow` as a foreground Bash call at the
+maximum timeout and re-running it while the task is still running (a
+timed-out foreground command moves to the background rather than stopping,
+so the skill stops it first). There is no blocking wait on a background
+task to fall back to.
 
 Early replies change what Claude may do, not how the council ends: Claude
 may read a settled role, tell the user, and act on independent work, but the
@@ -1336,3 +1366,28 @@ are also reaped. SIGINT/SIGTERM/SIGHUP to the council process cancel
 the fan-out first, then exit without emitting the final
 `CODEX_COUNCIL_DONE` sentinel; reply files already written stay on disk.
 POSIX-only.
+
+Each process group belongs to one attempt, and the attempt ends with it.
+The runner waits for codex's exit itself rather than for its pipes (on
+some Python versions `Process.wait()` also waits for the pipes to close,
+which a descendant can postpone forever), then gives the pipes
+`POST_EXIT_DRAIN_SECS` (10s) to reach EOF. A descendant still holding them
+(a tool's background process, for example) gets the group terminated, the
+pumps stop, and the output already read is kept with the warning `codex
+exited but its process group kept its output open; the group was
+terminated`. Whatever is still in the group when the attempt ends is then
+swept (one signal-0 probe when the group is empty, the usual case), and a
+cancellation at any point, the drain and the sweep included, still tears
+the group down. A descendant that moved into its own session escapes the
+sweep. An undecodable stdout line (nested too deeply, or holding an
+out-of-range number) is skipped, so it cannot stop a pump while the other
+stream keeps the watchdog quiet.
+
+Two failure modes sit outside any single process: the runner itself dying
+(SIGKILL, host teardown) while its codex groups keep running, and the
+runner's event loop stalling (a stopped process) while it still exists. The
+`status.json` tick and the recorded process identities make both visible
+to the follower within seconds or minutes (see Per-role reply files and the
+follower); recovery stays with Claude and `--reap`, never with an extra
+supervisor process, and a runner killed within milliseconds of a spawn can
+leave a group it never recorded.
