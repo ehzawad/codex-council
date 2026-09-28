@@ -4,8 +4,10 @@ Reads stderr plus the structured `error` / `turn.failed` events of codex's
 JSONL stdout (never agent messages, reasoning, or tool output), decides one
 verdict in a fixed order (auth, quota, anchored 429/5xx, model rejected,
 stale on resume only, substring retriable fallback, untagged), and formats
-the tagged error text a role reports. The stall verdict is structured and
-decided by the runner before any of this runs.
+the tagged error text a role reports. A model rejection, and a usage limit
+Codex names for one model, end with one action for the model that was sent.
+The stall verdict is structured and decided by the runner before any of
+this runs.
 """
 
 import json
@@ -119,6 +121,16 @@ QUOTA_ERROR_CODES = frozenset({
 # ("You've hit your usage limit. ...").
 QUOTA_MARKERS = (
     "hit your usage limit",
+)
+# codex-cli 0.157.1's wording when the cap applies to one model rather than
+# the plan: "You've hit your usage limit for <label>. Switch to another model
+# now, or try again at <time>." (with a typographic apostrophe). The label is
+# the server's name for the limit, not an echo of the -m value, so it is
+# never compared with the model sent: the message itself says the model
+# that request used is capped, and the tag adds the action for that model.
+_MODEL_USAGE_LIMIT_RE = re.compile(
+    r"hit your usage limit for \S.*?\. Switch to another model",
+    re.IGNORECASE,
 )
 # A failure naming one of these parameters is about the effort or service
 # tier, not the model, so it is never read as a model rejection.
@@ -300,10 +312,6 @@ def _is_transient_5xx_error(stderr_text):
     return _stderr_contains(stderr_text, TRANSIENT_5XX_MARKERS)
 
 
-def _is_retriable_error(stderr_text):
-    return _is_rate_limit_error(stderr_text) or _is_transient_5xx_error(stderr_text)
-
-
 def _is_stale_resume_error(stderr_text):
     return _stderr_contains(stderr_text, STALE_RESUME_MARKERS)
 
@@ -418,18 +426,30 @@ def _names_excluded_param(text):
     return any(name in lowered for name in MODEL_REJECTION_EXCLUDED_PARAMS)
 
 
+# Codex passes the provider's rejection sentence through as text. The model
+# id is in single quotes in the ChatGPT sign-in form observed live, and in
+# backticks in the OpenAI API's model_not_found wording, so either quote is
+# accepted around it.
+_MODEL_QUOTE = "['`]"
+
+
 def _model_rejection_patterns(requested_model):
     """Codex's complete rejection sentences for the model this invocation
-    sent (regex-escaped), or for any model when none was sent."""
-    model = re.escape(requested_model) if requested_model else r"[^']+"
+    sent (regex-escaped), or for any model when none was sent. The model
+    may be quoted with single quotes or backticks."""
+    q = _MODEL_QUOTE
+    model = re.escape(requested_model) if requested_model else r"[^'`]+"
     return (
         # ChatGPT sign-in; the trailing account wording varies.
         re.compile(
-            rf"The '{model}' model is not supported when using Codex with"
+            rf"The {q}{model}{q} model is not supported when using Codex with"
         ),
-        # API wording: unavailable or inaccessible (the two are not told apart).
+        # API wording: unavailable or inaccessible (the two are not told
+        # apart). Codex prints it bare or after its "unexpected status NNN
+        # ...: " prefix; a line search finds it either way.
         re.compile(
-            rf"The model '{model}' does not exist or you do not have access to it"
+            rf"The model {q}{model}{q} does not exist or you do not have "
+            "access to it"
         ),
     )
 
@@ -466,48 +486,77 @@ def _model_rejection(failure_text, records, requested_model):
     return None
 
 
+@dataclass(frozen=True)
+class FailureVerdict:
+    """One attempt's failure class (see _failure_verdict).
+
+    `kind` is "auth", "quota", "rate-limit", "5xx", "model-rejected",
+    "stale", or None (untagged); `rejection` is Codex's own rejection
+    message when kind is "model-rejected", else None.
+    """
+    kind: Optional[str]
+    rejection: Optional[str] = None
+
+
 def _failure_verdict(failure_text, records, requested_model, resume=False):
     """Classify a non-zero codex exit; the stall verdict is decided earlier.
 
     Precedence, identical on the fresh and resume paths: auth -> quota ->
     anchored 429/5xx -> model rejected -> stale (resume only) -> substring
-    retriable fallback -> None (untagged). Returns "auth", "quota",
-    "rate-limit", "5xx", "model-rejected", "stale", or None.
+    retriable fallback -> None (untagged). Returns a FailureVerdict, whose
+    rejection message is parsed here, once per attempt.
     """
     if _is_auth_error(failure_text):
-        return "auth"
+        return FailureVerdict("auth")
     if _is_quota_error(failure_text, records):
-        return "quota"
+        return FailureVerdict("quota")
     anchored = _structured_retriable_class(failure_text)
     if anchored:
-        return anchored
-    if _model_rejection(failure_text, records, requested_model) is not None:
-        return "model-rejected"
+        return FailureVerdict(anchored)
+    rejection = _model_rejection(failure_text, records, requested_model)
+    if rejection is not None:
+        return FailureVerdict("model-rejected", rejection)
     if resume and _is_stale_resume_error(failure_text):
-        return "stale"
-    return _retriable_class(failure_text)
+        return FailureVerdict("stale")
+    return FailureVerdict(_retriable_class(failure_text))
 
 
 # ---------- failure tags ----------
 
-# One recovery action per provenance for a [model-rejected] failure. The
-# runner never substitutes or replays: the host re-runs the role.
-_MODEL_REJECTED_ACTIONS = {
-    "routed": "Re-run this role with model, effort, and selection omitted "
-              "to inherit native configuration.",
-    "native_effort": "Re-run this role with model, effort, and selection "
-                     "omitted to inherit native configuration.",
-    "user": "Change or remove the explicit pin.",
-    "native": "Update the Codex configuration (model) or pin an available "
-              "model.",
-    "fallback": "Update the Codex configuration (model) or pin an available "
-                "model.",
-}
+# The recovery action for a refused model ([model-rejected], or a [quota]
+# usage limit Codex names for one model) depends on WHICH model was sent,
+# not on how the role chose it. A routed model or an explicit model pin can
+# be dropped. The natively configured model (sent by a native_effort role,
+# or inherited, as by an effort-only pin) is what an inheriting re-run
+# would send again, so only a configuration change or an explicit pin
+# avoids it, and both are the user's decision: the action addresses the
+# user, never the orchestrator, which must not edit Codex configuration or
+# pick a model on the user's behalf. The runner never substitutes or
+# replays: the host re-runs the role.
+_INHERIT_ACTION = (
+    "Re-run this role with model, effort, and selection omitted to inherit "
+    "native configuration."
+)
+_CHANGE_PIN_ACTION = "Change or remove the explicit pin."
+_NATIVE_MODEL_ACTION = (
+    "Ask the user to update the Codex configuration (model) or to name a "
+    "model to pin."
+)
+
+
+def _refused_model_action(decision):
+    """The one recovery action when Codex refused the model `decision` sent
+    (a rejection, or that model's usage limit)."""
+    if decision.dispatch_model is None or decision.provenance == "native_effort":
+        return _NATIVE_MODEL_ACTION
+    if decision.provenance == "routed":
+        return _INHERIT_ACTION
+    return _CHANGE_PIN_ACTION
 
 
 def _model_rejected_error(decision, provider_message, phase):
     """The terminal [model-rejected] text: what was rejected, Codex's own
-    message, and one action for this role's provenance."""
+    message, and one action for the model that was refused."""
     if decision.dispatch_model:
         subject = f"requested model '{decision.dispatch_model}'"
     else:
@@ -517,29 +566,35 @@ def _model_rejected_error(decision, provider_message, phase):
     return (
         f"[model-rejected] Codex rejected the {subject} for this invocation: "
         f"{provider_message.rstrip(' .')}. No substitute model was "
-        f"tried{kept}. {_MODEL_REJECTED_ACTIONS[decision.provenance]}"
+        f"tried{kept}. {_refused_model_action(decision)}"
     )
 
 
-def _classify_failure(failure_text, rc, phase, records=(), decision=None):
+def _classify_failure(failure_text, rc, phase, records=(), decision=None,
+                      verdict=None):
     """Return a tagged error string for a non-zero codex exit.
 
     `records` are the attempt's _failure_records and `decision` the role's
-    SelectionDecision (inheritance when omitted). A stale resume is never
-    formatted here: the resume path consults _failure_verdict first and
-    restarts fresh; every other verdict is the same on both paths.
+    SelectionDecision (inheritance when omitted). `verdict` is the
+    attempt's FailureVerdict when the caller already has one: the resume
+    path passes the verdict it branched on, so the tag always matches that
+    branch. Without it the fresh-path order is applied here. A stale
+    resume is never formatted: the resume path restarts fresh instead.
+    A [quota] whose text is Codex's usage limit for one model ends with
+    the action for the model that was sent; any other [quota] keeps
+    Codex's text alone.
     """
     decision = decision or _INHERIT_DECISION
-    verdict = _failure_verdict(failure_text, records, decision.dispatch_model)
+    if verdict is None:
+        verdict = _failure_verdict(failure_text, records,
+                                   decision.dispatch_model)
     detail = failure_text or f"codex {phase} exited {rc}"
-    if verdict in ("auth", "quota"):
-        return f"[{verdict}] {detail}"
-    if verdict in ("rate-limit", "5xx"):
-        return f"[retriable:{verdict}] {detail}"
-    if verdict == "model-rejected":
-        return _model_rejected_error(
-            decision,
-            _model_rejection(failure_text, records, decision.dispatch_model),
-            phase,
-        )
+    if verdict.kind == "quota" and _MODEL_USAGE_LIMIT_RE.search(detail):
+        return f"[quota] {detail} {_refused_model_action(decision)}"
+    if verdict.kind in ("auth", "quota"):
+        return f"[{verdict.kind}] {detail}"
+    if verdict.kind in ("rate-limit", "5xx"):
+        return f"[retriable:{verdict.kind}] {detail}"
+    if verdict.kind == "model-rejected":
+        return _model_rejected_error(decision, verdict.rejection, phase)
     return detail

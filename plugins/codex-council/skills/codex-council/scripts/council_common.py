@@ -1,21 +1,26 @@
 """Shared primitives for the codex-council runner (see codex_council.py).
 
 Nothing here imports a sibling module; every sibling imports from here:
-single-line escaping for report and progress text (_report_inline over
-LINEBREAK_CHARS), the advisory stderr sink (_diag), usage exits with the
-uniform recovery texts, the private-directory gate, atomic 0600 writes,
-strict JSON loading, JSONL record iteration, the project root, and the
-plugin version. Its module-level state (the diagnostics sink and the cached
-project root) exists only here.
+single-line, control-free escaping for report and progress text
+(_report_inline, and _log_inline for err.log diagnostics), the advisory
+stderr sink (_diag), stdout output that ends quietly when nobody reads it
+any more (_print_stdout), usage exits with the uniform recovery texts, the
+one private-path policy (_private_stat_problem) and the private-directory
+gate built on it, the one-launch-per-directory gate, atomic 0600 writes, strict JSON loading, JSONL record
+iteration, the UTC timestamp format (_utc_iso), the project root, and the
+plugin version. Its module-level state
+(the diagnostics sink and the cached project root) exists only here.
 """
 
 import contextlib
+import contextvars
 import errno
 import json
 import os
 import stat
 import subprocess
 import sys
+import time
 from functools import cache
 from pathlib import Path
 
@@ -37,16 +42,57 @@ STAGING_DIR_RECOVERY = (
     "absolute path, re-Write BOTH roles.json and context.md into that new "
     "directory, and re-run --check-staging-dir on it."
 )
+# A run directory holds exactly one launch. A launch leaves these behind: its
+# command's own stdout and stderr redirections and the runner's reply
+# directory, so any of them means the directory has already launched.
+REPLIES_SUBDIR = "replies"
+LAUNCH_OUTPUTS = ("out.md", "err.log", REPLIES_SUBDIR)
+# Recovery for a directory that already launched. The action is always a NEW
+# directory: relaunching here truncates a running council's out.md and
+# err.log, or replaces a finished council's report and mixes two runs in
+# replies/.
+LAUNCHED_DIR_RECOVERY = (
+    "Recovery: every launch needs its own directory, so leave this one and "
+    "its files as they are. Run `mktemp -d` again, run --discover in the "
+    "NEW directory, Write roles.json and context.md there, and run "
+    "--check-staging-dir on it."
+)
 # Uniform recovery appended to EVERY roles-file validation failure. The only
 # production writer of roles.json is an LLM; partial patches of a file that
 # already glitched once are the corruption vector, so every defect demands one
-# complete rewrite. The suffix stays mode-neutral because parse-time code
-# cannot know whether the caller staged a context file or piped stdin.
+# complete rewrite. Parse-time code cannot know its caller, so this default
+# names both the pre-flight and a direct command; a staged launch scopes in
+# STAGED_LAUNCH_ROLES_RECOVERY instead (see _roles_recovery).
 ROLES_REWRITE_RECOVERY = (
     "Recovery: rewrite the entire file passed to --roles-file in one "
     "complete Write operation; do not patch, append, or replace a "
     "substring. Do not launch until the rewritten file validates, then "
     "re-run the pre-flight or the direct command you used."
+)
+# The next step for a staged launch (--roles-file with --context-file) that
+# refuses before dispatch, in place of a pre-flight re-run. The launch
+# command's own shell redirections created out.md and err.log before the
+# runner started, so the directory already holds this launch and
+# --discover and the pre-flight refuse it (_usage_exit_if_launched): the
+# fix always goes into a NEW directory. A lowercase clause, so each
+# launch-side recovery can lead with it or follow its own fix with it.
+STAGED_LAUNCH_RESTART = (
+    "start over in a new directory: this launch's own redirections already "
+    "created out.md and err.log in this one, so the pre-flight refuses it "
+    "now. Leave it and its files as they are, run `mktemp -d` again, run "
+    "--discover in the NEW directory, Write roles.json and context.md "
+    "there, and run --check-staging-dir on it."
+)
+# ROLES_REWRITE_RECOVERY's staged-launch form: the same whole-file rule,
+# applied to the roles.json written in the new directory.
+STAGED_LAUNCH_ROLES_RECOVERY = (
+    f"Recovery: {STAGED_LAUNCH_RESTART} Write the new roles.json whole, in "
+    "one complete Write operation; do not patch, append, or replace a "
+    "substring."
+)
+# The recovery _roles_usage_exit appends; _roles_recovery scopes an override.
+_roles_recovery_text = contextvars.ContextVar(
+    "roles_recovery_text", default=ROLES_REWRITE_RECOVERY
 )
 
 
@@ -112,6 +158,22 @@ def _retire_diagnostics_stream():
     sys.stderr = _diagnostics["stream"]
 
 
+def _print_stdout(text):
+    """Print text to stdout and flush; exit 1 quietly if stdout is dead.
+
+    A dead stdout means nobody is reading any more (a follower's Monitor,
+    the caller of --discover): stop with exit 1 instead of a traceback, and
+    close stdout so an interpreter-shutdown flush of the broken stream
+    cannot rewrite the exit code (never exit 120).
+    """
+    try:
+        print(text, flush=True)
+    except (OSError, ValueError):
+        with contextlib.suppress(Exception):
+            sys.stdout.close()
+        raise SystemExit(1)
+
+
 # ---------- plugin version and project root ----------
 
 def _plugin_version():
@@ -153,9 +215,12 @@ def _project_root():
 
 # ---------- single-line report text ----------
 
-# Escapes for the FULL str.splitlines() boundary set beyond the plain space:
-# \r \n \x0b \x0c \x1c \x1d \x1e U+0085 U+2028 U+2029 (matches LINEBREAK_CHARS).
-_REPORT_INLINE_ESCAPES = str.maketrans({
+# Spellings for the FULL str.splitlines() boundary set beyond the plain
+# space (\r \n \x0b \x0c \x1c \x1d \x1e U+0085 U+2028 U+2029, matching
+# LINEBREAK_CHARS) and for tab. Every other non-printable character gets
+# the \xNN, \uNNNN, or \UNNNNNNNN form (see _escape_char).
+_REPORT_INLINE_ESCAPES = {
+    "\t": "\\t",
     "\r": "\\r",
     "\n": "\\n",
     "\x0b": "\\x0b",
@@ -166,16 +231,51 @@ _REPORT_INLINE_ESCAPES = str.maketrans({
     "\x85": "\\u0085",
     "\u2028": "\\u2028",
     "\u2029": "\\u2029",
-})
+}
+# A diagnostic line that is not a completion line must not carry this
+# marker: the follower drops a line whose last " reply=" names a path
+# outside the run's replies directory (codex_council._follow_reply_path_ok),
+# so foreign text holding it would hide the whole line from the Monitor.
+REPLY_MARKER = " reply="
+_REPLY_MARKER_ESCAPED = " reply\\x3d"
+
+
+def _escape_char(ch):
+    escaped = _REPORT_INLINE_ESCAPES.get(ch)
+    if escaped is not None:
+        return escaped
+    code = ord(ch)
+    if code < 0x100:
+        return f"\\x{code:02x}"
+    if code < 0x10000:
+        return f"\\u{code:04x}"
+    return f"\\U{code:08x}"
 
 
 def _report_inline(value):
-    """Keep report metadata on one line under any splitlines-based consumer.
+    """Keep report metadata on one line and free of terminal controls.
 
-    Escapes every character str.splitlines() treats as a boundary: \\r \\n
-    \\x0b \\x0c \\x1c \\x1d \\x1e U+0085 U+2028 U+2029.
+    Escapes every character str.isprintable() rejects: the full
+    str.splitlines() boundary set (\\r \\n \\x0b \\x0c \\x1c \\x1d \\x1e
+    U+0085 U+2028 U+2029), tab, the other C0 and C1 controls, DEL, format
+    characters such as bidirectional overrides, separators other than the
+    plain space, and lone surrogates. Catalog, configuration, and Codex
+    text is untrusted, and an ESC or OSC sequence in it must not reach a
+    terminal tailing err.log or --discover output.
     """
-    return str(value).translate(_REPORT_INLINE_ESCAPES)
+    text = str(value)
+    if text.isprintable():
+        return text
+    return "".join(ch if ch.isprintable() else _escape_char(ch) for ch in text)
+
+
+def _log_inline(value):
+    """_report_inline for an err.log line that is not a completion line.
+
+    Also escapes REPLY_MARKER, so foreign text inside a diagnostic (a
+    fallback reason, a Codex warning) cannot make the follower drop it.
+    """
+    return _report_inline(value).replace(REPLY_MARKER, _REPLY_MARKER_ESCAPED)
 
 
 # ---------- usage exits and the private-directory gate ----------
@@ -187,8 +287,54 @@ def _usage_exit(msg):
 
 
 def _roles_usage_exit(msg):
-    """Exit 2 on a roles-file validation defect, with the uniform recovery."""
-    _usage_exit(f"{msg} {ROLES_REWRITE_RECOVERY}")
+    """Exit 2 on a roles-file validation defect, with the uniform recovery.
+
+    The recovery is ROLES_REWRITE_RECOVERY unless a caller scoped another
+    with _roles_recovery.
+    """
+    _usage_exit(f"{msg} {_roles_recovery_text.get()}")
+
+
+@contextlib.contextmanager
+def _roles_recovery(text):
+    """Make `text` the recovery every roles-file defect carries in this block.
+
+    The defects are raised deep in parsing and authoring validation, which
+    cannot know their caller; the staged launch wraps its roles checks in
+    this with STAGED_LAUNCH_ROLES_RECOVERY, because its directory already
+    holds this launch and a pre-flight re-run there is refused.
+    """
+    token = _roles_recovery_text.set(text)
+    try:
+        yield
+    finally:
+        _roles_recovery_text.reset(token)
+
+
+def _private_stat_problem(st, *, directory):
+    """Why an lstat/fstat result is not private to this user, or None.
+
+    The one private-path policy, shared by the staging and follow
+    directory gate, the replies directory, and the model snapshot: not a
+    symlink, a directory (or a regular file when `directory` is false),
+    owned by the effective uid, and no group or other permission bits.
+    Returns (kind, fragment): kind is "symlink", "type", "owner", or
+    "mode", and fragment is the shared sentence fragment ("is a symlink",
+    "is not a directory", "is owned by uid N", "is mode 0NNN"); each caller
+    adds its own ending and failure handling.
+    """
+    if stat.S_ISLNK(st.st_mode):
+        return "symlink", "is a symlink"
+    if directory and not stat.S_ISDIR(st.st_mode):
+        return "type", "is not a directory"
+    if not directory and not stat.S_ISREG(st.st_mode):
+        return "type", "is not a regular file"
+    if st.st_uid != os.geteuid():
+        return "owner", f"is owned by uid {st.st_uid}"
+    mode = stat.S_IMODE(st.st_mode)
+    if mode & 0o077:
+        return "mode", f"is mode {mode:04o}"
+    return None
 
 
 def _check_private_dir(path, prefix="--check-staging-dir: ",
@@ -225,30 +371,42 @@ def _check_private_dir(path, prefix="--check-staging-dir: ",
             f"{prefix}cannot inspect {path!r} "
             f"({e.strerror or e}). {recovery}"
         )
-    if stat.S_ISLNK(st.st_mode):
-        _usage_exit(
-            f"{prefix}{path!r} is a symlink, not the directory "
-            f"printed by `mktemp -d`. {recovery}"
-        )
-    if not stat.S_ISDIR(st.st_mode):
-        _usage_exit(
-            f"{prefix}{path!r} is not a directory. "
-            f"{recovery}"
-        )
-    if st.st_uid != os.geteuid():
-        _usage_exit(
-            f"{prefix}{path!r} is owned by uid {st.st_uid}, not "
-            f"the invoking user (uid {os.geteuid()}). {recovery}"
-        )
-    mode = stat.S_IMODE(st.st_mode)
-    if mode & 0o077:
-        _usage_exit(
-            f"{prefix}{path!r} is mode {mode:04o}, not private "
-            f"0700 — not the private mode `mktemp -d` produces. Files "
-            f"already written here may have been readable by other local "
-            f"users. {recovery}"
-        )
+    problem = _private_stat_problem(st, directory=True)
+    if problem is not None:
+        kind, fragment = problem
+        ending = {
+            "symlink": ", not the directory printed by `mktemp -d`.",
+            "type": ".",
+            "owner": f", not the invoking user (uid {os.geteuid()}).",
+            "mode": (", not private 0700 — not the private mode `mktemp -d` "
+                     "produces. Files already written here may have been "
+                     "readable by other local users."),
+        }[kind]
+        _usage_exit(f"{prefix}{path!r} {fragment}{ending} {recovery}")
     return path
+
+
+def _usage_exit_if_launched(run_dir, prefix):
+    """Usage-error when run_dir already holds a council launch.
+
+    Called by --discover and the pre-flight after the private-directory
+    gate. Any of LAUNCH_OUTPUTS counts (lexists, so a dangling symlink
+    does too). The launch command's shell redirections truncate out.md and
+    err.log before the runner starts, so only a step that runs before that
+    command can stop a relaunch into a directory whose council may still be
+    running; the launch itself never checks. For the same reason, a staged
+    launch that refuses before dispatch never asks for a pre-flight re-run
+    in its own directory (STAGED_LAUNCH_RESTART).
+    """
+    present = [name for name in LAUNCH_OUTPUTS
+               if os.path.lexists(os.path.join(run_dir, name))]
+    if present:
+        _usage_exit(
+            f"{prefix}{run_dir!r} already holds a council launch "
+            f"({', '.join(present)} present): its council may still be "
+            "running, and relaunching here would truncate its out.md and "
+            f"err.log. {LAUNCHED_DIR_RECOVERY}"
+        )
 
 
 # ---------- atomic private writes, strict JSON, and JSONL records ----------
@@ -350,3 +508,18 @@ def _dedupe_preserve_order(items):
         seen.add(item)
         out.append(item)
     return out
+
+
+def _utc_iso(seconds):
+    """Unix seconds as "YYYY-MM-DDTHH:MM:SSZ", or None when out of range.
+
+    The one UTC timestamp format: snapshot creation, advertised
+    retirements, the selection clock, and continuity state.
+    """
+    try:
+        parts = time.gmtime(seconds)
+    except (OverflowError, OSError, ValueError):
+        return None
+    if not 1 <= parts.tm_year <= 9999:
+        return None
+    return "%04d-%02d-%02dT%02d:%02d:%02dZ" % tuple(parts[:6])

@@ -158,23 +158,38 @@ class BytecodeCacheTests(unittest.TestCase):
             self.assertEqual(sorted(os.listdir(scripts)),
                              sorted(f"{name}.py" for name in RUNNER_MODULES))
 
-    def test_siblings_import_with_bytecode_writes_off_then_restored(self):
+    def _record_imports(self, *flags, **env):
+        """Run the entry under the recorder; return what it recorded."""
         with tempfile.TemporaryDirectory() as root:
             scripts = self._copy_runner(root)
             report = os.path.join(root, "report.json")
             proc = subprocess.run(
-                [sys.executable, "-c", _RECORD_IMPORTS_WHILE_OFF,
+                [sys.executable, *flags, "-c", _RECORD_IMPORTS_WHILE_OFF,
                  os.path.join(scripts, "codex_council.py"), report],
-                cwd=root, env=self._env(), capture_output=True, text=True,
-                timeout=60,
+                cwd=root, env={**self._env(), **env}, capture_output=True,
+                text=True, timeout=60,
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
             with open(report, encoding="utf-8") as f:
-                recorded = json.load(f)
+                return json.load(f)
+
+    def test_siblings_import_with_bytecode_writes_off_then_restored(self):
+        recorded = self._record_imports()
         siblings = [name for name in RUNNER_MODULES if name != "codex_council"]
         self.assertFalse(recorded["started_off"])
         self.assertFalse(recorded["ended_off"])
         self.assertLessEqual(set(siblings), set(recorded["imported_while_off"]))
+
+    def test_bytecode_writes_the_user_turned_off_stay_off(self):
+        """The entry restores the interpreter's own setting rather than
+        turning writes back on: `python3 -B` and PYTHONDONTWRITEBYTECODE=1
+        still write no bytecode for the rest of the process."""
+        for flags, env in ((("-B",), {}),
+                           ((), {"PYTHONDONTWRITEBYTECODE": "1"})):
+            with self.subTest(flags=flags, env=env):
+                recorded = self._record_imports(*flags, **env)
+                self.assertTrue(recorded["started_off"])
+                self.assertTrue(recorded["ended_off"])
 
 
 class ModuleImportGraphTests(unittest.TestCase):
@@ -238,6 +253,7 @@ class ModuleStateTests(unittest.TestCase):
                    for name in RUNNER_MODULES}
         for state, owner in (
             ("_diagnostics", "council_common"),
+            ("_roles_recovery_text", "council_common"),
             ("_ROLE_LIVENESS", "codex_council"),
             ("STATE_DIR", "codex_council"),
         ):
@@ -250,6 +266,7 @@ class ModuleStateTests(unittest.TestCase):
         import codex_council
         import council_common
         import council_discovery
+        import council_selection
         # One cached project root (one git call) for state keys, workers,
         # and discovery; one diagnostics sink for every stderr write.
         self.assertIs(codex_council._project_root,
@@ -257,6 +274,12 @@ class ModuleStateTests(unittest.TestCase):
         self.assertIs(council_discovery._project_root,
                       council_common._project_root)
         self.assertIs(codex_council._diag, council_common._diag)
+        # Role lives beside the resolver that reads it; the entry, which
+        # no sibling may import, builds roles from that one class.
+        self.assertIs(codex_council.Role, council_selection.Role)
+        # One UTC timestamp format for snapshots, selection, and state.
+        for module in (codex_council, council_discovery, council_selection):
+            self.assertIs(module._utc_iso, council_common._utc_iso)
 
 
 if __name__ == "__main__":

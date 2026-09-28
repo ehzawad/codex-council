@@ -7,10 +7,12 @@ defects exit 2 (_validate_selection_authoring); evidence that stops
 supporting a valid automatic choice resolves it to native inheritance with
 a reason (_resolve_selection). Nothing here ranks models or efforts: every
 check is exact membership in the discovered data, which is untrusted text
-and reaches output only through _report_inline.
+and reaches output only through _report_inline (_log_inline in err.log).
 
-This module also owns the `selection` object grammar of roles.json,
-launch-time resolution (at most one fresh discovery per council), and the
+This module also owns the Role object the resolver works on, the
+`selection` object grammar of roles.json, the orchestration shared by the
+preflight and the launch (_resolve_run_selections: authoring validation,
+then at most one fresh discovery per council, at launch only), and the
 text that reports each decision in err.log, out.md, reply files, and the
 preflight plan.
 """
@@ -21,13 +23,19 @@ import time
 from dataclasses import dataclass, replace
 from typing import Optional
 
-from council_common import LINEBREAK_CHARS, _report_inline, _roles_usage_exit
+from council_common import (
+    LINEBREAK_CHARS,
+    _log_inline,
+    _report_inline,
+    _roles_usage_exit,
+    _utc_iso,
+)
 from council_discovery import (
     MODEL_ROUTING_ENV,
     _SNAPSHOT_ID_RE,
     _discover,
     _read_snapshot,
-    _utc_iso,
+    _retirement_passed,
 )
 
 # One grammar for model and effort values. Shape checks only: no value list
@@ -41,12 +49,22 @@ from council_discovery import (
 SELECTION_VALUE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]*\Z")
 # Model values a human might mean as "inherit", but which Codex would
 # receive as a literal model id (compared case-insensitively). Inheritance
-# is omission.
+# is omission. Efforts are not checked against these words: they are opaque
+# per-model values, so an automatic effort must be one the catalog
+# advertises and a pinned effort is forwarded as written.
 RESERVED_MODEL_VALUES = ("inherit", "default")
 SELECTION_MODES = ("user", "routed", "native_effort")
 # The runtime-grounded modes, bound to this run's --discover snapshot.
 AUTOMATIC_MODES = ("routed", "native_effort")
 INHERIT_HINT = "omit model, effort, and selection to inherit native configuration"
+# A malformed value in an explicit user pin (for example a display name
+# with a space) is repaired with the user, never by dropping the pin.
+USER_PIN_VALUE_HINT = (
+    "for an explicit user pin write the exact value the --discover summary "
+    "lists for what the user named (the execution id beside a display "
+    "name), or ask the user for it; keep the pin (selection.mode 'user') "
+    "and never drop it to inherit"
+)
 ROUTING_OFF_NOTE = f"{MODEL_ROUTING_ENV}=off"
 PROVENANCES = ("native", "user", "routed", "native_effort", "fallback")
 UNVERIFIED_MODEL_ADVISORY = (
@@ -100,22 +118,74 @@ class SelectionDecision:
     note: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class Role:
+    """One council role from roles.json: the object this module resolves.
+
+    `model` and `effort` are the requested per-role Codex overrides exactly
+    as authored (None = not requested; omitting model, effort, and
+    selection inherits Codex's native configuration), and `selection`
+    declares their provenance. What is actually sent is `decision`,
+    resolved once at launch before fan-out (see _resolve_run_selections
+    and _role_decision).
+    """
+    id: str
+    label: str
+    instruction: str
+    model: Optional[str] = None
+    effort: Optional[str] = None
+    selection: Optional[Selection] = None
+    decision: Optional[SelectionDecision] = None
+
+
 _INHERIT_DECISION = SelectionDecision("inherit", "native")
 
 
 # ---------- the roles.json selection object ----------
 
+def _parse_role_selection(entry, ctx, require_selection):
+    """Validate a role's model, effort, and selection; return
+    (model, effort, Selection or None).
+
+    On the skill path (require_selection, i.e. --skill-contract was passed)
+    a 'model' or 'effort' key with no 'selection' is refused first, before
+    its value is checked, so the first error for an untagged malformed pin
+    asks for its provenance instead of pointing at inheritance.
+    """
+    if require_selection and "selection" not in entry and (
+        "model" in entry or "effort" in entry
+    ):
+        _roles_usage_exit(
+            f"--roles-file {ctx}: 'model'/'effort' without 'selection': "
+            "declare selection.mode: 'user' for an explicit user "
+            "request, 'routed' or 'native_effort' for a runtime-grounded "
+            f"choice; or {INHERIT_HINT}."
+        )
+    model = _validate_optional_role_field(entry, "model", ctx)
+    effort = _validate_optional_role_field(entry, "effort", ctx)
+    return model, effort, _parse_selection(entry, model, effort, ctx)
+
+
 def _validate_optional_role_field(entry, field, ctx):
-    """Return a validated model/effort value, or None when omitted."""
+    """Return a validated model/effort value, or None when omitted.
+
+    A grammar failure in an explicit user pin (selection.mode 'user', or
+    no selection at all, which direct CLI use reads as a user pin) says how
+    to repair the pin; any other says how to inherit.
+    """
     if field not in entry:
         return None
     value = entry[field]
     if not isinstance(value, str) or not SELECTION_VALUE_PATTERN.match(value):
+        selection = entry.get("selection")
+        user_pin = "selection" not in entry or (
+            isinstance(selection, dict) and selection.get("mode") == "user"
+        )
         _roles_usage_exit(
             f"--roles-file {ctx}: optional field {field!r} must be a "
             "non-empty string matching "
             f"{SELECTION_VALUE_PATTERN.pattern} (got {value!r}); "
-            f"{INHERIT_HINT}."
+            f"{USER_PIN_VALUE_HINT if user_pin else INHERIT_HINT}."
         )
     if field == "model" and value.lower() in RESERVED_MODEL_VALUES:
         _roles_usage_exit(
@@ -138,7 +208,7 @@ def _validate_selection_reason(reason, ctx):
         )
 
 
-def _parse_selection(entry, model, effort, ctx, require_selection):
+def _parse_selection(entry, model, effort, ctx):
     """Validate a role's `selection` object; return a Selection, or None to
     inherit.
 
@@ -146,20 +216,12 @@ def _parse_selection(entry, model, effort, ctx, require_selection):
     needs model and/or effort. {"mode": "routed", "snapshot_id", "reason"}
     needs both; {"mode": "native_effort", "snapshot_id", "reason"} needs
     effort and forbids model (the runner pins the proven native model). A
-    model or effort with no selection is refused on the skill path
-    (require_selection, i.e. --skill-contract was passed) and read as an
-    explicit user pin in direct CLI use.
+    model or effort with no selection is read as an explicit user pin; the
+    skill path has already refused it (see _parse_role_selection).
     """
     if "selection" not in entry:
         if model is None and effort is None:
             return None
-        if require_selection:
-            _roles_usage_exit(
-                f"--roles-file {ctx}: 'model'/'effort' without 'selection': "
-                "declare selection.mode: 'user' for an explicit user "
-                "request, 'routed' or 'native_effort' for a runtime-grounded "
-                f"choice; or {INHERIT_HINT}."
-            )
         return Selection("user")
     value = entry["selection"]
     if not isinstance(value, dict):
@@ -250,35 +312,47 @@ def _effort_advertised(entry, effort):
     return any(option["effort"] == effort for option in entry["efforts"])
 
 
-def _execution_id_hint(snapshot, model):
-    """Point at the dispatch id when `model` is an entry's picker id or
-    display name (neither is what `-m` receives)."""
+def _catalog_alias(snapshot, model):
+    """(kind, execution id) when `model` is exactly an entry's display name
+    or picker id — neither is what `-m` receives — else None.
+
+    Only an execution id that matches SELECTION_VALUE_PATTERN is offered: an
+    id that could not be dispatched is no help, and the grammar keeps
+    catalog text from carrying spaces, control characters, or a " reply="
+    marker into a note.
+    """
     for entry in snapshot["catalog"]["models"]:
-        if model in (entry["catalog_id"], entry["display_name"]):
-            return f"; use the execution id '{entry['model']}'"
-    return ""
+        if not SELECTION_VALUE_PATTERN.match(entry["model"]):
+            continue
+        if model == entry["display_name"]:
+            return "display name", entry["model"]
+        if model == entry["catalog_id"]:
+            return "picker id", entry["model"]
+    return None
 
 
-def _routed_evidence_gap(snapshot, model, effort, now):
+def _routed_evidence_gap(snapshot, model, effort, now, source=None):
     """Why `snapshot` does not support routing to (model, effort), or None.
 
     Exact checks only: the dispatch id is advertised and visible, its
-    advertised retirement (if any) has not passed at `now`, and the effort
-    is one that entry advertises. Catalog order and the recommended marker
-    never matter.
+    advertised retirement (if any) has not passed at `now` (retired when
+    retirement_at <= now), and the effort is one that entry advertises.
+    Catalog order and the recommended marker never matter. `source` names
+    the evidence in the not-advertised text; the default, "snapshot <id>",
+    is the planning snapshot an author can look up.
     """
     entry = _catalog_entry(snapshot, model)
     if entry is None:
-        return (
-            f"model '{model}' is not an advertised execution id in snapshot "
-            f"{snapshot['snapshot_id']}{_execution_id_hint(snapshot, model)}"
-        )
+        alias = _catalog_alias(snapshot, model)
+        hint = f"; use the execution id '{alias[1]}'" if alias else ""
+        source = source or f"snapshot {snapshot['snapshot_id']}"
+        return (f"model '{model}' is not an advertised execution id in "
+                f"{source}{hint}")
     if entry["hidden"]:
         return (f"cannot route to hidden model '{model}' (hidden models are "
                 "for explicit user pins)")
-    upgrade = entry["upgrade"]
-    retirement = upgrade["retirement_at"] if upgrade else None
-    if retirement is not None and now is not None and retirement <= now:
+    retirement = _retirement_passed(entry, now)
+    if retirement:
         return f"model '{model}' advertised retirement passed ({retirement})"
     if not _effort_advertised(entry, effort):
         return f"effort '{effort}' is not advertised for model '{model}'"
@@ -299,23 +373,36 @@ def _native_model_gap(snapshot):
     return f"cannot adjust effort on the native model: {reason}"
 
 
-def _native_effort_gap(snapshot, effort):
-    """Why `snapshot` does not support `effort` on its proven native model."""
+def _native_effort_gap(snapshot, effort, planned_model=None):
+    """Why `snapshot` does not support `effort` on its proven native model.
+
+    `planned_model` (launch only) is the native model of the planning
+    snapshot, whose effort descriptions the choice was made from. An effort
+    is never carried onto another model, even one that advertises the same
+    spelling: the same name need not mean the same behavior.
+    """
     gap = _native_model_gap(snapshot)
     if gap:
         return gap
     model = snapshot["native"]["model"]
+    if planned_model is not None and model != planned_model:
+        return f"native model changed from '{planned_model}' to '{model}'"
     entry = _catalog_entry(snapshot, model)
     if entry is None or not _effort_advertised(entry, effort):
         return f"effort '{effort}' is not advertised for model '{model}'"
     return None
 
 
-def _user_pin_advisory(role, evidence):
+def _user_pin_advisory(role, evidence, now):
     """Advisory text for an explicit pin, or None; never a rejection.
 
     A pin reaches Codex unchanged whatever the catalog says (a custom
     provider's models are not in it); the snapshot only annotates it.
+    `now` (or None to skip) is compared with the pinned model's advertised
+    retirement. The effort checked against the model's advertised efforts
+    is the pinned one, or, for a model-only pin with no managed defaults,
+    the configured native effort Codex keeps (no effort override is sent,
+    and Codex does not validate effort on the client).
     """
     if evidence is None:
         return None
@@ -326,16 +413,41 @@ def _user_pin_advisory(role, evidence):
             entry = _catalog_entry(evidence, role.model)
             if entry is None:
                 notes.append(UNVERIFIED_MODEL_ADVISORY)
+                alias = _catalog_alias(evidence, role.model)
+                if alias:
+                    notes.append(f"'{role.model}' is the catalog {alias[0]} "
+                                 f"of execution id '{alias[1]}'")
+            else:
+                retirement = _retirement_passed(entry, now)
+                if retirement:
+                    notes.append(
+                        f"model '{role.model}' advertised retirement passed "
+                        f"({retirement}); forwarded unchanged")
         elif evidence["native"]["resolution"] == "proven":
             entry = _catalog_entry(evidence, evidence["native"]["model"])
-        if (
-            entry is not None and role.effort is not None
-            and not _effort_advertised(entry, role.effort)
-        ):
-            notes.append(
-                f"unverified effort: '{role.effort}' is not advertised for "
-                f"model '{entry['model']}'; forwarded unchanged"
-            )
+        if entry is not None and role.effort is not None:
+            if not _effort_advertised(entry, role.effort):
+                notes.append(
+                    f"unverified effort: '{role.effort}' is not advertised "
+                    f"for model '{entry['model']}'; forwarded unchanged"
+                )
+        elif entry is not None:  # a model-only pin
+            inherited = evidence["configured"]["effort"]
+            # With managed defaults present or unknown, the effort Codex
+            # keeps is not known; a null configured effort means the
+            # model's own default. The grammar keeps configuration text
+            # out of the note, as for the ids _catalog_alias offers.
+            if (
+                inherited is not None
+                and evidence["managed_defaults"]["status"] == "absent"
+                and SELECTION_VALUE_PATTERN.match(inherited)
+                and not _effort_advertised(entry, inherited)
+            ):
+                notes.append(
+                    "unverified effort: inherited native effort "
+                    f"'{inherited}' is not advertised for model "
+                    f"'{entry['model']}'; no effort override sent"
+                )
     partial = (role.model is None) != (role.effort is None)
     if partial and evidence["managed_defaults"]["status"] != "absent":
         notes.append(PARTIAL_PIN_ADVISORY)
@@ -357,8 +469,10 @@ def _resolve_selection(role, planning, launch, routing_mode, now):
     `planning` is this run's --discover snapshot and `launch` the fresh
     launch-time one (either may be None; preflight passes no launch
     snapshot, so its decisions are the plan). Launch evidence wins when
-    present. `now` ("YYYY-MM-DDTHH:MM:SSZ", or None to skip) is compared
-    with advertised retirements. Authoring defects never reach here (see
+    present; a native_effort choice also falls back when the launch native
+    model is not the planning one its effort was chosen for. `now`
+    ("YYYY-MM-DDTHH:MM:SSZ", or None to skip) is compared with advertised
+    retirements. Authoring defects never reach here (see
     _validate_selection_authoring): an automatic choice that the evidence
     does not support resolves to native inheritance, with the reason, and
     an explicit pin is forwarded unchanged with advisories at most.
@@ -370,7 +484,7 @@ def _resolve_selection(role, planning, launch, routing_mode, now):
     if selection is None or selection.mode == "user":
         # An untagged pin gets here only from direct CLI use.
         return _decision(role, "user", "user", role.model, role.effort,
-                         _user_pin_advisory(role, evidence))
+                         _user_pin_advisory(role, evidence, now))
     mode = selection.mode
     if routing_mode == "off":
         return _decision(role, mode, "fallback", note=ROUTING_OFF_NOTE)
@@ -389,11 +503,17 @@ def _resolve_selection(role, planning, launch, routing_mode, now):
                 role, mode, "fallback",
                 note=f"{stage} reports routing unavailable: {reasons}",
             )
-        gap = _routed_evidence_gap(evidence, role.model, role.effort, now)
+        # At launch the snapshot id is in memory only: name the stage.
+        gap = _routed_evidence_gap(evidence, role.model, role.effort, now,
+                                   stage if launch is not None else None)
         model = role.model
     else:
-        # native_effort pins the native model THIS evidence proves.
-        gap = _native_effort_gap(evidence, role.effort)
+        # native_effort pins the native model THIS evidence proves, and
+        # only when it is still the one discovery planned with.
+        planned = None
+        if launch is not None and planning is not None:
+            planned = planning["native"]["model"]
+        gap = _native_effort_gap(evidence, role.effort, planned)
         model = evidence["native"]["model"]
     if gap:
         if launch is not None:
@@ -437,9 +557,12 @@ def _validate_selection_authoring(roles, planning, planning_problem,
     """Exit 2 (uniform rewrite recovery) on an automatic selection this
     run's planning snapshot does not support.
 
-    Runs in preflight and at launch, before any worker. Explicit pins are
-    never checked against the catalog, and with routing off automatic roles
-    are not errors: they resolve to native inheritance.
+    Runs in preflight and at launch, before any worker. `now` is compared
+    with advertised retirements: the current time in preflight, the
+    planning snapshot's creation time at launch (see
+    _resolve_run_selections). Explicit pins are never checked against
+    the catalog, and with routing off automatic roles are not errors: they
+    resolve to native inheritance.
     """
     if routing_mode == "off":
         return
@@ -500,25 +623,39 @@ def _model_selection_lines(roles, routing_mode, state, reason):
         for role_id, decision in decisions
         if decision.provenance == "fallback"
     ]
-    return [_report_inline(line) for line in lines]
+    return [_log_inline(line) for line in lines]
 
 
-def _resolve_launch_selections(roles, run_dir, routing_mode):
-    """Validate authoring, discover once if needed, and attach decisions.
+def _resolve_run_selections(roles, run_dir, routing_mode, at_launch):
+    """Validate authoring and attach every role's decision: the one
+    orchestration behind the preflight plan and the launch.
 
-    Returns (roles with `decision` set, the launch snapshot or None). The
-    launch snapshot is taken only when a role carries an automatic
-    selection and routing is on — councils of inherited and explicit roles
-    pay no discovery latency — and is frozen for the whole council; it is
-    never written over the planning snapshot.
+    Reads this run's planning snapshot from `run_dir`; an authoring defect
+    exits 2 before any discovery. Returns (roles with `decision` set, the
+    launch snapshot or None). Only the launch (`at_launch`) discovers, and
+    only when a role carries an automatic selection and routing is on —
+    councils of inherited and explicit roles pay no discovery latency. The
+    launch snapshot is frozen for the whole council and never written over
+    the planning snapshot. The preflight passes the resolver no launch
+    snapshot, so its decisions are the plan.
+
+    The preflight judges authoring at the current time. The launch judges
+    it as of the planning snapshot's creation, so a choice already retired
+    at discovery stays an exit-2 defect, while a retirement that passes
+    after discovery is changed evidence: the resolver, given the real
+    `now`, falls back to inheritance.
     """
     now = _utc_iso(time.time())
     planning, planning_problem = _read_snapshot(run_dir)
+    authoring_now = now
+    if at_launch:
+        authoring_now = planning["created_at"] if planning is not None else None
     _validate_selection_authoring(
-        roles, planning, planning_problem, routing_mode, now
+        roles, planning, planning_problem, routing_mode, authoring_now
     )
     launch = None
-    if routing_mode == "auto" and any(_is_automatic(r) for r in roles):
+    if (at_launch and routing_mode == "auto"
+            and any(_is_automatic(r) for r in roles)):
         launch = _discover(routing_mode)
     resolved = [
         replace(role, decision=_resolve_selection(

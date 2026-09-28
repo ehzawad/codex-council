@@ -13,9 +13,9 @@ it:
 | Module | Owns |
 |---|---|
 | `codex_council.py` | CLI parsing and `main`, the staging and launch privacy gates, roles-file parsing, continuity state and locks, the `codex exec` runner with its output-inactivity watchdog and retries, fan-out, the report and reply files, and the `--follow` follower |
-| `council_common.py` | Shared primitives: `_report_inline` over `LINEBREAK_CHARS`, the advisory stderr sink (`_diag`), `_usage_exit` and `_roles_usage_exit` with the uniform recovery texts, `_check_private_dir`, `_atomic_write_private`, strict JSON loading, JSONL record iteration, `_project_root`, and `_plugin_version` |
+| `council_common.py` | Shared primitives: `_report_inline` (escapes the `LINEBREAK_CHARS` set and every other non-printable character) and `_log_inline` (also escapes ` reply=` in err.log diagnostics), the advisory stderr sink (`_diag`), `_print_stdout` (a dead stdout exits 1 quietly), `_usage_exit` and `_roles_usage_exit` with the uniform recovery texts, `_private_stat_problem` (the one private-path policy behind the staging and follow gate, the replies directory, and the snapshot reader) and `_check_private_dir`, `_usage_exit_if_launched` (the one-launch-per-directory gate over `LAUNCH_OUTPUTS`, which `--discover` and the preflight share), `_atomic_write_private`, strict JSON loading, JSONL record iteration, `_utc_iso` (the one UTC timestamp format), `_project_root`, and `_plugin_version` |
 | `council_discovery.py` | The discovery adapter: execution context, app-server transport, the `_normalize_*` helpers, building, writing, and reading the snapshot, the `--discover` summary and command, and `CODEX_COUNCIL_MODEL_ROUTING` |
-| `council_selection.py` | `Selection` and `SelectionDecision`, the `selection` grammar, authoring validation, the pure `_resolve_selection`, launch-time resolution, and the selection text in reports and the preflight plan |
+| `council_selection.py` | `Role` with its `Selection` and `SelectionDecision`, the `selection` grammar, authoring validation, the pure `_resolve_selection`, `_resolve_run_selections` (the one orchestration behind the preflight plan and the launch), and the selection text in reports and the preflight plan |
 | `council_failures.py` | Failure records from `error` and `turn.failed` events, the marker lists, `_failure_verdict`, and the failure tags |
 
 Imports point one way: `council_discovery` uses `council_common`,
@@ -52,13 +52,31 @@ and so is a key repeated at any object level, which would silently hide
 one value behind another.
 Every roles-file validation defect carries the same uniform recovery:
 rewrite the entire file in one complete Write operation, never patch a
-substring of a file that already glitched once.
+substring of a file that already glitched once (at a staged launch, the
+whole file is written in a new directory; see below).
 The staging-dir gate (`--check-staging-dir`) lstats the directory:
 symlinks, non-dirs, foreign-owned dirs, and group/other-accessible
 modes are all rejected with an action-first recovery hint that forbids
 chmod/mkdir/reuse of the rejected path and demands a fresh `mktemp -d`
 (a recovery hint satisfiable by chmod/mkdir on the same predictable
-path would defeat the privacy the gate exists for). The **launch path
+path would defeat the privacy the gate exists for). A run directory also
+holds **exactly one launch**: `--discover` and the pre-flight exit 2 when
+`out.md`, `err.log`, or `replies/` already exists
+(`_usage_exit_if_launched`), with a recovery that demands a new
+`mktemp -d` directory. The launch command's shell redirections truncate
+`out.md` and `err.log` before the runner starts, so relaunching into a
+directory whose council is still running (the natural move for a
+`[model-rejected]` re-run, which fails in under a second while siblings
+run) would tear that council's report, log, and follower apart, and a
+relaunch after it finished would replace its report and mix two runs in
+`replies/`. Only a step that runs before the launch command can refuse in
+time; the launch itself keeps accepting an existing `replies/`, so direct
+CLI use is unchanged. For the same reason a staged launch refused before
+dispatch never asks for a pre-flight re-run in its own directory, which
+that re-run would refuse: its roles, `context.md`, and missing-`codex`
+recoveries start over in a new directory with its own `--discover`
+(`STAGED_LAUNCH_RESTART`; for roles, `STAGED_LAUNCH_ROLES_RECOVERY`, scoped in
+with `_roles_recovery`). The **launch path
 re-validates the same privacy contract**: each on-disk input's lexical
 parent directory (`dirname(abspath(...))`, never realpath-first, so a
 symlink parent cannot launder into its target) must pass the identical
@@ -324,11 +342,20 @@ the restarted follower replays earlier lines, which Claude de-duplicates. The fo
 alter a run. Roles can, though: they run unsandboxed as the same user and can
 append to `err.log`, and no same-uid check can authenticate those lines. So the
 follower drops completion lines whose `reply=` path is not directly inside
-`RUNDIR/replies/` (the only shape the runner prints), SKILL.md treats reply
+`RUNDIR/replies/` (the only shape the runner prints; a diagnostic line that
+embeds foreign text escapes ` reply=` as ` reply\x3d`, so the filter never
+hides one), SKILL.md treats reply
 content as untrusted data, and the final reconciliation waits for the
-`run_in_background` completion notification, which only Claude Code emits. A
-session-cron wake-up or the native task wait remains the fallback when
-Monitor is unavailable.
+`run_in_background` completion notification, which only Claude Code emits.
+Without Monitor, the fallback depends on the host. An interactive session
+uses a one-shot session-cron wake-up, which fires between turns. In
+`claude -p` or a subagent, the final response ends the council's background
+shell (about five seconds later in `-p`), no cron fires inside a turn, and no
+notification can arrive afterwards, so the skill keeps the turn open by
+running `--follow` as a foreground Bash call at the maximum timeout and
+re-running it while the task is still running (a timed-out foreground
+command moves to the background rather than stopping). There is no blocking
+wait on a background task to fall back to.
 
 Early replies change what Claude may do, not how the council ends: Claude
 may read a settled role, tell the user, and act on independent work, but the
@@ -378,13 +405,16 @@ sends only the resolver's dispatch values. A few rules shape all three:
 ### The discovery adapter
 
 `--discover RUNDIR` validates RUNDIR with the same private-directory check as
-preflight (prefix `--discover: `; `roles.json` and `context.md` need not
-exist yet), reads `CODEX_COUNCIL_MODEL_ROUTING`, runs `_discover()`, writes
-the snapshot, and prints a summary. It cannot be combined with
-`--roles-file`, `--context-file`, `--check-staging-dir`, or `--follow`, and it
-exits 0 whenever RUNDIR and `CODEX_COUNCIL_MODEL_ROUTING` are valid, even when
-discovery is unavailable or `codex` is missing, because inheritance is always
-a valid outcome.
+preflight (prefix `--discover: `; `roles.json` and `context.md` need not exist
+yet), refuses a directory that already holds a launch (its planning snapshot
+is that council's evidence), reads `CODEX_COUNCIL_MODEL_ROUTING`, runs
+`_discover()`, writes the snapshot, and prints a summary. It cannot be
+combined with `--roles-file`, `--context-file`, `--check-staging-dir`, or
+`--follow`, and it exits 0 whenever RUNDIR and `CODEX_COUNCIL_MODEL_ROUTING`
+are valid, even when discovery is unavailable or `codex` is missing, because
+inheritance is always a valid outcome. Like the follower, it never ends in a
+traceback: Ctrl+C exits 130 after teardown without writing a snapshot, and a
+closed stdout exits 1 quietly (`_print_stdout`, shared with `--follow`).
 
 The adapter speaks newline-delimited JSON-RPC to
 `codex app-server --listen stdio://` and matches responses by id while
@@ -406,7 +436,7 @@ sequenceDiagram
     R->>A: id 2 account/read (refreshToken false)
     A-->>R: account type and requiresOpenaiAuth kept, identity never read
     R->>A: id 3 config/read (cwd is the project root, includeLayers false)
-    A-->>R: model, effort, provider, and the layer kind of model and effort
+    A-->>R: model, effort, provider, endpoint and catalog overrides, layer kinds
     R->>A: id 4 configRequirements/read (params null)
     A-->>R: managed new-thread defaults and provider keys
     loop at most 10 pages or 1000 entries
@@ -442,8 +472,8 @@ Teardown runs in `finally`: close stdin, wait 0.5s for the whole process
 group, SIGTERM the group, wait 0.5s, SIGKILL, reap. Neither a SIGTERM-ignoring
 server nor a grandchild holding a pipe outlives discovery. The adapter is
 synchronous (`selectors` on raw fds) and runs before `asyncio.run`, so it
-never blocks the council's event loop; Ctrl+C during launch discovery still
-tears the app-server group down and exits 130.
+never blocks the council's event loop; Ctrl+C during `--discover` or launch
+discovery still tears the app-server group down and exits 130.
 
 `_discover()` never raises (Ctrl+C aside). A missing `codex`, a spawn error, a
 timeout, a protocol violation, an RPC error, or even an internal bug yields a
@@ -452,7 +482,10 @@ snapshot with status `unavailable` and machine-safe problem codes:
 `server_exited:<method>`, `protocol_error:<kind>`,
 `rpc_error:<method>:<code>`, `schema_unsupported:<method>:<field>`,
 `server_request:<method>`, `catalog_incomplete:<why>`, `catalog_conflict`,
-and `internal_error:<type>`. `codex_version_unavailable` is informational.
+and `internal_error:<type>`. The catalog-level codes are the exception:
+`catalog_incomplete:<why>`, `catalog_conflict`, and a malformed entry's
+`schema_unsupported:model/list:<field>` keep status `ok` and only mark the
+catalog incomplete (below). `codex_version_unavailable` is informational.
 
 The pure `_normalize_*` helpers are the only code that reads response wire
 names; everything downstream reads the snapshot. They tolerate additive
@@ -474,7 +507,9 @@ launched the same way:
 - the `codex` that `PATH` resolves (`shutil.which`, recorded as an absolute
   path);
 - the runner's own working directory and environment, with no override, so a
-  relative `CODEX_HOME` resolves identically for both;
+  relative `CODEX_HOME` resolves identically for both (the fake app-server
+  records the `CODEX_HOME` and working directory it saw, and the tests
+  assert both match the runner's, a relative `CODEX_HOME` included);
 - no `--profile`.
 
 Project config layers are selected by `config/read`'s `cwd` parameter, not by
@@ -483,7 +518,14 @@ spawn directory is irrelevant, and omitting `cwd` drops every project layer.
 Discovery therefore passes `_project_root()`, the same root workers get as
 `codex exec -C` (the Git top level of the launch directory, else the launch
 directory). A `.codex/config.toml` below that root is not part of the
-council's baseline. `initialize` reports the `codexHome` the server selected.
+council's discovered baseline. That workers ignore it too rests on
+`codex exec -C <root>` stopping project layers at its `-C` working root
+rather than at the inherited process directory, which Codex's documentation
+implies (`-C` sets the agent's working directory) but which was not verified
+live; a fake-codex end-to-end test pins the plugin side by launching from a
+Git subdirectory and asserting that `config/read`'s `cwd`, every worker's
+`-C`, and the Git top level are one path. `initialize` reports the
+`codexHome` the server selected.
 
 The runner forwards no profile, and the app-server refuses `--profile` anyway
 ("--profile only applies to runtime commands and `codex mcp`"), so
@@ -498,8 +540,9 @@ routing nor native-model effort adjustment is offered.
 `RUNDIR/model-snapshot.json` (schema `codex-council/model-snapshot@1`) is
 written through `_atomic_write_private`, the reply files' pattern. If the
 write fails, any older snapshot is removed and `--discover` prints only a
-line telling Claude to write no automatic selections, because evidence from
-an earlier discovery must never be read back as this run's.
+line telling Claude to write no automatic selections (explicit user pins
+still apply), because evidence from an earlier discovery must never be read
+back as this run's.
 
 The snapshot records:
 
@@ -511,7 +554,10 @@ The snapshot records:
 - the `account` projection;
 - the `configured` model, effort, and provider, with the kind of layer
   (`user`, `project`, `system`, `mdm`, ...) that supplied the model and the
-  effort, but never a file path or layer contents;
+  effort, the names of any endpoint keys a layer set
+  (`endpoint_overrides`), and whether `model_catalog_json` replaces the
+  catalog (`catalog_override`), but never a file path, a URL, or layer
+  contents;
 - the `managed_defaults` observation (`present`, `absent`, or `unknown`);
 - the `native` resolution and the `routing` verdict;
 - the normalized `catalog`: each entry's dispatch `model`, `catalog_id`,
@@ -533,12 +579,23 @@ the schema field by field, with unique catalog models and a proven native
 model present in the catalog.
 
 The `--discover` summary is what Claude reads to choose selections. It holds
-the status line with the `snapshot_id`, the native configuration with its
-origins and managed defaults, the routing verdict with every reason, the
-native-effort verdict, each visible model with its JSON-quoted description,
-advertised efforts, and recommended, retirement, and upgrade notes, and the
-hidden models by name. Every line passes through `_report_inline`, because
-catalog text is untrusted data.
+the status line with the `snapshot_id` and the plugin `version=` (the
+unavailable and snapshot-not-written lines carry the version too, since those
+are the cases where knowing which plugin ran matters most), the native
+configuration with its origins and managed defaults, the routing verdict with
+every reason, the native-effort verdict, each visible model with its
+JSON-quoted display name (when it differs from the execution id), JSON-quoted
+description, advertised efforts, and recommended, retirement, and upgrade
+notes, and the hidden models by name. A retirement at or before the snapshot's
+`created_at` reads `retired <time> (not routable)` rather than `retires
+<time>`, so the summary never offers a pair the preflight refuses; the entry
+stays listed (not moved to the hidden line, which means catalog-hidden) so a
+user who names it can still pin it. The display name lets Claude map a model
+the user named as the picker shows it to the execution id `-m` receives. Every
+line passes through `_report_inline`, which escapes line breaks and every
+other non-printable character (ESC, BEL, C1 controls, DEL, bidirectional
+overrides), because catalog and configuration text is untrusted data and must
+not drive a terminal.
 
 ### Eligibility and native proof
 
@@ -555,16 +612,29 @@ these, and each failed condition adds one human-readable reason:
 - a signed-in account. An unauthenticated app-server still lists models, so a
   catalog alone is not entitlement evidence;
 - a corresponding provider: the configured provider is unset or `openai`,
-  and no managed `modelProvider`, `modelProviders`, or `modelCatalogJson` is
-  set. Probes showed a custom provider's `config/read` answer is correct
-  while `model/list` still returns OpenAI's catalog;
+  no config layer set `openai_base_url` or `chatgpt_base_url` (an `origins`
+  entry, or any `openai_base_url` value, since it has no built-in default),
+  no `model_catalog_json` is set (it has no built-in default, so any value
+  counts, whichever layer set it), and no managed `modelProvider`,
+  `modelProviders`, `modelCatalogJson`, or `chatgptBaseUrl` is set. Probes
+  showed a custom provider's `config/read` answer is correct while
+  `model/list` still returns OpenAI's catalog, and with `openai_base_url`
+  pointed at a dead endpoint `model/list` still returned a complete catalog,
+  so neither the catalog nor the sign-in proves what a redirected endpoint
+  serves. A `model_catalog_json` file replaces what `model/list` returns
+  with entries someone wrote; a trusted project's `.codex/config.toml` can
+  set it, so the repository under review could otherwise write the
+  descriptions that choose its reviewers. Only the key names are recorded,
+  never a URL or path;
 - no `CODEX_API_KEY`;
 - managed new-thread defaults `absent`.
 
 `native.resolution` is `proven` only when status is `ok`, managed new-thread
-defaults are `absent`, the provider corresponds, `CODEX_API_KEY` is unset, a
-model is configured, and a well-formed catalog entry exists whose `model` is
-exactly that configured model. A hidden entry counts. The entry is needed so
+defaults are `absent`, the provider corresponds (an endpoint or catalog
+override blocks it, as for routing, because the catalog's efforts for the
+native model are then unverified), `CODEX_API_KEY` is unset, a model is
+configured, and a well-formed catalog entry exists whose `model` is exactly
+that configured model. A hidden entry counts. The entry is needed so
 the model's advertised efforts are known. Otherwise the resolution is
 `unknown`, with the reason. A configured model is never filled in from the
 catalog's recommendation, and a missing effort is never filled in from its
@@ -597,8 +667,11 @@ non-empty single line with no length cap. Inheritance is omission of all
 three keys.
 
 `--skill-contract` marks the skill path, where a `model` or `effort` without
-`selection` exits 2. Direct CLI use without it reads such an untagged pin as
-`{"mode": "user"}`, which keeps earlier role files working.
+`selection` exits 2. That check runs before the value grammar, so a malformed
+untagged pin is first asked for its provenance, not told how to inherit.
+Direct CLI use without it reads such an untagged pin as `{"mode": "user"}`,
+which keeps earlier role files working, and a malformed value there gets the
+same repair-the-pin hint as a `mode: user` pin.
 
 Both values share
 `SELECTION_VALUE_PATTERN = ^[A-Za-z0-9][A-Za-z0-9._:/@+-]*\Z`: no leading `-`,
@@ -625,14 +698,24 @@ violation exits 2 with the rewrite recovery. The violations are:
 - a `snapshot_id` that does not match;
 - routing ineligible, for a routed pair;
 - a model that is not an advertised execution id, with a hint naming the
-  execution id when the value is some entry's picker id or display name;
+  execution id when the value is some entry's picker id or display name
+  (only an execution id that matches the value grammar is ever suggested,
+  so catalog text cannot smuggle spaces or controls into the message);
 - a hidden model, or one whose advertised retirement has passed;
 - an effort not advertised for that exact model;
 - an unproven native model, for `native_effort`.
 
 User pins are never validated against the catalog, since a custom provider's
 models are not in it; they only collect advisories. With routing off,
-automatic roles are not errors.
+automatic roles are not errors. A value that fails the grammar in a user
+pin (a display name with a space, say) gets recovery text that says to write
+the execution id the summary lists or ask the user, never to inherit, since
+dropping the pin would discard the user's request.
+
+Preflight compares advertised retirements with the current time. The launch
+repeats authoring validation as of the planning snapshot's `created_at`, so
+a choice already retired at discovery stays an exit 2, while a retirement
+that passes after discovery is changed evidence and falls back (below).
 
 Evidence validation happens at launch. When at least one role is automatic
 and routing is `auto`, the launch calls `_discover()` once, after the staging,
@@ -644,16 +727,27 @@ roles never pay that latency.
 A role whose evidence has changed resolves to native inheritance with a
 reason (`selection evidence changed since discovery: …`). That covers
 discovery unavailable, routing ineligible for a routed pair, a model no longer
-advertised, hidden, or retired, an effort no longer advertised, and a native
-model no longer proven. The run continues: evidence never causes an exit 2.
+advertised, hidden, or retired, an effort no longer advertised, a native
+model no longer proven, and, for `native_effort`, a launch native model that
+differs from the planning one (`native model changed from '<a>' to '<b>'`).
+The effort was chosen from the planning native model's descriptions, and
+the same effort name need not mean the same behavior on another model, so
+it is never carried over, even when the new model advertises that spelling.
+The launch snapshot is never written anywhere, so a routed model it no
+longer advertises is reported as not advertised `in launch discovery`
+rather than by an id no reader could look up. The run continues: evidence
+never causes an exit 2.
 
 `_resolve_selection(role, planning, launch, routing_mode, now)` is the single
-pure resolver for both paths. Preflight passes no launch snapshot and prints
-its decisions as the plan. Launch passes the fresh snapshot, whose evidence
-wins. The resolver returns a frozen `SelectionDecision`, which
-`dataclasses.replace` attaches to each `Role` before fan-out. `now` is
-compared with advertised retirement times. Catalog order and the recommended
-marker never change a decision; the tests permute both.
+pure resolver for both paths, and `_resolve_run_selections` is the one
+orchestration around it: read the planning snapshot, validate authoring,
+discover (at launch only), and resolve every role. Preflight passes no launch
+snapshot and prints its decisions as the plan. Launch passes the fresh
+snapshot, whose evidence wins. The resolver returns a frozen
+`SelectionDecision`, which `dataclasses.replace` attaches to each `Role`
+before fan-out. `now` is compared with advertised retirement times. Catalog
+order and the recommended marker never change a decision; the tests permute
+both.
 
 ```mermaid
 flowchart TD
@@ -666,7 +760,7 @@ flowchart TD
     Off -->|"no"| Evidence{"launch snapshot if taken,<br/>else the planning snapshot:<br/>status ok?"}
     Evidence -->|"no"| Fallback
     Evidence -->|"yes, routed"| Pair{"routing eligible, model advertised,<br/>visible, not retired,<br/>effort advertised for it?"}
-    Evidence -->|"yes, native_effort"| NativeProof{"native model proven,<br/>effort advertised for it?"}
+    Evidence -->|"yes, native_effort"| NativeProof{"native model proven,<br/>same as at discovery,<br/>effort advertised for it?"}
     Pair -->|"yes"| Routed["routed: send -m model<br/>and the effort"]
     Pair -->|"no"| Fallback
     NativeProof -->|"yes"| NativeEffort["native_effort: send -m proven native model<br/>and the effort"]
@@ -691,9 +785,16 @@ The command builders receive only the dispatch values. Session state never
 stores a selection, so a routed choice cannot become a later run's default.
 User-pin advisories are notes, never rejections:
 
-- a model absent from the catalog;
+- a model absent from the catalog, plus the execution id it maps to when
+  the value is an entry's display name or picker id;
+- a pinned model whose advertised retirement has passed at the resolver's
+  `now`;
 - an effort the catalog does not advertise for the pinned model, or for the
   proven native model when only an effort is pinned;
+- for a model-only pin, a configured native effort the pinned model does not
+  advertise, when managed defaults are absent (Codex keeps that effort and
+  does not validate it on the client; the note says no effort override was
+  sent);
 - a partial pin while managed new-thread defaults are present or unknown.
 
 Every surface reports what was sent, never what ran:
@@ -719,7 +820,9 @@ Every surface reports what was sent, never what ran:
   `requested_effort=`.
 - **Preflight.** It prints one `selection plan:` line per role.
 
-All catalog- or Codex-derived text passes through `_report_inline`.
+All catalog- or Codex-derived text passes through `_report_inline`, and
+err.log lines other than completion lines through `_log_inline`, which also
+escapes ` reply=` so the follower's reply-path filter cannot drop them.
 
 Requested, sent, and reported are three different things. The request is
 what `roles.json` says. What was sent is the dispatch values. What was
@@ -732,12 +835,11 @@ into a stronger claim.
 
 ### Failure classification
 
-Model selection adds two failure classes, `[quota]` and `[model-rejected]`;
-the full table is in [Failure-class tagging](#failure-class-tagging). After
-the structured stall verdict, `_failure_verdict` applies one order on both
-the fresh and resume paths: auth → quota → anchored 429/5xx → model rejected
-→ stale (resume only) → substring retriable fallback → untagged. Two
-placements matter:
+Model selection adds two failure classes, `[quota]` and `[model-rejected]`.
+The full table, and the one classification order `_failure_verdict` applies
+on both the fresh and resume paths after the structured stall verdict, are in
+[Failure-class tagging](#failure-class-tagging). Two placements in that order
+matter here:
 
 - **Quota comes before the anchored parser.** A provider can send a usage
   limit with HTTP 429, which would otherwise be retried as a rate limit.
@@ -754,8 +856,15 @@ or one of Codex's complete sentences about the model this invocation sent
 the same events' messages):
 
 - "The '<m>' model is not supported when using Codex with …" (ChatGPT
-  sign-in);
-- "The model '<m>' does not exist or you do not have access to it".
+  sign-in, observed live on codex-cli 0.157.1 as JSON-in-message);
+- "The model '<m>' does not exist or you do not have access to it" (the
+  API's `model_not_found` wording, which Codex passes through; not yet
+  observed live).
+
+The model may be quoted with single quotes or backticks (the API wording
+uses backticks). The sentences are searched per line, so they also match
+after codex's `unexpected status NNN …: ` prefix, whether that prefix is
+followed by the body's error message or by the raw JSON body.
 
 These never qualify: bare "not found" or "not supported", the "Model
 metadata for … not found" advisory, "Selected model is at capacity" (which
@@ -765,11 +874,30 @@ stays transient), and any failure naming `reasoning.effort`,
 The `[model-rejected]` message names what was rejected (the requested model,
 or the natively configured one) and quotes Codex. It says no substitute was
 tried; on the resume path it adds that the saved thread was kept. It then
-gives one action by provenance: re-run without `model`, `effort`, and
-`selection` for an automatic choice, change or remove the pin for a user pin,
-or update the Codex configuration or pin an available model for native
-inheritance. There is no automatic runner fallback: the host re-runs the
-role.
+gives one action for the model that was refused, not for the role's
+provenance: re-run without `model`, `effort`, and `selection` for a routed
+model, change or remove the pin for a user model pin, or ask the user to
+update the Codex configuration or name a model to pin for the natively
+configured model; the orchestrator never edits Codex configuration or picks
+that model itself. That last case covers a native-effort role (it sends the
+proven native model with `-m`), an effort-only user pin, and native
+inheritance: an inheriting re-run would send the same native model again.
+There is no automatic runner fallback: the host re-runs the role.
+
+A `[quota]` that is codex's usage limit for one model ("You've hit your
+usage limit for <label>. Switch to another model now, or try again at
+<time>.") stays `[quota]`: terminal, never retried, never clearing state,
+at the same place in the order. Its tag appends the same closing action
+for the model that was sent, since a routed model is a choice the council
+can drop instead of waiting for the reset. The label comes from the
+server's limit-name header and is not guaranteed to echo `-m`, so it is
+never compared with the model sent. A plan-wide usage limit keeps codex's
+text alone.
+
+`_failure_verdict` returns a `FailureVerdict` that carries the class and,
+for a rejection, Codex's message, so each attempt is classified and its
+rejection parsed once. The resume path passes the verdict it branched on to
+`_classify_failure`, so the printed tag always matches the branch taken.
 
 ### Evidence from codex-cli 0.157.1
 
@@ -795,6 +923,11 @@ are placeholders:
   the advisory
   "This session was recorded with model `<recorded>` but is resuming with `<current>`. Consider switching back to `<recorded>` as it may affect Codex performance."
 - `codex --profile <name> app-server` is refused.
+- The binary's strings hold codex's own usage-limit wordings, including the
+  per-model form "You've hit your usage limit for <label>. Switch to another
+  model now, …", and the `unexpected status ` prefix it puts before an HTTP
+  failure body. Neither model-rejection sentence is in the binary: both are
+  server text that codex passes through.
 
 ### Known limits
 
@@ -821,16 +954,21 @@ are placeholders:
   (`--bundled` even skips the remote refresh). It cannot observe layered
   configuration, managed defaults, or auth context, so it would add weaker
   evidence without closing any gap. When app-server discovery is
-  unavailable, roles inherit.
+  unavailable, no automatic selection is made: explicit pins still apply,
+  and every other role inherits.
 - **No post-run `thread/read` telemetry.** The protocol's thread model and
   effort fields describe the current configured or latest persisted values
   and state that they are not per-turn execution telemetry. Reading them
   after a run could not tell which model served a turn; it would only add
   another timeout and delay reply files.
-- **No runner model-hopping.** After `[model-rejected]` the runner neither
-  substitutes a model nor replays the role with inheritance. A replay could
+- **No runner model-hopping.** After `[model-rejected]`, or a `[quota]` for
+  one model's usage limit, the runner neither substitutes a model nor replays
+  the role with inheritance. A replay could
   repeat a writer role's side effects, and the choice belongs to the host:
-  Claude re-runs only that role, without `model`, `effort`, and `selection`.
+  Claude re-runs only that role, in a new run directory, without `model`,
+  `effort`, and `selection` for a refused routed model, or asks the user
+  about a refused pin or native model and never edits Codex configuration
+  itself.
 - **No cross-run cache.** Every run discovers fresh evidence. A cache would
   need invalidation keyed on the executable, configuration layers, account,
   workspace, provider, and CLI version, and it could never use credentials as
@@ -856,8 +994,8 @@ are placeholders:
 
 ```mermaid
 flowchart TD
-    Mktemp["Claude runs mktemp -d once"] --> Rundir["Private run dir"]
-    Rundir --> DiscoverGate["--discover: private-dir gate<br/>roles.json and context.md need not exist yet"]
+    Mktemp["Claude runs mktemp -d once per launch"] --> Rundir["Private run dir"]
+    Rundir --> DiscoverGate["--discover: private-dir gate, not yet launched<br/>roles.json and context.md need not exist yet"]
     DiscoverGate --> Snapshot["model-snapshot.json (0600)<br/>atomic, run-scoped, never cached"]
     Rundir --> Roles["roles.json"]
     Rundir --> Context["context.md"]
@@ -867,7 +1005,9 @@ flowchart TD
 
     Roles --> Preflight["--check-staging-dir<br/>private-dir gate: lstat, owner, 0700"]
     Context --> Preflight
-    Preflight --> Exists{"both files exist?"}
+    Preflight --> Launched{"out.md, err.log, or replies/<br/>already present?"}
+    Launched -->|"yes"| NewDir["exit 2: every launch needs<br/>a new mktemp -d directory"]
+    Launched -->|"no"| Exists{"both files exist?"}
     Exists -->|"no"| StageError["exit 2 with staging hint"]
     Exists -->|"yes"| SameDir{"same mktemp dir?"}
     SameDir -->|"no"| StageError
@@ -955,7 +1095,9 @@ threads — set `CODEX_COUNCIL_SESSION_KEY` (or rely on a finer identifier such 
 the whole load/resume-or-fresh/save retry loop, not just individual file reads
 or writes, so two council processes cannot concurrently resume the same role
 thread and then last-writer-wins the state file. Different roles still run in
-parallel.
+parallel. State files are written through the shared `_atomic_write_private`
+(a 0600 temp file, fsync, `os.replace`), so a crash or power loss never leaves
+a truncated state file that `load_session` would read as no thread.
 
 ## Failure-class tagging
 
@@ -965,10 +1107,10 @@ unrecognized failures carry the raw stderr untagged:
 | Tag | Behavior |
 |---|---|
 | `[auth]` | Never clears state, never retries — caller must fix auth then re-run |
-| `[quota]` | Terminal: never retried, never clears state. A usage, quota, or credit limit — a structured `error.code` or `error.type` such as `insufficient_quota`, `usage_limit_reached`, or `credit_balance_exhausted`, or codex's "hit your usage limit" prose — even when it carries HTTP 429 |
+| `[quota]` | Terminal: never retried, never clears state. A usage, quota, or credit limit — a structured `error.code` or `error.type` such as `insufficient_quota`, `usage_limit_reached`, or `credit_balance_exhausted`, or codex's "hit your usage limit" prose — even when it carries HTTP 429. A usage limit codex names for one model also ends with the `[model-rejected]` action for the model that was sent |
 | `[retriable:rate-limit]` / `[retriable:5xx]` | One retry after a 5s backoff (MAX_RETRY_ATTEMPTS=2; bumping that adds 10s, 20s, … via `backoff *= 2`) |
-| `[model-rejected]` | Terminal: never retried, no substitute model, and it never clears saved thread state, even when its text also looks stale. Codex rejected the model this invocation sent (or the natively configured one); the message quotes Codex and names one action for the role's provenance |
-| `[retriable:stall]` | Output-inactivity watchdog fired before any side-effect-capable tool work began; replay is safe, so it retries through the same shared budget as rate-limit/5xx |
+| `[model-rejected]` | Terminal: never retried, no substitute model, and it never clears saved thread state, even when its text also looks stale. Codex rejected the model this invocation sent (or the natively configured one); the message quotes Codex and names one action for the model that was refused |
+| `[retriable:stall]` | Output-inactivity watchdog fired before any side-effect-capable tool work began (only agent_message, reasoning, or Codex `error` notice items such as the resume advisory, or none); replay is safe, so it retries through the same shared budget as rate-limit/5xx |
 | `[stall]` | Watchdog fired after tool work began — terminal, because an automatic replay could duplicate side effects; a buffered agent_message without turn completion is quoted but never auto-promoted to success |
 | `[orchestrator-exception]` | A role's coroutine raised — siblings still complete via `gather(..., return_exceptions=True)` |
 | `[orchestrator-bug]` | A role task returned something other than a `RoleResult`; reported as a failure instead of crashing the report |

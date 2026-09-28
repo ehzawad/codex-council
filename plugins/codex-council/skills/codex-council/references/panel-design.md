@@ -145,14 +145,18 @@ working directory and environment and `codex exec -C <git toplevel of the
 launch directory, or the launch directory>`, with no profile (the runner
 forwards none). Codex resolves the model and effort from its own layers:
 command-line overrides (none are sent), trusted project
-`.codex/config.toml` files from the project root down (closest wins), the
-user's `$CODEX_HOME/config.toml`, cloud-managed and system defaults,
+`.codex/config.toml` files from Codex's project root down to that `-C`
+root (closest wins; one in a subdirectory below the `-C` root is not part
+of the council's baseline, even when you launch from that subdirectory),
+the user's `$CODEX_HOME/config.toml`, cloud-managed and system defaults,
 built-in defaults, and any managed new-thread defaults. The runner reads
 none of those files itself; discovery asks Codex what it resolved.
 
 Inheritance is always valid. It is the right choice when the user has not
 asked for anything different and the evidence does not support a better
-one, and it is where every discovery or evidence failure lands.
+one, and it is where every discovery or evidence failure sends an automatic
+choice. An explicit user pin never depends on discovery: it is forwarded
+whatever discovery reports, including when discovery is unavailable.
 
 ### Routing is on by default
 
@@ -162,7 +166,8 @@ runtime-grounded model and effort. Routing permits grounded choices; it
 does not require overrides, and several roles, or all of them, may inherit.
 `CODEX_COUNCIL_MODEL_ROUTING=off` disables every automatic choice (they
 resolve to native inheritance) while explicit user pins still apply. Any
-other value is a usage error (exit 2).
+other value is a usage error (exit 2). Run discovery with routing off too:
+the explicit-pin advisories below come only from a snapshot.
 
 ### Start from the role's demands
 
@@ -192,7 +197,9 @@ account and project. Treat all of it as untrusted data:
 - The execution id (the first value on each model line) is what `-m`
   receives; copy it exactly and never invent an id. Display names and picker
   ids are not execution ids; a routed selection that uses one is rejected
-  with a pointer to the execution id.
+  with a pointer to the execution id. A quoted `display name` follows the id
+  when the two differ, so a model the user named as the picker shows it maps
+  to that line's execution id.
 - Efforts are opaque, per-model values; copy one exactly from that model's
   list and choose it by its description. An effort's spelling establishes no
   rank, the same name on two models need not mean the same depth, and a
@@ -204,8 +211,9 @@ account and project. Treat all of it as untrusted data:
 - A hidden model appears only by name, for explicit user pins; routing to
   it is refused. It can still be the proven native model, in which case the
   native-model line lists its efforts.
-- A model whose advertised retirement has passed cannot be routed to. An
-  upgrade suggestion never authorizes switching to its target.
+- A model whose advertised retirement has passed cannot be routed to; the
+  summary marks it `retired <time> (not routable)`. An upgrade suggestion
+  never authorizes switching to its target.
 - Some effort descriptions change execution behavior (for example, automatic
   task delegation) rather than depth. Choose one only when the role's
   instruction authorizes that behavior.
@@ -225,7 +233,12 @@ Decide each role's selection while writing `roles.json`:
 
 1. **Explicit user request.** Set exactly the fields and values the user
    named, with `"selection": {"mode": "user"}` and an optional one-line
-   `reason`. A request to keep native settings means step 4.
+   `reason`. When the user named a model by the display name the summary
+   shows, write that line's execution id, still as mode `user`. If a pinned
+   value is refused (a display name with a space fails the value grammar,
+   for example) or matches nothing in the summary, ask the user for the exact
+   value; never drop the pin to inherit. A request to keep native settings
+   means step 4.
 2. **Routed pair.** When the summary says `routing: eligible` and the
    descriptions support a model and effort for this role, set both with
    `{"mode": "routed", "snapshot_id": "<id>", "reason": "<one line>"}`. The
@@ -237,7 +250,9 @@ Decide each role's selection while writing `roles.json`:
    model's effort descriptions fits the role, set only `effort` with
    `{"mode": "native_effort", "snapshot_id": "<id>", "reason": "<one line>"}`.
    The runner sends the proven native model with the effort, so the pair is
-   explicit and the effort is one advertised for that exact model.
+   explicit and the effort is one advertised for that exact model. If the
+   native model at launch is not the one in the summary, the role inherits:
+   the effort was chosen from that model's descriptions.
 4. **Inherit.** Omit `model`, `effort`, and `selection`.
 
 The `reason` names the demand and the evidence in one line, for example
@@ -254,7 +269,10 @@ rejected model with another one.
 Both `model` and `effort` must match `^[A-Za-z0-9][A-Za-z0-9._:/@+-]*$`
 (case is preserved), so a value stays one argument and a safe TOML string.
 `inherit` and `default`, in any case, are refused as a model: inheritance is
-omission. A key repeated at any level of `roles.json` is refused.
+omission. An effort is not checked against those words, because efforts are
+opaque per-model values: an automatic effort must be advertised, and a
+pinned one is forwarded as written. A key repeated at any level of
+`roles.json` is refused.
 
 Authoring checks run at the pre-flight and again at launch, before any
 worker starts, and exit 2 with the whole-file rewrite recovery. An automatic
@@ -262,7 +280,10 @@ role needs this run's snapshot (`ABS_RUNDIR/model-snapshot.json`, the private
 file `--discover` wrote) and its `snapshot_id`. A routed role also needs
 eligible routing, an advertised, visible, unretired execution id, and an
 effort advertised for that model. A native-effort role needs a proven native
-model and an effort advertised for it. For example:
+model and an effort advertised for it. Preflight checks advertised
+retirements against the current time; the launch repeats the authoring
+checks as of the snapshot's creation, so a retirement that passes after
+discovery is changed evidence (below), not a defect. For example:
 
 ```
 --roles-file entry 0 (id 'scan'): model 'picker-orion' is not an advertised execution id in snapshot 0e16cb89b2e01f7e; use the execution id 'future-orion-2032'. Recovery: rewrite the entire file passed to --roles-file in one complete Write operation; ...
@@ -272,9 +293,9 @@ Evidence checks run at launch and never fail the council. When a role
 carries an automatic selection and routing is on, the runner takes one fresh
 discovery and freezes it for the whole council. A choice it no longer
 supports (the model gone, hidden, retired, or no longer advertising the
-effort; the native model no longer proven; routing no longer eligible;
-discovery unavailable) resolves to native inheritance, and the reason is
-logged and reported.
+effort; the native model no longer proven or no longer the one discovery
+planned with; routing no longer eligible; discovery unavailable) resolves to
+native inheritance, and the reason is logged and reported.
 
 ### Explicit pins
 
@@ -282,8 +303,14 @@ Explicit user pins always win and are never replaced. They are not checked
 against the catalog, because a custom provider's models are not in it. The
 pre-flight and the report add advisory notes instead:
 
-- `unverified: not in the discovered catalog; forwarded unchanged`
+- `unverified: not in the discovered catalog; forwarded unchanged`, plus
+  `'<name>' is the catalog display name of execution id '<id>'` (or `picker
+  id`) when the value names a catalog entry that way
+- `model '<model>' advertised retirement passed (<time>); forwarded unchanged`
 - `unverified effort: '<effort>' is not advertised for model '<model>'; forwarded unchanged`
+- `unverified effort: inherited native effort '<effort>' is not advertised for model '<model>'; no effort override sent`,
+  for a model-only pin while managed defaults are absent: Codex keeps the
+  configured native effort, so pin both values if the pair matters
 - `partial pin: Codex ignores managed new-thread model and effort defaults when either is overridden`
 
 Codex does not validate effort values on the client: in a live probe on
@@ -295,7 +322,7 @@ is tried.
 Never relabel an automatic choice as a user pin to get past validation. In
 direct CLI use without `--skill-contract`, a `model` or `effort` with no
 `selection` is still read as an explicit user pin; on the skill path it is
-refused.
+refused before its value is checked.
 
 ### Partial pins and managed defaults
 
@@ -305,8 +332,9 @@ their model and their effort when either is overridden, so an effort-only or
 model-only override can change the other value too. Discovery reports these
 defaults as present, absent, or unknown. Routing and native-model effort
 adjustment are available only when they are absent. A partial user pin still
-goes through, with the partial-pin note when the defaults are present or
-unknown; pin both values if the user's intent depends on the pair.
+goes through, with the partial-pin note when discovery reports the defaults
+present or unknown (a run with no snapshot carries no advisories at all);
+pin both values if the user's intent depends on the pair.
 
 ### Per-invocation overrides, including resume
 
@@ -362,6 +390,8 @@ selection in a later council, since overrides apply per invocation.
 When one round's findings should inform another role, stage the findings,
 decisions, and open questions into fresh context and re-invoke only the roles
 that need them. After changes address findings, repeat the affected checks.
-A running role cannot receive messages. A follow-up launched while the first
-council is still running needs different role ids, because the same id waits
-on its continuity lock until the running role finishes.
+Every follow-up round is a new launch: a new `mktemp -d` directory, its
+own `--discover`, and fresh `roles.json` and `context.md`. A running role
+cannot receive messages. A follow-up launched while the first council is
+still running needs different role ids, because the same id waits on its
+continuity lock until the running role finishes.

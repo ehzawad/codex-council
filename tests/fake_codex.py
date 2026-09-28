@@ -10,7 +10,9 @@ PATH in the environment the code under test sees.
 Subcommands:
 
 * ``codex --version`` prints ``codex-cli 9.9.9`` (a scenario "version"
-  object can change the output or exit code, or make it hang).
+  object can change the output or exit code, or make it hang) and writes
+  ``version.pid`` into FAKE_CODEX_PID_DIR, so tests can prove the probe's
+  teardown left nothing behind.
 * ``codex app-server --listen stdio://`` runs a newline-delimited JSON-RPC
   loop driven by the scenario JSON file named by FAKE_CODEX_SCENARIO (an
   unset or not-yet-written scenario counts as ``{}``). Every received
@@ -18,18 +20,26 @@ Subcommands:
   client's reply to a server request is logged as ``response:<code>``),
   full requests go to FAKE_CODEX_REQUEST_LOG as JSON lines, and
   FAKE_CODEX_PID_DIR receives ``server.pid`` (and ``grandchild.pid``) so
-  tests can prove teardown left nothing behind.
+  tests can prove teardown left nothing behind, ``server.env`` (JSON: the
+  server's CODEX_HOME and working directory, to prove it runs in the
+  runner's execution context), and ``stdin.eof`` once the server reads
+  EOF on stdin (to prove teardown's stdin close alone ends it).
 * ``codex exec ...`` behaves like the older inline fakes: records its argv
   as JSON into FAKE_CODEX_ARGV_DIR (file names sort in invocation order),
   reads the prompt on stdin, and replies with thread.started /
-  agent_message / turn.completed. A resumed thread keeps the REQUESTED
-  thread id. Prompt sentinels (EXEC_SENTINELS) make it fail the way
-  current codex-cli does — a structured model_not_found, the ChatGPT
-  "model is not supported" sentence, a quota error carrying HTTP 429, a
-  model rejection whose text also looks like a stale thread — or emit the
-  resume advisory Codex prints when a thread resumes on a different
-  model. A rejection names the -m value the runner sent (NATIVE_MODEL when
-  none was sent).
+  agent_message / turn.completed. It runs the -m value the runner sent,
+  else the native model: the scenario's configured model (config/read's
+  config.model, so one scenario edit changes the native default for
+  discovery and exec alike), else NATIVE_MODEL. A fresh thread records the
+  model it started on under CODEX_HOME, as a real rollout does. A resumed
+  thread keeps the REQUESTED thread id, and a successful resume on a model
+  other than the recorded one emits the advisory Codex prints for it.
+  Prompt sentinels (EXEC_SENTINELS) make it fail the way current codex-cli
+  does: a structured model_not_found, the ChatGPT "model is not supported"
+  sentence, a quota error carrying HTTP 429, or a model rejection whose
+  text also looks like a stale thread (structured, or the text-only
+  ChatGPT sentence, which only names the model). A rejection names the
+  model the turn ran.
 
 Scenario format (every key optional)::
 
@@ -55,6 +65,8 @@ Scenario format (every key optional)::
           "raw": "<line>",              # write this line instead of a reply
           "raw_hex": "fffe",            # write these bytes (+ newline)
           "oversize": 100000,           # write one line of this many bytes
+          "unterminated": 100000,       # write this many bytes, no newline,
+                                        # then never respond
           "exit": 3                     # exit with this code, no reply
         }
       }
@@ -74,17 +86,16 @@ import sys
 FAKE_CODEX_SOURCE = r'''
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
 import time
 import uuid
 
-# Filled in by install(): the EXEC_SENTINELS map, NATIVE_MODEL, and the
-# model the resume advisory says a thread was recorded with.
+# Filled in by install(): the EXEC_SENTINELS map and NATIVE_MODEL.
 SENTINELS = __SENTINELS__
 NATIVE_MODEL = __NATIVE_MODEL__
-RECORDED_MODEL = __RECORDED_MODEL__
 
 
 def _scenario():
@@ -103,11 +114,11 @@ def _append(env_name, text):
             f.write(text + "\n")
 
 
-def _record_pid(name, pid):
+def _record(name, text):
     pid_dir = os.environ.get("FAKE_CODEX_PID_DIR")
     if pid_dir:
         with open(os.path.join(pid_dir, name), "w", encoding="utf-8") as f:
-            f.write(str(pid))
+            f.write(text)
 
 
 def _write_line(data):
@@ -121,8 +132,11 @@ def _send(message):
 
 def run_version(scenario):
     spec = scenario.get("version", {})
+    _record("version.pid", str(os.getpid()))
     if spec.get("hang"):
-        time.sleep(3600)
+        # Far past any probe timeout, yet bounded: a probe teardown bug
+        # cannot orphan the sleeper for long.
+        time.sleep(120)
     sys.stdout.write(spec.get("stdout", "codex-cli 9.9.9\n"))
     sys.stdout.flush()
     return spec.get("exit", 0)
@@ -154,6 +168,10 @@ def _answer(message, spec):
         _write_line(bytes.fromhex(spec["raw_hex"]))
     elif "oversize" in spec:
         _write_line(b"x" * spec["oversize"])
+    elif "unterminated" in spec:
+        sys.stdout.buffer.write(b"x" * spec["unterminated"])
+        sys.stdout.buffer.flush()
+        time.sleep(3600)
     elif "pages" in spec:
         cursor = (message.get("params") or {}).get("cursor") or ""
         page = spec["pages"].get(cursor)
@@ -172,7 +190,9 @@ def _answer(message, spec):
 def run_app_server(scenario):
     server = scenario.get("server", {})
     methods = scenario.get("methods", {})
-    _record_pid("server.pid", os.getpid())
+    _record("server.pid", str(os.getpid()))
+    _record("server.env", json.dumps({
+        "CODEX_HOME": os.environ.get("CODEX_HOME"), "cwd": os.getcwd()}))
     if server.get("ignore_sigterm"):
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
     if server.get("grandchild"):
@@ -183,7 +203,7 @@ def run_app_server(scenario):
                     "time.sleep(120)")
         # Inherits stdout/stderr: holds both pipes open after we exit.
         child = subprocess.Popen([sys.executable, "-c", code])
-        _record_pid("grandchild.pid", child.pid)
+        _record("grandchild.pid", str(child.pid))
     if server.get("startup_stderr"):
         sys.stderr.write(server["startup_stderr"] + "\n")
         sys.stderr.flush()
@@ -192,6 +212,7 @@ def run_app_server(scenario):
     while True:
         raw = sys.stdin.buffer.readline()
         if not raw:
+            _record("stdin.eof", "")
             break
         if not raw.strip():
             continue
@@ -250,6 +271,13 @@ def _failure(prompt, model):
             "param": "model",
             "message": not_found + " Thread not found in the model cache; "
                                    "no rollout found for it."})
+    if SENTINELS["reject_sentence_with_stale_words"] in prompt:
+        # No structured code: only the sentence naming the model says
+        # which model was refused.
+        return _api_error(400, {
+            "type": "invalid_request_error",
+            "message": f"The '{model}' model is not supported when using "
+                       "Codex with a ChatGPT account. Thread not found."})
     if SENTINELS["quota_429"] in prompt:
         return _api_error(429, {
             "type": "insufficient_quota", "code": "insufficient_quota",
@@ -259,7 +287,40 @@ def _failure(prompt, model):
     return None
 
 
-def run_exec(argv):
+def _native_model(scenario):
+    """The model exec runs without -m: the scenario's configured model."""
+    try:
+        model = scenario["methods"]["config/read"]["result"]["config"]["model"]
+    except (KeyError, TypeError):
+        model = None
+    return model if isinstance(model, str) and model else NATIVE_MODEL
+
+
+def _thread_file(thread_id):
+    """Where a thread's recorded model lives; None without CODEX_HOME."""
+    home = os.environ.get("CODEX_HOME")
+    if not home or not re.fullmatch(r"[A-Za-z0-9_-]+", thread_id):
+        return None
+    return os.path.join(home, "fake-threads", thread_id)
+
+
+def _record_thread_model(thread_id, model):
+    path = _thread_file(thread_id)
+    if path:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(model)
+
+
+def _recorded_thread_model(thread_id):
+    path = _thread_file(thread_id)
+    if not path or not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
+def run_exec(argv, scenario):
     prompt = sys.stdin.read()
     argv_dir = os.environ.get("FAKE_CODEX_ARGV_DIR")
     if argv_dir:
@@ -271,20 +332,27 @@ def run_exec(argv):
         thread_id = argv[argv.index("resume") + 1]
     else:
         thread_id = "thread-" + uuid.uuid4().hex[:12]
-    model = argv[argv.index("-m") + 1] if "-m" in argv else NATIVE_MODEL
+    if "-m" in argv:
+        model = argv[argv.index("-m") + 1]
+    else:
+        model = _native_model(scenario)
+    # The model a thread started on stays its recorded model.
+    recorded = _recorded_thread_model(thread_id) if resumed else None
+    if not resumed:
+        _record_thread_model(thread_id, model)
     events = [{"type": "thread.started", "thread_id": thread_id},
               {"type": "turn.started"}]
     failure = _failure(prompt, model)
     if failure is not None:
         _emit(events + failure)
         return 1
-    if resumed and SENTINELS["resume_advisory"] in prompt:
+    if recorded is not None and recorded != model:
         events.append({"type": "item.completed", "item": {
             "type": "error",
-            "message": f"This session was recorded with model "
-                       f"`{RECORDED_MODEL}` but is resuming with `{model}`. "
-                       f"Consider switching back to `{RECORDED_MODEL}` as it "
-                       "may affect Codex performance."}})
+            "message": f"This session was recorded with model `{recorded}` "
+                       f"but is resuming with `{model}`. Consider switching "
+                       f"back to `{recorded}` as it may affect Codex "
+                       "performance."}})
     events += [
         {"type": "item.completed",
          "item": {"type": "agent_message", "text": "fake reply from codex"}},
@@ -302,7 +370,7 @@ def main():
     if argv[:1] == ["app-server"]:
         return run_app_server(scenario)
     if argv[:1] == ["exec"]:
-        return run_exec(argv)
+        return run_exec(argv, scenario)
     sys.stderr.write("fake codex: unsupported arguments %r\n" % (argv,))
     return 2
 
@@ -322,7 +390,9 @@ LEAK_SENTINELS = (
     CONFIG_PATH_SENTINEL,
 )
 
-# The only methods discovery may ever send.
+# The only methods discovery may ever send. council_testlib backs this up
+# with its own FORBIDDEN_METHODS and login guards, so widening it alone
+# cannot admit an inference or login method.
 DISCOVERY_METHODS = frozenset({
     "initialize", "initialized", "account/read", "config/read",
     "configRequirements/read", "model/list",
@@ -331,8 +401,6 @@ DISCOVERY_METHODS = frozenset({
 NATIVE_MODEL = "future-orion-2032"
 NATIVE_EFFORT = "deliberate"
 RETIREMENT_AT = 1924992000  # 2031-01-01T00:00:00Z
-# The model the resume advisory says a thread was recorded with.
-RECORDED_MODEL = "future-lyra-2030"
 
 # Prompt sentinels for the fake `exec` (put one in a role instruction or the
 # shared context; both reach the prompt).
@@ -340,8 +408,8 @@ EXEC_SENTINELS = {
     "reject_structured": "PLEASE_REJECT_MODEL_STRUCTURED",
     "reject_chatgpt": "PLEASE_REJECT_MODEL_CHATGPT",
     "reject_with_stale_words": "PLEASE_REJECT_MODEL_WITH_STALE_WORDS",
+    "reject_sentence_with_stale_words": "PLEASE_REJECT_SENTENCE_STALE_WORDS",
     "quota_429": "PLEASE_QUOTA_429",
-    "resume_advisory": "PLEASE_RESUME_ADVISORY",
 }
 
 
@@ -352,7 +420,6 @@ def install(bin_dir):
         FAKE_CODEX_SOURCE
         .replace("__SENTINELS__", repr(EXEC_SENTINELS))
         .replace("__NATIVE_MODEL__", repr(NATIVE_MODEL))
-        .replace("__RECORDED_MODEL__", repr(RECORDED_MODEL))
     )
     with open(source, "w", encoding="utf-8") as f:
         f.write(text)
@@ -384,12 +451,14 @@ def model_entry(dispatch_id, **overrides):
     """One wire-format model/list record with synthetic defaults.
 
     Any wire field (including "model" itself) can be overridden, which is
-    how tests build malformed or picker-id != dispatch-id records.
+    how tests build malformed or picker-id != dispatch-id records. The
+    display name defaults to the dispatch id, so the --discover summary
+    shows one only where a test (or default_catalog) sets a different one.
     """
     entry = {
         "id": dispatch_id,
         "model": dispatch_id,
-        "displayName": f"Synthetic {dispatch_id}",
+        "displayName": dispatch_id,
         "description": f"Synthetic catalog entry for {dispatch_id}.",
         "hidden": False,
         "isDefault": False,

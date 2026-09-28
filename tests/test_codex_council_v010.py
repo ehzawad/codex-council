@@ -36,9 +36,11 @@ SCRIPTS_DIR = os.path.abspath(os.path.join(
     "plugins", "codex-council", "skills", "codex-council", "scripts",
 ))
 sys.path.insert(0, SCRIPTS_DIR)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import codex_council  # noqa: E402
 import council_common  # noqa: E402
+from council_testlib import assert_usage_exit as _assert_usage_exit  # noqa: E402
 
 SCRIPT = os.path.join(SCRIPTS_DIR, "codex_council.py")
 EPOCH = str(codex_council.SKILL_CONTRACT_EPOCH)
@@ -87,16 +89,6 @@ def _role_json(rid="alpha", label="A", instruction=None, **extra):
 
 def _make_role(rid="architect", label="Architect", model=None, effort=None):
     return codex_council.Role(rid, label, _instruction(), model, effort)
-
-
-def _assert_usage_exit(test, callable_, *, expect_in_stderr):
-    buf = io.StringIO()
-    with contextlib.redirect_stderr(buf):
-        with test.assertRaises(SystemExit) as ctx:
-            callable_()
-    test.assertEqual(ctx.exception.code, 2)
-    test.assertIn(expect_in_stderr, buf.getvalue())
-    return buf.getvalue()
 
 
 def _private_tmpdir(test):
@@ -167,8 +159,10 @@ class RoleOverrideParsingTests(unittest.TestCase):
                     expect_in_stderr="optional field 'model'",
                 )
                 self.assertIn("rewrite the entire file", err)
-                self.assertIn("omit model, effort, and selection to inherit",
-                              err)
+                # Untagged in direct CLI use is an explicit user pin: the
+                # hint repairs the pin instead of dropping it to inherit.
+                self.assertIn("never drop it to inherit", err)
+                self.assertNotIn("omit model, effort, and selection", err)
 
     def test_malformed_effort_rejected(self):
         for bad in ("", "low\n", "low ", 'low"', "lo w", "-low", "low\\",
@@ -295,6 +289,16 @@ class ItemErrorWarningTests(unittest.IsolatedAsyncioTestCase):
             [self.MISMATCH])
         self.assertEqual(codex_council.extract_item_errors(self._jsonl(False)),
                          [])
+
+    def test_extract_item_errors_docstring_names_the_verified_trigger(self):
+        """The resume advisory follows a recorded-vs-current model
+        difference; the verified case is a bare resume after the native
+        configuration changed, not only a different override."""
+        flat = " ".join(codex_council.extract_item_errors.__doc__.split())
+        self.assertIn("runs on a model other than the one it was recorded "
+                      "with", flat)
+        self.assertIn("no override after the native configuration changed",
+                      flat)
 
     async def test_item_error_on_successful_resume_becomes_warning(self):
         outputs = [self._jsonl(False), self._jsonl(True)]

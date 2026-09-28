@@ -13,6 +13,7 @@ Run from repo root:
     python3 -m unittest discover -s tests -p 'test_*.py'
 """
 
+import calendar
 import contextlib
 import copy
 import dataclasses
@@ -25,6 +26,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -46,7 +48,14 @@ import council_common  # noqa: E402
 import council_discovery  # noqa: E402
 import council_failures  # noqa: E402
 import council_selection  # noqa: E402
+import council_testlib  # noqa: E402
 import fake_codex  # noqa: E402
+from council_testlib import (  # noqa: E402
+    SNAPSHOT_ID,
+    assert_usage_exit as _assert_usage_exit,
+    catalog as _catalog,
+    clean_env as _clean_env,
+)
 
 SCRIPT = os.path.join(SCRIPTS_DIR, "codex_council.py")
 EPOCH = str(codex_council.SKILL_CONTRACT_EPOCH)
@@ -56,14 +65,16 @@ VEGA = "future-vega-2033"                 # visible, recommended
 LYRA = "future-lyra-2030"                 # visible, retires 2031-01-01
 HIDDEN = "future-hidden-2031"             # hidden
 CUSTOM = "acme/future-review-2034:rev2"   # a custom-provider id, never listed
-SNAPSHOT_ID = "0123456789abcdef"
 NOW = "2026-09-27T12:00:00Z"
+LYRA_RETIRES = "2031-01-01T00:00:00Z"      # fake_codex.RETIREMENT_AT
+BEFORE_LYRA_RETIRES = "2030-12-31T23:59:59Z"
 AFTER_LYRA_RETIRES = "2031-06-01T00:00:00Z"
+PAST_RETIREMENT_EPOCH = 1600000000          # an advertised retirement ...
+PAST_RETIREMENT = "2020-09-13T12:26:40Z"    # ... that has already passed
 SENTINELS = fake_codex.EXEC_SENTINELS
 REWRITE = "rewrite the entire file passed to --roles-file"
 INHERIT_HINT = ("omit model, effort, and selection to inherit native "
                 "configuration")
-FORBIDDEN_METHODS = ("thread/start", "thread/resume", "turn/start")
 
 
 def _instruction(text="Review"):
@@ -112,69 +123,19 @@ def _role(rid="architect", model=None, effort=None, mode=None,
         selection = council_selection.Selection("user")
     elif mode is not None:
         selection = council_selection.Selection(mode, snapshot_id, reason)
-    return codex_council.Role(
+    return council_selection.Role(
         rid, rid.title(), " ".join(_instruction()), model, effort, selection)
-
-
-def _assert_usage_exit(test, callable_, *, expect_in_stderr):
-    buf = io.StringIO()
-    with contextlib.redirect_stderr(buf):
-        with test.assertRaises(SystemExit) as ctx:
-            callable_()
-    test.assertEqual(ctx.exception.code, 2)
-    test.assertIn(expect_in_stderr, buf.getvalue())
-    return buf.getvalue()
-
-
-def _clean_env(**extra):
-    """os.environ minus anything that changes council or discovery verdicts."""
-    dropped = {
-        "CODEX_API_KEY", ROUTING_ENV, codex_council.SESSION_KEY_ENV,
-        codex_council.MAX_PARALLEL_ENV, codex_council.STALL_SECS_ENV,
-    }
-    env = {
-        key: value for key, value in os.environ.items()
-        if key not in dropped and not key.startswith("FAKE_CODEX_")
-    }
-    env.update(extra)
-    return env
 
 
 # ---------- synthetic snapshots (built by the real snapshot builder) ----------
 
-def _catalog(entries):
-    catalog = council_discovery._new_catalog()
-    page, problem = council_discovery._normalize_model_page({"data": entries})
-    assert problem is None, problem
-    council_discovery._merge_model_page(catalog, page, [])
-    return catalog
-
-
 def _snapshot(snapshot_id=SNAPSHOT_ID, routing_mode="auto", entries=None,
               **observed):
-    """A discovery snapshot; keyword args override the observations."""
-    base = {
-        "context": dict(
-            council_discovery._EMPTY_DISCOVERY_CONTEXT, project_root="/proj",
-            launch_cwd="/proj", codex_executable="/bin/codex",
-            codex_cli_version="9.9.9", codex_home="/home/.codex",
-        ),
-        "problems": [],
-        "conclusive": True,
-        "account": {"type": "chatgpt", "requires_openai_auth": True},
-        "configured": {"model": NATIVE, "effort": "deliberate",
-                       "provider": None, "model_origin": "user",
-                       "effort_origin": "user"},
-        "managed": {"status": "absent", "model": None, "effort": None,
-                    "provider_keys": []},
-        "catalog": _catalog(
-            fake_codex.default_catalog() if entries is None else entries),
-    }
-    base.update(observed)
-    return council_discovery._build_snapshot(
-        snapshot_id=snapshot_id, created_at="2026-09-27T12:00:00Z",
-        plugin_version="9.8.7", routing_mode=routing_mode, **base,
-    )
+    """A discovery snapshot; `entries` is the catalog's wire entries, and
+    keyword args override the observations."""
+    if entries is not None:
+        observed.setdefault("catalog", _catalog(entries))
+    return council_testlib.snapshot(snapshot_id, routing_mode, **observed)
 
 
 def _unavailable(problem="rpc_error:model/list:-32601"):
@@ -214,12 +175,13 @@ class SelectionValueGrammarTests(unittest.TestCase):
         for field in ("model", "effort"):
             for value in bad_values:
                 with self.subTest(field=field, value=value):
+                    # Untagged in direct CLI use: an explicit user pin.
                     err = _assert_usage_exit(
                         self, lambda f=field, v=value: _parse([_entry(**{f: v})]),
                         expect_in_stderr=f"optional field '{field}'",
                     )
                     self.assertIn(REWRITE, err)
-                    self.assertIn(INHERIT_HINT, err)
+                    self.assertIn(council_selection.USER_PIN_VALUE_HINT, err)
 
     def test_reserved_inheritance_words_are_not_model_ids(self):
         for value in ("inherit", "default", "INHERIT", "Default", "InHeRiT"):
@@ -235,6 +197,46 @@ class SelectionValueGrammarTests(unittest.TestCase):
                             f"{INHERIT_HINT}"),
                     )
                     self.assertIn(REWRITE, err)
+
+    def test_a_malformed_user_pin_is_repaired_never_dropped(self):
+        """A display name with a space is not an execution id; the error
+        for an explicit pin says to map or ask, not to inherit. Direct CLI
+        use reads an untagged value as a user pin, so it gets the same
+        repair hint."""
+        for field, value in (("model", "Future Orion"),
+                             ("effort", "Extra High")):
+            for selection in ({"mode": "user"}, None):
+                with self.subTest(field=field, selection=selection):
+                    extra = _present({field: value, "selection": selection})
+                    err = _assert_usage_exit(
+                        self, lambda e=extra: _parse([_entry(**e)]),
+                        expect_in_stderr=council_selection.USER_PIN_VALUE_HINT)
+                    self.assertNotIn(INHERIT_HINT, err)
+                    self.assertIn(REWRITE, err)
+        # An automatic value came from the summary: inheriting is fine.
+        err = _assert_usage_exit(
+            self, lambda: _parse([_routed(model="Future Orion")]),
+            expect_in_stderr=INHERIT_HINT)
+        self.assertNotIn(council_selection.USER_PIN_VALUE_HINT, err)
+
+    def test_reserved_words_are_ordinary_effort_values(self):
+        """Only a MODEL of inherit/default is refused. Efforts are opaque
+        per-model values: a pinned one is forwarded as written, and an
+        automatic one must be advertised like any other."""
+        for effort in ("inherit", "default", "Default", "INHERIT"):
+            with self.subTest(effort=effort):
+                role = _parse([_entry(effort=effort,
+                                      selection={"mode": "user"})],
+                              require_selection=True)[0]
+                decision = _resolve(role, _snapshot())
+                self.assertEqual(decision.dispatch_effort, effort)
+                cmd = codex_council._fresh_cmd("/r", None, effort)
+                self.assertEqual(cmd[cmd.index("-c") + 1],
+                                 f'model_reasoning_effort="{effort}"')
+                self.assertEqual(
+                    council_selection._routed_evidence_gap(
+                        _snapshot(), VEGA, effort, NOW),
+                    f"effort '{effort}' is not advertised for model '{VEGA}'")
 
     def test_accepted_values_stay_single_argv_items_and_toml_strings(self):
         for effort in ("adaptive-v2", "X.High:2", "a/b@c+d"):
@@ -298,6 +300,9 @@ class SelectionObjectParsingTests(unittest.TestCase):
             (_routed(effort=None), "needs both 'model' and 'effort'"),
             (_routed(snapshot_id=None), "needs 'snapshot_id'"),
             (_routed(snapshot_id="0123456789ABCDEF"), "needs 'snapshot_id'"),
+            # fullmatch: a valid id with anything after it is not an id.
+            (_routed(snapshot_id=SNAPSHOT_ID + "XYZ"), "needs 'snapshot_id'"),
+            (_routed(snapshot_id=SNAPSHOT_ID + "\n"), "needs 'snapshot_id'"),
             (_routed(snapshot_id="0123"), "needs 'snapshot_id'"),
             (_routed(snapshot_id=7), "needs 'snapshot_id'"),
         )
@@ -376,7 +381,12 @@ class SelectionObjectParsingTests(unittest.TestCase):
     def test_untagged_pins_are_user_pins_only_for_direct_cli_use(self):
         role = _parse([_entry(model=CUSTOM, effort="brisk")])[0]
         self.assertEqual(role.selection, council_selection.Selection("user"))
-        for extra in ({"model": CUSTOM}, {"effort": "brisk"}):
+        # On the skill path the missing selection is reported before the
+        # value grammar, so a malformed untagged pin is first asked for its
+        # provenance rather than told how to inherit.
+        for extra in ({"model": CUSTOM}, {"effort": "brisk"},
+                      {"model": "Future Orion"}, {"effort": "Extra High"},
+                      {"model": "inherit"}):
             with self.subTest(extra=extra):
                 err = _assert_usage_exit(
                     self, lambda e=extra: _parse([_entry(**e)],
@@ -386,6 +396,8 @@ class SelectionObjectParsingTests(unittest.TestCase):
                                      "'native_effort' for a runtime-grounded "
                                      "choice")
                 self.assertIn(REWRITE, err)
+                self.assertNotIn("optional field", err)
+                self.assertNotIn("not an inheritance value", err)
         # Inheritance and tagged selections are fine on the skill path.
         roles = _parse([_entry("a"), _routed("b"),
                         _entry("c", model=CUSTOM, selection={"mode": "user"})],
@@ -421,8 +433,10 @@ class SelectionObjectParsingTests(unittest.TestCase):
 
     def test_every_selection_defect_names_the_shared_recovery_once(self):
         defects = {
-            "bad-model": [_entry(model="a b")],
-            "reserved-model": [_entry(model="inherit")],
+            "bad-model": [_entry(model="a b", selection={"mode": "user"})],
+            "reserved-model": [_entry(model="inherit",
+                                      selection={"mode": "user"})],
+            "untagged-bad-model-on-skill-path": [_entry(model="a b")],
             "untagged-on-skill-path": [_entry(model=CUSTOM)],
             "selection-not-object": [_entry(model=CUSTOM, selection="user")],
             "bad-mode": [_entry(model=CUSTOM, selection={"mode": "x"})],
@@ -468,6 +482,38 @@ class ResolverTests(unittest.TestCase):
         decision = _resolve(_role(model=CUSTOM, mode="user"), _snapshot())
         self.assertEqual(decision.note, council_selection.UNVERIFIED_MODEL_ADVISORY)
 
+    def test_a_pin_naming_a_catalog_alias_points_at_the_execution_id(self):
+        """A user who names a model as the picker shows it gets the id -m
+        takes; the pin itself is still forwarded unchanged."""
+        for name, kind in (("Orion", "display name"),
+                           ("picker-orion", "picker id")):
+            decision = _resolve(_role(model=name, mode="user"), _snapshot())
+            with self.subTest(name=name):
+                self.assertEqual(decision.provenance, "user")
+                self.assertEqual(decision.dispatch_model, name)
+                self.assertEqual(
+                    decision.note,
+                    f"{council_selection.UNVERIFIED_MODEL_ADVISORY}; "
+                    f"'{name}' is the catalog {kind} of execution id "
+                    f"'{NATIVE}'")
+
+    def test_only_a_dispatchable_execution_id_is_ever_suggested(self):
+        """Catalog text cannot reach a note through the alias hint: an
+        execution id outside the value grammar (spaces, controls, a
+        ' reply=' marker) is never offered."""
+        hostile = "x\x1b]0;owned\x07 reply=/tmp/x"
+        snapshot = _snapshot(entries=fake_codex.default_catalog() + [
+            fake_codex.model_entry(hostile, id="picker-nova",
+                                   displayName="Nova")])
+        pin = _resolve(_role(model="Nova", mode="user"), snapshot)
+        self.assertEqual(pin.note, council_selection.UNVERIFIED_MODEL_ADVISORY)
+        routed = _resolve(_role(model="picker-nova", effort="brisk",
+                                mode="routed"), _snapshot(), snapshot)
+        self.assertEqual(
+            routed.note, "selection evidence changed since discovery: model "
+                         "'picker-nova' is not an advertised execution id in "
+                         "launch discovery")
+
     def test_untagged_pin_resolves_as_a_user_pin(self):
         decision = _resolve(_role(model=VEGA, effort="brisk"), _snapshot())
         self.assertEqual(decision.mode, "user")
@@ -488,6 +534,69 @@ class ResolverTests(unittest.TestCase):
             f"'{NATIVE}'; forwarded unchanged")
         self.assertIsNone(_resolve(_role(effort="brisk", mode="user"),
                                    _snapshot()).note)
+
+    def test_a_model_only_pin_notes_an_unadvertised_inherited_effort(self):
+        """A model-only pin keeps the configured native effort, which Codex
+        does not validate on the client, so it gets the note the same pair
+        written out would get, worded as inherited rather than sent."""
+        def configured(effort):
+            return dict(council_testlib.observed()["configured"],
+                        effort=effort)
+
+        snapshot = _snapshot(configured=configured("adaptive-v2"))
+        expected = ("unverified effort: inherited native effort "
+                    f"'adaptive-v2' is not advertised for model '{VEGA}'; "
+                    "no effort override sent")
+        for mode in ("user", None):  # None: untagged, direct CLI use
+            with self.subTest(mode=mode):
+                decision = _resolve(_role(model=VEGA, mode=mode), snapshot)
+                self.assertEqual(
+                    (decision.dispatch_model, decision.dispatch_effort),
+                    (VEGA, None))
+                self.assertEqual(decision.note, expected)
+        # Advertised for the pinned model, or no configured effort (Codex
+        # then uses the model's own default): nothing to note.
+        self.assertIsNone(_resolve(_role(model=NATIVE, mode="user"),
+                                   snapshot).note)
+        self.assertIsNone(_resolve(_role(model=VEGA, mode="user"),
+                                   _snapshot(configured=configured(None))).note)
+        # Managed defaults present or unknown: the kept effort is unknown,
+        # and the partial-pin note already covers it.
+        for managed in (_managed_present(), None):
+            with self.subTest(managed=managed):
+                note = _resolve(_role(model=VEGA, mode="user"), _snapshot(
+                    configured=configured("adaptive-v2"),
+                    managed=managed)).note
+                self.assertEqual(note, council_selection.PARTIAL_PIN_ADVISORY)
+        # A model outside the catalog has no efforts to compare with, and
+        # configuration text outside the value grammar never reaches a note.
+        self.assertEqual(
+            _resolve(_role(model=CUSTOM, mode="user"), snapshot).note,
+            council_selection.UNVERIFIED_MODEL_ADVISORY)
+        self.assertIsNone(_resolve(_role(model=VEGA, mode="user"), _snapshot(
+            configured=configured("x\x1b]0;owned\x07 reply=/tmp/x"))).note)
+
+    def test_a_pin_on_a_retired_model_is_noted_and_forwarded(self):
+        """A pin is never refused, but a model whose advertised retirement
+        has passed (retirement_at <= now) is flagged, as routing would be."""
+        expected = (f"model '{LYRA}' advertised retirement passed "
+                    f"({LYRA_RETIRES}); forwarded unchanged")
+        for now, note in ((AFTER_LYRA_RETIRES, expected),
+                          (LYRA_RETIRES, expected),
+                          (BEFORE_LYRA_RETIRES, None), (None, None)):
+            decision = _resolve(_role(model=LYRA, effort="brisk",
+                                      mode="user"), _snapshot(), now=now)
+            with self.subTest(now=now):
+                self.assertEqual(decision.provenance, "user")
+                self.assertEqual(
+                    (decision.dispatch_model, decision.dispatch_effort),
+                    (LYRA, "brisk"))
+                self.assertEqual(decision.note, note)
+        both = _resolve(_role(model=LYRA, effort="adaptive-v2", mode="user"),
+                        _snapshot(), now=AFTER_LYRA_RETIRES)
+        self.assertEqual(
+            both.note, f"{expected}; unverified effort: 'adaptive-v2' is not "
+                       f"advertised for model '{LYRA}'; forwarded unchanged")
 
     def test_partial_pin_advisory_follows_managed_defaults(self):
         """AC7: a partial pin while managed defaults exist is flagged."""
@@ -524,13 +633,31 @@ class ResolverTests(unittest.TestCase):
                           planned.dispatch_effort),
                          ("native_effort", NATIVE, "brisk"))
         self.assertIsNone(planned.requested_model)
-        # The native model changed before launch: the LAUNCH one is pinned.
+        launched = _resolve(role, _snapshot(), _snapshot("fedcba9876543210"))
+        self.assertEqual((launched.provenance, launched.dispatch_model,
+                          launched.dispatch_effort),
+                         ("native_effort", NATIVE, "brisk"))
+
+    def test_native_effort_never_moves_its_effort_to_another_model(self):
+        """The effort was chosen from the PLANNING native model's
+        descriptions; a different launch native model falls back even when
+        it advertises an effort with the same spelling."""
+        role = _role(effort="brisk", mode="native_effort")
         launch = _snapshot(configured={
             "model": VEGA, "effort": None, "provider": None,
-            "model_origin": "project", "effort_origin": None})
+            "model_origin": "project", "effort_origin": None,
+            "endpoint_overrides": [], "catalog_override": False})
+        self.assertEqual(launch["native"],
+                         {"resolution": "proven", "model": VEGA,
+                          "reason": None})
         launched = _resolve(role, _snapshot(), launch)
-        self.assertEqual((launched.dispatch_model, launched.dispatch_effort),
-                         (VEGA, "brisk"))
+        self.assertEqual(launched.provenance, "fallback")
+        self.assertIsNone(launched.dispatch_model)
+        self.assertIsNone(launched.dispatch_effort)
+        self.assertEqual(
+            launched.note, "selection evidence changed since discovery: "
+                           f"native model changed from '{NATIVE}' to "
+                           f"'{VEGA}'")
 
     def test_routing_off_resolves_every_automatic_role_to_inheritance(self):
         for role in (_role(model=VEGA, effort="brisk", mode="routed"),
@@ -580,9 +707,11 @@ class ResolverTests(unittest.TestCase):
             {"reasoningEffort": "deliberate", "description": "d"}],
             defaultReasoningEffort="deliberate")] + without_vega
         cases = (
+            # The launch snapshot is never written anywhere, so the note
+            # names the stage, not an id no reader could look up.
             (without_vega, VEGA, NOW,
-             f"model '{VEGA}' is not an advertised execution id in snapshot "
-             "fedcba9876543210"),
+             f"model '{VEGA}' is not an advertised execution id in launch "
+             "discovery"),
             (hidden_vega, VEGA, NOW,
              f"cannot route to hidden model '{VEGA}' (hidden models are for "
              "explicit user pins)"),
@@ -591,16 +720,24 @@ class ResolverTests(unittest.TestCase):
             (None, LYRA, AFTER_LYRA_RETIRES,
              f"model '{LYRA}' advertised retirement passed "
              "(2031-01-01T00:00:00Z)"),
+            # Retired when retirement_at <= now: the boundary is retired.
+            (None, LYRA, LYRA_RETIRES,
+             f"model '{LYRA}' advertised retirement passed "
+             "(2031-01-01T00:00:00Z)"),
         )
         for entries, model, now, detail in cases:
             launch = _snapshot(snapshot_id="fedcba9876543210", entries=entries)
             decision = _resolve(
                 _role(model=model, effort="brisk", mode="routed"),
                 _snapshot(), launch, now=now)
-            with self.subTest(detail=detail):
+            with self.subTest(detail=detail, now=now):
                 self.assertEqual(decision.provenance, "fallback")
                 self.assertEqual(decision.note, prefix + detail)
                 self.assertIsNone(decision.dispatch_model)
+        # One second before the advertised retirement the pair still routes.
+        before = _resolve(_role(model=LYRA, effort="brisk", mode="routed"),
+                          _snapshot(), _snapshot(), now=BEFORE_LYRA_RETIRES)
+        self.assertEqual(before.provenance, "routed")
 
     def test_native_effort_evidence_change_falls_back(self):
         prefix = "selection evidence changed since discovery: "
@@ -612,17 +749,26 @@ class ResolverTests(unittest.TestCase):
                                    "model: managed new-thread defaults present")
         moved = _resolve(role, _snapshot(), _snapshot(configured={
             "model": VEGA, "effort": None, "provider": None,
-            "model_origin": "user", "effort_origin": None}))
+            "model_origin": "user", "effort_origin": None,
+            "endpoint_overrides": [], "catalog_override": False}))
         self.assertEqual(
             moved.note,
-            prefix + f"effort 'adaptive-v2' is not advertised for model '{VEGA}'")
+            prefix + f"native model changed from '{NATIVE}' to '{VEGA}'")
+        narrowed = [fake_codex.model_entry(NATIVE)] + [
+            e for e in fake_codex.default_catalog() if e["model"] != NATIVE]
+        dropped = _resolve(role, _snapshot(), _snapshot(entries=narrowed))
+        self.assertEqual(
+            dropped.note,
+            prefix + f"effort 'adaptive-v2' is not advertised for model "
+                     f"'{NATIVE}'")
 
     def test_a_native_model_id_outside_the_grammar_is_never_pinned(self):
         odd = "odd model id"
         snapshot = _snapshot(
             entries=[fake_codex.model_entry(odd)],
             configured={"model": odd, "effort": None, "provider": None,
-                        "model_origin": "user", "effort_origin": None})
+                        "model_origin": "user", "effort_origin": None,
+                        "endpoint_overrides": [], "catalog_override": False})
         self.assertEqual(snapshot["native"]["resolution"], "proven")
         decision = _resolve(_role(effort="brisk", mode="native_effort"),
                             None, snapshot)
@@ -715,7 +861,7 @@ class ResolverTests(unittest.TestCase):
         routed = council_selection._role_decision(
             _role(model=VEGA, effort="brisk", mode="routed"))
         self.assertEqual(routed.provenance, "fallback")
-        attached = codex_council.Role(
+        attached = council_selection.Role(
             "x", "X", "i", decision=council_selection.SelectionDecision(
                 "routed", "routed", VEGA, "brisk", VEGA, "brisk", "r"))
         self.assertIs(council_selection._role_decision(attached),
@@ -821,14 +967,17 @@ class AuthoringValidationTests(unittest.TestCase):
         self._rejects(
             [_role(model=HIDDEN, effort="brisk", mode="routed")],
             f"cannot route to hidden model '{HIDDEN}'", planning=_snapshot())
-        self._rejects(
-            [_role(model=LYRA, effort="brisk", mode="routed")],
-            f"model '{LYRA}' advertised retirement passed "
-            "(2031-01-01T00:00:00Z)",
-            planning=_snapshot(), now=AFTER_LYRA_RETIRES)
+        for now in (AFTER_LYRA_RETIRES, LYRA_RETIRES):
+            with self.subTest(now=now):
+                self._rejects(
+                    [_role(model=LYRA, effort="brisk", mode="routed")],
+                    f"model '{LYRA}' advertised retirement passed "
+                    "(2031-01-01T00:00:00Z)",
+                    planning=_snapshot(), now=now)
         # Before the date the same pair is valid.
-        self._validate([_role(model=LYRA, effort="brisk", mode="routed")],
-                       planning=_snapshot())
+        for now in (NOW, BEFORE_LYRA_RETIRES):
+            self._validate([_role(model=LYRA, effort="brisk", mode="routed")],
+                           planning=_snapshot(), now=now)
 
     def test_effort_must_be_advertised_for_that_model_exactly(self):
         for effort in ("adaptive-v2", "Brisk", "BRISK"):
@@ -851,7 +1000,8 @@ class AuthoringValidationTests(unittest.TestCase):
             "configured",
             planning=_snapshot(configured={
                 "model": None, "effort": None, "provider": None,
-                "model_origin": None, "effort_origin": None}))
+                "model_origin": None, "effort_origin": None,
+                "endpoint_overrides": [], "catalog_override": False}))
         self._rejects(
             [_role(effort="max-plus", mode="native_effort")],
             f"effort 'max-plus' is not advertised for model '{NATIVE}'",
@@ -997,8 +1147,8 @@ class LaunchSelectionTests(unittest.TestCase):
 
         with patch.object(council_selection, "_discover",
                           side_effect=fake_discover):
-            resolved, snapshot = council_selection._resolve_launch_selections(
-                roles, self.run_dir, routing_mode)
+            resolved, snapshot = council_selection._resolve_run_selections(
+                roles, self.run_dir, routing_mode, at_launch=True)
         return resolved, snapshot, calls
 
     def test_no_automatic_role_means_no_launch_discovery(self):
@@ -1037,6 +1187,48 @@ class LaunchSelectionTests(unittest.TestCase):
                            expect_in_stderr="requires this run's discovery "
                                             "snapshot")
 
+    def _lyra_retiring_at(self, retirement):
+        """A catalog whose LYRA entry retires at `retirement` (ISO UTC)."""
+        epoch = calendar.timegm(time.strptime(retirement,
+                                              "%Y-%m-%dT%H:%M:%SZ"))
+        return [fake_codex.model_entry(LYRA, upgradeInfo={
+            "model": VEGA, "retirementAt": epoch})] + [
+            e for e in fake_codex.default_catalog() if e["model"] != LYRA]
+
+    def test_a_retirement_after_discovery_falls_back_instead_of_exiting(self):
+        """Authoring is judged as of discovery; a retirement that passes
+        between discovery (created_at 2026-09-27T12:00:00Z) and launch is
+        changed evidence, never an exit 2."""
+        launch_clock = calendar.timegm((2026, 9, 28, 0, 0, 0))
+        roles = [_role("a", model=LYRA, effort="brisk", mode="routed")]
+        for retirement, outcome in (
+            ("2026-09-27T12:00:01Z", "fallback"),   # after discovery
+            ("2026-09-27T12:00:00Z", "exit"),       # at discovery: retired
+            ("2026-09-27T11:59:59Z", "exit"),       # before discovery
+        ):
+            entries = self._lyra_retiring_at(retirement)
+            council_discovery._write_snapshot(
+                self.run_dir, _snapshot(entries=entries))
+            with self.subTest(retirement=retirement), patch.object(
+                    council_selection.time, "time",
+                    return_value=launch_clock):
+                if outcome == "exit":
+                    _assert_usage_exit(
+                        self, lambda e=entries: self._resolve_launch(
+                            roles, launch=_snapshot(entries=e)),
+                        expect_in_stderr=f"model '{LYRA}' advertised "
+                                         f"retirement passed ({retirement})")
+                    continue
+                resolved, _, calls = self._resolve_launch(
+                    roles, launch=_snapshot(entries=entries))
+                self.assertEqual(calls, ["auto"])
+                decision = resolved[0].decision
+                self.assertEqual(decision.provenance, "fallback")
+                self.assertEqual(
+                    decision.note,
+                    "selection evidence changed since discovery: model "
+                    f"'{LYRA}' advertised retirement passed ({retirement})")
+
 
 # ---------- structured failure records ----------
 
@@ -1048,10 +1240,25 @@ def _api_failure(status, error, *, event="turn.failed"):
     return json.dumps({"type": "turn.failed", "error": {"message": message}})
 
 
+def _text_failure(message):
+    """Codex's `error` plus `turn.failed` events carrying plain text."""
+    return "\n".join([
+        json.dumps({"type": "error", "message": message}),
+        json.dumps({"type": "turn.failed", "error": {"message": message}}),
+    ])
+
+
 NOT_FOUND = {"type": "invalid_request_error", "code": "model_not_found",
              "param": "model",
              "message": f"The model '{VEGA}' does not exist or you do not "
                         "have access to it."}
+# The API quota error codes the [quota] tag must recognize (terminal, never
+# retried as a 429). API error codes, not model names.
+SPEC_QUOTA_CODES = (
+    "insufficient_quota", "usage_limit_reached", "usage_limit_exceeded",
+    "credit_balance_exhausted", "organization_spend_limit_exceeded",
+    "project_spend_limit_exceeded", "organization_usage_limit_exceeded",
+)
 
 
 class FailureRecordTests(unittest.TestCase):
@@ -1074,6 +1281,18 @@ class FailureRecordTests(unittest.TestCase):
                                            None, "No credit."),
             council_failures.FailureRecord(message="plain failure"),
         ])
+
+    def test_a_boolean_status_is_not_an_http_status(self):
+        """JSON true is a bool, never HTTP status 1: the record carries no
+        status, so a model_not_found code still counts as a rejection."""
+        stdout = _api_failure(True, NOT_FOUND)
+        records = council_failures._failure_records(stdout)
+        self.assertEqual(records, [council_failures.FailureRecord(
+            None, "invalid_request_error", "model_not_found", "model",
+            NOT_FOUND["message"])])
+        self.assertEqual(council_failures._failure_verdict(
+            council_failures._failure_text(stdout, ""), records, VEGA).kind,
+            "model-rejected")
 
     def test_json_in_message_decoding_is_bounded(self):
         inner = {"code": "model_not_found", "message": "deepest"}
@@ -1108,10 +1327,16 @@ class FailureClassificationTests(unittest.TestCase):
     def _classify(self, stdout, stderr="", model=None, resume=False):
         text = council_failures._failure_text(stdout, stderr)
         records = council_failures._failure_records(stdout)
-        return council_failures._failure_verdict(text, records, model, resume)
+        return council_failures._failure_verdict(
+            text, records, model, resume).kind
 
     def test_quota_codes_and_prose_are_terminal_even_with_429(self):
-        for code in sorted(council_failures.QUOTA_ERROR_CODES):
+        # The specified codes, spelled out rather than read back from the
+        # implementation's set, so dropping one fails here. The set may
+        # grow; a newly recognized code needs no test edit.
+        self.assertLessEqual(set(SPEC_QUOTA_CODES),
+                             council_failures.QUOTA_ERROR_CODES)
+        for code in SPEC_QUOTA_CODES:
             for field in ("code", "type"):
                 stdout = _api_failure(429, {field: code, "message": "limit"})
                 with self.subTest(code=code, field=field):
@@ -1156,6 +1381,100 @@ class FailureClassificationTests(unittest.TestCase):
         self.assertIsNone(self._classify(stdout, model="acme./future-review"
                                                        "-2034:rev2"))
 
+    def test_rejection_sentences_accept_a_backtick_quoted_model(self):
+        """The OpenAI API's model_not_found sentence quotes the model in
+        backticks. Codex passes it through as JSON-in-message, or as text
+        after its "unexpected status NNN ...: " prefix (with the body's
+        message or the raw JSON body), and every form is a rejection of
+        the model it names, on both paths."""
+        api = (f"The model `{VEGA}` does not exist or you do not have "
+               "access to it.")
+        chatgpt = (f"The `{VEGA}` model is not supported when using Codex "
+                   "with a ChatGPT account.")
+        suffix = ", url: https://api.example.invalid/v1/responses, cf-ray: x"
+        for sentence in (api, chatgpt):
+            body = json.dumps({"error": {"message": sentence,
+                                         "type": "invalid_request_error"}})
+            forms = (
+                _api_failure(404, {"type": "invalid_request_error",
+                                   "message": sentence}),
+                _text_failure(f"unexpected status 404 Not Found: {sentence}"
+                              f"{suffix}"),
+                _text_failure(f"unexpected status 404 Not Found: {body}"
+                              f"{suffix}"),
+            )
+            for stdout in forms:
+                for resume in (False, True):
+                    with self.subTest(sentence=sentence[:24],
+                                      stdout=stdout[:48], resume=resume):
+                        self.assertEqual(
+                            self._classify(stdout, model=VEGA, resume=resume),
+                            "model-rejected")
+                        self.assertEqual(
+                            self._classify(stdout, resume=resume),
+                            "model-rejected")
+                        self.assertIsNone(
+                            self._classify(stdout, model=CUSTOM,
+                                           resume=resume))
+        # Codex's own text is what the tag quotes.
+        stdout = _text_failure(f"unexpected status 404 Not Found: {api}")
+        routed = council_selection.SelectionDecision(
+            "routed", "routed", dispatch_model=VEGA)
+        self.assertIn(
+            f"this invocation: unexpected status 404 Not Found: "
+            f"{api.rstrip('.')}. No substitute",
+            council_failures._classify_failure(
+                council_failures._failure_text(stdout, ""), 1, "exec",
+                council_failures._failure_records(stdout), routed))
+
+    def test_a_usage_limit_for_one_model_ends_with_that_models_action(self):
+        """Codex names a usage cap that applies to one model. It stays a
+        terminal [quota] on both paths, and the tag ends with the action for
+        the model that was sent, as for a rejection of it. The limit's label
+        is the server's, never compared with the model sent. A plan-wide
+        usage limit keeps Codex's text alone."""
+        per_model = _text_failure(
+            "You’ve hit your usage limit for Future-Vega-Tier. Switch to "
+            "another model now, or try again at 3:05 PM.")
+        plan = _text_failure("You've hit your usage limit. Upgrade to "
+                             "continue, or try again at 3:05 PM.")
+        native_action = ("Ask the user to update the Codex configuration "
+                         "(model) or to name a model to pin.")
+        for stdout in (per_model, plan):
+            for resume in (False, True):
+                with self.subTest(stdout=stdout[:60], resume=resume):
+                    self.assertEqual(
+                        self._classify(stdout, model=VEGA, resume=resume),
+                        "quota")
+        text = council_failures._failure_text(per_model, "")
+        records = council_failures._failure_records(per_model)
+        for provenance, model, action in (
+            ("routed", VEGA, "Re-run this role with model, effort, and "
+                             "selection omitted to inherit native "
+                             "configuration."),
+            ("user", VEGA, "Change or remove the explicit pin."),
+            ("user", None, native_action),
+            ("native_effort", NATIVE, native_action),
+            ("native", None, native_action),
+        ):
+            decision = council_selection.SelectionDecision(
+                "user", provenance, dispatch_model=model)
+            for phase in ("exec", "resume"):
+                with self.subTest(provenance=provenance, model=model,
+                                  phase=phase):
+                    self.assertEqual(
+                        council_failures._classify_failure(
+                            text, 1, phase, records, decision),
+                        f"[quota] {text} {action}")
+        routed = council_selection.SelectionDecision(
+            "routed", "routed", dispatch_model=VEGA)
+        text = council_failures._failure_text(plan, "")
+        self.assertEqual(
+            council_failures._classify_failure(
+                text, 1, "exec", council_failures._failure_records(plan),
+                routed),
+            f"[quota] {text}")
+
     def test_near_misses_are_not_rejections(self):
         cases = (
             _api_failure(400, {"message": "Resource not found"}),
@@ -1179,6 +1498,22 @@ class FailureClassificationTests(unittest.TestCase):
             with self.subTest(stdout=stdout[:60]):
                 self.assertNotEqual(self._classify(stdout, model=VEGA),
                                     "model-rejected")
+        # With no structured record to veto it, a stderr line that names
+        # reasoning effort or service tier is still about that setting,
+        # even when it also carries a complete rejection sentence.
+        for stderr in (
+            f"The model '{VEGA}' does not exist or you do not have access to "
+            "it (model_reasoning_effort).",
+            f"The model '{VEGA}' does not exist or you do not have access to "
+            "it: reasoning.effort",
+            f"The '{VEGA}' model is not supported when using Codex with a "
+            "ChatGPT account (service_tier).",
+        ):
+            for resume in (False, True):
+                with self.subTest(stderr=stderr[-32:], resume=resume):
+                    self.assertNotEqual(
+                        self._classify("", stderr, VEGA, resume),
+                        "model-rejected")
         self.assertEqual(
             self._classify("", "Selected model is at capacity. Please try a "
                                "different model.", model=VEGA), "5xx")
@@ -1218,24 +1553,40 @@ class FailureClassificationTests(unittest.TestCase):
                 self.assertEqual(self._classify(stdout, stderr, VEGA), fresh)
                 self.assertEqual(
                     self._classify(stdout, stderr, VEGA, resume=True), resumed)
+        # An anchored 429/5xx outranks even a complete rejection sentence
+        # naming the requested model. At HTTP 400 the same text is a
+        # rejection; a transient failure stays retriable, never terminal.
+        for sentence in (NOT_FOUND["message"],
+                         f"The '{VEGA}' model is not supported when using "
+                         "Codex with a ChatGPT account."):
+            for status, verdict in ((400, "model-rejected"), (503, "5xx"),
+                                    (429, "rate-limit")):
+                stdout = _api_failure(status, {"message": sentence})
+                for resume in (False, True):
+                    with self.subTest(sentence=sentence[:24], status=status,
+                                      resume=resume):
+                        self.assertEqual(
+                            self._classify(stdout, "", VEGA, resume), verdict)
 
     def test_rejection_message_names_what_was_sent_and_one_action(self):
         stdout = _api_failure(404, NOT_FOUND)
         text = council_failures._failure_text(stdout, "")
         records = council_failures._failure_records(stdout)
         provider = NOT_FOUND["message"].rstrip(".")
+        # The action follows WHICH model was refused. The native model (a
+        # native_effort role's pin, an effort-only user pin, or plain
+        # inheritance) is what an inheriting re-run would send again.
+        native_action = ("Ask the user to update the Codex configuration "
+                         "(model) or to name a model to pin.")
         for provenance, model, action in (
             ("user", VEGA, "Change or remove the explicit pin."),
+            ("user", None, native_action),
             ("routed", VEGA, "Re-run this role with model, effort, and "
                              "selection omitted to inherit native "
                              "configuration."),
-            ("native_effort", NATIVE, "Re-run this role with model, effort, "
-                                      "and selection omitted to inherit "
-                                      "native configuration."),
-            ("native", None, "Update the Codex configuration (model) or pin "
-                             "an available model."),
-            ("fallback", None, "Update the Codex configuration (model) or "
-                               "pin an available model."),
+            ("native_effort", NATIVE, native_action),
+            ("native", None, native_action),
+            ("fallback", None, native_action),
         ):
             decision = council_selection.SelectionDecision(
                 "user", provenance, dispatch_model=model)
@@ -1243,7 +1594,8 @@ class FailureClassificationTests(unittest.TestCase):
                        else "natively configured model")
             for phase, kept in (("resume", " and the saved thread was kept"),
                                 ("exec", "")):
-                with self.subTest(provenance=provenance, phase=phase):
+                with self.subTest(provenance=provenance, model=model,
+                                  phase=phase):
                     self.assertEqual(
                         council_failures._classify_failure(
                             text, 1, phase, records, decision),
@@ -1346,6 +1698,98 @@ class RunRoleSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.calls[0][4:8], [
             "-m", VEGA, "-c", 'model_reasoning_effort="brisk"'])
 
+    @staticmethod
+    def _sentence_failure(model, extra=""):
+        """Codex's text-only ChatGPT rejection sentence naming `model`: no
+        structured code, so only the model it names ties it to an
+        invocation."""
+        return _api_failure(400, {
+            "type": "invalid_request_error",
+            "message": f"The '{model}' model is not supported when using "
+                       f"Codex with a ChatGPT account.{extra}"})
+
+    async def test_a_fallback_role_matches_the_model_it_sent_not_requested(self):
+        """A routed role that fell back requested VEGA but sent no model, so
+        a sentence naming the native model rejects THIS invocation. On
+        resume that outranks the stale-looking words: one subprocess, the
+        saved thread kept; the fresh path tags it the same way."""
+        stdout = self._sentence_failure(NATIVE, " Thread not found.")
+        fell_back = self._decided(
+            _role(model=VEGA, effort="brisk", mode="routed"), "fallback")
+        for saved in (None, "live-sid"):
+            self.calls.clear()
+            if saved:
+                codex_council.save_session("architect", saved)
+            with self.subTest(saved=saved), self._fake(self._failed(stdout)):
+                result = await self._attempts(fell_back)
+                self.assertTrue(result.error.startswith(
+                    "[model-rejected] Codex rejected the natively configured "
+                    "model for this invocation"), result.error)
+                self.assertTrue(result.error.endswith(
+                    "Ask the user to update the Codex configuration (model) "
+                    "or to name a model to pin."))
+                self.assertEqual(len(self.calls), 1)
+                self.assertEqual("resume" in self.calls[0], bool(saved))
+                self.assertNotIn("-m", self.calls[0])
+                self.assertEqual(codex_council.load_session("architect")[0],
+                                 saved)
+
+    async def test_a_sentence_naming_another_model_is_not_this_rejection(self):
+        """A native_effort role requested no model but sent the native one:
+        a sentence naming a different model says nothing about this
+        invocation, on either path, and stays an untagged failure."""
+        stdout = self._sentence_failure(VEGA)
+        pinned_native = self._decided(
+            _role(effort="adaptive-v2", mode="native_effort"),
+            "native_effort", NATIVE, "adaptive-v2")
+        for saved in (None, "live-sid"):
+            self.calls.clear()
+            if saved:
+                codex_council.save_session("architect", saved)
+            with self.subTest(saved=saved), self._fake(self._failed(stdout)):
+                result = await self._attempts(pinned_native)
+                self.assertFalse(result.error.startswith("["), result.error)
+                self.assertIn(f"The '{VEGA}' model is not supported",
+                              result.error)
+                self.assertEqual(len(self.calls), 1)
+                self.assertEqual(self.calls[0][4:6], ["-m", NATIVE])
+                self.assertEqual(codex_council.load_session("architect")[0],
+                                 saved)
+
+    async def test_a_failed_attempt_is_classified_once_on_both_paths(self):
+        """The resume path formats the verdict it branched on: the failure
+        is classified, and Codex's rejection parsed, once per attempt."""
+        role = self._decided(_role(model=VEGA, mode="user"), "user", VEGA)
+        real_verdict = council_failures._failure_verdict
+        real_rejection = council_failures._model_rejection
+        for saved in (None, "live-sid"):
+            self.calls.clear()
+            if saved:
+                codex_council.save_session("architect", saved)
+            verdicts, rejections = [], []
+
+            def verdict_spy(*args, **kwargs):
+                verdicts.append(kwargs.get("resume", False))
+                return real_verdict(*args, **kwargs)
+
+            def rejection_spy(*args):
+                rejections.append(args)
+                return real_rejection(*args)
+
+            with self.subTest(saved=saved), \
+                 self._fake(self._failed(_api_failure(404, NOT_FOUND))), \
+                 patch.object(codex_council, "_failure_verdict",
+                              side_effect=verdict_spy), \
+                 patch.object(council_failures, "_failure_verdict",
+                              side_effect=verdict_spy), \
+                 patch.object(council_failures, "_model_rejection",
+                              side_effect=rejection_spy):
+                result = await self._attempts(role)
+                self.assertTrue(result.error.startswith("[model-rejected]"))
+                self.assertEqual(len(self.calls), 1)
+                self.assertEqual(verdicts, [bool(saved)])
+                self.assertEqual(len(rejections), 1)
+
     async def test_quota_429_is_terminal_and_keeps_state_on_both_paths(self):
         stdout = _api_failure(429, {"type": "insufficient_quota",
                                     "code": "insufficient_quota",
@@ -1358,6 +1802,28 @@ class RunRoleSelectionTests(unittest.IsolatedAsyncioTestCase):
                  self._fake(self._failed(stdout)):
                 result = await self._attempts(_role())
                 self.assertTrue(result.error.startswith("[quota] "))
+                self.assertEqual(len(self.calls), 1)
+                self.assertEqual(codex_council.load_session("architect")[0],
+                                 saved)
+
+    async def test_a_routed_models_usage_limit_names_the_inherit_rerun(self):
+        """A routed role that hit its model's usage limit fails [quota]
+        once, keeps its thread, and is told to re-run inheriting."""
+        stdout = _text_failure(
+            "You’ve hit your usage limit for Future-Vega-Tier. Switch to "
+            "another model now, or try again at 3:05 PM.")
+        role = self._decided(_role(model=VEGA, effort="brisk",
+                                   mode="routed"), "routed", VEGA, "brisk")
+        for saved in (None, "live-sid"):
+            self.calls.clear()
+            if saved:
+                codex_council.save_session("architect", saved)
+            with self.subTest(saved=saved), self._fake(self._failed(stdout)):
+                result = await self._attempts(role)
+                self.assertTrue(result.error.startswith("[quota] "))
+                self.assertTrue(result.error.endswith(
+                    "Re-run this role with model, effort, and selection "
+                    "omitted to inherit native configuration."), result.error)
                 self.assertEqual(len(self.calls), 1)
                 self.assertEqual(codex_council.load_session("architect")[0],
                                  saved)
@@ -1377,6 +1843,27 @@ class RunRoleSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.ok)
         self.assertEqual(len(self.calls), 2)
         self.assertEqual(codex_council.load_session("architect")[0], "new-sid")
+
+    async def test_a_fallback_role_resumes_its_saved_thread_bare(self):
+        """A routed role that fell back resumes the thread an earlier council
+        saved: same UUID, no -m/-c, and the thread is never reset."""
+        codex_council.save_session("architect", "live-sid")
+        ok = codex_council.CodexRun(returncode=0, stdout="\n".join([
+            json.dumps({"type": "thread.started", "thread_id": "live-sid"}),
+            json.dumps({"type": "item.completed", "item": {
+                "type": "agent_message", "text": "ok"}}),
+        ]), stderr="")
+        fell_back = self._decided(
+            _role(model=VEGA, effort="brisk", mode="routed"), "fallback")
+        with self._fake(ok):
+            result = await self._attempts(fell_back)
+        self.assertTrue(result.ok, result.error)
+        (cmd,) = self.calls
+        self.assertEqual(cmd[cmd.index("resume") + 1], "live-sid")
+        self.assertNotIn("-m", cmd)
+        self.assertNotIn("-c", cmd)
+        self.assertEqual(codex_council.load_session("architect")[0],
+                         "live-sid")
 
     async def test_commands_carry_only_the_decisions_dispatch_values(self):
         ok = codex_council.CodexRun(returncode=0, stdout="\n".join([
@@ -1410,8 +1897,8 @@ def _decided_role(rid, provenance, *, model=None, effort=None, mode=None,
     decision = council_selection.SelectionDecision(
         mode or "inherit", provenance, model, effort, dispatch[0],
         dispatch[1], reason, note)
-    return codex_council.Role(rid, rid.title(), "i", model, effort, selection,
-                              decision)
+    return council_selection.Role(rid, rid.title(), "i", model, effort,
+                                  selection, decision)
 
 
 def _provenance_roles():
@@ -1577,6 +2064,27 @@ class ReportingTests(unittest.TestCase):
         for line in lines:
             self.assertEqual(line.splitlines(), [line])
 
+    def test_selection_lines_survive_the_followers_reply_path_filter(self):
+        """Foreign text holding ' reply=' (a discovery stderr excerpt, a
+        catalog or config value) must not make --follow drop the line, and
+        control characters in it must not reach a terminal."""
+        note = ("launch discovery unavailable: stderr: boom reply=/tmp/x "
+                "\x1b]0;owned\x07")
+        role = _decided_role("fell", "fallback", model=VEGA, effort="brisk",
+                             mode="routed", reason="r", note=note)
+        lines = council_selection._model_selection_lines(
+            [role], "auto", "unavailable", "stderr: boom reply=/tmp/x")
+        self.assertEqual(len(lines), 2)
+        replies_dir = "/abs/run/replies"
+        for line in lines:
+            with self.subTest(line=line):
+                self.assertTrue(line.isprintable())
+                self.assertNotIn(" reply=", line)
+                self.assertIn(" reply\\x3d/tmp/x", line)
+                self.assertTrue(codex_council._follow_reply_path_ok(
+                    line, replies_dir))
+        self.assertIn("\\x1b]0;owned\\x07", lines[1])
+
     def test_model_selection_err_log_lines(self):
         lines = council_selection._model_selection_lines(
             _provenance_roles(), "auto", "unavailable", "codex_missing")
@@ -1598,17 +2106,8 @@ class ReportingTests(unittest.TestCase):
 
 # ---------- end to end: the real script with the fake codex ----------
 
-_FAKE_BIN = {}
-
-
-def setUpModule():
-    _FAKE_BIN["tmp"] = tempfile.TemporaryDirectory()
-    _FAKE_BIN["dir"] = _FAKE_BIN["tmp"].name
-    fake_codex.install(_FAKE_BIN["dir"])
-
-
-def tearDownModule():
-    _FAKE_BIN.pop("tmp").cleanup()
+setUpModule = council_testlib.install_fake_codex
+tearDownModule = council_testlib.remove_fake_codex
 
 
 class LaunchEndToEndTests(unittest.TestCase):
@@ -1626,7 +2125,8 @@ class LaunchEndToEndTests(unittest.TestCase):
         self.scenario_path = os.path.join(self.root, "scenario.json")
         self.method_log = os.path.join(self.root, "methods.log")
         self.env = _clean_env(
-            PATH=_FAKE_BIN["dir"] + os.pathsep + os.environ.get("PATH", ""),
+            PATH=(council_testlib.fake_bin_dir() + os.pathsep
+                  + os.environ.get("PATH", "")),
             FAKE_CODEX_SCENARIO=self.scenario_path,
             FAKE_CODEX_METHOD_LOG=self.method_log,
             FAKE_CODEX_ARGV_DIR=self.argv_dir,
@@ -1635,18 +2135,13 @@ class LaunchEndToEndTests(unittest.TestCase):
             CODEX_HOME=self._mkdir("codex-home"),
         )
         self.scenario(fake_codex.default_scenario())
-        self.addCleanup(self._assert_only_discovery_methods)
+        self.addCleanup(lambda: council_testlib.assert_only_discovery_methods(
+            self, fake_codex.read_lines(self.method_log)))
 
     def _mkdir(self, name):
         path = os.path.join(self.root, name)
         os.mkdir(path, 0o700)
         return path
-
-    def _assert_only_discovery_methods(self):
-        for method in fake_codex.read_lines(self.method_log):
-            if not method.startswith("response:"):
-                self.assertIn(method, fake_codex.DISCOVERY_METHODS)
-            self.assertNotIn(method, FORBIDDEN_METHODS)
 
     def scenario(self, scenario):
         fake_codex.write_scenario(self.scenario_path, scenario)
@@ -1781,22 +2276,35 @@ class LaunchEndToEndTests(unittest.TestCase):
             self.assertIn(f"selection=routed model={VEGA} effort=deliberate",
                           f.readline())
 
-    def test_native_effort_pins_the_launch_native_model(self):
+    def test_native_effort_pins_the_planned_native_model_or_falls_back(self):
         snapshot_id = self.discover()
         self.stage([_native_effort(effort="brisk", snapshot_id=snapshot_id)])
-        # The native model changes between planning and launch.
-        scenario = fake_codex.default_scenario()
-        scenario["methods"]["config/read"]["result"]["config"]["model"] = VEGA
-        self.scenario(scenario)
         proc = self.launch()
         self.assertEqual(proc.returncode, 0, proc.stderr)
         (argv,) = self.argvs()
-        self.assertEqual(argv[3:7], ["-m", VEGA, "-c",
+        self.assertEqual(argv[3:7], ["-m", NATIVE, "-c",
                                      'model_reasoning_effort="brisk"'])
         self.assertIn("(routed effort: brisk on native model "
-                      f"{VEGA})", proc.stdout)
-        self.assertIn(f"sent model {VEGA} (pinned native model), effort "
+                      f"{NATIVE})", proc.stdout)
+        self.assertIn(f"sent model {NATIVE} (pinned native model), effort "
                       "brisk", proc.stdout)
+        # The native model changes between planning and launch (a config
+        # edit, or a launch from another project root). The new model also
+        # advertises "brisk", but the effort was chosen from the planned
+        # model's descriptions, so it is never carried over.
+        self.reset_argvs()
+        self.scenario(self._native_scenario(VEGA))
+        proc = self.launch()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        (argv,) = self.argvs()
+        self.assert_no_overrides(argv)
+        self.assertIn(
+            "[codex-council:architect] routing fell back to native "
+            "inheritance: selection evidence changed since discovery: native "
+            f"model changed from '{NATIVE}' to '{VEGA}'\n", proc.stderr)
+        self.assertIn("native_effort=0 fallback=1",
+                      self.selection_line(proc.stderr))
+        self.assertIn("(native inheritance; routing fell back)", proc.stdout)
 
     def test_launch_discovery_failure_inherits_and_the_run_succeeds(self):
         """AC4: an unavailable launch discovery never blocks the council."""
@@ -1827,18 +2335,209 @@ class LaunchEndToEndTests(unittest.TestCase):
         """AC8: an account switch shows a different catalog at launch."""
         snapshot_id = self.discover()
         self.stage([_routed(snapshot_id=snapshot_id)])
+        snapshot_path = os.path.join(self.run_dir,
+                                     council_discovery.SNAPSHOT_FILENAME)
+        with open(snapshot_path, "rb") as f:
+            planning_bytes = f.read()
         self.scenario(fake_codex.default_scenario(catalog=[
             e for e in fake_codex.default_catalog() if e["model"] != VEGA]))
         proc = self.launch()
         self.assertEqual(proc.returncode, 0, proc.stderr)
         (argv,) = self.argvs()
         self.assert_no_overrides(argv)
-        self.assertRegex(
-            proc.stderr,
-            r"\[codex-council:architect\] routing fell back to native "
-            r"inheritance: selection evidence changed since discovery: "
-            rf"model '{VEGA}' is not an advertised execution id in snapshot "
-            r"[0-9a-f]{16}\n")
+        # The launch snapshot is in memory only: the note names the stage.
+        self.assertIn(
+            "[codex-council:architect] routing fell back to native "
+            "inheritance: selection evidence changed since discovery: "
+            f"model '{VEGA}' is not an advertised execution id in launch "
+            "discovery\n", proc.stderr)
+        # The launch never writes over the planning snapshot, so the same
+        # roles.json still validates against it through the pre-flight's
+        # own orchestration afterwards.
+        with open(snapshot_path, "rb") as f:
+            self.assertEqual(f.read(), planning_bytes)
+        roles = codex_council._resolve_roles(codex_council._parse_roles_json(
+            codex_council._read_roles_file(
+                os.path.join(self.run_dir, "roles.json")),
+            require_selection=True))
+        planned, _ = council_selection._resolve_run_selections(
+            roles, self.run_dir, "auto", at_launch=False)
+        self.assertEqual(planned[0].decision.provenance, "routed")
+        # The pre-flight itself now refuses the directory: it launched.
+        preflight = self.run_script("--check-staging-dir", self.run_dir,
+                                    "--skill-contract", EPOCH)
+        self.assertEqual(preflight.returncode, 2, preflight.stdout)
+        self.assertIn("already holds a council launch (replies present)",
+                      preflight.stderr)
+
+    def _lyra_retired_scenario(self):
+        """The default scenario with LYRA's advertised retirement passed."""
+        return self._retired_scenario(LYRA)
+
+    @staticmethod
+    def _retired_scenario(model):
+        """The default scenario with `model`'s advertised retirement passed."""
+        catalog = fake_codex.default_catalog()
+        for entry in catalog:
+            if entry["model"] == model:
+                entry["upgradeInfo"] = dict(
+                    entry["upgradeInfo"] or {
+                        "model": NATIVE, "migrationMarkdown": None,
+                        "modelLink": None, "upgradeCopy": None},
+                    retirementAt=PAST_RETIREMENT_EPOCH)
+        return fake_codex.default_scenario(catalog=catalog)
+
+    @staticmethod
+    def _native_scenario(model):
+        """The default scenario with `model` as the configured native model
+        (the fake's discovery and exec both follow it)."""
+        scenario = fake_codex.default_scenario()
+        scenario["methods"]["config/read"]["result"]["config"]["model"] = model
+        return scenario
+
+    @staticmethod
+    def _advisory(recorded, resumed):
+        """Codex's resume advisory, as the report relays it."""
+        return (f"_Warning: codex reported: This session was recorded with "
+                f"model `{recorded}` but is resuming with `{resumed}`. "
+                f"Consider switching back to `{recorded}` as it may affect "
+                "Codex performance._")
+
+    def test_a_retired_routed_model_is_refused_at_preflight_and_launch(self):
+        self.scenario(self._lyra_retired_scenario())
+        snapshot_id = self.discover()
+        self.stage([_routed(model=LYRA, snapshot_id=snapshot_id)])
+        expected = (f"model '{LYRA}' advertised retirement passed "
+                    f"({PAST_RETIREMENT})")
+        preflight = self.run_script("--check-staging-dir", self.run_dir,
+                                    "--skill-contract", EPOCH)
+        self.assertEqual(preflight.returncode, 2, preflight.stdout)
+        self.assertIn(expected, preflight.stderr)
+        self.assertNotIn("staging OK", preflight.stdout)
+        proc = self.launch()
+        self.assertEqual(proc.returncode, 2, proc.stdout)
+        self.assertIn(expected, proc.stderr)
+        self.assertNotIn("dispatching", proc.stderr)
+        self.assertEqual(self.argvs(), [])
+
+    def test_a_retired_model_is_marked_in_the_summary_and_on_a_pin(self):
+        """The summary never offers a pair the pre-flight refuses: a past
+        retirement reads "retired ... (not routable)". A user pin of it is
+        still forwarded unchanged, with a note."""
+        self.scenario(self._lyra_retired_scenario())
+        proc = self.run_script("--discover", self.run_dir,
+                               "--skill-contract", EPOCH)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        (line,) = [ln for ln in proc.stdout.splitlines()
+                   if ln.startswith(f"- {LYRA} ")]
+        self.assertIn(f"; retired {PAST_RETIREMENT} (not routable); "
+                      "upgrade suggested: ", line)
+        self.assertNotIn("; retires ", line)
+        self.forget_discovery()
+        self.stage([_entry(model=LYRA, effort="brisk",
+                           selection={"mode": "user"})])
+        preflight = self.run_script("--check-staging-dir", self.run_dir,
+                                    "--skill-contract", EPOCH)
+        self.assertEqual(preflight.returncode, 0, preflight.stderr)
+        self.assertIn(
+            f"selection plan: architect: explicit override (model {LYRA}, "
+            f"effort brisk); model '{LYRA}' advertised retirement passed "
+            f"({PAST_RETIREMENT}); forwarded unchanged", preflight.stdout)
+        proc = self.launch()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        (argv,) = self.argvs()
+        self.assertIn(LYRA, argv)
+
+    def test_a_retirement_only_the_launch_catalog_shows_falls_back(self):
+        snapshot_id = self.discover()
+        self.stage([_routed(model=LYRA, snapshot_id=snapshot_id)])
+        preflight = self.run_script("--check-staging-dir", self.run_dir,
+                                    "--skill-contract", EPOCH)
+        self.assertEqual(preflight.returncode, 0, preflight.stderr)
+        self.scenario(self._lyra_retired_scenario())
+        proc = self.launch()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        (argv,) = self.argvs()
+        self.assert_no_overrides(argv)
+        self.assertIn(
+            "[codex-council:architect] routing fell back to native "
+            "inheritance: selection evidence changed since discovery: model "
+            f"'{LYRA}' advertised retirement passed ({PAST_RETIREMENT})\n",
+            proc.stderr)
+
+    def test_a_user_pin_by_display_name_is_pointed_at_the_execution_id(self):
+        self.discover()
+        self.stage([_entry(model="Orion", selection={"mode": "user"})])
+        preflight = self.run_script("--check-staging-dir", self.run_dir,
+                                    "--skill-contract", EPOCH)
+        self.assertEqual(preflight.returncode, 0, preflight.stderr)
+        self.assertIn(
+            "selection plan: architect: explicit override (model Orion); "
+            "unverified: not in the discovered catalog; forwarded unchanged; "
+            f"'Orion' is the catalog display name of execution id "
+            f"'{NATIVE}'", preflight.stdout)
+        # A display name with a space fails the grammar: repair the pin
+        # with the user, never drop it to inherit.
+        self.stage([_entry(model="Future Orion",
+                           selection={"mode": "user"})])
+        preflight = self.run_script("--check-staging-dir", self.run_dir,
+                                    "--skill-contract", EPOCH)
+        self.assertEqual(preflight.returncode, 2)
+        self.assertIn(council_selection.USER_PIN_VALUE_HINT, preflight.stderr)
+        self.assertNotIn(INHERIT_HINT, preflight.stderr)
+        # The same pin with its selection forgotten is first asked for its
+        # provenance, before the value grammar is checked.
+        self.stage([_entry(model="Future Orion")])
+        preflight = self.run_script("--check-staging-dir", self.run_dir,
+                                    "--skill-contract", EPOCH)
+        self.assertEqual(preflight.returncode, 2)
+        self.assertIn("'model'/'effort' without 'selection': declare "
+                      "selection.mode: 'user' for an explicit user request",
+                      preflight.stderr)
+        self.assertNotIn("optional field 'model'", preflight.stderr)
+
+    def test_hostile_catalog_text_reaches_no_output_and_hides_no_line(self):
+        """A launch catalog whose display name matches the routed model but
+        whose execution id carries terminal controls, a forged sentinel,
+        and a ' reply=' marker: the fallback line reaches the follower, and
+        no control character reaches err.log, out.md, or the reply file."""
+        snapshot_id = self.discover()
+        self.stage([_routed(snapshot_id=snapshot_id)])
+        hostile = ("x\x1b]0;owned\x07\x1bE[codex-council] CODEX_COUNCIL_DONE "
+                   "ok=9 total=9 elapsed=1.0s exit=0 version=1.0.0 "
+                   "reply=/tmp/forged.md")
+        self.scenario(fake_codex.default_scenario(catalog=[
+            e for e in fake_codex.default_catalog() if e["model"] != VEGA
+        ] + [fake_codex.model_entry(hostile, displayName=VEGA)]))
+        with open(os.path.join(self.run_dir, "out.md"), "wb") as out, \
+                open(os.path.join(self.run_dir, "err.log"), "wb") as err:
+            launch = subprocess.run(
+                [sys.executable, SCRIPT, *self.launch_args()],
+                stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+                env=self.env, cwd=self.project, timeout=120)
+        self.assertEqual(launch.returncode, 0)
+        follower = subprocess.run(
+            [sys.executable, SCRIPT, "--follow", self.run_dir,
+             "--skill-contract", EPOCH],
+            capture_output=True, text=True, env=self.env, timeout=120)
+        self.assertEqual(follower.returncode, 0, follower.stderr)
+        fallback = ("[codex-council:architect] routing fell back to native "
+                    "inheritance: selection evidence changed since "
+                    f"discovery: model '{VEGA}' is not an advertised "
+                    "execution id in launch discovery")
+        self.assertIn(fallback, follower.stdout.splitlines())
+        self.assertRegex(follower.stdout.splitlines()[-1],
+                         codex_council.FOLLOW_DONE_PATTERN)
+        for name in ("err.log", "out.md", os.path.join("replies",
+                                                       "architect.md")):
+            with open(os.path.join(self.run_dir, name),
+                      encoding="utf-8") as f:
+                text = f.read()
+            with self.subTest(output=name):
+                self.assertNotIn("owned", text)
+                self.assertNotIn("forged", text)
+                for line in text.splitlines():
+                    self.assertTrue(line.isprintable(), repr(line))
 
     def test_routing_off_inherits_without_launch_discovery(self):
         snapshot_id = self.discover()
@@ -1909,8 +2608,34 @@ class LaunchEndToEndTests(unittest.TestCase):
         self.assertEqual(len(self.argvs()), 1)
         self.assertIn("[model-rejected] Codex rejected the natively "
                       "configured model", proc.stdout)
-        self.assertIn("Update the Codex configuration (model) or pin an "
-                      "available model.", proc.stdout)
+        self.assertIn("Ask the user to update the Codex configuration "
+                      "(model) or to name a model to pin.", proc.stdout)
+        self.assertNotIn("is stale", proc.stderr)
+        self.assertEqual(self.saved_thread("architect"), thread)
+
+    def test_a_fallen_back_role_matches_the_rejection_to_what_it_sent(self):
+        """The routed role asked for VEGA but fell back, so it sent no model
+        and Codex's text-only sentence names the native model. That is a
+        rejection of this invocation, not a stale thread: one subprocess,
+        and the saved thread is kept."""
+        self.stage([_entry()])
+        self.assertEqual(self.launch().returncode, 0)
+        thread = self.saved_thread("architect")
+        self.reset_argvs()
+        self.stage([_routed(text="Review "
+                            + SENTINELS["reject_sentence_with_stale_words"])])
+        proc = self.launch(**{ROUTING_ENV: "off"})
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        (argv,) = self.argvs()
+        self.assert_no_overrides(argv)
+        self.assertEqual(argv[argv.index("resume") + 1], thread)
+        self.assertIn(
+            "_Failed: [model-rejected] Codex rejected the natively configured "
+            f"model for this invocation: The '{NATIVE}' model is not "
+            "supported when using Codex with a ChatGPT account. Thread not "
+            "found. No substitute model was tried and the saved thread was "
+            "kept. Ask the user to update the Codex configuration (model) or "
+            "to name a model to pin._", proc.stdout)
         self.assertNotIn("is stale", proc.stderr)
         self.assertEqual(self.saved_thread("architect"), thread)
 
@@ -1929,6 +2654,38 @@ class LaunchEndToEndTests(unittest.TestCase):
             "inherit native configuration.", proc.stdout)
         self.assertIsNone(self.saved_thread("architect"))
 
+    def test_a_rejected_native_model_points_at_the_codex_configuration(self):
+        """A native_effort role and an effort-only pin both run the native
+        model, which an inheriting re-run would send again: the action asks
+        the user for a configuration change or a model to pin, never
+        inheritance, and never has the orchestrator change either itself."""
+        snapshot_id = self.discover()
+        action = ("No substitute model was tried. Ask the user to update "
+                  "the Codex configuration (model) or to name a model to "
+                  "pin._")
+        not_found = (f"The model '{NATIVE}' does not exist or you do not "
+                     "have access to it.")
+        text = "Review " + SENTINELS["reject_structured"]
+        for entry, subject, sent in (
+            (_native_effort(effort="brisk", snapshot_id=snapshot_id,
+                            text=text),
+             f"requested model '{NATIVE}'", ["-m", NATIVE]),
+            (_entry(text=text, effort="brisk", selection={"mode": "user"}),
+             "natively configured model", []),
+        ):
+            self.reset_argvs()
+            self.stage([entry])
+            with self.subTest(selection=entry["selection"]["mode"]):
+                proc = self.launch()
+                self.assertEqual(proc.returncode, 1, proc.stderr)
+                (argv,) = self.argvs()
+                self.assertEqual(argv[3:3 + len(sent) + 2], sent + [
+                    "-c", 'model_reasoning_effort="brisk"'])
+                self.assertIn(
+                    f"_Failed: [model-rejected] Codex rejected the {subject} "
+                    f"for this invocation: {not_found[:-1]}. {action}",
+                    proc.stdout)
+
     def test_quota_429_is_terminal_with_one_subprocess(self):
         self.stage([_entry(text="Review " + SENTINELS["quota_429"])])
         proc = self.launch()
@@ -1938,27 +2695,74 @@ class LaunchEndToEndTests(unittest.TestCase):
         self.assertNotIn("retriable error", proc.stderr)
 
     def test_resume_after_a_native_default_change_warns_on_the_same_thread(self):
-        """AC11: Codex's own advisory is kept verbatim; the UUID is kept."""
+        """AC11: the thread was recorded on the native model LYRA. The native
+        default then moves to NATIVE and LYRA retires. The inherited role
+        resumes the same UUID with no overrides and no launch discovery,
+        and Codex's own advisory is relayed verbatim."""
+        self.scenario(self._native_scenario(LYRA))
         self.stage([_entry()])
-        self.assertEqual(self.launch().returncode, 0)
+        first = self.launch()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertNotIn("codex reported", first.stdout)
         thread = self.saved_thread("architect")
         self.reset_argvs()
-        self.stage([_entry(text="Review " + SENTINELS["resume_advisory"])])
+        self.scenario(self._lyra_retired_scenario())
         proc = self.launch()
         self.assertEqual(proc.returncode, 0, proc.stderr)
         (argv,) = self.argvs()
         self.assert_no_overrides(argv)
         self.assertEqual(argv[argv.index("resume") + 1], thread)
+        self.assertIn(self._advisory(LYRA, NATIVE), proc.stdout)
+        self.assertFalse(self.launch_discovered())
+        self.assertNotIn("adopted new id", proc.stdout + proc.stderr)
+        self.assertEqual(self.saved_thread("architect"), thread)
+
+    def test_a_routed_thread_resumes_natively_after_its_model_retires(self):
+        """AC11: a routed role's model retires between councils. The next
+        council plans the same route, the launch falls back, and the role
+        resumes the same thread with no overrides: the fallback is noted,
+        Codex's advisory names the model change, and the thread is kept."""
+        snapshot_id = self.discover()
+        self.stage([_routed(model=VEGA, effort="deliberate",
+                            snapshot_id=snapshot_id)])
+        first = self.launch()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        thread = self.saved_thread("architect")
+        self.reset_argvs()
+        self.run_dir = self._mkdir("run-next")  # the next council
+        snapshot_id = self.discover()
+        self.stage([_routed(model=VEGA, effort="deliberate",
+                            snapshot_id=snapshot_id)])
+        self.scenario(self._retired_scenario(VEGA))
+        proc = self.launch()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(self.launch_discovered())
+        (argv,) = self.argvs()
+        self.assert_no_overrides(argv)
+        self.assertEqual(argv[argv.index("resume") + 1], thread)
         self.assertIn(
-            "_Warning: codex reported: This session was recorded with model "
-            f"`{fake_codex.RECORDED_MODEL}` but is resuming with `{NATIVE}`. "
-            f"Consider switching back to `{fake_codex.RECORDED_MODEL}` as it "
-            "may affect Codex performance._", proc.stdout)
+            "[codex-council:architect] routing fell back to native "
+            "inheritance: selection evidence changed since discovery: model "
+            f"'{VEGA}' advertised retirement passed ({PAST_RETIREMENT})\n",
+            proc.stderr)
+        self.assertIn("architect: started (resume)", proc.stderr)
+        self.assertIn(self._advisory(VEGA, NATIVE), proc.stdout)
         self.assertNotIn("adopted new id", proc.stdout + proc.stderr)
         self.assertEqual(self.saved_thread("architect"), thread)
 
     def test_skill_path_refuses_untagged_pins_before_any_worker(self):
+        """--skill-contract marks the skill path in the pre-flight and the
+        launch alike: a model with no selection never reports staging OK."""
         self.stage([_entry(model=CUSTOM)])
+        preflight = self.run_script("--check-staging-dir", self.run_dir,
+                                    "--skill-contract", EPOCH)
+        self.assertEqual(preflight.returncode, 2, preflight.stdout)
+        self.assertIn("declare selection.mode", preflight.stderr)
+        self.assertEqual(preflight.stdout, "")
+        preflight = self.run_script("--check-staging-dir", self.run_dir)
+        self.assertEqual(preflight.returncode, 0, preflight.stderr)
+        self.assertIn("selection plan: architect: explicit override (model "
+                      f"{CUSTOM})", preflight.stdout)
         proc = self.launch()
         self.assertEqual(proc.returncode, 2)
         self.assertIn("declare selection.mode", proc.stderr)
@@ -1977,10 +2781,182 @@ class LaunchEndToEndTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 2)
         self.assertIn("does not identify this run's discovery snapshot",
                       proc.stderr)
-        self.assertIn(REWRITE, proc.stderr)
+        # The staged launch's form of the whole-file rewrite: its directory
+        # already holds this launch, so the rewrite goes into a new one.
+        self.assertEqual(proc.stderr.count(
+            council_common.STAGED_LAUNCH_ROLES_RECOVERY), 1, proc.stderr)
+        self.assertNotIn("re-run the pre-flight", proc.stderr)
         self.assertNotIn("dispatching", proc.stderr)
         self.assertEqual(self.argvs(), [])
         self.assertFalse(self.launch_discovered())
+
+    def test_a_staged_launch_refusal_starts_over_in_a_new_directory(self):
+        """A staged launch that refuses before dispatch has already made its
+        directory a launched one (the command's own redirections created
+        out.md and err.log), so the recovery it writes to err.log never asks
+        for a pre-flight re-run there, which would be refused; it starts
+        over in a new directory with its own --discover, and that works."""
+        empty_bin = self._mkdir("empty-bin")
+
+        def empty_context():
+            with open(os.path.join(self.run_dir, "context.md"), "w",
+                      encoding="utf-8") as f:
+                f.write("   \n")
+
+        def roles_defect():
+            with open(os.path.join(self.run_dir, "roles.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump([_entry("architect", _="")], f)
+
+        cases = (
+            ("codex missing", {"PATH": empty_bin}, None,
+             "Codex CLI not found on PATH"),
+            ("empty context", {}, empty_context, "empty or whitespace-only"),
+            ("roles defect", {}, roles_defect, "unknown field(s) '_'"),
+        )
+        for index, (name, env, break_input, expected) in enumerate(cases):
+            with self.subTest(refusal=name):
+                self.run_dir = self._mkdir(f"run-{index}")
+                self.discover()
+                self.stage([_entry("architect")])
+                preflight = self.run_script(
+                    "--check-staging-dir", self.run_dir,
+                    "--skill-contract", EPOCH)
+                self.assertEqual(preflight.returncode, 0, preflight.stderr)
+                if break_input is not None:
+                    break_input()
+                # The SKILL launch shape: `> out.md 2> err.log`.
+                err_log = os.path.join(self.run_dir, "err.log")
+                with open(os.path.join(self.run_dir, "out.md"), "wb") as out, \
+                        open(err_log, "wb") as err:
+                    launch = subprocess.run(
+                        [sys.executable, SCRIPT, *self.launch_args()],
+                        stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+                        env={**self.env, **env}, cwd=self.project,
+                        timeout=120)
+                self.assertEqual(launch.returncode, 2)
+                with open(err_log, encoding="utf-8") as f:
+                    logged = f.read()
+                self.assertIn(expected, logged)
+                self.assertEqual(logged.count(
+                    council_common.STAGED_LAUNCH_RESTART), 1, logged)
+                self.assertNotIn("re-run --check-staging-dir", logged)
+                self.assertNotIn("re-run the pre-flight", logged)
+                # The same-directory pre-flight re-run is refused.
+                rerun = self.run_script(
+                    "--check-staging-dir", self.run_dir,
+                    "--skill-contract", EPOCH)
+                self.assertEqual(rerun.returncode, 2, rerun.stdout)
+                self.assertIn("already holds a council launch",
+                              rerun.stderr)
+        # The recovery it gives instead goes through.
+        self.run_dir = self._mkdir("fresh")
+        self.discover()
+        self.stage([_entry("architect")])
+        preflight = self.run_script("--check-staging-dir", self.run_dir,
+                                    "--skill-contract", EPOCH)
+        self.assertEqual(preflight.returncode, 0, preflight.stderr)
+        self.assertEqual(self.argvs(), [])
+
+    def test_a_launch_directory_is_never_reused_for_another_launch(self):
+        """The skill's launch command opens out.md and err.log before the
+        runner starts, so from that moment the directory may hold a running
+        council: the pre-flight and --discover refuse it, and after the run
+        the report, log, and planning snapshot are left untouched."""
+        snapshot_id = self.discover()
+        self.stage([_routed(snapshot_id=snapshot_id)])
+        preflight = self.run_script("--check-staging-dir", self.run_dir,
+                                    "--skill-contract", EPOCH)
+        self.assertEqual(preflight.returncode, 0, preflight.stderr)
+        # What `> out.md 2> err.log` does before the runner even starts.
+        out = open(os.path.join(self.run_dir, "out.md"), "wb")
+        err = open(os.path.join(self.run_dir, "err.log"), "wb")
+        self.addCleanup(out.close)
+        self.addCleanup(err.close)
+        running = self.run_script("--check-staging-dir", self.run_dir,
+                                  "--skill-contract", EPOCH)
+        self.assertEqual(running.returncode, 2, running.stdout)
+        self.assertIn("already holds a council launch (out.md, err.log "
+                      "present)", running.stderr)
+        launch = subprocess.run(
+            [sys.executable, SCRIPT, *self.launch_args()],
+            stdin=subprocess.DEVNULL, stdout=out, stderr=err, env=self.env,
+            cwd=self.project, timeout=120)
+        self.assertEqual(launch.returncode, 0)
+        out.close()
+        err.close()
+        outputs = {}
+        for name in ("out.md", "err.log",
+                     council_discovery.SNAPSHOT_FILENAME):
+            with open(os.path.join(self.run_dir, name), "rb") as f:
+                outputs[name] = f.read()
+        self.assertIn(b"CODEX_COUNCIL_DONE ok=1 total=1", outputs["err.log"])
+        self.forget_discovery()
+        for args in (("--check-staging-dir", self.run_dir),
+                     ("--discover", self.run_dir)):
+            with self.subTest(command=args[0]):
+                proc = self.run_script(*args, "--skill-contract", EPOCH)
+                self.assertEqual(proc.returncode, 2, proc.stdout)
+                self.assertIn("already holds a council launch (out.md, "
+                              "err.log, replies present)", proc.stderr)
+                self.assertIn(council_common.LAUNCHED_DIR_RECOVERY,
+                              proc.stderr)
+        self.assertFalse(self.launch_discovered())
+        for name, content in outputs.items():
+            with open(os.path.join(self.run_dir, name), "rb") as f:
+                self.assertEqual(f.read(), content, name)
+
+    def test_a_subdirectory_launch_discovers_and_runs_at_the_git_root(self):
+        """Execution-context parity from a Git subdirectory: discovery's
+        config/read cwd and every worker's -C are the same Git top level,
+        not the launch directory, so a .codex/config.toml below the root
+        is outside the discovered baseline (whether codex exec also ignores
+        it is Codex's side and is not verified live here)."""
+        repo = self._mkdir("repo")
+        env = {**self.env, "GIT_CONFIG_GLOBAL": os.devnull,
+               "GIT_CONFIG_NOSYSTEM": "1"}
+        subprocess.run(["git", "init", "-q", repo], env=env, check=True,
+                       capture_output=True)
+        subdir = os.path.join(repo, "pkg", "sub")
+        os.makedirs(subdir)
+        toplevel = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"], cwd=subdir, env=env,
+            check=True, capture_output=True, text=True).stdout.strip()
+        request_log = os.path.join(self.root, "requests.log")
+        env["FAKE_CODEX_REQUEST_LOG"] = request_log
+
+        def run_from_subdir(*args):
+            return subprocess.run(
+                [sys.executable, SCRIPT, *args], capture_output=True,
+                text=True, env=env, cwd=subdir, stdin=subprocess.DEVNULL,
+                timeout=120)
+
+        proc = run_from_subdir("--discover", self.run_dir,
+                               "--skill-contract", EPOCH)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        snapshot, problem = council_discovery._read_snapshot(self.run_dir)
+        self.assertIsNone(problem)
+        self.stage([_routed(snapshot_id=snapshot["snapshot_id"])])
+        launch = run_from_subdir(*self.launch_args())
+        self.assertEqual(launch.returncode, 0, launch.stderr)
+        config_reads = [
+            json.loads(line)["params"]["cwd"]
+            for line in fake_codex.read_lines(request_log)
+            if json.loads(line)["method"] == "config/read"
+        ]
+        # Planning discovery, then the launch's own revalidation.
+        self.assertEqual(config_reads, [toplevel, toplevel])
+        self.assertEqual(snapshot["context"]["project_root"], toplevel)
+        (argv,) = self.argvs()
+        self.assertEqual(argv[argv.index("-C") + 1], toplevel)
+        with open(os.path.join(self.pid_dir, "server.env"),
+                  encoding="utf-8") as f:
+            spawned_in = json.load(f)["cwd"]
+        # The processes themselves ran in the subdirectory.
+        self.assertEqual(os.path.realpath(spawned_in),
+                         os.path.realpath(subdir))
+        self.assertNotEqual(os.path.realpath(subdir),
+                            os.path.realpath(toplevel))
 
     def test_reply_files_match_the_report_and_the_follower_reaches_done(self):
         snapshot_id = self.discover()

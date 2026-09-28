@@ -114,13 +114,13 @@ their content cannot be staged.
 
 ## Extraction rules
 
-Use the exact private `ABS_RUNDIR` printed by the single `mktemp -d` call in
-`SKILL.md`. Each recipe must run inside one Bash invocation: shell options and
-variables do not persist across Claude Code Bash calls, so every recipe
-re-assigns its own paths. Placeholder discipline: paste concrete values for
-every `<angle-bracket>` placeholder and for the literal `ABS_RUNDIR` prefix
-before running — never leave an undefined `$file`-style variable from an
-earlier tool call in the command.
+Use the exact private `ABS_RUNDIR` printed by this launch's `mktemp -d` call
+(`SKILL.md` Step 3; every launch gets its own). Each recipe must run inside
+one Bash invocation: shell options and variables do not persist across Claude
+Code Bash calls, so every recipe re-assigns its own paths. Placeholder
+discipline: paste concrete values for every `<angle-bracket>` placeholder and
+for the literal `ABS_RUNDIR` prefix before running — never leave an undefined
+`$file`-style variable from an earlier tool call in the command.
 
 ## The fail-closed skeleton
 

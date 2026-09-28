@@ -211,14 +211,12 @@ sequenceDiagram
 
     U->>C: Invoke codex-council
     C->>C: Read the work and compose a task-specific panel
-    C->>F: mktemp -d once
-    opt routing on (the default)
-        C->>S: --discover F --skill-contract 3
-        S->>A: initialize, account/read, config/read, configRequirements/read, model/list
-        A-->>S: metadata only, no thread or turn
-        S->>F: model-snapshot.json (0600)
-        S-->>C: compact summary with snapshot_id
-    end
+    C->>F: mktemp -d (a new directory for every launch)
+    C->>S: --discover F --skill-contract 3 (always, even with routing off)
+    S->>A: initialize, account/read, config/read, configRequirements/read, model/list
+    A-->>S: metadata only, no thread or turn
+    S->>F: model-snapshot.json (0600)
+    S-->>C: compact summary with snapshot_id
     C->>C: Per role choose a routed pair, a native-model effort, the user's pin, or inheritance
     C->>U: Announce panel
     C->>F: Write roles.json and context.md
@@ -376,10 +374,19 @@ or that directory itself outside Git. Workers use the `codex` found on `PATH`
 and inherit the runner's working directory and environment, including
 `CODEX_HOME` and any credentials. The runner forwards no `--profile`, so a
 profile selected in another Codex session does not apply to the council.
-Discovery spawns the app-server the same way and reads the configuration
-Codex resolves for that same root, so a `.codex/config.toml` in a
-subdirectory below the root is not part of the council's baseline. Launch the
-council from the project whose Codex configuration you want it to use.
+Discovery spawns the app-server the same way and asks Codex for the
+configuration it resolves at that same root (`config/read` with that `cwd`,
+which on codex-cli 0.157.1 selects project layers from the parameter and
+ignores a subdirectory's `.codex/config.toml`), so such a subdirectory layer
+is not part of the council's discovered baseline even when you launch from
+that subdirectory. Workers get the same root as `-C`. That `codex exec`
+then also stops its project layers at the `-C` root, not at the inherited
+working directory, follows from Codex's documentation (`-C` sets the
+agent's working directory, and project layers run from the project root down
+to the working directory) but has not been verified live. The tests pin the
+plugin side: from a subdirectory launch, discovery's `cwd` and every
+worker's `-C` are the same Git top level. Launch the council from the
+project whose Codex configuration you want it to use.
 
 **`CODEX_API_KEY`.** `codex exec` honors `CODEX_API_KEY`, but the app-server
 does not (see
@@ -409,21 +416,35 @@ never logs in, and is bounded to 20 seconds. It writes
 `ABS_RUNDIR/model-snapshot.json` (mode 0600) and prints a compact summary:
 the native model and effort and the kind of layer each came from, managed
 new-thread defaults, whether routing is eligible, whether effort can be
-adjusted on the native model, and each advertised model with its description
-and advertised efforts. Hidden models are listed by name only, for explicit
-pins. There is no cross-run cache: every run directory gets its own snapshot.
+adjusted on the native model, and each advertised model with its display
+name (when it differs from the execution id), description, and advertised
+efforts. A model whose advertised retirement has already passed is marked
+`retired <time> (not routable)`; an explicit pin of it is forwarded with a
+note. Hidden models are listed by name only, for explicit pins. Catalog
+and configuration text is printed as data, with control characters escaped.
+There is no cross-run cache: every run directory gets its own snapshot.
 `--discover` exits 0 even when discovery is unavailable or `codex` is missing;
-the summary then says that roles must inherit.
+the summary then says to write no automatic selections: explicit pins still
+apply, and every other role inherits. Its first line always carries the
+plugin `version=`. It exits 2 for a directory that already holds a launch
+(see Preflight). The skill runs it even with routing off, because explicit
+pins get their advisory notes from the snapshot.
 
 Routing is eligible only when routing is on, discovery completed, the catalog
 is complete and well-formed, you are signed in, the configured provider is the
-default OpenAI one with no managed provider or model-catalog override,
-`CODEX_API_KEY` is not set, and no managed new-thread defaults are present.
-The summary lists every reason that fails. Adjusting only the effort on the
-native model has its own proof: discovery completed, no managed new-thread
-defaults, a matching provider, no `CODEX_API_KEY`, a configured model, and a
-well-formed catalog entry for exactly that model (a hidden one counts), so its
-efforts are known. Available models, efforts, and defaults depend on the
+default OpenAI one with no endpoint override (`openai_base_url` or
+`chatgpt_base_url`), no `model_catalog_json` catalog file, and no managed
+provider, model-catalog, or endpoint setting, `CODEX_API_KEY` is not set, and
+no managed new-thread defaults are present. An overridden endpoint counts as a
+different provider because the catalog discovery reads is not evidence of what
+that endpoint serves. A `model_catalog_json` file replaces the catalog with
+entries someone wrote, and any config layer can set it, including a trusted
+project's `.codex/config.toml`, so the repository under review could describe
+the models that review it. The summary lists every reason that fails.
+Adjusting only the effort on the native model has its own proof: discovery
+completed, no managed new-thread defaults, a matching provider, endpoint, and
+catalog, no `CODEX_API_KEY`, a configured model, and a well-formed catalog
+entry for exactly that model (a hidden one counts), so its efforts are known. Available models, efforts, and defaults depend on the
 client and the account, so the catalog is evidence of what is advertised to
 you, not a guarantee of access. Its recommended marker is never treated as
 your configured model.
@@ -474,9 +495,19 @@ values are copied from your snapshot):
 }
 ```
 
-**Preflight.** `--check-staging-dir` runs no discovery. It checks each
-automatic selection against `ABS_RUNDIR/model-snapshot.json` and prints the
-plan, one line per role:
+**Preflight.** `--check-staging-dir` runs no discovery. It refuses (exit 2)
+whatever the launch would refuse before dispatch, including a missing `codex`
+binary and an invalid `CODEX_COUNCIL_MAX_PARALLEL`, `CODEX_COUNCIL_STALL_SECS`,
+or `CODEX_COUNCIL_MODEL_ROUTING`. It also refuses a directory that already
+holds a launch (`out.md`, `err.log`, or `replies/` exists): every launch,
+including a re-run of one role or a follow-up round, gets its own
+`mktemp -d` directory, because the launch command's own redirections would
+truncate a running council's `out.md` and `err.log` before the runner could
+object. Those redirections also mean a staged launch refused before
+dispatch has used up its directory, so its `err.log` recovery starts over in
+a new one with its own `--discover` rather than re-running the preflight
+there. It checks each automatic selection against
+`ABS_RUNDIR/model-snapshot.json` and prints the plan, one line per role:
 
 ```
 [codex-council] staging OK: ABS_RUNDIR (4 roles; max parallel 6) version=1.0.0
@@ -502,10 +533,14 @@ and before any worker starts, and uses it for the whole council. The planning
 snapshot is never overwritten. A choice the fresh evidence no longer supports
 falls back to native inheritance with the reason logged, instead of failing
 the run. That covers discovery now unavailable, routing now ineligible for a
-routed pair, a model that is gone, hidden, or retired, an effort no longer
-advertised, or a native model no longer proven. `native_effort` pins the
-native model that launch discovery proves. A council of only inherited and
-explicit roles runs no launch discovery at all.
+routed pair, a model that is gone, hidden, or retired (including a
+retirement that passed after discovery), an effort no longer advertised, or a
+native model no longer proven. `native_effort` sends the native model that
+launch discovery proves only when it is the one discovery planned with: the
+effort was chosen from that model's descriptions, so a changed native model
+(a config edit, or a launch from another project root) falls back instead of
+carrying the effort over. A council of only inherited and explicit roles runs
+no launch discovery at all.
 
 **`CODEX_COUNCIL_MODEL_ROUTING`.** Unset, empty, or `auto` keeps routing on.
 `off` turns automatic selection off: `routed` and `native_effort` roles
@@ -518,10 +553,16 @@ launch, and `--discover`.
 is forwarded unchanged. It is never replaced, never routed around, and never
 rejected for being absent from the catalog, so custom-provider model ids keep
 working. Discovery only annotates a pin: a model not in the catalog, or an
-effort the catalog does not advertise for that model, gets an "unverified"
-note in the preflight plan and the report. Pinning only one of model and
-effort while managed new-thread defaults are present or unknown gets a
-"partial pin" note, because Codex then ignores both managed defaults.
+effort the catalog does not advertise for that model (including the native
+effort a model-only pin keeps, when no managed defaults are set), gets an
+"unverified" note in the preflight plan and the report, and a model named
+by a catalog display name or picker id also gets the execution id it maps
+to, so Claude can rewrite the pin with that id (the summary prints each
+display name next to its id). A pinned value that fails the value grammar,
+such as a display name with a space, is repaired with the user, never
+dropped to inherit. Pinning only one of model and effort while managed
+new-thread defaults are present or unknown gets a "partial pin" note,
+because Codex then ignores both managed defaults.
 
 **Overrides are per invocation.** A role's values are sent on every
 invocation, fresh and resume alike (`-m` and `-c` sit before the `resume`
@@ -547,12 +588,18 @@ the `requested_model=` and `requested_effort=`.
 invocation—a structured `model_not_found`, or Codex's own complete rejection
 sentence—the role fails as `[model-rejected]`. That failure is terminal. It
 is not retried, no substitute model is tried, it never clears a saved thread,
-and the message quotes Codex and names one next step: re-run the role with
-`model`, `effort`, and `selection` omitted (automatic choices), change or
-remove the pin (user pins), or update the Codex configuration or pin an
-available model (native inheritance). A usage, quota, or credit limit fails
-as `[quota]`, which is terminal and never retried, even when the provider
-reports it as HTTP 429.
+and the message quotes Codex and names one next step for the model that was
+refused: re-run the role with `model`, `effort`, and `selection` omitted (a
+routed model), change or remove the pin (a user model pin), or ask the user
+to update the Codex configuration or name a model to pin (the natively
+configured model, which a native-effort role, an effort-only pin, or native
+inheritance runs, and which an inheriting re-run would send again; Claude
+never edits Codex configuration itself). A
+usage, quota, or credit limit fails as `[quota]`, which is terminal and
+never retried, even when the provider reports it as HTTP 429. When Codex
+says the usage limit is for one model, the `[quota]` message ends with the
+same next step as a rejection of the model that was sent, so a routed role
+can re-run on native configuration instead of waiting for the reset.
 
 ### Other settings
 
@@ -598,10 +645,11 @@ every 1800s when disabled) and each line carries per-role `quiet=Ns` (or
 `version=`. Each completion line ends with `reply=<path>` pointing at that
 role's reply file. The skill follows the run with a Claude Code Monitor on
 `codex_council.py --follow <run dir>`, re-armed whenever a monitor expires
-while the background task is still running, and falls
-back to a one-shot session-cron wake-up or the native
-[background-task mechanism](https://code.claude.com/docs/en/interactive-mode)
-when Monitor is unavailable, so progress surfaces without a shell polling loop.
+while the background task is still running. Without Monitor, an interactive
+session falls back to a one-shot session-cron wake-up, while `claude -p` or
+a subagent, whose final response would end the council, keeps its turn open
+by running the same follower as a foreground command and re-running it after
+each timeout; either way progress surfaces without a shell polling loop.
 
 ## 1.0.0 changes
 
@@ -620,6 +668,9 @@ when Monitor is unavailable, so progress surfaces without a shell polling loop.
   what each role was sent and why; nothing claims which model ran.
 - **New failure tags.** `[model-rejected]` and `[quota]` are terminal and
   never retried, and a model rejection never clears a saved thread.
+- **One launch per run directory.** Every launch, including a re-run of one
+  rejected role or a follow-up round, gets its own `mktemp -d` directory;
+  `--discover` and the preflight refuse a directory that already launched.
 - **Verifier framing.** The collaboration brief tells each role it is an
   independent cross-model check: the user's requirements are authoritative,
   Claude's account of the work is a set of claims to verify, and verified
@@ -645,6 +696,10 @@ when Monitor is unavailable, so progress surfaces without a shell polling loop.
   value, is rejected (exit 2).
 - A quota or credit failure that carries HTTP 429 is now `[quota]` and is not
   retried; before, it could be retried once as `[retriable:rate-limit]`.
+- `--check-staging-dir` (and the new `--discover`) refuse, with exit 2, a
+  directory that already holds a launch (`out.md`, `err.log`, or `replies/`
+  present). Stage each launch in its own `mktemp -d` directory; the launch
+  command itself still accepts a directory it has run in before.
 - Each role section in `out.md` and in its reply file now starts with a
   `_Model selection: ..._` line, the report adds a `Model selection:`
   paragraph after the Summary, and reply-file headers add `selection=`. Their
@@ -674,13 +729,16 @@ claude plugins install codex-council@codex-council       # skip if already insta
 Step 2 is the one that matters: the harness loads whichever `installPath` the manifest declares, **not** whichever symlinks exist in the cache. Without the manifest rewrite, bumping the version in `plugin.json` and re-running dev-link creates a new symlink that the harness will happily ignore.
 
 Two skew guards help here. The runner prints `version=<plugin version>` in the
-preflight "staging OK" line, the dispatch line, the heartbeat, and the
-`CODEX_COUNCIL_DONE` sentinel, and the model snapshot records
+discovery summary's first line, the preflight "staging OK" line, the dispatch
+line, the heartbeat, and the `CODEX_COUNCIL_DONE` sentinel, and the model
+snapshot records
 `plugin_version` — postmortem **visibility** into which plugin version
 actually ran, not skew prevention. And `SKILL.md`'s command templates pass
 `--skill-contract 3`: if the linked script's contract epoch differs, the
-invocation is refused (exit 2) as a stale SKILL/script pair — re-run
-`scripts/dev-link.sh` (or reinstall the plugin) and restart the session.
+invocation is refused (exit 2) as a stale SKILL/script pair. In a development
+checkout, re-run `scripts/dev-link.sh` and restart the session; an installed
+plugin is updated from its marketplace, then plugins are reloaded or a fresh
+session is started. Never change the epoch to get past it.
 
 After the one-time restart, edits to `plugins/codex-council/**` are live on the next `/codex-council:codex-council` invocation. **SKILL.md caveat:** the Claude Code harness's skill-content caching behavior is not documented, so `SKILL.md` edits may still require a session restart; the script and the rest of the plugin files update live.
 
@@ -716,7 +774,8 @@ should fail closed with `set -euo pipefail`. Merge into your existing
 
 The test suite needs no Codex install or network: `tests/fake_codex.py`
 puts a scripted `codex` (app-server and exec) on `PATH` with synthetic model
-ids. CI runs it on Python 3.10, 3.12, and 3.14, plus a pinned ruff:
+ids, and `tests/council_testlib.py` holds the helpers the test modules share.
+CI runs it on Python 3.10, 3.12, and 3.14, plus a pinned ruff:
 
 ```bash
 python3 -m unittest discover -s tests -p 'test_*.py'
