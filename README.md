@@ -150,7 +150,7 @@ flowchart LR
     User["User"] --> Claude["Claude Code"]
     Claude --> Skill["codex-council skill<br/>SKILL.md"]
     Skill --> Panel["Read the work, size the panel: 1..N roles<br/>choose each role's model and effort or inherit<br/>announce and launch"]
-    Panel --> Discover["codex_council.py --discover RUNDIR<br/>metadata only, bounded to 20s"]
+    Panel --> Discover["codex_council.py --discover RUNDIR<br/>council_discovery: metadata only, bounded to 20s"]
     Panel --> Script["codex_council.py<br/>--roles-file + --context-file"]
 
     subgraph Plugin["codex-council plugin"]
@@ -158,7 +158,7 @@ flowchart LR
         Discover --> Snapshot["RUNDIR/model-snapshot.json<br/>native configuration, catalog,<br/>routing eligibility"]
         Snapshot -.->|"catalog descriptions"| Panel
         Script --> Validate["Launch-side privacy gate<br/>validate staged inputs<br/>parse roles and selections"]
-        Validate --> Select["Resolve each role's selection<br/>authoring check against the snapshot (exit 2)<br/>one launch discovery if a role is automatic<br/>native, user, routed, native_effort, or fallback"]
+        Validate --> Select["council_selection: resolve each role's selection<br/>authoring check against the snapshot (exit 2)<br/>one launch discovery if a role is automatic<br/>native, user, routed, native_effort, or fallback"]
         Snapshot --> Select
         Select --> Prompt["Bookend context with<br/>each role instruction"]
         Prompt --> Fanout["asyncio.Semaphore + gather<br/>bounded parallel fan-out"]
@@ -188,7 +188,7 @@ flowchart LR
     ExecA --> JSONL["JSONL events"]
     ExecB --> JSONL
     ExecN --> JSONL
-    JSONL --> Parse["Extract thread.started<br/>Extract final agent_message<br/>Classify failures"]
+    JSONL --> Parse["Extract thread.started<br/>Extract final agent_message<br/>council_failures: classify failures"]
     Parse --> Replies["Per-role reply files<br/>replies/role-id.md as each settles<br/>then K/N completion line in err.log"]
     Parse --> Report["Aggregated markdown report<br/>out.md, with what each role was sent"]
     Replies --> Follow["--follow via Monitor<br/>relays progress lines<br/>drops reply= paths outside replies/"]

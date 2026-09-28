@@ -18,6 +18,25 @@ it:
 | `council_selection.py` | `Role` with its `Selection` and `SelectionDecision`, the `selection` grammar, authoring validation, the pure `_resolve_selection`, `_resolve_run_selections` (the one orchestration behind the preflight plan and the launch), and the selection text in reports and the preflight plan |
 | `council_failures.py` | Failure records from `error` and `turn.failed` events, the marker lists, `_failure_verdict` (whose `FailureVerdict.retriable` is the retry decision), and the failure tags |
 
+```mermaid
+flowchart LR
+    Entry["codex_council.py<br/>the only entry point: CLI, staging gates,<br/>continuity state, codex exec and watchdog,<br/>fan-out, report, --follow"]
+    Common["council_common<br/>escaping, diagnostics sink, private-path policy,<br/>launch gate, atomic writes, strict JSON,<br/>project root, plugin version"]
+    Discovery["council_discovery<br/>app-server adapter, snapshot,<br/>--discover summary, routing mode"]
+    Selection["council_selection<br/>selection contract, authoring checks,<br/>pure resolver, launch revalidation"]
+    Failures["council_failures<br/>failure records, classifier order,<br/>tags and recovery actions"]
+
+    Entry --> Common
+    Entry --> Discovery
+    Entry --> Selection
+    Entry --> Failures
+    Discovery --> Common
+    Selection --> Common
+    Selection --> Discovery
+    Failures --> Common
+    Failures --> Selection
+```
+
 Imports point one way: `council_discovery` uses `council_common`,
 `council_selection` uses both, `council_failures` uses `council_common` and
 `council_selection`, and only `codex_council.py` imports all four. Module
@@ -437,7 +456,7 @@ unsolicited messages interleave:
 
 ```mermaid
 sequenceDiagram
-    participant R as codex_council.py
+    participant R as runner (council_discovery)
     participant V as codex --version
     participant A as codex app-server
 
@@ -462,6 +481,11 @@ sequenceDiagram
     opt server-to-client request at any point
         A->>R: a message with both method and id
         R-->>A: error -32601, discovery marked inconclusive
+    end
+    Note over R,A: app-server stderr is never copied, only a fixed category is recorded (usage_error, panic, other)
+    opt SIGTERM or SIGHUP arrives during discovery
+        R->>A: SIGTERM, then SIGKILL, to the whole process group
+        R->>R: one interruption line, exit 128 + signum
     end
     R->>A: close stdin, then SIGTERM and SIGKILL to the group if needed
 ```
@@ -1152,6 +1176,8 @@ flowchart LR
     Adopt --> Save
     Resume -->|stale| Fresh["clear state + fresh codex exec"]
     Fresh --> Save
+    Resume -->|"auth, quota, model-rejected,<br/>or other terminal failure"| Keep["keep the saved thread<br/>tagged failure, nothing substituted"]
+    Resume -->|"429 / 5xx / replay-safe stall"| Retry["one retry on the same thread"]
 ```
 
 ## Resume footgun mitigation
