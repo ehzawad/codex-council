@@ -241,6 +241,12 @@ POST_EXIT_DRAIN_WARNING = (
     "codex exited but its process group kept its output open; the group was "
     "terminated"
 )
+# An output pump or the prompt writer ended with an exception (named in {}):
+# output may be missing, so the attempt is never treated as replay-safe.
+IO_FAILED_WARNING = (
+    "an output reader or the prompt writer failed ({}); the output may be "
+    "incomplete, so a stall is not retried"
+)
 # How often an attempt looks for its codex process's exit while the pipes
 # are still open (Process.wait() may also wait for them; see _process_exit).
 EXIT_POLL_SECS = 0.1
@@ -335,8 +341,9 @@ class CodexRun:
     stdout/stderr. `turn_completed` / `unsafe_to_replay` are derived from the
     buffered JSONL events so the stall policy can tell a wedged shutdown from
     an interrupted turn, and a replay-safe attempt from one whose tool work
-    may have had side effects. `warning` notes a process-group cleanup the
-    role's result should carry (POST_EXIT_DRAIN_WARNING).
+    may have had side effects. `warning` notes what the role's result
+    should carry: a process-group cleanup (POST_EXIT_DRAIN_WARNING) or a
+    failed output reader or prompt writer (IO_FAILED_WARNING).
     """
     returncode: int | None
     stdout: str
@@ -674,12 +681,14 @@ class _EventFlagScanner:
     only — for example the advisory that a resumed thread was recorded
     with another model, routine once roles are routed). Every other type
     (command executions, MCP tool calls, file changes, web searches, to-do
-    lists, collab tool calls, and any unknown/future type) marks the attempt
-    unsafe to replay — conservative by default, since replaying such a turn
-    could duplicate side effects. A non-blank line that is not a JSON object
-    (it does not decode, is nested too deeply, holds an out-of-range number,
-    or is another JSON value) could hide such an item, so it marks the
-    attempt unsafe to replay too; it never stops the stdout pump.
+    lists, collab tool calls, any unknown/future type, and a type that is
+    not a string) marks the attempt unsafe to replay — conservative by
+    default, since replaying such a turn could duplicate side effects. A
+    non-blank line that is not a JSON object (it does not decode, is nested
+    too deeply, holds an out-of-range number, or is another JSON value)
+    could hide such an item, so it marks the attempt unsafe to replay too,
+    and so does anything else scanning a line raises: feed() and finish()
+    never raise, so scanning never stops the stdout pump.
     """
 
     _SAFE_ITEM_TYPES = frozenset({"agent_message", "reasoning", "error"})
@@ -706,20 +715,25 @@ class _EventFlagScanner:
         if not line:
             return
         try:
-            event = json.loads(line)
-        except (ValueError, RecursionError):
-            event = None
-        if not isinstance(event, dict):
+            replay_safe = self._replay_safe(json.loads(line))
+        except Exception:
+            # Undecodable, or any surprise at all: unknown work.
+            replay_safe = False
+        if not replay_safe:
             self.unsafe_to_replay = True
-            return
+
+    def _replay_safe(self, event):
+        """False when `event` is, or could hide, side-effect-capable work."""
+        if not isinstance(event, dict):
+            return False
         event_type = event.get("type")
         if event_type == "turn.completed":
             self.turn_completed = True
-        elif event_type in ("item.started", "item.completed"):
-            item = event.get("item")
-            item_type = item.get("type") if isinstance(item, dict) else None
-            if item_type not in self._SAFE_ITEM_TYPES:
-                self.unsafe_to_replay = True
+        if event_type not in ("item.started", "item.completed"):
+            return True
+        item = event.get("item")
+        item_type = item.get("type") if isinstance(item, dict) else None
+        return isinstance(item_type, str) and item_type in self._SAFE_ITEM_TYPES
 
 
 async def _run_codex_subprocess(cmd, prompt, role_id=""):
@@ -732,7 +746,8 @@ async def _run_codex_subprocess(cmd, prompt, role_id=""):
     get POST_EXIT_DRAIN_SECS to reach EOF; if they are still open, the group
     is terminated and the pumps stop, and the output already read is kept
     with POST_EXIT_DRAIN_WARNING. Either way the group is swept when the
-    attempt ends.
+    attempt ends. A pump or the prompt writer that ended with an exception
+    makes the attempt unsafe to replay, with IO_FAILED_WARNING.
 
     Returns a CodexRun. All termination paths — the watchdog, the drain
     bound, outer cancellation, and any post-spawn failure — converge on one
@@ -842,6 +857,7 @@ async def _run_codex_subprocess(cmd, prompt, role_id=""):
         asyncio.create_task(_watchdog()) if stall_secs > 0 else None
     )
     warning = None
+    unsafe_to_replay = False
     try:
         try:
             await _process_exit(proc)
@@ -857,7 +873,19 @@ async def _run_codex_subprocess(cmd, prompt, role_id=""):
                 await _begin_termination()
                 for task in held:
                     task.cancel()
-            await asyncio.gather(*helpers, return_exceptions=True)
+            failed = sorted({
+                type(outcome).__name__
+                for outcome in await asyncio.gather(
+                    *helpers, return_exceptions=True)
+                if isinstance(outcome, BaseException)
+                and not isinstance(outcome, asyncio.CancelledError)
+            })
+            if failed:
+                # Output the scanner never saw could have held tool work.
+                unsafe_to_replay = True
+                failure = IO_FAILED_WARNING.format(", ".join(failed))
+                warning = _append_warning(warning, failure)
+                _diag(f"[codex-council:{role_id}] {failure}")
             if termination["task"] is not None:
                 await termination["task"]
             await _sweep_process_group(proc, pgid)
@@ -879,7 +907,7 @@ async def _run_codex_subprocess(cmd, prompt, role_id=""):
         stderr=bytes(stderr_buf).decode("utf-8", errors="replace"),
         stalled=stalled["flag"],
         turn_completed=scanner.turn_completed,
-        unsafe_to_replay=scanner.unsafe_to_replay,
+        unsafe_to_replay=unsafe_to_replay or scanner.unsafe_to_replay,
         warning=warning,
     )
 
@@ -1041,8 +1069,8 @@ def _start_line(role, phase, attempt, stall_secs):
 async def _run_role_once(role, prompt, attempt):
     """One attempt for one role (see _run_role_invocation).
 
-    A warning any of its codex runs reports (POST_EXIT_DRAIN_WARNING) is
-    added to the role's result.
+    A warning any of its codex runs reports (POST_EXIT_DRAIN_WARNING,
+    IO_FAILED_WARNING) is added to the role's result.
     """
     runs = []
 

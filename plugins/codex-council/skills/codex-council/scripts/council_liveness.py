@@ -60,12 +60,15 @@ _PS_ENV = {"LC_ALL": "C", "TZ": "UTC0"}
 
 # --follow timing: read err.log every FOLLOW_POLL_SECS, look at the runner
 # and the follower's own parent every FOLLOW_CHECK_SECS; no dispatch line
-# within FOLLOW_START_SECS means no council activity. A tick older than
-# TICK_WARN_SECS while the runner is present is reported once; at
-# TICK_GIVE_UP_SECS the follower stops (exit 4).
+# within FOLLOW_START_SECS means no council activity. No usable status.json
+# for STATUS_UNUSABLE_WARN_SECS after dispatch (or after its last usable
+# read) is reported once. A tick older than TICK_WARN_SECS while the runner
+# is present is reported once; at TICK_GIVE_UP_SECS the follower stops
+# (exit 4).
 FOLLOW_POLL_SECS = 0.5
 FOLLOW_CHECK_SECS = 2
 FOLLOW_START_SECS = 120
+STATUS_UNUSABLE_WARN_SECS = 30
 TICK_WARN_SECS = 120
 TICK_GIVE_UP_SECS = 300
 # A wall-clock jump this much larger than the monotonic advance between two
@@ -277,8 +280,9 @@ class RunStatus:
     once attach() names a file, every transition and every tick of the
     event loop republishes it atomically (0600). Each publish is a tick:
     tick.seq grows and tick.at is its wall time, so a fresh tick shows the
-    runner's event loop is turning. A failed write is reported once and
-    never affects the council.
+    runner's event loop is turning. A failed write is reported once, removes
+    the file an earlier write left (so no stale tick remains), and never
+    affects the council.
     """
 
     def __init__(self):
@@ -367,6 +371,10 @@ class RunStatus:
             _atomic_write_private(
                 self.path, json.dumps(self.snapshot()).encode("utf-8"))
         except OSError as e:
+            # An earlier file would keep an ageing tick and make a live
+            # runner look unresponsive: better no file than a stale one.
+            with contextlib.suppress(OSError):
+                os.remove(self.path)
             if not self._write_failed:
                 self._write_failed = True
                 _diag(
@@ -397,10 +405,14 @@ def _int(value, minimum):
 
 
 def _number(value):
-    if isinstance(value, (int, float)) and not isinstance(value, bool) \
-            and math.isfinite(value):
-        return float(value)
-    return None
+    """A finite float, or None (also for an int no float can hold)."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _text(value):
@@ -410,9 +422,9 @@ def _text(value):
 def read_status(path):
     """status.json as a RunView, or None when there is no usable file.
 
-    Unknown fields are ignored and a consumed field of the wrong type reads
-    as unknown (None), so an unexpected file degrades to fewer facts,
-    never to a wrong claim.
+    Unknown fields are ignored and a consumed field of the wrong type, or a
+    number no float can hold, reads as unknown (None), so an unexpected
+    file degrades to fewer facts, never to a wrong claim.
     """
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
@@ -538,6 +550,8 @@ class _Follower:
         self.pending = b""
         self.dispatched_at = None
         self.traceback_noted = False
+        self.status_seen_at = 0.0
+        self.unusable_noted = False
         self.stale = False
         self.suspend_floor = 0.0
         self.last_wall, self.last_mono = time.time(), time.monotonic()
@@ -617,10 +631,20 @@ class _Follower:
             self.note(f"no council activity: {detail}")
             return FOLLOW_EXIT_NO_ACTIVITY
         view = read_status(self.status_path)
+        now = time.monotonic()
         if view is None or view.pid is None:
             # Nothing to check yet, or the runner could not write the file
-            # (it says so in err.log, which is relayed): err.log alone.
+            # (it says so in err.log, which is relayed): err.log alone, and
+            # one line once that has lasted STATUS_UNUSABLE_WARN_SECS.
+            unusable = now - max(self.dispatched_at, self.status_seen_at)
+            if not self.unusable_noted and (
+                    unusable >= STATUS_UNUSABLE_WARN_SECS):
+                self.unusable_noted = True
+                self.note(f"runner liveness unavailable: no usable "
+                          f"{STATUS_FILENAME}; following err.log only; run "
+                          "--status")
             return None
+        self.status_seen_at = now
         runner = runner_state(view.pid, view.identity)
         if runner == "gone":
             # A terminal line written just before the exit wins.
@@ -693,7 +717,9 @@ def follow(run_dir, verbose=False):
     the runner recorded in status.json: gone without a terminal line is one
     `runner gone` line and exit 4; present with a tick older than
     TICK_WARN_SECS is one `runner not responding` line (then `runner
-    responding again` on recovery) and exit 4 at TICK_GIVE_UP_SECS. Exit 0
+    responding again` on recovery) and exit 4 at TICK_GIVE_UP_SECS; no
+    usable status.json for STATUS_UNUSABLE_WARN_SECS is one `runner
+    liveness unavailable` line, and err.log is still relayed. Exit 0
     after the CODEX_COUNCIL_DONE sentinel, an interruption line, or a
     `runner aborted` line; exit 3 when no dispatch line appears within
     FOLLOW_START_SECS. A Python traceback in err.log is one advisory line.
@@ -723,9 +749,10 @@ def _status_lines(view, now, table):
     if view is None:
         return [
             f"runner: unknown (no usable {STATUS_FILENAME}: the council has "
-            "not dispatched, or this is not its run directory)",
+            "not dispatched, its runner could not write the file, or this "
+            "is not its run directory)",
             "next: read err.log; a launch that dispatched writes "
-            f"{STATUS_FILENAME} at once",
+            f"{STATUS_FILENAME} at once, and err.log says when it cannot",
         ]
     runner = _identity_state(table, view.pid, view.identity)
     tick_age = None if view.tick_at is None else max(0.0, now - view.tick_at)

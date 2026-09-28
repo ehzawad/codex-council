@@ -250,6 +250,41 @@ class RunStatusTests(unittest.TestCase):
             self.run.finish("done", 0)
         self.assertEqual(err.getvalue().count("status.json not written"), 1)
 
+    def test_a_failed_write_removes_the_earlier_file(self):
+        """A file left from an earlier write would age into a false
+        `runner not responding`; readers see no usable file instead."""
+        self.run.attach(self.path)
+        self.run.begin(["a"])
+        self.assertIsNotNone(council_liveness.read_status(self.path))
+        err = io.StringIO()
+        with patch.object(council_liveness, "_atomic_write_private",
+                          side_effect=OSError(28, "No space left on device")), \
+                contextlib.redirect_stderr(err):
+            self.run.update("a", state="active", attempt=1)
+            self.run.update("a", state="settled", outcome="ok")
+        self.assertEqual(os.listdir(self.run_dir), [])
+        self.assertEqual(err.getvalue().count("status.json not written"), 1)
+        self.run.finish("done", 0)
+        self.assertEqual(council_liveness.read_status(self.path).state, "done")
+
+    def test_numbers_no_float_can_hold_are_unknown(self):
+        pid, identity = _own_runner()
+        _status(self.run_dir, pid=pid, identity=identity, roles={
+            "a": {"state": "active", "attempt": 1, "output_at": 10 ** 400}})
+        with open(self.path, encoding="utf-8") as f:
+            data = json.load(f)
+        data["tick"]["at"] = 10 ** 400
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        view = council_liveness.read_status(self.path)
+        self.assertEqual((view.pid, view.tick_at), (pid, None))
+        self.assertIsNone(view.roles["a"]["output_at"])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(council_liveness.status_command(self.run_dir), 0)
+        self.assertIn(f"runner: not responding (pid {pid} present; last "
+                      "status tick never)", out.getvalue())
+
     def test_reader_ignores_unknown_fields_and_distrusts_bad_types(self):
         with open(self.path, "w", encoding="utf-8") as f:
             json.dump({"schema": 99, "future": {"x": 1},
@@ -496,6 +531,38 @@ class FollowTests(unittest.TestCase):
         self._later(0.6, lambda: self._write(DONE_LINE + "\n"))
         code, lines = self._follow()
         self.assertEqual((code, lines), (0, [DISPATCH_LINE, DONE_LINE]))
+
+    UNAVAILABLE_LINE = ("[codex-council-follow] runner liveness unavailable: "
+                        "no usable status.json; following err.log only; run "
+                        "--status")
+
+    def test_status_never_usable_after_dispatch_warns_once(self):
+        self._write(DISPATCH_LINE + "\n")
+        self._later(0.8, lambda: self._write(DONE_LINE + "\n"))
+        with patch.object(council_liveness, "STATUS_UNUSABLE_WARN_SECS", 0.2):
+            code, lines = self._follow()
+        self.assertEqual((code, lines),
+                         (0, [DISPATCH_LINE, self.UNAVAILABLE_LINE, DONE_LINE]))
+
+    def test_status_lost_after_dispatch_warns_once_and_relays_on(self):
+        """A file that was usable and then goes missing or unreadable gets
+        the same one line, never repeated, and err.log is still relayed."""
+        pid, identity = _own_runner()
+        self._write(DISPATCH_LINE + "\n")
+        _status(self.run_dir, pid=pid, identity=identity)
+        path = os.path.join(self.run_dir, council_liveness.STATUS_FILENAME)
+        self._later(0.3, lambda: os.remove(path))
+
+        def unreadable():
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("{not json")
+
+        self._later(0.9, unreadable)
+        self._later(1.3, lambda: self._write(DONE_LINE + "\n"))
+        with patch.object(council_liveness, "STATUS_UNUSABLE_WARN_SECS", 0.4):
+            code, lines = self._follow()
+        self.assertEqual((code, lines),
+                         (0, [DISPATCH_LINE, self.UNAVAILABLE_LINE, DONE_LINE]))
 
     def test_a_new_parent_ends_the_follower_quietly(self):
         self._write(DISPATCH_LINE + "\n")
@@ -852,6 +919,73 @@ class CodexLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(run.turn_completed)
         # An unreadable line could have been tool work.
         self.assertTrue(run.unsafe_to_replay)
+
+    _BAD_ITEM = textwrap.dedent("""\
+        import time
+        emit({"type": "thread.started", "thread_id": "sid"})
+        emit({"type": "turn.started"})
+        emit({"type": "item.started", "item": {"type": []}})
+        time.sleep(0.3)
+        """)
+
+    async def test_a_reply_after_a_malformed_item_is_still_extracted(self):
+        cmd = self._script(self._BAD_ITEM + self._REPLY)
+        run = await codex_council._run_codex_subprocess(cmd, "p")
+        self.assertEqual(codex_council.extract_final_message(run.stdout),
+                         "done")
+        self.assertTrue(run.turn_completed)
+        self.assertTrue(run.unsafe_to_replay)
+        self.assertIsNone(run.warning)
+
+    async def test_a_malformed_item_then_silence_is_never_replayed(self):
+        """The verification council's reproduction: an item whose type is a
+        list, a side effect, then silence under a 1s watchdog. The effect
+        happens once and the stall is terminal, never retried."""
+        effects = os.path.join(self.tmp.name, "effects.txt")
+        cmd = self._script(self._BAD_ITEM + textwrap.dedent(f"""\
+            with open({effects!r}, "a") as f:
+                f.write("performed effect\\n")
+            time.sleep(60)
+            """))
+        role = codex_council.Role(
+            "review", "Review",
+            "Review. If nothing material, say so. Thoroughness beats speed.")
+        env = dict(clean_env(), XDG_STATE_HOME=self.tmp.name,
+                   CODEX_COUNCIL_STALL_SECS="1")
+        with patch.dict(os.environ, env, clear=True), \
+                patch.object(codex_council, "STATE_DIR",
+                             os.path.join(self.tmp.name, "state")), \
+                patch.object(codex_council, "_fresh_cmd", return_value=cmd), \
+                patch.object(codex_council, "RETRY_BACKOFF_SECS", 0), \
+                contextlib.redirect_stderr(io.StringIO()):
+            result = await codex_council._run_role_attempts(role, "p")
+        with open(effects, encoding="utf-8") as f:
+            self.assertEqual(f.read().splitlines(), ["performed effect"])
+        self.assertFalse(result.ok)
+        self.assertEqual(result.attempts, 1)
+        self.assertTrue(result.error.startswith("[stall]"), result.error)
+
+    async def test_a_failed_output_reader_makes_the_attempt_unsafe(self):
+        """Whatever ends a pump early, the lost output could have held tool
+        work: the attempt is never replay-safe and says why."""
+        cmd = self._script('emit({"type": "turn.started"})\n'
+                           "import time\ntime.sleep(60)\n")
+
+        def broken_feed(scanner, chunk):
+            raise RuntimeError("reader broke")
+
+        err = io.StringIO()
+        with patch.dict(os.environ, {"CODEX_COUNCIL_STALL_SECS": "1"}), \
+                patch.object(codex_council._EventFlagScanner, "feed",
+                             broken_feed), \
+                contextlib.redirect_stderr(err):
+            run = await codex_council._run_codex_subprocess(cmd, "p", "torn")
+        self.assertTrue(run.stalled)
+        self.assertTrue(run.unsafe_to_replay)
+        self.assertEqual(
+            run.warning,
+            codex_council.IO_FAILED_WARNING.format("RuntimeError"))
+        self.assertIn(f"[codex-council:torn] {run.warning}", err.getvalue())
 
     async def test_the_run_status_follows_the_codex_process(self):
         seen = []

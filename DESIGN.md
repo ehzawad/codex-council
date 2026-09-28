@@ -692,7 +692,12 @@ another role's output never keeps this one alive. The stdout pump also
 scans JSONL events for the stall policy's flags. A non-blank line that is
 not a JSON object (it does not decode, is too deeply nested, holds an
 out-of-range number, or is another JSON value) could hide an item, so it
-counts as unknown work; it never stops a pump.
+counts as unknown work, and so does an item whose type is not a string;
+scanning never raises, so it never stops a pump. If a pump or the prompt
+writer still ends with an exception, the output may be incomplete: the
+attempt counts as unsafe to replay and carries the warning `an output
+reader or the prompt writer failed (<ExcType>); the output may be
+incomplete, so a stall is not retried`.
 
 The council has no total elapsed-time or run-level deadline. The
 output-inactivity watchdog fires after `CODEX_COUNCIL_STALL_SECS` seconds of
@@ -726,11 +731,12 @@ was buffered, the kill hit a wedged shutdown: the reply is kept as success
 with the warning "codex wedged after completing its turn; process
 terminated" and state is saved best-effort. Otherwise, if every item started
 or completed was an agent message, reasoning, or a Codex `error` notice (the
-resume advisory, for example), and every non-blank stdout line was a JSON
-object, replay is safe and the attempt is `[retriable:stall]`. Any other
-item type, known or not, or a line that is not a JSON object, makes it a
-terminal `[stall]`, and a buffered message without turn completion is
-quoted but never promoted to success.
+resume advisory, for example), every non-blank stdout line was a JSON
+object, and neither an output reader nor the prompt writer failed, replay
+is safe and the attempt is `[retriable:stall]`. Any other item type, known
+or not (or not a string), a line that is not a JSON object, or such a
+failure makes it a terminal `[stall]`, and a buffered message without turn
+completion is quoted but never promoted to success.
 
 **Key decisions and why.**
 
@@ -742,9 +748,9 @@ quoted but never promoted to success.
   the user's Codex configuration.
 - *No run-level deadline.* A long, productive role must not be killed for
   taking long; the host bounds a run's lifetime.
-- *Conservative replay.* An unknown item type, or a line that is not a
-  JSON object, counts as work, because replaying a turn that did work could
-  repeat its side effects.
+- *Conservative replay.* An unknown item type, a line that is not a JSON
+  object, or output a failed reader never saw counts as work, because
+  replaying a turn that did work could repeat its side effects.
 
 **Limits.** Terminating a live codex (the watchdog, a cancellation, or
 `--reap`) reaches its process group and the groups of its current
@@ -955,8 +961,10 @@ leader's start identity, last-output time, and outcome. A process identity
 is the pid plus its `ps -o lstart=` start time, read in the C locale and UTC
 by one `ps` call bounded to 2 s; the same pid with another start time is
 another process. A `ps` that fails or times out means "cannot tell", never
-"gone". Readers ignore unknown fields and treat a field of the wrong type as
-unknown.
+"gone". Readers ignore unknown fields and treat a field of the wrong type,
+or a number no float can hold, as unknown. A failed write is reported once
+in `err.log` and removes the file an earlier write left, so a live runner
+never shows an ageing tick; readers then find no usable file.
 
 After dispatch the follower checks every 2 s. A runner whose pid is gone, or
 now belongs to another process, with no terminal line gives one
@@ -965,7 +973,11 @@ line and exit 4. A runner that is present but has published no tick for
 120 s gives one `runner not responding` line (and `runner responding again`
 on recovery), and exit 4 at 300 s. A wall-clock jump far beyond the
 monotonic time between polls is treated as a system suspend and restarts
-the tick age. The follower also exits 5 when its own parent disappears.
+the tick age. With no usable `status.json` for 30 s after dispatch, the
+follower prints one
+`[codex-council-follow] runner liveness unavailable: no usable status.json; following err.log only; run --status`
+line and keeps relaying `err.log`. The follower also exits 5 when its own
+parent disappears.
 
 `--status RUNDIR` prints about ten lines of facts and exits 0: the runner's
 state (`running`, `not responding`, `gone`, `done`, `interrupted`,

@@ -3217,6 +3217,41 @@ class EventFlagScannerTests(unittest.TestCase):
                 s.finish()
                 self.assertTrue(s.unsafe_to_replay)
 
+    def test_an_item_type_that_is_not_a_string_is_unknown_work(self):
+        """A list or object type once raised TypeError out of feed(), which
+        ended the stdout pump before the attempt was marked unsafe; the
+        lines after it are still scanned."""
+        for item_type in ([], {}, 5, None, True):
+            with self.subTest(item_type=item_type):
+                event = {"type": "item.started", "item": {"type": item_type}}
+                s = codex_council._EventFlagScanner()
+                self._feed(s, json.dumps(event) + '\n{"type":"turn.completed"}\n')
+                self.assertTrue(s.unsafe_to_replay)
+                self.assertTrue(s.turn_completed)
+                s = codex_council._EventFlagScanner()
+                self._feed(s, json.dumps(event))
+                s.finish()
+                self.assertTrue(s.unsafe_to_replay)
+
+    def test_any_scanning_surprise_is_unknown_work_and_never_raises(self):
+        real = codex_council._EventFlagScanner._replay_safe
+
+        def surprising(scanner, event):
+            if event.get("surprise"):
+                raise LookupError("an event shape nobody expected")
+            return real(scanner, event)
+
+        with patch.object(codex_council._EventFlagScanner, "_replay_safe",
+                          surprising):
+            s = codex_council._EventFlagScanner()
+            self._feed(s, '{"surprise":1}\n{"type":"turn.completed"}\n')
+            self.assertTrue(s.unsafe_to_replay)
+            self.assertTrue(s.turn_completed)
+            s = codex_council._EventFlagScanner()
+            self._feed(s, '{"surprise":1}')
+            s.finish()
+            self.assertTrue(s.unsafe_to_replay)
+
 
 def _stalled_run(stdout="", stderr="", turn_completed=False,
                  unsafe_to_replay=False):

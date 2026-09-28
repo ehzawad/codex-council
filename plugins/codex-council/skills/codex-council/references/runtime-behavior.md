@@ -407,8 +407,12 @@ parent process. Its exit codes:
 When `err.log` shows a Python traceback, the follower also prints one
 advisory `[codex-council-follow]` line and keeps following, since the runner
 may continue. When the runner cannot write `status.json`, its own
-`err.log` line says so, and the follower keeps relaying `err.log` without
-runner checks. A system suspend is detected and restarts the tick age.
+`err.log` line says so and it removes the file an earlier write left, so no
+stale tick remains. When the follower finds no usable `status.json` for 30
+seconds after dispatch, it prints one
+`[codex-council-follow] runner liveness unavailable: no usable status.json; following err.log only; run --status`
+line and keeps relaying `err.log` without runner checks. A system suspend
+is detected and restarts the tick age.
 
 Monitor watches end at a deadline: at most 30 minutes interactively
 (`timeout_ms` 1800000) and at most 10 minutes in a non-interactive
@@ -740,13 +744,18 @@ and applies the stall policy:
   is saved best-effort; no retry.
 - No side-effect-capable tool work had begun (only pure-text
   agent_message/reasoning items, Codex's own `error` notices such as the
-  resume advisory, or nothing, and every non-blank stdout line was a JSON
-  object): replay is safe — **`[retriable:stall]`**, retried through the
-  shared retry budget.
-- Otherwise: **terminal `[stall]`** — tool work had begun, or a stdout line
-  that is not a JSON object may have hidden it, and replaying could
-  duplicate side effects. A buffered agent_message without turn completion is
-  quoted in the error but never auto-promoted to success.
+  resume advisory, or nothing; every non-blank stdout line was a JSON
+  object; and neither an output reader nor the prompt writer failed): replay
+  is safe — **`[retriable:stall]`**, retried through the shared retry
+  budget.
+- Otherwise: **terminal `[stall]`** — tool work had begun, or something may
+  have hidden it (a stdout line that is not a JSON object, an item whose
+  type is not a string, or a failed output reader or prompt writer, which
+  also adds the warning `an output reader or the prompt writer failed
+  (<ExcType>); the output may be incomplete, so a stall is not retried`),
+  and replaying could duplicate side effects. A buffered agent_message
+  without turn completion is quoted in the error but never auto-promoted to
+  success.
 
 `CODEX_COUNCIL_STALL_SECS` semantics: unset → 1800 (the default); `0`
 disables the watchdog (which permits an indefinitely silent role);
