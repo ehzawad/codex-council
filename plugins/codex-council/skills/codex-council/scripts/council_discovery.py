@@ -5,9 +5,11 @@ how native configuration resolves for the project, without ever starting a
 thread or a turn. The adapter is deliberately narrow: stdio JSON-RPC to
 `codex app-server`, five read-only methods, one monotonic deadline, and a
 strict projection into a small snapshot. Wire-format names stay inside the
-_normalize_* helpers; everything downstream reads only the snapshot. Any
-failure yields status "unavailable", which always means "no automatic
-selection": explicit user pins still apply and every other role inherits.
+_normalize_* helpers; everything downstream reads only the snapshot. When
+Codex cannot give a usable answer the status is "unavailable", which means
+"no automatic selection": explicit user pins still apply and every other
+role inherits. Problems inside the catalog keep the status "ok" and only
+mark the catalog incomplete.
 
 This module also owns CODEX_COUNCIL_MODEL_ROUTING, the private
 RUNDIR/model-snapshot.json file (atomic write, strict read), and the
@@ -201,9 +203,10 @@ def _stop_process_group(proc):
     """Close stdin, then escalate SIGTERM -> SIGKILL over the process group.
 
     start_new_session=True made proc a group leader (pgid == pid). Each step
-    waits DISCOVERY_CLOSE_GRACE_SECS for the WHOLE group, so neither a
-    grandchild holding a pipe nor a server ignoring SIGTERM outlives
-    discovery. An interruption during those waits (Ctrl+C, or the runner's
+    waits DISCOVERY_CLOSE_GRACE_SECS for the WHOLE group, so neither a group
+    member holding a pipe nor a server ignoring SIGTERM outlives discovery;
+    a descendant that started its own session is outside the group and
+    outside this teardown. An interruption during those waits (Ctrl+C, or the runner's
     termination signal) SIGKILLs the group before it propagates, so even
     a cut-short teardown leaves nothing behind. Never raises otherwise.
     """
@@ -1367,8 +1370,7 @@ def _read_snapshot(run_dir):
         return None, f"cannot inspect {SNAPSHOT_FILENAME} ({e.strerror or e})"
     if problem:
         return None, problem
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    flags |= getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
     try:
         with open(os.open(path, flags), "rb") as f:
             problem = _snapshot_file_problem(os.fstat(f.fileno()))
@@ -1530,7 +1532,7 @@ def _discovery_summary(snapshot):
           for entry in visible),
     ]
     if hidden:
-        lines.append(f"hidden (explicit pins only): {', '.join(hidden)}")
+        lines.append(f"hidden (not routable): {', '.join(hidden)}")
     return [_report_inline(line) for line in lines]
 
 
@@ -1543,9 +1545,9 @@ def _discover_command(run_dir):
     because inheritance is always a valid outcome. A directory that
     already launched exits 2 before discovering, so that council's planning
     snapshot is never replaced. If the snapshot cannot be written, any
-    older one is removed and the only line printed says to write no
-    automatic selections (explicit user pins still apply). Every first
-    line carries the plugin version. A dead stdout exits 1 quietly (the
+    older one is removed (best-effort) and the only line printed says to
+    write no automatic selections (explicit user pins still apply). Every
+    first line carries the plugin version. A dead stdout exits 1 quietly (the
     snapshot is already written); Ctrl+C, SIGTERM, and SIGHUP are left to
     the caller, which reports them after discovery's teardown.
     """

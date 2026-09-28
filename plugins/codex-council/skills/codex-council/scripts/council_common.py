@@ -6,8 +6,8 @@ single-line, control-free escaping for report and progress text
 stderr sink (_diag), stdout output that ends quietly when nobody reads it
 any more (_print_stdout), usage exits with the uniform recovery texts, the
 one private-path policy (_private_stat_problem) and the private-directory
-gate built on it, the one-launch-per-directory gate, atomic 0600 writes, strict JSON loading, JSONL record
-iteration, the UTC timestamp format (_utc_iso), the project root (a
+gate built on it, the one-launch-per-directory gate, atomic 0600 writes,
+strict JSON loading, JSONL record iteration, the UTC timestamp format (_utc_iso), the project root (a
 bounded, cached git lookup), and the plugin version. Its module-level state
 (the diagnostics sink and the cached project root) exists only here.
 """
@@ -269,7 +269,7 @@ _REPORT_INLINE_ESCAPES = {
 }
 # A diagnostic line that is not a completion line must not carry this
 # marker: the follower drops a line whose last " reply=" names a path
-# outside the run's replies directory (codex_council._follow_reply_path_ok),
+# outside the run's replies directory (council_liveness._reply_path_ok),
 # so foreign text holding it would hide the whole line from the Monitor.
 REPLY_MARKER = " reply="
 _REPLY_MARKER_ESCAPED = " reply\\x3d"
@@ -455,8 +455,8 @@ def _atomic_write_private(path, data):
     failure policy (reply files are advisory, a snapshot must not go stale).
     """
     directory = os.path.dirname(path)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+             | os.O_CLOEXEC)
     tmp_path = None
     try:
         for _ in range(8):
@@ -520,7 +520,8 @@ def _iter_json_objects(jsonl_output):
     *unescaped* inside a JSON string. codex/serde_json can emit an agent_message
     containing one of those literally, and splitting there would tear the record
     into two invalid fragments — silently dropping a completed reply and turning
-    a successful role into a failure.
+    a successful role into a failure. A line nested too deeply or holding an
+    out-of-range number is skipped like any other malformed line.
     """
     for line in jsonl_output.split("\n"):
         line = line.strip()
@@ -528,7 +529,7 @@ def _iter_json_objects(jsonl_output):
             continue
         try:
             event = json.loads(line)
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):
             continue
         if isinstance(event, dict):
             yield event

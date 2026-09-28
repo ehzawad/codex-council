@@ -1,11 +1,17 @@
-"""v0.10.0 runner surfaces: per-role reply files, --follow, model/effort keys.
+"""Per-role reply files and per-role model/effort overrides.
+
+Covers the replies/ directory and its atomic reply files, the completion
+line's reply= path, the report and reply-file rendering of what each role
+sent, the placement of -m / -c on the codex command line, Codex's
+item-level advisories, and the end-to-end launch with --follow. The
+`selection` contract (discovery, routing, [model-rejected]/[quota]) is
+covered in tests/test_model_selection.py, and --follow's liveness checks,
+--status, and --reap in tests/test_liveness.py.
 
 Unit tests import codex_council directly; end-to-end tests drive the REAL
-script as a subprocess with a FAKE `codex` on PATH (no network, no real
-Codex) and an isolated XDG_STATE_HOME, like tests/test_codex_council_cli.py.
-Model ids are synthetic; the v1.0.0 selection contract (the `selection`
-object, discovery, routing, [model-rejected]/[quota]) is covered in
-tests/test_model_selection.py.
+script as a subprocess with the fake `codex` from tests/fake_codex.py on
+PATH (no network, no real Codex) and an isolated XDG_STATE_HOME. Model ids
+are synthetic.
 
 Lives outside the plugin subtree so end-user installs don't bundle it.
 Run from repo root:
@@ -24,56 +30,29 @@ import stat
 import subprocess
 import sys
 import tempfile
-import textwrap
-import threading
 import time
 import unittest
 from unittest.mock import patch
 
-SCRIPTS_DIR = os.path.abspath(os.path.join(
-    os.path.dirname(__file__),
-    "..",
-    "plugins", "codex-council", "skills", "codex-council", "scripts",
-))
-sys.path.insert(0, SCRIPTS_DIR)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import council_testlib  # noqa: E402
 import codex_council  # noqa: E402
 import council_common  # noqa: E402
-from council_testlib import assert_usage_exit as _assert_usage_exit  # noqa: E402
-
-SCRIPT = os.path.join(SCRIPTS_DIR, "codex_council.py")
-EPOCH = str(codex_council.SKILL_CONTRACT_EPOCH)
-FIXED_PROJECT_ROOT = "/fixed/project/root"
-
-HANG_SENTINEL = "PLEASE_HANG_SILENTLY"
-FAIL_SENTINEL = "PLEASE_FAIL"
-
-# Fake codex: records its argv (so tests can see -m / -c placement), then
-# hangs, fails, or replies "fake reply for <role marker>".
-FAKE_CODEX = textwrap.dedent(
-    f"""\
-    #!/usr/bin/env python3
-    import json, os, sys, uuid
-    prompt = sys.stdin.read()
-    argv_dir = os.environ.get("FAKE_CODEX_ARGV_DIR")
-    if argv_dir:
-        with open(os.path.join(argv_dir, uuid.uuid4().hex + ".json"), "w") as f:
-            json.dump(sys.argv[1:], f)
-    if {HANG_SENTINEL!r} in prompt:
-        import time
-        time.sleep(300)
-        sys.exit(3)
-    if {FAIL_SENTINEL!r} in prompt:
-        sys.stderr.write("fake codex: simulated role failure\\n")
-        sys.exit(3)
-    tid = "thread-" + uuid.uuid4().hex[:12]
-    sys.stdout.write(json.dumps({{"type": "thread.started", "thread_id": tid}}) + "\\n")
-    sys.stdout.write(json.dumps({{"type": "item.completed", "item": {{
-        "type": "agent_message", "text": "fake reply from codex"}}}}) + "\\n")
-    sys.stdout.write(json.dumps({{"type": "turn.completed"}}) + "\\n")
-    """
+import council_liveness  # noqa: E402
+from council_selection import Selection  # noqa: E402
+from council_testlib import (  # noqa: E402
+    EPOCH,
+    FIXED_PROJECT_ROOT,
+    SCRIPT,
 )
+from fake_codex import EXEC_SENTINELS  # noqa: E402
+
+HANG_SENTINEL = EXEC_SENTINELS["hang"]
+FAIL_SENTINEL = EXEC_SENTINELS["fail"]
+
+setUpModule = council_testlib.install_fake_codex
+tearDownModule = council_testlib.remove_fake_codex
 
 
 def _instruction(text="Review"):
@@ -88,7 +67,10 @@ def _role_json(rid="alpha", label="A", instruction=None, **extra):
 
 
 def _make_role(rid="architect", label="Architect", model=None, effort=None):
-    return codex_council.Role(rid, label, _instruction(), model, effort)
+    """A Role; a model or effort makes it an explicit user pin."""
+    selection = Selection("user") if model or effort else None
+    return codex_council.Role(rid, label, _instruction(), model, effort,
+                              selection)
 
 
 def _private_tmpdir(test):
@@ -98,104 +80,9 @@ def _private_tmpdir(test):
     return d.name
 
 
-# ---------- contract epoch / brief ----------
-
-class ContractEpochTests(unittest.TestCase):
-    def test_epoch_is_3(self):
-        self.assertEqual(codex_council.SKILL_CONTRACT_EPOCH, 3)
-
-    def test_help_mentions_follow_replies_and_v100(self):
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            with self.assertRaises(SystemExit):
-                codex_council._parse_args(["--help"])
-        text = out.getvalue()
-        self.assertIn("--follow", text)
-        self.assertIn("v1.0.0", text)
-        self.assertIn("replies/", text)
-
-
-class CollaborationBriefTests(unittest.TestCase):
-    # Phrase pins and instruction bookending live in
-    # test_codex_council.ComposePromptTests; this only guards the tone.
-    def test_brief_has_no_all_caps_emphasis(self):
-        self.assertNotRegex(codex_council.COLLABORATION_BRIEF, r"[A-Z]{4,}")
-
-
-# ---------- optional model / effort role keys ----------
-
-class RoleOverrideParsingTests(unittest.TestCase):
-    def _parse(self, **extra):
-        return codex_council._parse_roles_json(json.dumps([_role_json(**extra)]))
-
-    def test_omitted_keys_inherit(self):
-        role = self._parse()[0]
-        self.assertIsNone(role.model)
-        self.assertIsNone(role.effort)
-
-    def test_valid_model_and_effort_are_kept(self):
-        for model in ("future-orion-2032", "acme/future-review-2034:rev2",
-                      "org/model:tag_1", "Future.Model@v2+exp"):
-            with self.subTest(model=model):
-                role = self._parse(model=model, effort="brisk")[0]
-                self.assertEqual(role.model, model)
-                self.assertEqual(role.effort, "brisk")
-                # Direct CLI use: an untagged pin is an explicit user pin.
-                self.assertEqual(role.selection.mode, "user")
-
-    def test_unlisted_but_well_shaped_effort_is_accepted(self):
-        # No hardcoded value list: discovery evidence or Codex decides.
-        for effort in ("adaptive-v2", "futurelevel", "High", "x-high"):
-            with self.subTest(effort=effort):
-                self.assertEqual(self._parse(effort=effort)[0].effort, effort)
-
-    def test_malformed_model_rejected_with_rewrite_recovery(self):
-        for bad in ("", "-m", " future", "future 6", "future-6\n",
-                    "future\u2028x", None, 6, ["future-6"], ".hidden",
-                    'fu"ture', "fu'ture", "fu\\ture", "fu<ture>"):
-            with self.subTest(model=bad):
-                err = _assert_usage_exit(
-                    self, lambda bad=bad: self._parse(model=bad),
-                    expect_in_stderr="optional field 'model'",
-                )
-                self.assertIn("rewrite the entire file", err)
-                # Untagged in direct CLI use is an explicit user pin: the
-                # hint repairs the pin instead of dropping it to inherit.
-                self.assertIn("never drop it to inherit", err)
-                self.assertNotIn("omit model, effort, and selection", err)
-
-    def test_malformed_effort_rejected(self):
-        for bad in ("", "low\n", "low ", 'low"', "lo w", "-low", "low\\",
-                    "<low>", None, 3):
-            with self.subTest(effort=bad):
-                _assert_usage_exit(
-                    self, lambda bad=bad: self._parse(effort=bad),
-                    expect_in_stderr="optional field 'effort'",
-                )
-
-    def test_unknown_keys_still_rejected_and_message_names_optional_keys(self):
-        err = _assert_usage_exit(
-            self, lambda: self._parse(reasoning="high"),
-            expect_in_stderr="unknown field(s) 'reasoning'",
-        )
-        self.assertIn("optionally 'model', 'effort', and 'selection'", err)
-
+# ---------- model / effort on the codex command line ----------
 
 class CommandOverrideTests(unittest.TestCase):
-    def test_no_overrides_keep_the_exact_old_commands(self):
-        self.assertEqual(
-            codex_council._fresh_cmd("/r"),
-            ["codex", "exec", "-C", "/r",
-             "--dangerously-bypass-approvals-and-sandbox",
-             "--json", "--skip-git-repo-check", "-"],
-        )
-        self.assertEqual(
-            codex_council._resume_cmd("/r", "sid"),
-            ["codex", "exec", "-C", "/r", "resume", "sid",
-             "--dangerously-bypass-approvals-and-sandbox",
-             "--skip-git-repo-check", "--json", "-"],
-        )
-
     def test_fresh_places_overrides_on_parent_exec(self):
         cmd = codex_council._fresh_cmd("/r", "future-vega-2033", "brisk")
         self.assertEqual(
@@ -290,16 +177,6 @@ class ItemErrorWarningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(codex_council.extract_item_errors(self._jsonl(False)),
                          [])
 
-    def test_extract_item_errors_docstring_names_the_verified_trigger(self):
-        """The resume advisory follows a recorded-vs-current model
-        difference; the verified case is a bare resume after the native
-        configuration changed, not only a different override."""
-        flat = " ".join(codex_council.extract_item_errors.__doc__.split())
-        self.assertIn("runs on a model other than the one it was recorded "
-                      "with", flat)
-        self.assertIn("no override after the native configuration changed",
-                      flat)
-
     async def test_item_error_on_successful_resume_becomes_warning(self):
         outputs = [self._jsonl(False), self._jsonl(True)]
 
@@ -329,7 +206,6 @@ class ReportOverridesTests(unittest.TestCase):
         )
 
     def test_summary_shows_sent_model_and_effort_only_when_set(self):
-        # Roles built without a selection object are explicit pins.
         out = codex_council._format_report([
             self._r(_make_role("a", "A", "future-vega-2033", "brisk")),
             self._r(_make_role("b", "B", None, "deliberate")),
@@ -529,7 +405,7 @@ class RunCouncilReplyFilesTests(unittest.IsolatedAsyncioTestCase):
                 role=role, ok=True, text="fast reply", elapsed_seconds=0.1)
 
         roles = [_make_role("architect"), _make_role("security", "Security")]
-        results, lines, checks = await self._run(roles, fake_role, self.replies)
+        results, _, checks = await self._run(roles, fake_role, self.replies)
         self.assertEqual(len(checks), 2)
         self.assertRegex(
             checks[0][0],
@@ -542,15 +418,52 @@ class RunCouncilReplyFilesTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("_Failed: boom_", checks[1][1])
         # out.md sections and reply files render identically.
         report = codex_council._format_report(results, 1.0)
-        for (_, content), r in zip(checks, results):
+        for _, content in checks:
             body = content.partition("\n\n")[2].rstrip()
             self.assertIn(body, report)
+
+    async def test_stale_resume_warning_reaches_reply_file_and_report(self):
+        """A saved thread Codex no longer has: the role reruns fresh, and its
+        result, reply file, and report section all say continuity was
+        lost."""
+        codex_council.save_session("architect", "stale-sid")
+
+        async def fake_subproc(cmd, prompt, role_id=None):
+            if "resume" in cmd:
+                return codex_council.CodexRun(
+                    1, "", "Error: thread/resume failed: no rollout found "
+                    "for thread id stale-sid (code -32600)")
+            return codex_council.CodexRun(0, "\n".join([
+                json.dumps({"type": "thread.started", "thread_id": "new-sid"}),
+                json.dumps({"type": "item.completed", "item": {
+                    "type": "agent_message", "text": "fresh reply"}}),
+            ]), "")
+
+        with patch.object(codex_council, "_run_codex_subprocess",
+                          side_effect=fake_subproc), \
+             patch.object(codex_council, "_diag"):
+            results = await codex_council.run_council(
+                [_make_role("architect")], "body", max_parallel=1,
+                replies_dir=self.replies)
+        warning = codex_council.STALE_RESUME_WARNING
+        self.assertTrue(results[0].ok)
+        self.assertEqual(results[0].warning, warning)
+        self.assertEqual(codex_council.load_session("architect")[0], "new-sid")
+        with open(os.path.join(self.replies, "architect.md"),
+                  encoding="utf-8") as f:
+            reply = f.read()
+        self.assertIn(" warning=yes", reply.splitlines()[0])
+        self.assertIn(f"_Warning: {warning}_\n\nfresh reply", reply)
+        # out.md is this report.
+        report = codex_council._format_report(results, 1.0)
+        self.assertIn("[architect]: ok — WARNING — ", report)
+        self.assertIn(f"_Warning: {warning}_\n\nfresh reply", report)
 
     async def test_crashed_role_gets_a_reply_file_too(self):
         async def fake_role(role, prompt):
             raise RuntimeError("kaboom")
 
-        results, lines, checks = await self._run(
+        results, _, checks = await self._run(
             [_make_role("architect")], fake_role, self.replies)
         self.assertEqual(len(checks), 1)
         self.assertRegex(
@@ -561,12 +474,12 @@ class RunCouncilReplyFilesTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[orchestrator-exception] RuntimeError: kaboom",
                       results[0].error)
 
-    async def test_no_replies_dir_means_no_files_and_old_line_format(self):
+    async def test_no_replies_dir_means_no_files_and_no_reply_suffix(self):
         async def fake_role(role, prompt):
             return codex_council.RoleResult(
                 role=role, ok=True, text="x", elapsed_seconds=0.1)
 
-        results, lines, checks = await self._run(
+        _, lines, checks = await self._run(
             [_make_role("architect")], fake_role, None)
         self.assertEqual(checks, [])
         self.assertIn("[codex-council] 1/1 architect: ok (0.1s)", lines)
@@ -578,275 +491,29 @@ class RunCouncilReplyFilesTests(unittest.IsolatedAsyncioTestCase):
                 role=role, ok=True, text="x", elapsed_seconds=0.1)
 
         os.rmdir(self.replies)
-        results, lines, checks = await self._run(
+        results, lines, _ = await self._run(
             [_make_role("architect")], fake_role, self.replies)
         self.assertTrue(results[0].ok)
         self.assertIn("[codex-council] 1/1 architect: ok (0.1s)", lines)
         self.assertTrue(any("reply file not written" in ln for ln in lines))
 
 
-# ---------- --follow ----------
-
-class FollowArgTests(unittest.TestCase):
-    def test_follow_is_exclusive_with_launch_and_preflight_flags(self):
-        for other in (["--roles-file", "r.json"], ["--context-file", "c.md"],
-                      ["--check-staging-dir", "d"]):
-            with self.subTest(other=other):
-                _assert_usage_exit(
-                    self,
-                    lambda other=other: codex_council._parse_args(
-                        ["--follow", "/x", *other]),
-                    expect_in_stderr="--follow cannot be combined with",
-                )
-
-    def test_follow_accepts_skill_contract(self):
-        args = codex_council._parse_args(
-            ["--follow", "/x", "--skill-contract", EPOCH])
-        self.assertEqual(args.follow, "/x")
-
-    def test_empty_follow_rejected(self):
-        _assert_usage_exit(self, lambda: codex_council._parse_args(["--follow", ""]),
-                           expect_in_stderr="--follow must be non-empty")
-
-
-DONE_LINE = ("[codex-council] CODEX_COUNCIL_DONE ok=1 total=1 elapsed=1.0s "
-             "exit=0 version=0.10.0")
-DISPATCH_LINE = ("[codex-council] dispatching 1 roles with max parallel 6 "
-                 "(architect); version=0.10.0.")
-
-
-class FollowInProcessTests(unittest.TestCase):
-    """Drive _follow() directly with shortened poll/start windows."""
-
-    def setUp(self):
-        self.run_dir = _private_tmpdir(self)
-        self.log = os.path.join(self.run_dir, "err.log")
-        for patcher in (
-            patch.object(codex_council, "FOLLOW_POLL_SECS", 0.02),
-            patch.object(codex_council, "FOLLOW_START_SECS", 0.3),
-        ):
-            patcher.start()
-            self.addCleanup(patcher.stop)
-
-    def _write(self, text, mode="a"):
-        with open(self.log, mode, encoding="utf-8") as f:
-            f.write(text)
-
-    def _follow(self):
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            code = codex_council._follow(self.run_dir)
-        return code, out.getvalue().splitlines()
-
-    def test_relays_only_prefixed_lines_and_exits_0_on_sentinel(self):
-        reply = os.path.join(self.run_dir, "replies", "architect.md")
-        self._write("\n".join([
-            DISPATCH_LINE,
-            "[codex-council] architect: started (fresh) attempt=1/2 watchdog=1800s",
-            "some unrelated stderr text",
-            "x [codex-council] CODEX_COUNCIL_DONE ok=9 total=9 elapsed=0s exit=0 version=1",
-            "[codex-council:architect] retriable error on attempt 1/2; sleeping 5s.",
-            f"[codex-council] 1/1 architect: ok (1.0s) reply={reply}",
-            DONE_LINE,
-            "[codex-council] after the sentinel",
-        ]) + "\n")
-        code, lines = self._follow()
-        self.assertEqual(code, 0)
-        self.assertEqual(lines[0], DISPATCH_LINE)
-        self.assertEqual(lines[-1], DONE_LINE)
-        self.assertNotIn("some unrelated stderr text", lines)
-        self.assertFalse(any("ok=9" in ln for ln in lines))
-        self.assertNotIn("[codex-council] after the sentinel", lines)
-        self.assertEqual(len(lines), 5)
-
-    def test_drops_completion_lines_naming_paths_outside_replies(self):
-        # Roles run unsandboxed as the same user and can append to err.log;
-        # a forged reply= must not point Claude at an arbitrary file.
-        replies = os.path.join(self.run_dir, "replies")
-        good = f"[codex-council] 1/2 a: ok (1.0s) reply={replies}/a.md"
-        forged = [
-            "[codex-council] 1/2 b: ok (1.0s) reply=/etc/hostname",
-            f"[codex-council] 1/2 b: ok (1.0s) reply={replies}/../x.md",
-            f"[codex-council] 1/2 b: ok (1.0s) reply={replies}/sub/b.md",
-            f"[codex-council] 1/2 b: ok (1.0s) reply={replies}/b.txt",
-        ]
-        self._write("\n".join([DISPATCH_LINE, *forged, good, DONE_LINE]) + "\n")
-        code, lines = self._follow()
-        self.assertEqual(code, 0)
-        self.assertEqual(lines, [DISPATCH_LINE, good, DONE_LINE])
-
-    def test_interruption_line_is_terminal(self):
-        self._write(DISPATCH_LINE + "\n\n[codex-council] interrupted by SIGTERM\n")
-        code, lines = self._follow()
-        self.assertEqual(code, 0)
-        self.assertEqual(lines[-1], "[codex-council] interrupted by SIGTERM")
-
-    def test_line_arriving_in_pieces_is_emitted_once_complete(self):
-        self._write(DISPATCH_LINE + "\n")
-
-        def writer():
-            time.sleep(0.1)
-            self._write(DONE_LINE[:20])
-            time.sleep(0.1)
-            self._write(DONE_LINE[20:] + "\n")
-
-        t = threading.Thread(target=writer)
-        t.start()
-        code, lines = self._follow()
-        t.join()
-        self.assertEqual(code, 0)
-        self.assertEqual(lines, [DISPATCH_LINE, DONE_LINE])
-
-    def test_missing_err_log_exits_3(self):
-        code, lines = self._follow()
-        self.assertEqual(code, codex_council.FOLLOW_EXIT_NO_ACTIVITY)
-        self.assertEqual(len(lines), 1)
-        self.assertTrue(lines[0].startswith(
-            "[codex-council-follow] no council activity:"))
-        self.assertIn("did not appear", lines[0])
-
-    def test_err_log_without_dispatch_exits_3(self):
-        self._write("codex-council input staging error:\n- bad\n")
-        code, lines = self._follow()
-        self.assertEqual(code, 3)
-        self.assertIn("no dispatch line", lines[-1])
-
-    def test_err_log_appearing_late_is_followed(self):
-        def writer():
-            time.sleep(0.1)
-            self._write(DISPATCH_LINE + "\n" + DONE_LINE + "\n")
-
-        t = threading.Thread(target=writer)
-        t.start()
-        code, lines = self._follow()
-        t.join()
-        self.assertEqual(code, 0)
-        self.assertEqual(lines, [DISPATCH_LINE, DONE_LINE])
-
-    def test_silent_dispatched_council_is_presumed_gone(self):
-        self._write(DISPATCH_LINE + "\n")
-        old = time.time() - codex_council.FOLLOW_SILENCE_SECS - 10
-        os.utime(self.log, (old, old))
-        code, lines = self._follow()
-        self.assertEqual(code, codex_council.FOLLOW_EXIT_RUNNER_GONE)
-        self.assertEqual(lines[0], DISPATCH_LINE)
-        self.assertTrue(lines[-1].startswith(
-            "[codex-council-follow] runner presumed gone"))
-
-    def test_runner_aborted_line_is_terminal(self):
-        aborted = ("[codex-council] runner aborted exit=1: stdout "
-                   "unavailable; the report was not delivered")
-        self._write(DISPATCH_LINE + "\n" + aborted + "\n[codex-council] x\n")
-        code, lines = self._follow()
-        self.assertEqual(code, 0)
-        self.assertEqual(lines, [DISPATCH_LINE, aborted])
-
-    def test_system_suspend_restarts_the_silence_count(self):
-        # err.log is not yet silent long enough; then the wall clock jumps
-        # an hour while the monotonic clock does not (a laptop suspend).
-        # Without suspend detection that jump alone would trip exit 4.
-        self._write(DISPATCH_LINE + "\n")
-        recent = time.time() - codex_council.FOLLOW_SILENCE_SECS + 30
-        os.utime(self.log, (recent, recent))
-        real_time = time.time
-        calls = {"n": 0}
-
-        def jumped_time():
-            calls["n"] += 1
-            return real_time() + (3600 if calls["n"] > 1 else 0)
-
-        def writer():
-            time.sleep(0.3)
-            with open(self.log, "a", encoding="utf-8") as f:
-                f.write(DONE_LINE + "\n")
-
-        t = threading.Thread(target=writer)
-        t.start()
-        with patch.object(codex_council.time, "time", jumped_time):
-            code, lines = self._follow()
-        t.join()
-        self.assertEqual(code, 0, lines)
-        self.assertEqual(lines, [DISPATCH_LINE, DONE_LINE])
-
-    def test_traceback_is_advisory_not_terminal(self):
-        self._write(DISPATCH_LINE + "\nTraceback (most recent call last):\n"
-                    "  File x\nTraceback (most recent call last):\n"
-                    + DONE_LINE + "\n")
-        code, lines = self._follow()
-        self.assertEqual(code, 0)
-        notes = [ln for ln in lines if "Python traceback" in ln]
-        self.assertEqual(len(notes), 1)
-        self.assertEqual(lines[-1], DONE_LINE)
-
-    def test_replaced_err_log_is_reread_from_start(self):
-        self._write("[codex-council] old run line\n")
-
-        def relaunch():
-            time.sleep(0.1)
-            tmp = self.log + ".new"
-            with open(tmp, "w", encoding="utf-8") as f:
-                f.write(DISPATCH_LINE + "\n" + DONE_LINE + "\n")
-            os.replace(tmp, self.log)
-
-        t = threading.Thread(target=relaunch)
-        t.start()
-        code, lines = self._follow()
-        t.join()
-        self.assertEqual(code, 0)
-        self.assertEqual(lines, ["[codex-council] old run line",
-                                 DISPATCH_LINE, DONE_LINE])
-
-    def test_non_private_or_symlink_dir_is_usage_error(self):
-        os.chmod(self.run_dir, 0o755)
-        self.addCleanup(os.chmod, self.run_dir, 0o700)
-        _assert_usage_exit(self, lambda: codex_council._follow(self.run_dir),
-                           expect_in_stderr="--follow: ")
-        link = self.run_dir + "-link"
-        os.chmod(self.run_dir, 0o700)
-        os.symlink(self.run_dir, link)
-        self.addCleanup(os.remove, link)
-        _assert_usage_exit(self, lambda: codex_council._follow(link),
-                           expect_in_stderr="is a symlink")
-
-    def test_non_regular_err_log_is_usage_error(self):
-        os.mkfifo(self.log)
-        _assert_usage_exit(self, lambda: codex_council._follow(self.run_dir),
-                           expect_in_stderr="not a regular file")
-
-    def test_follow_never_writes(self):
-        self._write(DISPATCH_LINE + "\n" + DONE_LINE + "\n")
-        before = sorted(os.listdir(self.run_dir))
-        with open(self.log, "rb") as f:
-            content = f.read()
-        self._follow()
-        self.assertEqual(sorted(os.listdir(self.run_dir)), before)
-        with open(self.log, "rb") as f:
-            self.assertEqual(f.read(), content)
-
-
 # ---------- end to end (fake codex on PATH) ----------
 
 class EndToEndTests(unittest.TestCase):
     def setUp(self):
-        self.bindir = tempfile.TemporaryDirectory()
-        self.addCleanup(self.bindir.cleanup)
         self.statedir = tempfile.TemporaryDirectory()
         self.addCleanup(self.statedir.cleanup)
         self.run_dir = _private_tmpdir(self)
         self.argv_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.argv_dir.cleanup)
-        fake = os.path.join(self.bindir.name, "codex")
-        with open(fake, "w", encoding="utf-8") as f:
-            f.write(FAKE_CODEX)
-        os.chmod(fake, 0o755)
-        self.env = dict(os.environ)
-        self.env["PATH"] = self.bindir.name + os.pathsep + self.env.get("PATH", "")
-        self.env["XDG_STATE_HOME"] = self.statedir.name
-        self.env["CODEX_HOME"] = self.statedir.name
-        self.env["FAKE_CODEX_ARGV_DIR"] = self.argv_dir.name
-        for name in ("CODEX_COUNCIL_SESSION_KEY", "CODEX_COUNCIL_MAX_PARALLEL",
-                     "CODEX_COUNCIL_STALL_SECS", "CODEX_COUNCIL_MODEL_ROUTING"):
-            self.env.pop(name, None)
+        self.env = council_testlib.clean_env(
+            PATH=council_testlib.fake_bin_dir() + os.pathsep
+            + os.environ.get("PATH", ""),
+            XDG_STATE_HOME=self.statedir.name,
+            CODEX_HOME=self.statedir.name,
+            FAKE_CODEX_ARGV_DIR=self.argv_dir.name,
+        )
 
     def _stage(self, roles):
         with open(os.path.join(self.run_dir, "roles.json"), "w",
@@ -901,7 +568,7 @@ class EndToEndTests(unittest.TestCase):
             "[codex-council] model selection: routing=auto; "
             "discovery=not-run (no runtime-grounded selections); native=1 "
             "user=1 routed=0 native_effort=0 fallback=0")
-        self.assertRegex(lines[-1], codex_council.FOLLOW_DONE_PATTERN)
+        self.assertRegex(lines[-1], council_liveness.FOLLOW_DONE_PATTERN)
         replies = os.path.join(self.run_dir, "replies")
         self.assertEqual(stat.S_IMODE(os.lstat(replies).st_mode), 0o700)
         for rid, status in (("architect", "ok"), ("security", "FAILED")):
@@ -957,9 +624,9 @@ class EndToEndTests(unittest.TestCase):
         stdout, stderr = follower.communicate(timeout=60)
         self.assertEqual(follower.returncode, 0, stderr)
         lines = stdout.splitlines()
-        self.assertRegex(lines[-1], codex_council.FOLLOW_ABORTED_PATTERN)
+        self.assertRegex(lines[-1], council_liveness.FOLLOW_ABORTED_PATTERN)
         self.assertIn("stdout unavailable", lines[-1])
-        self.assertFalse(any(codex_council.FOLLOW_DONE_PATTERN.match(ln)
+        self.assertFalse(any(council_liveness.FOLLOW_DONE_PATTERN.match(ln)
                              for ln in lines))
 
     def test_reply_files_survive_sigterm_and_follow_exits_on_interruption(self):
@@ -1024,7 +691,7 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("fake reply from codex", proc.stdout)
         self.assertRegex(
             [ln for ln in proc.stderr.splitlines() if ln.strip()][-1],
-            codex_council.FOLLOW_DONE_PATTERN)
+            council_liveness.FOLLOW_DONE_PATTERN)
 
     def test_follow_cli_on_typo_path_is_usage_error(self):
         proc = subprocess.run(

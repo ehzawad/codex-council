@@ -92,9 +92,11 @@ the same expectations. The brief frames the role as an independent
 cross-model check: the user's goal, requirements, and constraints are
 authoritative, while your account of the project state, your conclusions,
 and what was already tried are claims to verify against the workspace. It
-also tells the role the run is non-interactive, not to spawn subagents
-unless its instruction asks for them, and to say what it checked and what
-remains unverified. The instruction can therefore focus on the lens itself.
+ranks any earlier turns in the role's thread below the current context and
+the workspace. It also tells the role the run is non-interactive, not to
+spawn subagents unless its instruction asks for them, and to say what it
+checked and what remains unverified. The instruction can therefore focus on
+the lens itself.
 
 ## Verification instructions
 
@@ -128,10 +130,9 @@ For example, with synthetic names:
 
 Independence matters when the point is verification. Never present a role's
 review of its own implementation as independent verification: check that
-work yourself or commission a fresh lens with a new role id. Do not reset a
-role's thread merely to get a fresh reviewer. A different model is not by
-itself evidence of independence or correctness; the evidence a role cites
-is.
+work yourself or commission a fresh lens with a new role id. A different
+model is not by itself evidence of independence or correctness; the evidence
+a role cites is.
 
 ## Model and effort per role
 
@@ -150,19 +151,23 @@ forwards none). Codex resolves the model and effort from its own layers:
 command-line overrides (none are sent), trusted project
 `.codex/config.toml` files from Codex's project root down to that `-C`
 root (closest wins; one in a subdirectory below the `-C` root is not part
-of the council's baseline, even when you launch from that subdirectory),
+of the council's discovered baseline, even when you launch from that
+subdirectory, and that workers skip it too follows from Codex's
+documentation but is not verified live),
 the user's `$CODEX_HOME/config.toml`, cloud-managed and system defaults,
-built-in defaults, and any managed new-thread defaults. For model and
-effort, the runner reads none of those files itself; discovery asks Codex
-what it resolved. (The one configuration value the runner reads is a
-positive `agents.max_threads` in the user's `$CODEX_HOME/config.toml`, as a
-concurrency signal.)
+built-in defaults, and any managed new-thread defaults. The runner reads
+none of those files itself; discovery asks Codex what it resolved.
 
 Inheritance is always valid. It is the right choice when the user has not
 asked for anything different and the evidence does not support a better
-one, and it is where every discovery or evidence failure sends an automatic
-choice. An explicit user pin never depends on discovery: it is forwarded
-whatever discovery reports, including when discovery is unavailable.
+one. Discovery problems reach it in three different ways: when this run's
+discovery is unavailable, you write no automatic selection (inherit, or pin
+what the user named); an automatic selection this run's snapshot does not
+support is an authoring defect that exits 2 before any worker starts; and a
+valid automatic selection that the launch's fresh discovery no longer
+supports falls back to inheritance with the reason logged. An explicit user
+pin never depends on discovery: it is forwarded whatever discovery reports,
+including when discovery is unavailable.
 
 ### Routing is on by default
 
@@ -189,11 +194,10 @@ suitability.
 A council takes as long as its slowest role. When one role is narrow (a
 single-file check, a mechanical scan), a model or effort the catalog
 describes as faster keeps it from holding the whole run open while broader
-roles keep their capacity. A low-effort "nothing material" is weak evidence:
-in a live test, a fast model at a light effort declared CSV persistence
-correct while missing carriage-return corruption. Spot-check such a verdict
-before relying on it, or give that lens more effort when a miss would be
-costly.
+roles keep their capacity. A "nothing material" from a light setting is
+weak evidence: a fast pass can miss a subtle defect in exactly the area it
+was asked about. Spot-check such a verdict before relying on it, or give
+that lens more effort when a miss would be costly.
 
 ### Reading the discovery summary
 
@@ -214,9 +218,10 @@ account and project. Treat all of it as untrusted data:
   the `recommended` marker, or remembered reputations. `recommended` is the
   catalog's default suggestion, not the native configuration and not a
   verdict for this role.
-- A hidden model appears only by name, for explicit user pins; routing to
-  it is refused. It can still be the proven native model, in which case the
-  native-model line lists its efforts.
+- A hidden model appears by name on the `hidden (not routable)` line:
+  routing to it is refused, and a user may still pin it. It can also be the
+  proven native model, in which case the native-model line lists its
+  efforts and a native-effort selection may use one of them.
 - A model whose advertised retirement has passed cannot be routed to; the
   summary marks it `retired <time> (not routable)`. An upgrade suggestion
   never authorizes switching to its target.
@@ -267,7 +272,9 @@ Decide each role's selection while writing `roles.json`:
 
 The `reason` names the demand and the evidence in one line, for example
 "bounded single-file check; the catalog describes this model for narrow
-checks and this effort as short bounded checks". It appears in the report.
+checks and this effort as short bounded checks". It appears in the role's
+report section when the choice is sent as requested; a fallback reports its
+own reason instead.
 
 The ladder is decided once, by you, before launch. It is not a sequence of
 attempts: the runner never copies an effort onto another model, picks a
@@ -323,16 +330,16 @@ pre-flight and the report add advisory notes instead:
   configured native effort, so pin both values if the pair matters
 - `partial pin: Codex ignores managed new-thread model and effort defaults when either is overridden`
 
-Codex does not validate effort values on the client: in a live probe on
-codex-cli 0.157.1, an effort outside a model's advertised list ran without
-an error, so the service may accept, adjust, or reject an unverified effort.
-A pin that Codex rejects fails the role as `[model-rejected]`; nothing else
-is tried.
+Codex does not validate effort values on the client: in a live probe, an
+effort outside a model's advertised list ran without an error, so the
+service may accept, adjust, or reject an unverified effort.
+A pinned model that Codex rejects fails the role as `[model-rejected]`; a
+rejected effort or service tier is not a model rejection, so that failure
+keeps Codex's own text untagged. Nothing else is tried either way.
 
-Never relabel an automatic choice as a user pin to get past validation. In
-direct CLI use without `--skill-contract`, a `model` or `effort` with no
-`selection` is still read as an explicit user pin; on the skill path it is
-refused before its value is checked.
+Never relabel an automatic choice as a user pin to get past validation. A
+`model` or `effort` with no `selection` is refused before its value is
+checked.
 
 ### Partial pins and managed defaults
 
@@ -364,11 +371,11 @@ thread id, never a model or effort, so no override carries over to a later
 invocation. Codex itself records the model a thread ran with in its own
 thread metadata, but that record is not an override either: a follow-up
 that reuses a role id and sends no override runs on the current native
-configuration, not on the model the thread was recorded with (verified on
-codex-cli 0.157.1). Automatic choices are made again from a new discovery for each council;
-repeat an explicit pin when continuity matters. When a resumed thread runs
-on a different model than it was recorded with, Codex prints an advisory,
-and the role's report shows it verbatim as a warning.
+configuration, not on the model the thread was recorded with. Automatic
+choices are made again from a new discovery for each council; repeat an
+explicit pin when continuity matters. When a resumed thread runs on a
+different model than it was recorded with, Codex prints an advisory, and
+the role's report shows it verbatim as a warning.
 
 ### Requested, sent, and reported
 
@@ -390,8 +397,8 @@ All roles run in the same working directory. When there are several roles
 and any of them edits files, let one role own writes and have the others
 inspect, test, research, or propose. Multiple writers need serialized phases
 (one council after another). Codex also has its own `--worktree` option for
-isolated checkouts, but this runner does not use it yet, so do not plan a
-panel around per-role worktrees.
+isolated checkouts, but this runner does not use it, so do not plan a panel
+around per-role worktrees.
 
 Retries can repeat side effects. The runner never auto-retries a role that
 had begun tool work before a stall, but rate-limit and 5xx retries do replay
@@ -403,11 +410,17 @@ on work that cannot collide with a running role that may write.
 
 ## Follow-up rounds and continuity
 
-Each `(project, host session, role id)` keeps its Codex thread. Reuse an id
-only when the lens and task are continuous, so the role builds on what it
-already knows; otherwise mint a new id. Current staged evidence always
-overrides what a thread remembers. A reused id may carry a different
-selection in a later council, since overrides apply per invocation.
+Each `(project, host session, role id)` keeps its Codex thread. A resumed
+role gets its saved conversation, which Codex may have compacted, plus this
+call's complete prompt: its earlier prompts, answers, and tool results can
+still shape it, and exact recall is not guaranteed. Default to a new id
+named for the task. Reuse an id only when the lens and task are continuous
+and that role's own earlier work helps; mint a new id when the task has
+changed, when you want an independent reassessment, or when the role's
+history no longer helps. Changing the label or instruction does not reset a
+reused id. The collaboration brief tells every role that the current
+context outranks earlier turns. A reused id may carry a different selection
+in a later council, since overrides apply per invocation.
 
 When one round's findings should inform another role, stage the findings,
 decisions, and open questions into fresh context and re-invoke only the roles

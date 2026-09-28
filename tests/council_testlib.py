@@ -2,8 +2,8 @@
 
 Not a test module itself (the name does not match test*.py); test files
 import it (unittest discover puts tests/ on sys.path). It holds what more
-than one test module needs: the usage-exit assertion, one clean
-environment, the process checks that prove teardown left nothing behind,
+than one test module needs: the runner's path and contract epoch, the
+usage-exit assertion, one clean environment, the process checks that prove teardown left nothing behind,
 the synthetic discovery observations and snapshot builder, the per-module
 fake `codex` install, and the discovery-methods check with its independent
 FORBIDDEN_METHODS and login guards. The fake itself, and
@@ -32,6 +32,10 @@ import codex_council  # noqa: E402
 import council_discovery  # noqa: E402
 import fake_codex  # noqa: E402
 
+SCRIPT = os.path.join(SCRIPTS_DIR, "codex_council.py")
+EPOCH = str(codex_council.SKILL_CONTRACT_EPOCH)
+# What unit tests patch _project_root to, so state keys are deterministic.
+FIXED_PROJECT_ROOT = "/fixed/project/root"
 SNAPSHOT_ID = "0123456789abcdef"
 
 
@@ -119,13 +123,12 @@ def default_signal_dispositions():
 
 # ---------- synthetic snapshots (built by the real snapshot builder) ----------
 
-def catalog(entries, problems=None):
+def catalog(entries):
     """A catalog accumulator built from wire entries by the real helpers."""
     built = council_discovery._new_catalog()
     page, problem = council_discovery._normalize_model_page({"data": entries})
     assert problem is None, problem
-    council_discovery._merge_model_page(
-        built, page, [] if problems is None else problems)
+    council_discovery._merge_model_page(built, page, [])
     return built
 
 

@@ -1,1338 +1,1153 @@
-# codex-council internals
+# codex-council design
 
-Implementation details for contributors. User-facing docs live in
-[README.md](README.md).
+How the plugin works and why, for contributors. Each document has one job:
+[README.md](README.md) introduces the plugin; this file explains its
+mechanisms and the decisions behind them;
+[SKILL.md](plugins/codex-council/skills/codex-council/SKILL.md) is Claude's
+complete, compact operating procedure; and its references teach
+[panel and selection authoring](plugins/codex-council/skills/codex-council/references/panel-design.md),
+[context staging](plugins/codex-council/skills/codex-council/references/context-staging.md),
+and [operation, outputs, and recovery](plugins/codex-council/skills/codex-council/references/runtime-behavior.md).
 
-## Module layout
+Every diagram has a stable id used for its Mermaid source
+(`docs/diagrams/<id>.mmd`), its PNG (`docs/diagrams/<id>.png`), and its
+caption here and in `docs/codex-council.pdf`. Each concern below follows
+the same template: purpose, how it works, key decisions and why, and
+limits.
 
-The runner is standard-library Python in
-`plugins/codex-council/skills/codex-council/scripts/`. `codex_council.py` is
-the only entry point; it imports four sibling modules, and nothing imports
-it:
+## Overview
 
-| Module | Owns |
-|---|---|
-| `codex_council.py` | CLI parsing and `main`, the staging and launch privacy gates, roles-file parsing, continuity state and locks, the `codex exec` runner with its output-inactivity watchdog and retries, fan-out, the report and reply files, and the `--follow` follower |
-| `council_common.py` | Shared primitives: `_report_inline` (escapes the `LINEBREAK_CHARS` set and every other non-printable character) and `_log_inline` (also escapes ` reply=` in err.log diagnostics), the advisory stderr sink (`_diag`), `_print_stdout` (a dead stdout exits 1 quietly), `_usage_exit` and `_roles_usage_exit` with the uniform recovery texts, `_private_stat_problem` (the one private-path policy behind the staging and follow gate, the replies directory, and the snapshot reader) and `_check_private_dir`, `_usage_exit_if_launched` (the one-launch-per-directory gate over `LAUNCH_OUTPUTS`, which `--discover` and the preflight share), `_atomic_write_private`, strict JSON loading, JSONL record iteration, `_utc_iso` (the one UTC timestamp format), `_project_root` (a capped, cached `git rev-parse` that discovery also charges to its deadline), and `_plugin_version` |
-| `council_discovery.py` | The discovery adapter: execution context, app-server transport, the `_normalize_*` helpers, building, writing, and reading the snapshot, the `--discover` summary and command, and `CODEX_COUNCIL_MODEL_ROUTING` |
-| `council_selection.py` | `Role` with its `Selection` and `SelectionDecision`, the `selection` grammar, authoring validation, the pure `_resolve_selection`, `_resolve_run_selections` (the one orchestration behind the preflight plan and the launch), and the selection text in reports and the preflight plan |
-| `council_failures.py` | Failure records from `error` and `turn.failed` events, the marker lists, `_failure_verdict` (whose `FailureVerdict.retriable` is the retry decision), and the failure tags |
+codex-council lets Claude Code commission independent OpenAI Codex workers
+to check or extend its work, then reconcile what they report. Claude reads
+the live work, composes a task-specific panel of roles, chooses each role's
+model and effort from runtime evidence, stages a shared brief, and launches
+the council runner. The runner is a pure runner: it records a model snapshot
+when asked, validates the staged inputs, fans out one `codex exec` per role,
+watches each process, and writes each reply and the final report. Claude
+reads the replies as evidence and reconciles one result; the runner never
+judges content.
 
-```mermaid
-flowchart LR
-    Entry["codex_council.py<br/>the only entry point: CLI, staging gates,<br/>continuity state, codex exec and watchdog,<br/>fan-out, report, --follow"]
-    Common["council_common<br/>escaping, diagnostics sink, private-path policy,<br/>launch gate, atomic writes, strict JSON,<br/>project root, plugin version"]
-    Discovery["council_discovery<br/>app-server adapter, snapshot,<br/>--discover summary, routing mode"]
-    Selection["council_selection<br/>selection contract, authoring checks,<br/>pure resolver, launch revalidation"]
-    Failures["council_failures<br/>failure records, classifier order,<br/>tags and recovery actions"]
+Rules that hold everywhere:
 
-    Entry --> Common
-    Entry --> Discovery
-    Entry --> Selection
-    Entry --> Failures
-    Discovery --> Common
-    Selection --> Common
-    Selection --> Discovery
-    Failures --> Common
-    Failures --> Selection
-```
-
-Imports point one way: `council_discovery` uses `council_common`,
-`council_selection` uses both, `council_failures` uses `council_common` and
-`council_selection`, and only `codex_council.py` imports all four. Module
-state has one owner and is used through it: the diagnostics sink and the
-cached project root live in `council_common`, per-role liveness and
-`STATE_DIR` in `codex_council.py`. Siblings import names directly, so a test
-patches the module whose global the calling code reads (for example
-`council_discovery._project_root` for discovery's `config/read` cwd).
-`codex_council.py` puts its own directory first on `sys.path` before it
-imports the siblings, because `python3 -P` and `PYTHONSAFEPATH=1` leave that
-directory off. It imports them with bytecode writes off, so, like the
-single-file runner (Python never caches bytecode for the script it runs), a
-run writes no `__pycache__` into the plugin directory; the interpreter's
-setting is restored right after the sibling imports.
-
-## No catalog, no defaults
-
-The script accepts roles **only** via `--roles-file` (a path to a JSON
-file holding the list of `{id, label, instruction}` objects, each with
-optional `model`, `effort`, and `selection`), and the
-preferred launch path supplies context via `--context-file` in the same
-private staging directory. `instruction` is a **list of sentence-sized
-strings** — the only accepted form — that the script
-whitespace-normalizes and joins into the single paragraph Codex sees; the
-required scope phrase ("nothing material", any case) and closing sentence
-("Thoroughness beats speed.") are checked on that joined paragraph, not on
-individual items.
-The list form exists because the
-only production writer of roles.json is an LLM file-Write: multi-KB
-single-line JSON string literals are where its writes corrupt.
-For the same reason, unknown keys in a role object are **rejected**
-with a rewrite-the-whole-file message — stray filler fields like
-`"_": ""` are the signature of a glitched write, not harmless extras —
-and so is a key repeated at any object level, which would silently hide
-one value behind another.
-Every roles-file validation defect carries the same uniform recovery:
-rewrite the entire file in one complete Write operation, never patch a
-substring of a file that already glitched once (at a staged launch, the
-whole file is written in a new directory; see below).
-The staging-dir gate (`--check-staging-dir`) lstats the directory:
-symlinks, non-dirs, foreign-owned dirs, and group/other-accessible
-modes are all rejected with an action-first recovery hint that forbids
-chmod/mkdir/reuse of the rejected path and demands a fresh `mktemp -d`
-(a recovery hint satisfiable by chmod/mkdir on the same predictable
-path would defeat the privacy the gate exists for), then names the whole
-sequence the new directory needs: `--discover` there, both files re-Written
-with the new `snapshot_id` in every automatic selection, and the pre-flight
-(`STAGING_DIR_RECOVERY`). A run directory also
-holds **exactly one launch**: `--discover` and the pre-flight exit 2 when
-`out.md`, `err.log`, or `replies/` already exists
-(`_usage_exit_if_launched`), with a recovery that demands a new
-`mktemp -d` directory. The launch command's shell redirections truncate
-`out.md` and `err.log` before the runner starts, so relaunching into a
-directory whose council is still running (the natural move for a
-`[model-rejected]` re-run, which fails in under a second while siblings
-run) would tear that council's report, log, and follower apart, and a
-relaunch after it finished would replace its report and mix two runs in
-`replies/`. Only a step that runs before the launch command can refuse in
-time; the launch itself keeps accepting an existing `replies/`, so direct
-CLI use is unchanged. The rule is therefore enforced by `--discover` and
-the pre-flight, not atomically at launch (see Known limits): SKILL.md makes
-the pre-flight its own Bash call and the launch a separate one made only
-after the pre-flight exits 0, because in one combined call a refused
-pre-flight would not stop the launch's redirections. For the same reason a
-staged launch refused before dispatch never asks for a pre-flight re-run in
-its own directory, which that re-run would refuse: its input and path
-checks (a missing, unreadable, or misplaced `roles.json` or `context.md`,
-`STAGED_LAUNCH_PATH_HINT`), roles, `context.md`, and missing-`codex`
-recoveries start over in a new directory with its own `--discover`
-(`STAGED_LAUNCH_RESTART`; for roles, `STAGED_LAUNCH_ROLES_RECOVERY`, scoped in
-with `_roles_recovery`). The direct stdin mode keeps the plain staging hint.
-The **launch path
-re-validates the same privacy contract**: each on-disk input's lexical
-parent directory (`dirname(abspath(...))`, never realpath-first, so a
-symlink parent cannot launder into its target) must pass the identical
-private-dir check before any content is read, in both staged and
-stdin-context modes. The staged input files themselves must
-be regular non-symlinks, preventing a private directory from redirecting
-validation or reads to an external path. Keeping the panel and context in files
-also keeps a large role array and multiline context out of the shell, where a
-stray quote, brace, or missing redirection target would otherwise break the
-call before the runner can diagnose it. There is no
-built-in role catalog, no positional shortcuts, and no `--list-roles`
-flag. Bare invocation (no `--roles-file`, with context piped or staged)
-exits 2 — the script's way of telling Claude to go compose a panel.
-
-The orchestrator deliberately has no plugin-imposed content-size or panel-count
-ceiling: role count, role IDs, labels, instructions, staged context, stdin, and
-composed prompts are accepted without truncation. Active role concurrency is
-bounded separately, so a large panel queues instead of spawning every process
-at once. The active model/provider and available memory are still real
-downstream constraints; their failures are surfaced rather than guessed at by
-an arbitrary content cap.
-
-The reasoning: every hardcoded catalog is a bias. A fixed set of coding
-roles biases Claude toward coding panels, and even a broad thematic
-shelf still biases Claude toward "pick-from-this-shelf" rather than
-"compose-from-context." Leaving the catalog out entirely makes Claude (the orchestrator) read the
-user's task, design role ids/labels/instructions on the fly, announce the
-composed panel, and then fan out. The
-script's job is fan-out, retry, and aggregation — Claude owns reconciliation
-into the user's shared goal rather than relaying disconnected role opinions.
-The same reasoning applies to models: the runner carries no model roster and
-no effort table, because every such list goes stale with the next model
-generation, subscription change, or provider. Capability comes from runtime
-discovery, and the fallback is always the user's own native configuration
-(see [Model selection architecture](#model-selection-architecture)).
-
-Context-derived roles do not mean context-light roles. Before panel synthesis,
-Claude reconstructs the user's live task model: the larger problem and project
-implementation, current trajectory, in-flight files/modules/tests/artifacts,
-bugs and errors under investigation, hypotheses and research evidence, known
-unknowns and plausible blind spots, and unstated or possibly wrong assumptions.
-Claude asks and answers those working questions from the conversation and live
-workspace, asking the user only when a missing choice materially changes the
-authorized outcome.
-
-Practical consequence: every invocation requires Claude to compose
-the full role JSON. That's more tokens per panel proposal, but it
-matches the actual design intent (adaptive in-context selection) and
-removes any pull toward formulaic coding-flavored panels.
-
-The intended product shape is an adaptive, general-purpose verification and
-collaboration pattern. Claude identifies the claims, decisions, and results
-worth checking, derives roles from the current goal, and orchestrates them
-through shared context, workspace access, persisted role threads, and final
-reconciliation; Claude stays responsible for the result.
-The same machinery can support implementation, diagnosis, creation, planning,
-research, review, or other domains as far as the active model and tools allow.
-It deliberately leans toward programmatic problem-solving—computer science,
-software and ML/AI engineering, DevSecOps, platform/security automation,
-debugging/testing, project implementation, and evidence-based technical
-research—without reinstating a domain catalog or fixed role shelf.
-
-There is also no default role count. The runner accepts a panel of one, and
-the skill sizes panels to the work: one role for a focused bug, review, or
-question; more only when each added role brings a lens the others would not.
-Every role costs a full Codex run and reconciliation effort, and the council
-waits on its slowest role, so over-composed panels are slower without being
-better. The collaboration brief the runner adds to each prompt is
-count-neutral for the same reason ("you may be the only role, or one of
-several").
-
-Per-role `model`, `effort`, and `selection` keys are described in
-[Model selection architecture](#model-selection-architecture). In short, the
-runner validates their shape with one grammar, checks automatic choices only
-against this run's discovered data, and passes what it decides to send as
-parent `codex exec` options, `-m <model>` and
-`-c model_reasoning_effort="<effort>"`, ahead of `resume` so fresh and resumed
-attempts carry the same values. A role that omits all three inherits Codex's
-native configuration in the worker's execution context, and its commands are
-byte-identical to those of earlier releases.
-
-Codex itself has a stable in-process `multi_agent` capability (on by
-default) and a `multi_agent_v2` feature (stable but off by default, as of
-codex-cli 0.156.1). The council deliberately
-uses external `codex exec` fan-out because each role needs an independently
-persisted thread id and process-level failure/cancellation isolation. A
-positive user-level `agents.max_threads` is still used as a conservative
-concurrency signal; it is not treated as proof of provider capacity because
-these are separate processes.
-
-A single fan-out is parallel contribution, not direct peer messaging. Claude
-mediates collaboration by giving every role the same situational context,
-reconciling the report, and staging material findings into selective follow-up
-rounds. Because all subprocesses share the working directory, implementation
-panels with several roles assign one write-owning role; multiple writers must
-use serialized phases (the runner does not yet use Codex's `--worktree`). This
-also limits duplicate side effects when a transient failure causes a role
-retry.
-
-## End-to-end fan-out
-
-```mermaid
-sequenceDiagram
-    participant C as Claude Code
-    participant F as --follow (Monitor)
-    participant T as codex_council.py
-    participant D as codex app-server
-    participant R as per-subprocess readers + watchdog
-    participant A as codex exec (role A)
-    participant B as codex exec (role B)
-    participant N as codex exec (role N)
-
-    C->>T: run_in_background: --context-file + --roles-file
-    C->>F: Monitor: --follow RUNDIR
-    T->>T: launch privacy gate on each input's lexical parent
-    T->>T: parse roles, authoring check against RUNDIR/model-snapshot.json
-    opt routing auto and a routed or native_effort role
-        T->>D: one metadata-only launch discovery (kept in memory)
-        D-->>T: launch snapshot, frozen for this council
-    end
-    T->>T: _resolve_selection per role, attach each SelectionDecision
-    T-->>F: dispatch line, model selection line, fallback reasons
-    par up to effective max_parallel
-        T->>A: role framing + collaboration brief + shared context (only the dispatch -m / effort)
-        T->>B: role framing + collaboration brief + shared context (only the dispatch -m / effort)
-        T->>N: role framing + collaboration brief + shared context (only the dispatch -m / effort)
-    end
-    A-->>R: stdout/stderr chunks reset the shared quiet clock
-    B-->>R: stdout/stderr chunks reset the shared quiet clock
-    N-->>R: stdout/stderr chunks reset the shared quiet clock
-    opt quiet reaches CODEX_COUNCIL_STALL_SECS
-        R->>A: SIGTERM then SIGKILL the stalled attempt
-        R-->>T: stall verdict + replay-safety flags
-        T->>T: stall policy - ok-with-warning, retriable, or terminal
-    end
-    R-->>T: buffered JSONL events per role
-    T->>T: per-role extract_final_message, or classify the failure
-    loop as each role settles
-        T->>T: write replies/role-id.md, then log K/N completion with reply=path
-        T-->>F: err.log line
-        F-->>C: event (reply= paths outside replies/ dropped)
-        C-->>C: read reply as untrusted data, act on independent work
-    end
-    T-->>C: aggregated markdown report in out.md
-    T-->>F: CODEX_COUNCIL_DONE (progress signal, follower exits 0)
-    T-->>C: background-task completion notification
-    C-->>C: check evidence and reconcile across roles
-```
-
-## Context working set
-
-Claude, not the Python runner, decides what conversation context to stage. For
-long host sessions it constructs a decision-complete working set that leads
-with the objective, the acceptance criteria, and the question to verify, and
-labels Claude's own conclusions as claims, with the evidence against them.
-The rest is the current problem/project and goal-directed or exploratory
-trajectory; in-flight modules, files, objects, drafts, queries, experiments,
-tests, deployments, and research; active bugs/errors, symptoms, attempted
-fixes, hypotheses, and evidence; recent working context at high fidelity; live
-primary evidence from disk; known unknowns, blind spots, assumptions, and
-provenance; and older still-relevant decisions, invariants, and rejected
-approaches as a faithful summary.
-Conversation age alone never controls inclusion. Superseded state, duplicate
-discussion, and irrelevant history are omitted. A compacted host summary is an
-index that must be reconciled with current live state before launch.
-
-The runner accepts that staged context without a byte cap or truncation. It
-does not attempt token counting because the active model/provider owns the real
-context window and can change independently of this plugin. `_compose_prompt`
-keeps the shared context intact, labels it, adds a compact collaboration brief
-that tells each role how to interpret the situational map, and bookends it with
-the role-specific instruction.
-
-The brief frames each role as an independent cross-model check on Claude
-Code's work. The user's goal, requirements, and constraints are authoritative.
-Claude's account of the project state, its conclusions, and what has been
-tried are claims to verify against the workspace, not facts to accept. The
-brief also says the run is non-interactive, so assumptions are stated and
-decisions that need the user become open questions. It tells roles not to
-spawn subagents unless their instruction asks for them, to stay within their
-lens and stop when its deliverable is complete, to keep verified evidence
-separate from inference, to size testing to the change, and to finish with
-plain paragraphs Claude can reconcile.
-
-## Adaptive concurrency and progress
-
-Panels have no count cap, but `run_council` wraps role execution in an
-`asyncio.Semaphore`. The active limit resolves in this order:
-
-1. positive `CODEX_COUNCIL_MAX_PARALLEL` override;
-2. positive user-level Codex `agents.max_threads` from
-   `$CODEX_HOME/config.toml` (or `~/.codex/config.toml`); current Codex
-   documentation lists it as a legacy alias of
-   `agents.max_concurrent_threads_per_session`, which the runner does not
-   read;
-3. `DEFAULT_MAX_PARALLEL=6`, the default Codex documented for
-   `agents.max_threads` when the runner adopted it (current documentation
-   leaves the default to Codex).
-
-Each queued role makes a nonblocking continuity-lock probe while it briefly
-holds a subprocess permit. If another council owns the same persisted thread,
-the probe closes its file descriptor, releases the permit immediately, sleeps
-outside the permit (doubling from 0.1s to a 2s cap, since the lock holder has
-no run-level deadline), and retries; unrelated roles can run, and arbitrarily
-large panels do not accumulate one open lock file per queued role. Only a role that
-holds both its continuity lock and permit appears active or launches Codex.
-
-Progress is stderr-only and best-effort: one shared diagnostics helper writes
-the dispatch line, the model selection summary and fallback lines that follow
-it, per-attempt start lines
-(`<role>: started (fresh|resume) attempt=K/N watchdog=…`), retry/adoption
-notices, stall diagnostics, the heartbeat, and the `CODEX_COUNCIL_DONE`
-sentinel. A dead stderr permanently redirects diagnostics to a no-op sink and
-never changes role results or the exit code. The heartbeat cadence adapts to
-the watchdog — `min(1800, stall_secs // 3)` with a 300s floor while enabled
-(600s at the default threshold), 1800s when disabled — and each line records
-completed/active/queued counts, per-active-role `quiet=Ns` (or `retry-wait`
-during backoff), the `watchdog=` threshold, and the plugin `version=`.
-Claude Code redirects it to `err.log`. Per-role completion lines keep the
-`[codex-council] K/N <id>: ok|FAILED (<secs>s)` prefix and append
-` reply=<abs path>` when the reply file was written.
-
-## Per-role reply files and the follower
-
-Before v0.10.0 no reply reached disk until every role finished, so Claude
-waited on the slowest role and an interrupted run lost all finished work.
-Now, as each role settles (ok, failed, or crashed), the runner writes
-`<RUNDIR>/replies/<key>.md`, where `RUNDIR` is the directory of
-`--context-file` (or of `--roles-file` in stdin mode), both already
-privacy-checked at launch. `<key>` reuses the state-file role component: the
-literal id when it is a short safe filename, a deterministic SHA-256 key
-otherwise. The file body is produced by the same per-role section renderer
-as `out.md`, so an early read and the final report cannot drift, preceded by
-a one-line status header
-(`<!-- codex-council reply id=… status=… elapsed=… attempts=… selection=… -->`,
-plus the sent `model=`/`effort=` when a role sends them, the
-`requested_model=`/`requested_effort=` of a fallback, and `warning=yes`).
-Writes are atomic through the shared `_atomic_write_private` helper: an
-`O_CREAT|O_EXCL|O_NOFOLLOW` 0600 temp file in the same directory, fsync, then
-`os.replace`. `replies/` is created
-0700; if it already exists it must be a real, user-owned, private directory,
-otherwise the runner skips reply files with one warning rather than failing
-the council. The file is written before the completion line is logged, so a
-`reply=` path always points at a complete file, and files survive
-SIGINT/SIGTERM even though the sentinel does not.
-
-`--follow DIR` is a read-only companion for Claude Code's Monitor tool. It
-validates `DIR` with the same private-dir check, polls `DIR/err.log`, prints
-every `[codex-council` line with a flush per line, and exits 0 after the
-`CODEX_COUNCIL_DONE` sentinel, an interruption line, or a `runner aborted`
-line (the runner logs one when stdout is dead at report time or an unhandled
-exception escapes). It exits 3 with a `[codex-council-follow] no council
-activity` line when, 120s after it starts, `err.log` is absent or has no
-dispatch line, so a monitor on a mistyped path or a launch that failed
-validation does not sit silent. It exits 4 (`runner presumed gone`) when a
-dispatched run's `err.log` stays byte-silent for 2 x `PROGRESS_HEARTBEAT_SECS`
-+ 60s, measured from the file mtime so the check survives a re-arm; a
-wall-clock jump well beyond the monotonic advance between polls is treated as
-a suspend and restarts the count, because the runner's heartbeat sleeps on
-the monotonic clock. Monitors expire after at most 30 minutes (10 in
-`claude -p`) and are re-armed while the council's task is still running;
-the restarted follower replays earlier lines, which Claude de-duplicates. The follower never writes, so it cannot forge the sentinel or
-alter a run. Roles can, though: they run unsandboxed as the same user and can
-append to `err.log`, and no same-uid check can authenticate those lines. So the
-follower drops completion lines whose `reply=` path is not directly inside
-`RUNDIR/replies/` (the only shape the runner prints; a diagnostic line that
-embeds foreign text escapes ` reply=` as ` reply\x3d`, so the filter never
-hides one), SKILL.md treats reply
-content as untrusted data, and the final reconciliation waits for the
-`run_in_background` completion notification, which only Claude Code emits.
-Without Monitor, the fallback depends on the host. An interactive session
-uses a one-shot session-cron wake-up, which fires between turns. In
-`claude -p` or a subagent, the final response ends the council's background
-shell (about five seconds later in `-p`), no cron fires inside a turn, and no
-notification can arrive afterwards, so the skill keeps the turn open by
-running `--follow` as a foreground Bash call at the maximum timeout and
-re-running it while the task is still running (a timed-out foreground
-command moves to the background rather than stopping). There is no blocking
-wait on a background task to fall back to.
-
-Early replies change what Claude may do, not how the council ends: Claude
-may read a settled role, tell the user, and act on independent work, but the
-final verdict, cross-role conflicts, and writes that overlap a running writer
-role wait for the full report. The runner has no partial-cancellation
-feature.
-
-The SKILL templates depend on `--follow` and reply files (epoch 2) and on
-`--discover` and the `selection` contract (epoch 3), so the skill contract
-epoch is 3. `--skill-contract` also marks the skill path for the selection
-rules below.
-
-## Model selection architecture
-
-Model selection has three parts: an optional discovery adapter that turns the
-installed Codex's metadata into a run-scoped snapshot, one pure resolver that
-decides what each role sends, and the unchanged `codex exec` runner, which
-sends only the resolver's dispatch values. A few rules shape all three:
-
+- **No catalog and no default count.** Roles come from the work, never from a
+  fixed shelf, and a panel of one is as valid as a panel of ten. The runner
+  imposes no size cap on panels, role fields, context, or prompts and never
+  truncates them.
 - **Native configuration is the baseline and the universal fallback.**
   Inheritance is omission: no `-m`, no `-c model_reasoning_effort`, and never
-  an `inherit` or `default` placeholder. Codex then resolves its own effective
-  configuration in the worker's execution context — CLI overrides, trusted
-  project `.codex/config.toml` layers, the user's `$CODEX_HOME/config.toml`,
-  cloud, system, and managed layers, and any managed new-thread defaults.
-- **Routing is the skill's default, and explicit pins always win.** Invoking
-  the skill authorizes its documented routing policy;
-  `CODEX_COUNCIL_MODEL_ROUTING=off` disables automatic selection. A pin the
-  user asked for is forwarded unchanged and never replaced.
-- **Claude chooses, the runner validates.** Claude walks a fallback ladder
-  per role — a routed pair grounded in this run's snapshot, else the proven
-  native model with only the effort adjusted, else inheritance of both — and
-  matches roles to catalog descriptions. The runner never ranks models or
-  efforts; every check is exact membership in discovered data.
-- **Discovery is optional, bounded, run-scoped, and never an inference
-  turn.** Any discovery failure means inheritance, never a blocked run.
+  an `inherit` or `default` placeholder.
+- **Claude chooses, the runner validates.** Claude matches roles to catalog
+  descriptions; the runner never ranks models or efforts, and every check it
+  makes is exact membership in discovered data.
+- **Authoring defects and changed evidence are different.** A malformed or
+  unsupported choice exits 2 before any worker starts; evidence that stops
+  supporting a valid choice between planning and launch resolves that role
+  to inheritance with a recorded reason.
 - **Never claim a model ran.** `codex exec --json` reports neither the model
-  nor the effort that served a turn, so reports describe what was sent.
-- **Authoring defects and evidence changes are different.** A malformed or
-  unsupported choice exits 2 with the whole-file rewrite recovery; evidence
-  that stops supporting a valid choice between planning and launch resolves
-  that role to inheritance with a recorded reason.
+  nor the effort that served a turn, so every surface reports what was sent.
 - **The host keeps its own settings.** Claude keeps the host session's model
-  and effort (the skill's frontmatter pins neither); council routing controls
-  only the external Codex workers.
+  and effort (the skill's frontmatter pins neither); council routing
+  controls only the external Codex workers.
+- **Tolerant readers of external data.** Codex responses, catalog entries,
+  and `status.json` are read field by field: unknown fields are ignored, a
+  field of the wrong type is unknown, and unknown leads to the safe choice
+  (no automatic selection, no liveness claim, no signal).
 
-### The discovery adapter
+Trust boundaries: the run directory is private to the user, but roles run
+unsandboxed as that same user, so anything a role can reach it can also
+write, including `err.log`, `out.md`, and `replies/`. Claude therefore treats
+reply content as untrusted evidence, and only Claude Code's own task
+notification marks the end of a run.
 
-`--discover RUNDIR` validates RUNDIR with the same private-directory check as
-preflight (prefix `--discover: `; `roles.json` and `context.md` need not exist
-yet), refuses a directory that already holds a launch (its planning snapshot
-is that council's evidence), reads `CODEX_COUNCIL_MODEL_ROUTING`, runs
-`_discover()`, writes the snapshot, and prints a summary. It cannot be
-combined with `--roles-file`, `--context-file`, `--check-staging-dir`, or
-`--follow`, and it exits 0 whenever RUNDIR and `CODEX_COUNCIL_MODEL_ROUTING`
-are valid, even when discovery is unavailable or `codex` is missing, because
-inheritance is always a valid outcome. Like the follower, it never ends in a
-traceback: Ctrl+C exits 130 after teardown without writing a snapshot,
-SIGTERM or SIGHUP does the same with exit 128 + the signal number and
-`[codex-council] --discover interrupted by SIGTERM` (or `SIGHUP`), and a
-closed stdout exits 1 quietly (`_print_stdout`, shared with `--follow`).
+Supported versions are the current ones only: Claude Code 2.1.x, codex-cli
+0.158 or later, and Python 3.12 or later on macOS or Linux.
 
-The adapter speaks newline-delimited JSON-RPC to
-`codex app-server --listen stdio://` and matches responses by id while
-unsolicited messages interleave:
+## Architecture
 
-```mermaid
-sequenceDiagram
-    participant R as runner (council_discovery)
-    participant V as codex --version
-    participant A as codex app-server
+### Level 0: the council in context
 
-    Note over R,A: one monotonic deadline of 20s covers every step
-    R->>R: project root from git rev-parse, with its own 5s cap
-    R->>V: version probe with its own 5s cap
-    V-->>R: codex-cli version, or null (informational)
-    R->>A: spawn with the runner's cwd and environment in a new process group
-    R->>A: id 1 initialize (clientInfo codex-council, experimentalApi false)
-    A-->>R: codexHome
-    R->>A: initialized notification
-    R->>A: id 2 account/read (refreshToken false)
-    A-->>R: account type and requiresOpenaiAuth kept, identity never read
-    R->>A: id 3 config/read (cwd is the project root, includeLayers false)
-    A-->>R: model, effort, provider, endpoint and catalog overrides, layer kinds
-    R->>A: id 4 configRequirements/read (params null)
-    A-->>R: managed new-thread defaults and provider keys
-    loop at most 10 pages or 1000 entries
-        R->>A: id 5+k model/list (limit 100, includeHidden, exact cursor)
-        A-->>R: data and nextCursor
-    end
-    opt server-to-client request at any point
-        A->>R: a message with both method and id
-        R-->>A: error -32601, discovery marked inconclusive
-    end
-    Note over R,A: app-server stderr is never copied, only a fixed category is recorded (usage_error, panic, other)
-    opt SIGTERM or SIGHUP arrives during discovery
-        R->>A: SIGTERM, then SIGKILL, to the whole process group
-        R->>R: one interruption line, exit 128 + signum
-    end
-    R->>A: close stdin, then SIGTERM and SIGKILL to the group if needed
-```
+![d00-context: the user, Claude Code with the skill, the council runner, the Codex workers, and the shared workspace, top to bottom](docs/diagrams/d00-context.png)
 
-Only those methods are ever sent — never `thread/start`, `thread/resume`,
-`turn/start`, or any login or account-changing method — and the tests assert
-that the fake server sees nothing else. Notifications and other unsolicited
-messages are counted and dropped (more than 10,000 fails the session). A
-server-to-client request is answered with JSON-RPC `-32601`, recorded as
-`server_request:<method>`, and makes discovery inconclusive.
+*d00-context — Council in context. Source:
+[d00-context.mmd](docs/diagrams/d00-context.mmd).*
 
-One monotonic deadline, `DISCOVERY_TIMEOUT_SECS = 20`, covers the project
-root lookup (`git rev-parse --show-toplevel`, capped at
-`PROJECT_ROOT_TIMEOUT_SECS = 5` and at the time left; a timeout on its own
-cap falls back to the launch directory exactly as a Git failure does, while
-running out of discovery's budget caches nothing and ends discovery as
-`timeout:project_root` before Codex starts), the `codex --version` probe
-(itself capped at 5s; an unparsable version is recorded, never fatal), the
-spawn, the handshake, and every request; notifications never extend it.
-Lines are capped at 8 MiB and total stdout at 32 MiB. Pagination echoes the
-exact opaque cursor with a fresh id and stops at 10 pages or 1,000 entries;
-a repeated cursor is a cycle. Reaching a bound with pages outstanding marks
-the catalog incomplete — it never implies an omitted model is unavailable.
-stderr is drained concurrently and only a 4 KiB tail is kept. None of its
-text ever leaves the adapter, because a server's stderr is free-form and can
-carry account ids, plan names, or tokens: when the server exits early, only
-a fixed category is recorded after `server_exited:<method>`, as
-`server_stderr:usage_error` (the command line was refused, as by a Codex
-without `app-server --listen`), `server_stderr:panic`, or
-`server_stderr:other`.
+The user states an objective; Claude investigates the workspace, briefs the
+runner, and the runner dispatches Codex workers that work in the same
+workspace. Workers return evidence to the runner, the runner returns replies
+and a report to Claude, and Claude reconciles one result for the user.
 
-Teardown runs in `finally`: close stdin, wait 0.5s for the whole process
-group, SIGTERM the group, wait 0.5s, SIGKILL, reap. Neither a SIGTERM-ignoring
-server nor a grandchild holding a pipe outlives discovery. The adapter is
-synchronous (`selectors` on raw fds) and runs before `asyncio.run`, so it
-never blocks the council's event loop. Ctrl+C during `--discover` or launch
-discovery still tears the version-probe and app-server groups down and exits
-130. The council's own SIGTERM and SIGHUP handlers belong to that event
-loop and do not exist yet, so `main` wraps both discovery paths in
-`_termination_raises`, which turns SIGTERM and SIGHUP into an exception that
-unwinds through the same `finally` teardown, then exits 128 + the signal
-number with one interruption line (`[codex-council] --discover interrupted
-by SIGTERM`, or the launch's `[codex-council] interrupted by SIGTERM`, which
-the follower treats as terminal). Only the first signal raises, so a second
-cannot cut the teardown short, a signal already ignored (SIGHUP under
-`nohup`) stays ignored, and an interruption inside a teardown wait SIGKILLs
-the group before it propagates.
+### Level 1: runtime components
 
-`_discover()` never raises (Ctrl+C and those termination signals aside). A
-missing `codex`, a spawn error, a timeout, a protocol violation, an RPC
-error, or even an internal bug yields a snapshot with status `unavailable`
-and machine-safe problem codes:
-`codex_missing`, `spawn_failed:<errno>`, `timeout:<method>`,
-`timeout:project_root`, `server_exited:<method>` with
+![d10-components: Claude Code, the runner, the follower, the host task tracker, the run directory, saved threads, codex app-server, codex exec, and the workspace](docs/diagrams/d10-components.png)
+
+*d10-components — Runtime components and ownership. Source:
+[d10-components.mmd](docs/diagrams/d10-components.mmd).*
+
+| Component | Owns | Talks to |
+|---|---|---|
+| Claude Code with the skill | the panel, `roles.json`, `context.md`, early use of replies, reconciliation | the runner (commands), the run directory, the follower |
+| Runner CLI (`codex_council.py`) | validation, selection, fan-out, the watchdog, replies, the report, `status.json` | the run directory, `codex app-server`, `codex exec`, saved threads |
+| `codex app-server` | model and configuration metadata only | the runner, over stdio JSON-RPC |
+| `codex exec`, one per role | the role's work in the workspace | the runner, over stdin, stdout, and stderr |
+| Follower (`--follow`) | relaying actionable progress, noticing a dead or stuck runner | reads `err.log` and `status.json`; writes only its own stdout |
+| Host task tracker | the background task's lifetime and its completion notification | Claude |
+
+The launch command's shell, not the runner, creates `out.md` and `err.log`
+by redirecting stdout and stderr. Only the host task tracker reports that
+the runner's process ended; `out.md`, the `CODEX_COUNCIL_DONE` line, and the
+follower's exit are separate signals and none of them is that notification.
+
+The run directory holds exactly one launch:
+
+| Entry | Written by | Read by | Mode |
+|---|---|---|---|
+| `model-snapshot.json` | `--discover` | the preflight, the launch | 0600 |
+| `roles.json`, `context.md` | Claude | the preflight, the launch | Claude's Write |
+| `out.md` | the launch's stdout redirect | Claude | the shell's |
+| `err.log` | the launch's stderr redirect | the follower, Claude | the shell's |
+| `replies/<key>.md` | the runner, as each role settles | Claude | 0600, in a 0700 `replies/` |
+| `status.json` | the runner | `--follow`, `--status`, `--reap` | 0600 |
+
+### Level 1: modules
+
+![d11-modules: codex_council imports council_selection, council_discovery, council_failures, council_liveness, and council_common](docs/diagrams/d11-modules.png)
+
+*d11-modules — Module responsibilities and imports, verified from the
+import statements. Source: [d11-modules.mmd](docs/diagrams/d11-modules.mmd).*
+
+The runner is standard-library Python in
+`plugins/codex-council/skills/codex-council/scripts/`.
+
+| Module | Responsibility |
+|---|---|
+| `codex_council.py` | the only entry point: CLI parsing, staging and launch gates, roles-file parsing, continuity state and locks, the `codex exec` runner with its watchdog, post-exit drain, and retries, fan-out, reply files, the report, and the run's live state |
+| `council_selection.py` | `Role`, the `selection` contract, authoring validation, the pure resolver, and selection text for plans and reports |
+| `council_discovery.py` | the `codex app-server` adapter, the snapshot file, the `--discover` command and summary, and `CODEX_COUNCIL_MODEL_ROUTING` |
+| `council_failures.py` | failure records, the ordered classifier, and failure tags with their recovery actions |
+| `council_liveness.py` | `status.json` (writer and tolerant reader), process identity, and `--follow`, `--status`, and `--reap` |
+| `council_common.py` | shared primitives: escaping, the diagnostics sink, the private-path policy and launch gate, atomic private writes, strict JSON, the project root, and the plugin version |
+
+Imports point one way and no production module imports the entry point.
+Module state has one owner: the diagnostics sink and the cached project root
+live in `council_common`, the run's live state and `STATE_DIR` in
+`codex_council.py`. Siblings import names directly, so a test patches the
+module whose global the calling code reads (for example
+`council_discovery._project_root`). The entry puts its own directory first
+on `sys.path`, because `python3 -P` and `PYTHONSAFEPATH=1` leave it off, and
+imports its siblings with bytecode writes off, so a run writes no
+`__pycache__` into the installed plugin.
+
+### Commands
+
+| Command | Reads | Writes | Exit codes |
+|---|---|---|---|
+| `--discover RUNDIR` | Codex metadata | `model-snapshot.json`; the summary on stdout | 0 (also when discovery is unavailable), 1 stdout gone, 2 usage or refused directory, 130 or 128 + signal when interrupted |
+| `--check-staging-dir RUNDIR` | `roles.json`, `context.md`, the snapshot | `staging OK` and the selection plan on stdout | 0, or 2 with a recovery |
+| launch (`--roles-file`, `--context-file`) | the staged inputs, the snapshot, Codex | the report on stdout, progress on stderr, `replies/`, `status.json`, saved threads | 0 some role responded, 1 all failed or aborted, 2 refused before dispatch, 130 or 128 + signal when interrupted |
+| `--follow RUNDIR` | `err.log`, `status.json` | relayed lines on stdout | 0, 1, 2, 3, 4, 5 (see [Progress](#progress-replies-and-reconciliation)) |
+| `--status RUNDIR` | `status.json`, one `ps` | about ten lines on stdout | 0 (2 for a bad directory) |
+| `--reap RUNDIR` | `status.json`, one `ps` | signals to verified groups and a live codex's descendants | 0 done, 1 refused, 2 bad directory |
+
+Every command that SKILL.md shows passes `--skill-contract 3`, the contract
+epoch. The epoch changes only when SKILL.md's command contract changes
+incompatibly; a mismatch is refused (exit 2) as a stale SKILL/script pair,
+with the installed-plugin recovery first and the development-checkout one
+second. Without the flag the check is skipped. A `model` or `effort` without
+a `selection` object is refused either way.
+
+## Panel and context contract
+
+**Purpose.** Give Claude one strict, simple input format that survives an
+LLM file write, and give every role the same situational map.
+
+**How it works.** The runner accepts roles only through `--roles-file`, a
+JSON array of objects with `id`, `label`, and `instruction`, plus optional
+`model`, `effort`, and `selection`. `instruction` is a list of
+sentence-sized strings that the runner whitespace-normalizes and joins into
+one paragraph; the joined paragraph must contain "nothing material" (any
+case) and end with "Thoroughness beats speed." Role ids match
+`^[a-z0-9_-]+$`. Unknown keys, a key repeated at any level, and `NaN` or
+`Infinity` are refused, each with the same recovery: rewrite the whole file
+in one Write operation. The shared context arrives through `--context-file`
+in the same private directory (or on stdin for direct CLI use) and must be
+non-empty UTF-8. A bare invocation with no roles exits 2.
+
+The prompt for each role is its instruction, a short collaboration brief,
+the shared context unchanged under its own heading, and the instruction
+again. The
+brief frames the role as an independent cross-model check: the user's goal,
+requirements, and constraints are authoritative, while Claude's account of
+the state and its conclusions are claims to verify against the workspace. It
+says the run is non-interactive, tells the role not to spawn subagents
+unless asked, to stay within its lens, to separate verified evidence from
+inference, and to finish with plain paragraphs Claude can reconcile. It
+tells a role that any earlier turns in its thread are background: where
+they conflict with the shared context or the workspace, the current context
+and workspace win. It is count-neutral ("you may be the only role, or one
+of several").
+
+**Key decisions and why.**
+
+- *A list of sentences, not one long string.* The only production writer
+  of `roles.json` is an LLM file write, and multi-kilobyte single-line
+  string literals are where such writes corrupt.
+- *Unknown and duplicate keys are refused.* A stray filler field is the
+  signature of a glitched write, and a repeated key silently hides one
+  value behind another. A whole-file rewrite never patches a file that
+  already glitched once.
+- *No catalog, no caps.* Every hardcoded role shelf biases Claude toward
+  picking from it, and every size cap is a guess about a provider's limits.
+  Real model, provider, and memory limits surface as the downstream errors
+  they are.
+- *External `codex exec` per role, not Codex's in-process agents.* Each role
+  needs its own persisted thread id and process-level failure and
+  cancellation isolation.
+- *Claude mediates collaboration.* Roles share context but not messages;
+  Claude reconciles each round and stages findings into selective follow-up
+  rounds.
+
+**Limits.** All roles share the working tree, so implementation panels need
+one writing role or serialized phases; the runner does not use Codex's
+`--worktree`. Context is sent on stdin, so non-text artifacts are named by
+path rather than inlined.
+
+## Model discovery
+
+**Purpose.** Learn, for this run only, which models the installed Codex
+advertises for this account and how native configuration resolves, without
+starting any Codex work.
+
+![d20-discovery: the caller, the execution context, codex --version, codex app-server, normalization, the snapshot file, and the summary](docs/diagrams/d20-discovery.png)
+
+*d20-discovery — Model discovery. `--discover` writes the snapshot and
+prints the summary; a launch keeps its fresh evidence in memory. Source:
+[d20-discovery.mmd](docs/diagrams/d20-discovery.mmd).*
+
+**How it works.** Discovery runs in the same execution context as the
+workers: the `codex` that `PATH` resolves, the runner's working directory
+and environment, and no `--profile`. It runs `codex --version`, then starts
+`codex app-server --listen stdio://` in its own process group and speaks
+newline-delimited JSON-RPC, matching responses by id while notifications
+interleave. The only messages it sends, in order:
+
+| Step | Method | What is kept |
+|---|---|---|
+| 1 | `initialize` (then the `initialized` notification) | `codexHome` |
+| 2 | `account/read` | the account type and whether OpenAI sign-in is required |
+| 3 | `config/read`, with `cwd` set to the project root | the model, effort, provider, the kind of layer that set the model and effort, endpoint key names, whether a model catalog file is configured |
+| 4 | `configRequirements/read` | managed new-thread defaults and managed provider keys |
+| 5+ | `model/list`, paged, hidden models included | the normalized catalog |
+
+No thread or turn is ever started, and no login or account-changing method
+is ever called; the tests assert the fake server sees nothing else. A
+request from the server is answered with JSON-RPC `-32601` and makes the
+result inconclusive.
+
+| Bound | Value |
+|---|---|
+| work budget (project root lookup, version probe, spawn, handshake, every request) | 20 s, monotonic; notifications never extend it |
+| project root lookup (`git rev-parse --show-toplevel`) | 5 s, falling back to the launch directory |
+| version probe | 5 s; an unparsable version is informational |
+| catalog paging | 10 pages or 1,000 entries; a repeated cursor is a cycle |
+| one line / all stdout | 8 MiB / 32 MiB |
+| unsolicited messages | 10,000 |
+| teardown after the budget | close stdin, then SIGTERM and SIGKILL to the group, waiting at most 0.5 s at each step |
+
+The 20 seconds bound discovery's work; teardown adds its own bounded waits,
+so no member of the app-server's process group outlives discovery (a
+descendant that started its own session is outside that group and this
+teardown). Discovery never raises: a missing `codex`,
+a spawn error, a timeout, a protocol violation, an RPC error, or an internal
+bug gives status `unavailable` with fixed problem codes (`codex_missing`,
+`spawn_failed:<errno>`, `timeout:<method>`, `server_exited:<method>` with
 `server_stderr:<category>`, `protocol_error:<kind>`,
 `rpc_error:<method>:<code>`, `schema_unsupported:<method>:<field>`,
-`server_request:<method>`, `catalog_incomplete:<why>`, `catalog_conflict`,
-and `internal_error:<type>`. The catalog-level codes are the exception:
-`catalog_incomplete:<why>`, `catalog_conflict`, and a malformed entry's
-`schema_unsupported:model/list:<field>` keep status `ok` and only mark the
-catalog incomplete (below). `codex_version_unavailable` is informational.
+`server_request:<method>`, `internal_error:<type>`). Problems inside the
+catalog (a malformed entry, a conflicting duplicate, a paging bound) keep
+status `ok` and only mark the catalog incomplete.
 
-The pure `_normalize_*` helpers are the only code that reads response wire
-names; everything downstream reads the snapshot. They tolerate additive
-fields and reject wrong types without coercing them: `hidden: "false"` or a boolean
-`retirementAt` makes an entry unusable. The dispatch identity is an entry's
-`model` field, which is what `-m` receives. The picker `id` is kept distinct
-and recorded as `catalog_id`, because the two need not be equal. Effort values
-are an open vocabulary (any non-empty string). A malformed entry, or a
-duplicate `model` with conflicting content, makes that model unusable and the
-catalog incomplete while the rest stays readable; identical duplicates
-collapse. A malformed page (`data` not a list, a non-string cursor, a missing
-`result`) makes discovery unavailable.
+The `_normalize_*` helpers are the only code that reads wire names. They
+tolerate additional fields, reject wrong types without coercing them, keep
+an entry's dispatch id (`model`, what `-m` receives) apart from its picker
+`id` (recorded as `catalog_id`), and treat efforts as an open vocabulary.
 
-### Execution-context parity
+`--discover` writes `RUNDIR/model-snapshot.json` (schema
+`codex-council/model-snapshot@1`) atomically with mode 0600 and prints a
+summary: the status with a random `snapshot_id` and the plugin version, the
+native configuration with where each value came from, the routing verdict
+with every reason, the native-model effort verdict, each visible model with
+its quoted display name, description, and efforts, and the hidden models on
+a `hidden (not routable)` line. A retirement already passed at discovery
+reads `retired <time> (not routable)`. Every summary line passes through
+`_report_inline`, which escapes line breaks and every other non-printable
+character. The snapshot is read back only if it is the private regular file
+`--discover` wrote and it matches the schema field by field.
 
-Discovery has to describe the context workers actually run in, so both are
-launched the same way:
+Discovery decides two verdicts once, so the summary, the preflight, and the
+launch share their reasons:
 
-- the `codex` that `PATH` resolves (`shutil.which`, recorded as an absolute
-  path);
-- the runner's own working directory and environment, with no override, so a
-  relative `CODEX_HOME` resolves identically for both (the fake app-server
-  records the `CODEX_HOME` and working directory it saw, and the tests
-  assert both match the runner's, a relative `CODEX_HOME` included);
-- no `--profile`.
+| Condition | Routing (routed pairs) | Native proof (effort on the native model) |
+|---|---|---|
+| `CODEX_COUNCIL_MODEL_ROUTING` is `auto` | required | required |
+| status `ok` | required | required |
+| a complete, well-formed catalog | required | not required; the native model's own entry must be usable |
+| signed in (an unauthenticated app-server still lists models) | required | required |
+| provider unset or `openai`; no `openai_base_url` or `chatgpt_base_url` from any layer; no `model_catalog_json` | required | required |
+| in managed requirements: no `modelProvider` other than `openai`, no non-empty `modelProviders`, no `modelCatalogJson`, no `chatgptBaseUrl` | required | required |
+| `CODEX_API_KEY` unset (`codex exec` honors it; the app-server does not) | required | required |
+| managed new-thread defaults absent | required | required |
+| model and effort not set by a layer that outranks CLI flags (`mdm`, `legacyManagedConfigTomlFromFile`, `legacyManagedConfigTomlFromMdm`) | required | required |
+| a configured model with a well-formed catalog entry | — | required; a hidden entry counts |
 
-Project config layers are selected by `config/read`'s `cwd` parameter, not by
-the server's spawn directory. That was verified on codex-cli 0.157.1: the
-spawn directory is irrelevant, and omitting `cwd` drops every project layer.
-Discovery therefore passes `_project_root()`, the same root workers get as
-`codex exec -C` (the Git top level of the launch directory, else the launch
-directory). A `.codex/config.toml` below that root is not part of the
-council's discovered baseline. That workers ignore it too rests on
-`codex exec -C <root>` stopping project layers at its `-C` working root
-rather than at the inherited process directory, which Codex's documentation
-implies (`-C` sets the agent's working directory) but which was not verified
-live; a fake-codex end-to-end test pins the plugin side by launching from a
-Git subdirectory and asserting that `config/read`'s `cwd`, every worker's
-`-C`, and the Git top level are one path. `initialize` reports the
-`codexHome` the server selected.
+A hidden model can never be routed to, but it can be the proven native
+model, so a native-effort choice may use its advertised efforts, and a user
+may pin it. Neither verdict reads the catalog's recommended marker, catalog
+order, or the shape of ids, and a missing configured model or effort is
+never filled in from the catalog.
 
-The runner forwards no profile, and the app-server refuses `--profile` anyway
-("--profile only applies to runtime commands and `codex mcp`"), so
-`context.profile` is always null. A profile selected in some other Codex
-process never applies to the council. `CODEX_API_KEY` is recorded as presence
-only: `codex exec` honors it but the app-server does not. When it is set, the
-catalog may describe a different auth context than the workers', so neither
-routing nor native-model effort adjustment is offered.
+**Key decisions and why.**
 
-### The snapshot
+- *`codex app-server`, not `codex debug models`.* Only the app-server
+  observes layered configuration, managed requirements, and the account.
+- *Same execution context as the workers.* Project layers are selected by
+  `config/read`'s `cwd`, not by the spawn directory, so discovery passes the
+  same root workers get as `-C`.
+- *Only key names, never values.* Endpoint overrides and catalog files are
+  recorded by key name only; no endpoint URL, configuration-source or
+  catalog-file path, email, plan, account id, or token is read into the
+  snapshot, and the tests plant sentinel values to prove it. The snapshot
+  does record the execution context it describes: the project root, the
+  launch directory, the resolved `codex` executable, and `CODEX_HOME`.
+- *The app-server's stderr never leaves the adapter.* It is free-form and can
+  carry identity or tokens, so only a fixed `server_stderr:<category>`
+  (`usage_error`, `panic`, or `other`) is recorded.
+- *An overridden endpoint or catalog file blocks both verdicts.* The catalog
+  `model/list` returns does not describe what a redirected endpoint serves,
+  and a catalog file (which a trusted project's `.codex/config.toml` can
+  set) would let the repository under review describe its own reviewers.
+- *Managed new-thread defaults block both verdicts.* Codex ignores both
+  managed defaults when either the model or the effort is overridden, so
+  even an effort-only override could change the model.
+- *No cache.* Every run discovers fresh evidence into its own directory; a
+  cache would need invalidation keyed on credentials it must never store.
 
-`RUNDIR/model-snapshot.json` (schema `codex-council/model-snapshot@1`) is
-written through `_atomic_write_private`, the reply files' pattern. If the
-write fails, any older snapshot is removed and `--discover` prints only a
-line telling Claude to write no automatic selections (explicit user pins
-still apply), because evidence from an earlier discovery must never be read
-back as this run's.
+**Limits.**
 
-The snapshot records:
+| Claim | Evidence |
+|---|---|
+| `config/read`'s `cwd` selects project layers, and omitting it drops them | verified live |
+| discovery and every worker get the same root, from a Git subdirectory launch too | pinned by an end-to-end fake-codex test |
+| `codex exec -C <root>` also ignores a `.codex/config.toml` below the root | follows from Codex's documentation of `-C`; not verified live |
+| the app-server refuses `--profile` | verified live |
+| an unauthenticated app-server still lists models | verified live |
+| a catalog is evidence of what is advertised, not of access | by design: a rejection is classified, not predicted |
 
-- a random 16-hex `snapshot_id`, the UTC creation time, and the plugin
-  version;
-- `status` (`ok` or `unavailable`) and its `problems`;
-- the execution `context`: project root, launch cwd, executable, CLI
-  version, codex home, profile, and API-key presence;
-- the `account` projection;
-- the `configured` model, effort, and provider, with the kind of layer
-  (`user`, `project`, `system`, `mdm`, ...) that supplied the model and the
-  effort, the names of any endpoint keys a layer set
-  (`endpoint_overrides`), and whether `model_catalog_json` replaces the
-  catalog (`catalog_override`), but never a file path, a URL, or layer
-  contents;
-- the `managed_defaults` observation (`present`, `absent`, or `unknown`);
-- the `native` resolution and the `routing` verdict;
-- the normalized `catalog`: each entry's dispatch `model`, `catalog_id`,
-  display name, description, `hidden`, `recommended`, default effort,
-  advertised efforts with their descriptions, and upgrade target with
-  retirement time.
+If the snapshot cannot be written, an older one is removed on a best-effort
+basis (a failed removal is not reported) and `--discover` prints only a
+line telling Claude to write no automatic selections. Discovery describes
+the process that runs it, so it must run from the directory the council will
+launch from.
 
-The account projection reads exactly two fields, `type` and
-`requires_openai_auth`. Email, plan, account ids, workspace routing, and
-tokens are never read, so they cannot reach the snapshot, stdout, or stderr;
-the tests plant sentinel values in every one of those fields and assert they
-never appear. The app-server's own stderr gets the same guarantee: only a
-fixed `server_stderr:<category>` leaves the adapter, and the tests write the
-same sentinels to the fake server's stderr, on `--discover` and on launch
-discovery, and assert they reach no snapshot, summary, err.log, report, or
-reply file.
+## Choosing and validating selections
 
-`_read_snapshot` accepts only the private regular file `--discover` writes.
-lstat refuses a symlink, special file, foreign owner, or group/other mode
-bits, and the open adds `O_NOFOLLOW|O_NONBLOCK`. The content must be strict
-JSON (no duplicate keys, no `NaN` or `Infinity`, at most 64 MiB) that matches
-the schema field by field, with unique catalog models and a proven native
-model present in the catalog.
+**Purpose.** Let Claude give each role a grounded model and effort while the
+runner guarantees that an automatic choice rests on this run's evidence and
+that a user's pin is never altered.
 
-The `--discover` summary is what Claude reads to choose selections. It holds
-the status line with the `snapshot_id` and the plugin `version=` (the
-unavailable and snapshot-not-written lines carry the version too, since those
-are the cases where knowing which plugin ran matters most), the native
-configuration with its origins and managed defaults, the routing verdict with
-every reason, the native-effort verdict, each visible model with its
-JSON-quoted display name (when it differs from the execution id), JSON-quoted
-description, advertised efforts, and recommended, retirement, and upgrade
-notes, and the hidden models by name. A retirement at or before the snapshot's
-`created_at` reads `retired <time> (not routable)` rather than `retires
-<time>`, so the summary never offers a pair the preflight refuses; the entry
-stays listed (not moved to the hidden line, which means catalog-hidden) so a
-user who names it can still pin it. The display name lets Claude map a model
-the user named as the picker shows it to the execution id `-m` receives. Every
-line passes through `_report_inline`, which escapes line breaks and every
-other non-printable character (ESC, BEL, C1 controls, DEL, bidirectional
-overrides), because catalog and configuration text is untrusted data and must
-not drive a terminal.
+![d21-choose: what the user asked for decides first (a pin, or native settings kept); otherwise a routed pair, native-model effort, or inheritance, all written to roles.json](docs/diagrams/d21-choose.png)
 
-### Eligibility and native proof
+*d21-choose — Claude chooses one role's model and effort. The runner does
+none of this reasoning. Source: [d21-choose.mmd](docs/diagrams/d21-choose.mmd).*
 
-`_build_snapshot` decides both verdicts once, so the summary, preflight, and
-launch read the same answers and reasons.
+**How it works.** Claude walks the ladder once per role before launch. A
+user's explicit request wins (and a request to keep native settings means
+inheritance). Otherwise a routed pair needs routing to be eligible and the
+catalog's descriptions to support both the model and the effort; otherwise
+an effort on the proven native model needs one of that model's effort
+descriptions to fit; otherwise the role inherits. Descriptions justify a
+choice; ids, version-like fragments, catalog order, and the recommended
+marker never rank one.
 
-`status` is `ok` only when `initialize` and all four sources answered with a
-valid shape and no server request arrived. `routing.eligible` requires all of
-these, and each failed condition adds one human-readable reason:
+`selection` has three shapes: `{"mode": "user"}` (optionally with a
+single-line `reason`), which needs `model` and/or `effort`;
+`{"mode": "routed", "snapshot_id", "reason"}`, which needs both; and
+`{"mode": "native_effort", "snapshot_id", "reason"}`, which needs `effort`
+and forbids `model` because the runner pins the proven native model.
+`snapshot_id` is the 16-hex id `--discover` printed, and `reason` is a
+non-empty single line. Inheritance is omission of all three keys. Both
+values share `SELECTION_VALUE_PATTERN = ^[A-Za-z0-9][A-Za-z0-9._:/@+-]*\Z`:
+no leading `-` and no whitespace, control characters, quotes, backslashes,
+or angle brackets, so `-m <model>` stays one argument, the TOML string in
+`-c model_reasoning_effort="<effort>"` cannot be broken out of, and report
+lines stay single-line. Case is preserved, and `inherit` and `default`, in
+any case, are refused as model values. A `model` or `effort` without
+`selection` is refused before the grammar is checked.
 
-- routing mode `auto`;
-- status `ok`;
-- a complete, well-formed catalog;
-- a signed-in account. An unauthenticated app-server still lists models, so a
-  catalog alone is not entitlement evidence;
-- a corresponding provider: the configured provider is unset or `openai`,
-  no config layer set `openai_base_url` or `chatgpt_base_url` (an `origins`
-  entry, or any `openai_base_url` value, since it has no built-in default),
-  no `model_catalog_json` is set (it has no built-in default, so any value
-  counts, whichever layer set it), and no managed `modelProvider`,
-  `modelProviders`, `modelCatalogJson`, or `chatgptBaseUrl` is set. Probes
-  showed a custom provider's `config/read` answer is correct while
-  `model/list` still returns OpenAI's catalog, and with `openai_base_url`
-  pointed at a dead endpoint `model/list` still returned a complete catalog,
-  so neither the catalog nor the sign-in proves what a redirected endpoint
-  serves. A `model_catalog_json` file replaces what `model/list` returns
-  with entries someone wrote; a trusted project's `.codex/config.toml` can
-  set it, so the repository under review could otherwise write the
-  descriptions that choose its reviewers. Only the key names are recorded,
-  never a URL or path;
-- no `CODEX_API_KEY`;
-- managed new-thread defaults `absent`;
-- neither the configured model nor the effort from a layer that outranks CLI
-  overrides. `config/read` names the `ConfigLayerSource` type that supplied
-  each (`origins`), and three of them take precedence even over `-m` and
-  `-c`: `mdm` (macOS managed preferences), `legacyManagedConfigTomlFromFile`,
-  and `legacyManagedConfigTomlFromMdm` (the legacy `managed_config.toml`).
-  A value one of them supplies would silently replace what the council
-  sends, so the reason reads `managed layer overrides CLI flags (model
-  origin mdm)`. Cloud-managed (`enterpriseManaged`), system, user, project,
-  and packaged-default layers rank below CLI overrides and do not count.
+![d22-resolve: only an automatic choice with routing on needs the snapshot; an unsupported one exits 2, rewritten at the preflight or started over at launch; a supported one reaches the pure resolver, through one fresh discovery at launch](docs/diagrams/d22-resolve.png)
 
-`native.resolution` is `proven` only when status is `ok`, the account is
-signed in (the same rule as routing: an unauthenticated app-server still
-lists models, so its catalog does not show what the account can run),
-managed new-thread defaults are `absent`, no layer that outranks CLI
-overrides supplied the model or effort, the provider corresponds (an
-endpoint or catalog override blocks it, as for routing, because the
-catalog's efforts for the native model are then unverified),
-`CODEX_API_KEY` is unset, a model is configured, and a well-formed catalog
-entry exists whose `model` is exactly that configured model. A hidden entry
-counts. The entry is needed so the model's advertised efforts are known. Otherwise the resolution is
-`unknown`, with the reason. A configured model is never filled in from the
-catalog's recommendation, and a missing effort is never filled in from its
-default.
+*d22-resolve — Validate authoring, then resolve against the newest
+evidence. User pins and inheritance need no snapshot. Source:
+[d22-resolve.mmd](docs/diagrams/d22-resolve.mmd).*
 
-Managed new-thread defaults block both verdicts because of a documented
-coupling. An explicit override of either the model or the reasoning effort
-makes Codex ignore both managed defaults, so an effort-only override could
-silently change the model the user expected to inherit. `native_effort` also
-sends the proven native model with the effort (`-m <native model>`) rather
-than the effort alone, so the effort always travels with the exact model it
-was validated against. Neither verdict consults the catalog's `isDefault`
-marker (recorded as `recommended` for display), catalog order, or the shape
-of ids.
+Authoring validation runs at the preflight and again at launch, before any
+worker, and checks only automatic choices, and only while routing is on:
+user pins and inheritance pass without a snapshot, and with routing off an
+automatic choice resolves to inheritance instead. It refuses (exit 2) an
+automatic role whose planning snapshot is absent, unreadable, or not the
+private file `--discover` wrote; whose `snapshot_id` does not match; that is
+routed while routing is ineligible; whose model is not an advertised
+execution id (the message names the right id when the value is a picker id
+or display name); whose model is hidden or already retired; whose effort is
+not advertised for that model; or that is `native_effort` without a proven
+native model. At the preflight the recovery is a whole-file rewrite of
+`roles.json` in the same directory; at launch, whose redirects have already
+claimed the directory, it is a new directory. The preflight judges
+retirement against the current time; the launch judges authoring as of the
+snapshot's creation, so a retirement that passes after discovery is changed
+evidence rather than a defect.
 
-### The roles.json selection contract
+At launch, when routing is on and at least one role is automatic, the runner
+takes one fresh discovery after every input check and freezes it for the
+whole council; it lives in memory only and never overwrites the planning
+snapshot. `_resolve_selection(role, planning, launch, routing_mode, now)` is
+the single pure resolver for both paths; its clock at launch is read after
+that discovery finishes. A role whose evidence changed resolves to native
+inheritance with a reason (`selection evidence changed since discovery: …`):
+discovery now unavailable, routing now ineligible for a routed pair, a
+model gone, hidden, or retired, an effort no longer advertised, a native
+model no longer proven, or, for `native_effort`, a native model that differs
+from the one discovery planned with. Evidence never causes an exit 2.
 
-Role objects take `id`, `label`, `instruction`, and optionally `model`,
-`effort`, and `selection`. `selection` has one of three shapes:
+Each decision is a frozen `SelectionDecision` holding the provenance
+(`native`, `user`, `routed`, `native_effort`, or `fallback`), the requested
+and the dispatch values, the reason, a note (a fallback reason or a pin
+advisory), and the proven native model (never sent; it only tells a refusal
+whether the refused model was the native one). Command builders receive only
+the dispatch values. Explicit pins are forwarded unchanged and only
+annotated: a model absent from the catalog (with the execution id a display
+name or picker id maps to), a retired model, an effort the catalog does not
+advertise for that model, a model-only pin whose inherited native effort
+that model does not advertise, and a partial pin while managed defaults are
+present or unknown.
 
-- `{"mode": "user"}`, optionally with a single-line `reason`. It needs
-  `model` and/or `effort` and forbids `snapshot_id`.
-- `{"mode": "routed", "snapshot_id", "reason"}`, which needs both `model`
-  and `effort`.
-- `{"mode": "native_effort", "snapshot_id", "reason"}`, which needs `effort`
-  and forbids `model`, because the runner pins the proven native model.
+Every surface reports what was sent:
 
-`snapshot_id` must be the 16-hex id `--discover` printed. `reason` is a
-non-empty single line with no length cap; its meaning is not validated, and
-`mode: "user"` is the orchestrator's own label (see Known limits).
-Inheritance is omission of all three keys.
-
-`--skill-contract` marks the skill path, where a `model` or `effort` without
-`selection` exits 2. That check runs before the value grammar, so a malformed
-untagged pin is first asked for its provenance, not told how to inherit.
-Direct CLI use without it reads such an untagged pin as `{"mode": "user"}`,
-which keeps earlier role files working, and a malformed value there gets the
-same repair-the-pin hint as a `mode: user` pin.
-
-Both values share
-`SELECTION_VALUE_PATTERN = ^[A-Za-z0-9][A-Za-z0-9._:/@+-]*\Z`: no leading `-`,
-and no whitespace, control characters, quotes, backslashes, or angle
-brackets. That makes every consumer safe by construction. `-m <model>` stays
-one argv item. The TOML basic string in `-c model_reasoning_effort="<effort>"`
-needs no escaping and cannot be broken out of. Report lines and reply-file
-headers stay single-line. Case is preserved, never folded, and no list of
-valid values exists anywhere in code. `inherit` and `default`, in any case,
-are refused as model values, since Codex would receive them as literal model
-ids. The roles file goes through a strict JSON loader that also rejects
-`NaN` and `Infinity`.
-
-### Authoring versus evidence validation
-
-Authoring validation (`_validate_selection_authoring`) asks whether an
-automatic choice is supported by this run's planning snapshot,
-`RUNDIR/model-snapshot.json`, where RUNDIR is the directory of the staged
-inputs. It runs in preflight and again at launch, before any worker. A
-violation exits 2 with the rewrite recovery. The violations are:
-
-- a snapshot that is absent, unreadable, malformed, or not the private file
-  `--discover` writes;
-- a `snapshot_id` that does not match;
-- routing ineligible, for a routed pair;
-- a model that is not an advertised execution id, with a hint naming the
-  execution id when the value is some entry's picker id or display name
-  (only an execution id that matches the value grammar is ever suggested,
-  so catalog text cannot smuggle spaces or controls into the message);
-- a hidden model, or one whose advertised retirement has passed;
-- an effort not advertised for that exact model;
-- an unproven native model, for `native_effort`.
-
-User pins are never validated against the catalog, since a custom provider's
-models are not in it; they only collect advisories. With routing off,
-automatic roles are not errors. A value that fails the grammar in a user
-pin (a display name with a space, say) gets recovery text that says to write
-the execution id the summary lists or ask the user, never to inherit, since
-dropping the pin would discard the user's request.
-
-Preflight compares advertised retirements with the current time. The launch
-repeats authoring validation as of the planning snapshot's `created_at`, so
-a choice already retired at discovery stays an exit 2, while a retirement
-that passes after discovery is changed evidence and falls back (below). The
-resolver's clock at launch is read after launch discovery finishes, so a
-retirement that passes while that discovery runs is already in effect.
-
-Evidence validation happens at launch. When at least one role is automatic
-and routing is `auto`, the launch calls `_discover()` once, after the staging,
-roles, context, codex-presence, and authoring checks. It freezes that launch
-snapshot for the whole council. The launch snapshot lives in memory only and
-never overwrites the planning snapshot. Councils of inherited and explicit
-roles never pay that latency.
-
-A role whose evidence has changed resolves to native inheritance with a
-reason (`selection evidence changed since discovery: …`). That covers
-discovery unavailable, routing ineligible for a routed pair, a model no longer
-advertised, hidden, or retired, an effort no longer advertised, a native
-model no longer proven, and, for `native_effort`, a launch native model that
-differs from the planning one (`native model changed from '<a>' to '<b>'`).
-The effort was chosen from the planning native model's descriptions, and
-the same effort name need not mean the same behavior on another model, so
-it is never carried over, even when the new model advertises that spelling.
-The launch snapshot is never written anywhere, so a routed model it no
-longer advertises is reported as not advertised `in launch discovery`
-rather than by an id no reader could look up. The run continues: evidence
-never causes an exit 2.
-
-`_resolve_selection(role, planning, launch, routing_mode, now)` is the single
-pure resolver for both paths, and `_resolve_run_selections` is the one
-orchestration around it: read the planning snapshot, validate authoring,
-discover (at launch only), and resolve every role. Preflight passes no launch
-snapshot and prints its decisions as the plan. Launch passes the fresh
-snapshot, whose evidence wins. The resolver returns a frozen
-`SelectionDecision`, which `dataclasses.replace` attaches to each `Role`
-before fan-out. `now` is compared with advertised retirement times. Catalog
-order and the recommended marker never change a decision; the tests permute
-both.
-
-```mermaid
-flowchart TD
-    Role["role: model, effort, selection"] --> Any{"any of the three?"}
-    Any -->|"none"| Native["native: send nothing"]
-    Any -->|"yes"| Mode{"selection.mode"}
-    Mode -->|"user, or untagged in direct CLI use"| User["user: send the pin unchanged<br/>advisories only"]
-    Mode -->|"routed or native_effort"| Off{"routing mode off?"}
-    Off -->|"yes"| Fallback["fallback: send nothing<br/>record the reason"]
-    Off -->|"no"| Evidence{"launch snapshot if taken,<br/>else the planning snapshot:<br/>status ok?"}
-    Evidence -->|"no"| Fallback
-    Evidence -->|"yes, routed"| Pair{"routing eligible, model advertised,<br/>visible, not retired,<br/>effort advertised for it?"}
-    Evidence -->|"yes, native_effort"| NativeProof{"native model proven,<br/>same as at discovery,<br/>effort advertised for it?"}
-    Pair -->|"yes"| Routed["routed: send -m model<br/>and the effort"]
-    Pair -->|"no"| Fallback
-    NativeProof -->|"yes"| NativeEffort["native_effort: send -m proven native model<br/>and the effort"]
-    NativeProof -->|"no"| Fallback
-```
-
-### Provenance and reporting
-
-`SelectionDecision` keeps the request and the dispatch apart. Its fields are:
-
-- `mode`, what the role asked for: `inherit`, `user`, `routed`, or
-  `native_effort`;
-- `provenance`, what the council does: `native`, `user`, `routed`,
-  `native_effort`, or `fallback`;
-- `requested_model` and `requested_effort`;
-- `dispatch_model` and `dispatch_effort`, where None means that override is
-  not sent;
-- the selection `reason`;
-- a `note`, which holds a fallback reason or a user-pin advisory;
-- `native_model`, the native model the resolving evidence proves (None
-  without proof), recorded on every explicit pin and on every automatic
-  choice that is sent as requested. It is never sent; it only tells a
-  refusal whether the refused model was the native one.
-
-The command builders receive only the dispatch values. Session state never
-stores a selection, so a routed choice cannot become a later run's default.
-User-pin advisories are notes, never rejections:
-
-- a model absent from the catalog, plus the execution id it maps to when
-  the value is an entry's display name or picker id;
-- a pinned model whose advertised retirement has passed at the resolver's
-  `now`;
-- an effort the catalog does not advertise for the pinned model, or for the
-  proven native model when only an effort is pinned;
-- for a model-only pin, a configured native effort the pinned model does not
-  advertise, when managed defaults are absent (Codex keeps that effort and
-  does not validate it on the client; the note says no effort override was
-  sent);
-- a partial pin while managed new-thread defaults are present or unknown.
-
-Every surface reports what was sent, never what ran:
-
-- **err.log.** After the unchanged dispatch line comes
+- `err.log`: after the dispatch line,
   `[codex-council] model selection: routing=<auto|off>; discovery=<ok|unavailable|not-run>[ (<reason>)]; native=N user=N routed=N native_effort=N fallback=N`,
-  then one `[codex-council:<id>] routing fell back to native inheritance: <reason>`
-  line per fallback. The follower's dispatch detection depends on the
-  dispatch line's prefix, which is why it stays unchanged.
-- **Report Summary.** Each line notes what the role sent: ` (explicit: …)`,
-  ` (routed: …)`, ` (routed effort: <e> on native model <m>)`, or
-  ` (native inheritance; routing fell back)`. Inherited roles get no note.
-- **Model selection paragraph.** After the Summary comes
-  `Model selection: <discovery sentence>. codex exec does not report the model or effort that served a turn; …`.
-  The discovery sentence is `launch discovery not run (<why>)`,
-  `launch discovery ok (codex-cli <v>)`, or
-  `launch discovery unavailable: <problems>`.
-- **Role sections.** Every section opens with `_Model selection: …_` after
-  its heading and before any warning. `_format_role_section` renders it for
-  both `out.md` and the reply files, so the two stay byte-identical.
-- **Reply-file headers.** They carry `selection=<provenance>`, the sent
-  `model=`/`effort=`, and, for a fallback, `requested_model=` and
-  `requested_effort=`.
-- **Preflight.** It prints one `selection plan:` line per role.
+  then one `routing fell back to native inheritance: <reason>` line per
+  fallback;
+- the report's Summary line notes each role's sent values, a
+  `Model selection:` paragraph names the launch discovery
+  (`launch discovery not run (<why>)`, `launch discovery ok (codex-cli <v>)`,
+  or `launch discovery unavailable: <problems>`), and each role section opens
+  with `_Model selection: …_`, which carries the `reason` when the choice was
+  sent as requested and the fallback reason otherwise;
+- each reply header carries `selection=`, the sent `model=` and `effort=`,
+  and for a fallback `requested_model=` and `requested_effort=`.
 
-All catalog- or Codex-derived text passes through `_report_inline`, and
-err.log lines other than completion lines through `_log_inline`, which also
-escapes ` reply=` so the follower's reply-path filter cannot drop them.
+**Key decisions and why.**
 
-Requested, sent, and reported are three different things. The request is
-what `roles.json` says. What was sent is the dispatch values. What was
-reported is whatever Codex said, and `codex exec --json` names neither the
-model nor the effort, so the council never claims one. A resume advisory
-("This session was recorded with model `<recorded>` but is resuming with
-`<current>`…") arrives as a Codex item-level error on a successful turn. It
-is kept verbatim as a role warning (`codex reported: …`) and never parsed
-into a stronger claim.
+- *The runner never ranks.* Every list of models or efforts goes stale with
+  the next model generation; the only checks are membership in this run's
+  evidence.
+- *`native_effort` sends the native model with the effort.* The effort was
+  chosen from that model's descriptions and the same spelling need not mean
+  the same thing on another model, so it always travels with the model it
+  was validated against, and a changed native model falls back instead of
+  carrying the effort over.
+- *Changed evidence falls back instead of failing.* Separate processes
+  cannot make planning and launch atomic; a council that still runs on the
+  user's own configuration is better than one that refuses.
+- *Pins are never validated against the catalog.* A custom provider's models
+  are not in it, and the user asked for exactly that value.
+- *Escaping covers metadata, not replies.* Catalog, configuration, and
+  Codex-derived text in plans, headers, summary notes, and diagnostics goes
+  through `_report_inline`, and `err.log` diagnostics also through
+  `_log_inline`, which escapes ` reply=`. A successful role's reply body is
+  the multiline Markdown the role returned, which is why Claude treats it as
+  untrusted evidence.
 
-### Failure classification
+**Limits.**
 
-Model selection adds two failure classes, `[quota]` and `[model-rejected]`.
-The full table, and the one classification order `_failure_verdict` applies
-on both the fresh and resume paths after the structured stall verdict, are in
-[Failure-class tagging](#failure-class-tagging). Two placements in that order
-matter here:
-
-- **Quota comes before the anchored parser.** A provider can send a usage
-  limit with HTTP 429, which would otherwise be retried as a rate limit.
-- **Model rejection comes before stale recovery.** A rejection whose text
-  also contains stale-thread words ("thread not found", "no rollout found")
-  must never clear a valid saved thread.
-
-A model rejection needs positive evidence. `_failure_records` reads only
-`error` and `turn.failed` events, decodes JSON-in-message up to three levels,
-and never looks at agent messages, reasoning, or tool output. The evidence
-is either a structured `model_not_found` code whose `param` is `model` or
-absent, with status 400, 404, or none, or one of Codex's complete sentences
-about the model this invocation sent (regex-escaped), found in those records
-or in the failure text (stderr plus the same events' messages):
-
-- "The '<m>' model is not supported when using Codex with …" (ChatGPT
-  sign-in, observed live on codex-cli 0.157.1 as JSON-in-message);
-- "The model '<m>' does not exist or you do not have access to it" (the
-  API's `model_not_found` wording, which Codex passes through; not yet
-  observed live).
-
-The model may be quoted with single quotes or backticks (the API wording
-uses backticks). The sentences are searched per line, so they also match
-after codex's `unexpected status NNN …: ` prefix, whether that prefix is
-followed by the body's error message or by the raw JSON body.
-
-These never qualify: bare "not found" or "not supported", the "Model
-metadata for … not found" advisory, "Selected model is at capacity" (which
-stays transient), and a failure about reasoning effort or service tier.
-That exclusion is judged per record and only on unambiguous evidence: a
-record whose structured `param` is `reasoning.effort`,
-`model_reasoning_effort`, or `service_tier` is set aside (with any
-failure-text line repeating its message), and unstructured text is set
-aside only when it names one of them as a whole token outside the quoted
-model id its sentence names. A set-aside record never hides another, so a
-definitive rejection wins whatever order Codex emitted the records in, and
-a model id that itself contains those words (`future-service_tier-2035`) is
-still rejected as a model rather than falling through to stale recovery.
-
-The `[model-rejected]` message names what was rejected (the requested model,
-or the natively configured one) and quotes Codex. It says no substitute was
-tried; on the resume path it adds that the saved thread was kept. It then
-gives one action for the model that was refused, not for the role's
-provenance: re-run without `model`, `effort`, and `selection` for a routed
-model, change or remove the pin for a user model pin, or ask the user to
-update the Codex configuration or name a model to pin for the natively
-configured model; the orchestrator never edits Codex configuration or picks
-that model itself. That last case covers a native-effort role (it sends the
-proven native model with `-m`), an effort-only user pin, native
-inheritance, and a routed or pinned model equal to the `native_model` its
-decision recorded: in each, an inheriting re-run would send the same native
-model again. The message then calls a sent model `the requested model
-'<m>', which is also the natively configured model,`. Without that proof a
-routed or pinned model keeps its own action, and an inheriting re-run that
-meets the same refusal gets the native one. There is no automatic runner
-fallback: the host re-runs the role.
-
-A `[quota]` that is codex's usage limit for one model ("You've hit your
-usage limit for <label>. Switch to another model now, or try again at
-<time>.") stays `[quota]`: terminal, never retried, never clearing state,
-at the same place in the order. Its tag appends the same closing action
-for the model that was sent, since a routed model that is not the native
-one is a choice the council can drop instead of waiting for the reset. The label comes from the
-server's limit-name header and is not guaranteed to echo `-m`, so it is
-never compared with the model sent. A plan-wide usage limit keeps codex's
-text alone.
-
-`_failure_verdict` returns a `FailureVerdict` that carries the class and,
-for a rejection, Codex's message, so each attempt is classified and its
-rejection parsed once. Both paths pass the verdict they computed to
-`_classify_failure`, so the printed tag always matches the branch taken,
-and they copy `FailureVerdict.retriable` onto the `RoleResult`, which is
-the only thing `_run_role_attempts` consults when deciding a retry.
-
-### Evidence from codex-cli 0.157.1
-
-These probes ran while this was designed (September 2026, macOS, ChatGPT
-sign-in). They are historical evidence, not guarantees, and the names below
-are placeholders:
-
-- A whole discovery session (spawn, handshake, four requests, close) took
-  about 0.65s; a full `--discover` took one to two seconds.
-- An unauthenticated `CODEX_HOME` still returned a smaller model list, so a
-  catalog is not entitlement evidence.
-- A model the account cannot use made `codex exec` exit 1. It printed a
-  `Model metadata for … not found` advisory, then an `error`/`turn.failed`
-  pair whose message was
-  `The '<model>' model is not supported when using Codex with a ChatGPT account.`
-- An effort a model does not advertise was accepted (exit 0, normal reply).
-  Whether the server honored or clamped it is unknown. Codex does not
-  validate effort client-side, so the snapshot's exact-membership check is
-  the only effort check for automatic modes, and an explicit pin gets an
-  advisory only.
-- Parent-placed `-m`/`-c` applied to resumed turns. A resume without them ran
-  on the current configured model rather than the thread's recorded one, with
-  the advisory
-  "This session was recorded with model `<recorded>` but is resuming with `<current>`. Consider switching back to `<recorded>` as it may affect Codex performance."
-- `codex --profile <name> app-server` is refused.
-- The binary's strings hold codex's own usage-limit wordings, including the
-  per-model form "You've hit your usage limit for <label>. Switch to another
-  model now, …", and the `unexpected status ` prefix it puts before an HTTP
-  failure body. Neither model-rejection sentence is in the binary: both are
-  server text that codex passes through.
-
-### Known limits
-
-- **Planning, launch, and exec are not atomic.** Configuration, account, or
-  catalog can still change after launch discovery. Separate processes cannot
-  make that window atomic, so launch revalidation narrows it without closing
-  it.
 - **User-pin provenance and semantic grounding rest on the orchestrator.**
-  `selection.mode: "user"` is a label the orchestrator writes, not evidence
-  that the user asked for the value: the runner cannot authenticate it, and
-  a role labeled `user` is forwarded unchanged with advisories only,
-  bypassing catalog validation, even with routing off. Likewise `reason` is
-  checked only as a non-empty single line, never for meaning: an advertised
-  pair is accepted whatever its reason says and whether or not the catalog
-  descriptions support it. Both guarantees rest on the trusted orchestrator
-  following SKILL.md (pin only what the user named; ground each automatic
-  choice in the descriptions; never relabel an automatic choice as a pin),
-  not on runner enforcement. Enforcing them would need an authorization
-  source the orchestrator does not control, not a model ranking.
-- **One launch per directory is not enforced atomically.** `--discover` and
-  the pre-flight refuse a directory holding `out.md`, `err.log`, or
-  `replies/`, but the launch itself does not check: its own redirections
-  created the first two before it starts, and direct CLI use keeps accepting
-  an existing `replies/`. The rule rests on the orchestrator running the
-  pre-flight as its own call and launching only after it exits 0; a launch
-  with no pre-flight, a combined call that ignores the pre-flight's exit,
-  or two launches racing into one directory are not prevented.
-- **Legacy managed layers can still override an explicit pin.** Per Codex's
-  managed configuration documentation, `managed_config.toml` and macOS
-  managed preferences take precedence even over CLI `--config` overrides.
-  When `config/read`'s origins show one of them supplied the configured
-  model or effort, routing is ineligible and the native model unproven, so
-  no automatic value is sent. An explicit user pin is still forwarded
-  unchanged and may be overridden there, and a layer that supplies neither
-  key but outranks CLI flags for some other setting is not inspected.
-- **A signed-out discovery proves nothing.** With no account, the catalog
-  is not the account's, so both routing and native-model effort adjustment
-  stand down; only explicit pins and inheritance remain. An account that is
-  signed in is still no guarantee that a listed model will be accepted, which
-  is why a rejection is classified rather than predicted.
-- **Resume under managed defaults is untested.** The resume evidence above
-  covers ordinary configuration. How a resumed thread resolves under managed
-  new-thread defaults has not been exercised; those defaults disable both
+  `selection.mode: "user"` is a label the orchestrator writes: the runner
+  cannot authenticate it, and a role labeled `user` is forwarded unchanged
+  with advisories only. Likewise `reason` is checked only as a non-empty
+  single line, never for meaning, so an advertised pair is accepted whatever
+  its reason says. Both rest on Claude following SKILL.md, not on runner
+  enforcement; enforcing them would need an authorization source the
+  orchestrator does not control.
+- **Planning, launch, and exec are not atomic.** Configuration, account, or
+  catalog can still change after launch discovery; launch revalidation
+  narrows that window without closing it.
+- **Managed layers can still override an explicit pin.** A layer that
+  outranks CLI flags blocks automatic choices when it sets the model or
+  effort, but an explicit pin is still sent and may be overridden there, and
+  a layer that sets neither is not inspected.
+- **Resume under managed defaults is untested.** Those defaults disable both
   automatic modes, so the council claims nothing there beyond sending no
   override.
 
-### Deliberately not done
+## Staging and preflight
 
-- **No `codex debug models` fallback.** It is a second, experimental
-  raw-catalog format with different field names and completeness semantics
-  (`--bundled` even skips the remote refresh). It cannot observe layered
-  configuration, managed defaults, or auth context, so it would add weaker
-  evidence without closing any gap. When app-server discovery is
-  unavailable, no automatic selection is made: explicit pins still apply,
-  and every other role inherits.
-- **No post-run `thread/read` telemetry.** The protocol's thread model and
-  effort fields describe the current configured or latest persisted values
-  and state that they are not per-turn execution telemetry. Reading them
-  after a run could not tell which model served a turn; it would only add
-  another timeout and delay reply files.
-- **No runner model-hopping.** After `[model-rejected]`, or a `[quota]` for
-  one model's usage limit, the runner neither substitutes a model nor replays
-  the role with inheritance. A replay could
-  repeat a writer role's side effects, and the choice belongs to the host:
-  Claude re-runs only that role, in a new run directory, without `model`,
-  `effort`, and `selection` for a refused routed model that is not the
-  native one, or asks the user about a refused pin or native model and
-  never edits Codex configuration itself.
-- **No cross-run cache.** Every run discovers fresh evidence. A cache would
-  need invalidation keyed on the executable, configuration layers, account,
-  workspace, provider, and CLI version, and it could never use credentials as
-  a key. The planning snapshot lives in the run's private directory and is
-  revalidated at launch.
-- **No profile forwarding.** The runner passes no `--profile`, and the
-  app-server refuses one, so discovery could not describe a profiled worker.
-  Flattening a profile into `-c` overrides would change provenance and could
-  trigger the managed-default coupling.
-- **No recommended-default routing.** The catalog's `isDefault` marker is
-  recorded as `recommended` for display only. It is never read as the user's
-  configured model and never picked automatically.
-- **A future native-subagent adapter needs its own tests.** Claude Code
-  resolves subagent models differently from Codex workers. Omitting a model,
-  an explicit `inherit` (the main conversation's model), and the special
-  `default` (which clears an override) are not interchangeable, and an
-  environment default such as `CLAUDE_CODE_SUBAGENT_MODEL` can take part.
-  Any such adapter must test omission, `inherit`, and `default` separately
-  and must not reuse the Codex worker rule that refuses those words as model
-  ids.
+**Purpose.** Refuse every bad input before a worker exists, keep reviewed
+content private, and never let a launch damage another launch's files.
 
-## Staging validation
+![d23-staging: mktemp, discovery, writing inputs, the foreground preflight, the separate background launch, and the launch gate](docs/diagrams/d23-staging.png)
 
-```mermaid
-flowchart TD
-    Mktemp["Claude runs mktemp -d once per launch"] --> Rundir["Private run dir"]
-    Rundir --> DiscoverGate["--discover: private-dir gate, not yet launched<br/>roles.json and context.md need not exist yet"]
-    DiscoverGate --> Snapshot["model-snapshot.json (0600)<br/>atomic, run-scoped, never cached"]
-    Rundir --> Roles["roles.json"]
-    Rundir --> Context["context.md"]
-    Rundir --> Out["out.md"]
-    Rundir --> Err["err.log"]
-    Rundir --> Replies["replies/ (0700)<br/>per-role files (0600)"]
+*d23-staging — Stage and pass the gates. Inputs exist before the
+preflight; outputs appear only when the separate launch call's redirects
+run. Source: [d23-staging.mmd](docs/diagrams/d23-staging.mmd).*
 
-    Roles --> Preflight["--check-staging-dir<br/>private-dir gate: lstat, owner, 0700"]
-    Context --> Preflight
-    Preflight --> Launched{"out.md, err.log, or replies/<br/>already present?"}
-    Launched -->|"yes"| NewDir["exit 2: every launch needs<br/>a new mktemp -d directory"]
-    Launched -->|"no"| Exists{"both files exist?"}
-    Exists -->|"no"| StageError["exit 2 with staging hint"]
-    Exists -->|"yes"| SameDir{"same mktemp dir?"}
-    SameDir -->|"no"| StageError
-    SameDir -->|"yes"| Parse["parse roles + validate context"]
-    Parse -->|"empty or non-UTF-8 context"| StageError
-    Parse -->|"bad roles JSON, unknown or duplicate key,<br/>malformed selection"| RolesError["exit 2 with whole-file<br/>rewrite recovery"]
-    Parse -->|"ok"| Authoring{"automatic selections supported<br/>by this run's snapshot?"}
-    Snapshot --> Authoring
-    Authoring -->|"no"| RolesError
-    Authoring -->|"yes: staging OK + selection plan, exit 0;<br/>launch in a separate Bash call"| LaunchGate["launch path re-validates privacy<br/>lexical parent of every on-disk input<br/>before any content read"]
-    LaunchGate -->|"public, symlinked, or foreign-owned parent"| StageError
-    LaunchGate -->|"private"| Revalidate["re-parse, re-check authoring,<br/>one launch discovery when a role is automatic"]
-    Revalidate --> Launch["launch fan-out"]
+**How it works.** Every launch gets its own `mktemp -d` directory. Claude
+runs `--discover` there, writes `roles.json` and `context.md`, and runs
+`--check-staging-dir` as its own foreground call. The preflight runs no
+discovery and refuses (exit 2) whatever the launch would refuse before
+dispatch:
 
-    Launch --> Replies
-    Launch --> Out
-    Launch --> Err
-    Err --> Follow["--follow relays [codex-council lines<br/>drops reply= paths outside replies/"]
-    Err --> Sentinel["CODEX_COUNCIL_DONE"]
+- the directory is not private (below);
+- the directory already holds a launch (`out.md`, `err.log`, or
+  `replies/`);
+- `roles.json` or `context.md` is missing, not a regular non-symlink file, or
+  unreadable; `context.md` is empty or not UTF-8;
+- a roles defect, including an unsupported automatic selection;
+- no `codex` on `PATH`, or an invalid `CODEX_COUNCIL_MAX_PARALLEL`,
+  `CODEX_COUNCIL_STALL_SECS`, or `CODEX_COUNCIL_MODEL_ROUTING`;
+- a contract epoch mismatch.
+
+On success it prints the plan, one line per role:
+
+```
+[codex-council] staging OK: ABS_RUNDIR (4 roles; max parallel 6) version=<plugin version>
+[codex-council] selection plan: inherited-lens: native inheritance
+[codex-council] selection plan: boundary-checks: routed (model future-vega-2033, effort brisk); revalidated at launch
+[codex-council] selection plan: design-judgment: native-model effort (effort adaptive-v2 on native model future-orion-2032); revalidated at launch
+[codex-council] selection plan: user-pinned: explicit override (model acme/future-review-2034:rev2); unverified: not in the discovered catalog; forwarded unchanged
 ```
 
-## State key and locking
+Only after exit 0 does Claude launch, in a separate background call whose
+redirects create `out.md` and `err.log`. The launch repeats the same checks
+on each input's lexical parent directory (`dirname(abspath(...))`, never
+resolved through symlinks first) before reading any content, then parses,
+validates authoring, and resolves selections.
 
-```mermaid
-flowchart LR
-    Root["project root"] --> RootHash["sha256 root prefix"]
-    Env["explicit or auto session key"] --> SessionHash["optional sha256 session prefix"]
-    Role["role id"] --> RoleKey["literal legacy id or sha256 key"]
+The private-directory predicate, shared with the replies directory and the
+snapshot reader, is: not a symlink, the right file type, owned by the
+effective user, and no group or other permission bits. `mktemp -d` (mode
+0700) is the prescribed way to get one, but the check does not demand exact
+owner bits, so an owned 0500 directory passes. A rejected directory is
+abandoned, never repaired: the recovery demands a new `mktemp -d`,
+`--discover` there, both files re-written with the new `snapshot_id`, and the
+preflight. A roles defect found by the preflight is fixed by rewriting the
+whole file in the same directory; any refusal at launch starts over in a new
+directory, because the launch's redirects have already claimed this one.
 
-    RootHash --> Filename
-    SessionHash --> Filename
-    RoleKey --> Filename
-    Filename --> State["$XDG_STATE_HOME/codex-council/key__role.json"]
-    State --> Lock["state-file lock"]
-    Lock --> Load["load stored thread id"]
-    Load --> Resume["codex exec resume"]
-    Resume --> Match{"thread id matches?"}
-    Match -->|yes| Save["save session metadata"]
-    Match -->|no| Adopt["adopt new thread id + warn"]
-    Adopt --> Save
-    Resume -->|stale| Fresh["clear state + fresh codex exec"]
-    Fresh --> Save
-    Resume -->|"auth, quota, model-rejected,<br/>or other terminal failure"| Keep["keep the saved thread<br/>tagged failure, nothing substituted"]
-    Resume -->|"429 / 5xx / replay-safe stall"| Retry["one retry on the same thread"]
-```
+**Key decisions and why.**
 
-## Resume footgun mitigation
+- *Private directories, not predictable `/tmp` names.* The report and
+  context can hold sensitive content, and a predictable name can be
+  pre-created or symlinked by another local user who could then read the
+  report or plant a fake `CODEX_COUNCIL_DONE` line.
+- *Recovery never suggests chmod or mkdir.* A hint that could be satisfied
+  on the same predictable path would defeat the privacy the gate exists for.
+- *One launch per directory, checked before the launch.* The launch
+  command's redirects truncate `out.md` and `err.log` before the runner
+  starts, so relaunching into a running council's directory would tear its
+  report, log, and follower apart. Only a step that runs before the launch
+  command can refuse in time.
+- *Preflight and launch are separate calls.* In one combined call a refused
+  preflight would not stop the launch's redirects.
+- *Inputs live in files.* A large role array and multiline context stay out
+  of the shell, where a stray quote would break the call before the runner
+  could diagnose it.
 
-`codex exec resume <id>` parses `<id>` as a UUID first (UUIDs take
-precedence if it parses). Verified against the installed codex-cli: a
-valid-but-unknown UUID **errors** (`no rollout found for thread id ...
-(code -32600)`, exit 1) and is handled by the stale-resume path (clear
-state + restart fresh); only a value that is **not** a valid UUID is
-treated as a thread *name* and silently starts a **new** thread (rc==0,
-fresh `thread.started`). The council only ever stores real UUIDs emitted
-by `thread.started`, so the silent-spawn case is unreachable via normal
-state — the mismatch check is **defense-in-depth** against a
-corrupt/hand-edited state file or future CLI drift. After every resume
-the script extracts `thread.started.thread_id`; if it doesn't equal the
-requested ID, it adopts the new ID and warns. It does **not** re-run —
-the turn has already completed on the new thread; re-running burns
-tokens for no benefit.
+**Limits.**
 
-Model and effort overrides ride on the parent command
-(`codex exec -C <root> [-m <model>] [-c model_reasoning_effort="<effort>"] resume <id>`),
-so a resumed attempt carries the same dispatch values as a fresh one. A
-resumed thread that sends none runs on the current native configuration, and
-a `[model-rejected]` failure on resume keeps the stored thread even when its
-text also looks stale (see
-[Failure classification](#failure-classification)).
+- **One launch per directory is not enforced atomically.** `--discover` and
+  the preflight refuse a directory holding `out.md`, `err.log`, or
+  `replies/`, but the launch itself does not check: its own redirects create
+  the first two before it starts, and direct CLI use accepts an existing
+  `replies/`. A launch without a preflight, a combined call that ignores the
+  preflight's exit, or two launches racing into one directory are not
+  prevented. "A fresh directory per launch" is the required workflow, not a
+  one-use token.
 
-Per-role state is protected by a POSIX advisory lock keyed by
-`(project, session key, role)`. Role IDs longer than the formerly accepted
-32-character range use a deterministic SHA-256 filename component, avoiding
-the operating system's filename-length limit while preserving the full role ID
-in memory, reports, prompts, and state metadata. Short-role state filenames
-remain unchanged for thread-continuity compatibility. The session key is explicit when
-`CODEX_COUNCIL_SESSION_KEY` is set; otherwise the runner auto-detects common
-host-session identifiers such as Claude session ids, `CODEX_THREAD_ID`,
-`TERM_SESSION_ID`, `TMUX_PANE`, `STY`, and `VSCODE_PID`. That gives normal
-multi-terminal isolation without requiring the user to export anything, while
-calls from the same terminal/session keep continuity. `VSCODE_PID` is the
-lowest-priority fallback and is **window-scoped**, not tab-scoped: multiple
-integrated terminals in one VS Code window share it and therefore share role
-threads — set `CODEX_COUNCIL_SESSION_KEY` (or rely on a finer identifier such as
-`TERM_SESSION_ID`) to isolate those. The lock is held across
-the whole load/resume-or-fresh/save retry loop, not just individual file reads
-or writes, so two council processes cannot concurrently resume the same role
-thread and then last-writer-wins the state file. Different roles still run in
-parallel. State files are written through the shared `_atomic_write_private`
-(a 0600 temp file, fsync, `os.replace`), so a crash or power loss never leaves
-a truncated state file that `load_session` would read as no thread.
+## Launch and fan-out
 
-## Failure-class tagging
+**Purpose.** Run any number of roles with bounded concurrency, without two
+councils ever driving the same role thread at once, and deliver each
+result as soon as it settles.
 
-Recognized failure classes are tagged before they hit the report;
-unrecognized failures carry the raw stderr untagged:
+![d24-fanout: the resolved panel, one task per role, permits, the nonblocking lock probe, waiting outside the permit, the attempt loop, the completion callback, and gathered results](docs/diagrams/d24-fanout.png)
 
-| Tag | Behavior |
+*d24-fanout — Launch and bounded fan-out. Source:
+[d24-fanout.mmd](docs/diagrams/d24-fanout.mmd).*
+
+**How it works.** After the dispatch line and the model-selection lines, the
+runner starts one task per role behind an `asyncio.Semaphore` of
+`CODEX_COUNCIL_MAX_PARALLEL` permits (default 6). A task holding a permit
+makes a nonblocking probe for its role's continuity lock. If another
+council holds it, the task closes the lock file, releases the permit, and
+waits outside it (0.1 s, doubling to 2 s) before trying again, so unrelated
+roles run and a large panel never holds one open lock file per queued role.
+A task holding both runs the role's attempt loop; a retry's 5-second
+backoff keeps both. As each role settles, a completion callback writes its
+reply file, then its `K/N` line. `asyncio.gather(..., return_exceptions=True)`
+collects every result, so one role's exception never cancels its siblings;
+it is reported as `[orchestrator-exception]`. Completion lines arrive in
+completion order; the report keeps the input order.
+
+**Key decisions and why.**
+
+- *A local concurrency choice.* The roles are separate processes, so no
+  Codex setting describes their concurrency, and the limit is not a promise
+  about provider capacity.
+- *Probe, don't block, on role locks.* A blocked task would hold a permit
+  and a file descriptor while doing nothing.
+
+**Limits.** Lock acquisition is probe-based, not FIFO-fair: a long-waiting
+role can lose a race to a newer one. Each role has exactly one lock file.
+There is no partial cancellation: a running role cannot be stopped or
+steered on its own.
+
+## Thread continuity
+
+**Purpose.** Let a role resume its Codex thread across councils in the same
+project and host session when Claude deliberately reuses its id, and never
+let two councils race on one thread.
+
+![d25-continuity: project root, session scope, and role id form the state key; the key names the role lock and the state file; the attempt resumes or starts fresh and saves when the outcome allows](docs/diagrams/d25-continuity.png)
+
+*d25-continuity — Thread identity and persistence. Source:
+[d25-continuity.mmd](docs/diagrams/d25-continuity.mmd).*
+
+**How it works.** The state key combines a hash of the project root (the Git
+top level, else the launch directory), an optional hash of the session
+scope, and the role component: the role id itself when it has 32 characters
+or fewer, else a fixed-size SHA-256 key. The scope is
+`CODEX_COUNCIL_SESSION_KEY` when set, else the first host session id found
+among `CLAUDE_CODE_SESSION_ID`, `CLAUDE_SESSION_ID`, `CODEX_THREAD_ID`,
+`TERM_SESSION_ID`, `TMUX_PANE`, `STY`, and `VSCODE_PID`, else none (project-wide
+state). State lives in `$XDG_STATE_HOME/codex-council/<key>.json` beside a
+POSIX lock file, and the lock is held across the role's whole
+load, resume-or-fresh, save, and retry loop. State files are written
+atomically (a 0600 temporary file, fsync, rename) and hold the thread id and
+bookkeeping (role id, project path, session key, update time), never a
+model, effort, or selection.
+
+| Outcome | What happens to saved state |
 |---|---|
-| `[auth]` | Never clears state, never retries — caller must fix auth then re-run. Recognized structurally (HTTP 401 on a failure record or as an anchored status, or an `authentication_error` / `invalid_api_key` error type or code) as well as by Codex's sign-in wording, and checked first, so a 401 whose message also looks stale never clears a thread |
-| `[quota]` | Terminal: never retried, never clears state. A usage, quota, or credit limit — a structured `error.code` or `error.type` such as `insufficient_quota`, `usage_limit_reached`, or `credit_balance_exhausted`, or codex's "hit your usage limit" prose — even when it carries HTTP 429. A usage limit codex names for one model also ends with the `[model-rejected]` action for the model that was sent |
-| `[retriable:rate-limit]` / `[retriable:5xx]` | One retry after a 5s backoff (MAX_RETRY_ATTEMPTS=2; bumping that adds 10s, 20s, … via `backoff *= 2`) |
-| `[model-rejected]` | Terminal: never retried, no substitute model, and it never clears saved thread state, even when its text also looks stale. Codex rejected the model this invocation sent (or the natively configured one); the message quotes Codex and names one action for the model that was refused |
-| `[retriable:stall]` | Output-inactivity watchdog fired before any side-effect-capable tool work began (only agent_message, reasoning, or Codex `error` notice items such as the resume advisory, or none); replay is safe, so it retries through the same shared budget as rate-limit/5xx |
-| `[stall]` | Watchdog fired after tool work began — terminal, because an automatic replay could duplicate side effects; a buffered agent_message without turn completion is quoted but never auto-promoted to success |
-| `[orchestrator-exception]` | A role's coroutine raised — siblings still complete via `gather(..., return_exceptions=True)` |
-| `[orchestrator-bug]` | A role task returned something other than a `RoleResult`; reported as a failure instead of crashing the report |
-| (untagged stale) | Detected via `STALE_RESUME_MARKERS` on the resume path only; that role's state is cleared and a fresh thread is started for it only |
+| no saved thread id | a fresh invocation |
+| fresh success with a final message and an emitted thread id | the new id is saved |
+| fresh success with a final message but no thread id | the reply is kept; nothing is saved |
+| any failed fresh invocation | its new id is not saved |
+| resume success whose emitted id is non-empty and different | the new id is adopted and saved, even without a final message, with a warning |
+| resume success with no emitted id, or the same id | saved when a final message arrived |
+| stale resume (the thread is gone) | the state is cleared best-effort (only if it still holds that id), a fresh invocation runs in the same attempt with the same prompt, and the role's result carries `STALE_RESUME_WARNING` |
+| a stall after a completed turn (ok with a warning) | the emitted or resumed id is saved best-effort |
+| auth, quota, model rejection, rate limit, 5xx, any other stall, or untagged failure | state is left as it was |
+| a save that fails | the reply is kept, with a warning |
 
-A stall verdict is structured (from the watchdog), not text-sniffed, and is
-handled before any text classification: partial stale- or auth-looking stderr
-in a killed run must neither classify the failure nor clear resume state. A
-stalled attempt whose turn had already completed (final
-agent_message buffered plus turn completion) is not a failure at all — the
-kill hit a wedged shutdown, so the reply is kept as success with the warning
-"codex wedged after completing its turn; process terminated" and state is
-saved best-effort. Every other non-zero exit is classified by
+`codex exec resume <id>` parses `<id>` as a UUID first. A valid but unknown
+UUID errors (`no rollout found for thread id … (code -32600)`, exit 1) and
+takes the stale path; only a value that is not a UUID is read as a thread
+*name* and silently starts a new thread. Codex emits UUIDs, but the runner
+stores any non-empty emitted id and does not check its shape, so the
+adoption check above is the guard for an unexpected id or a hand-edited
+state file. Adoption never re-runs the turn: it already completed on the new
+thread.
+
+Model and effort overrides sit on the parent command
+(`codex exec -C <root> [-m <model>] [-c model_reasoning_effort="<effort>"] resume <id>`)
+and are sent on every invocation, never persisted. A resumed thread that
+sends none runs on the current native configuration, and Codex's advisory
+about the changed model is kept verbatim as a role warning
+(`codex reported: …`), never parsed into a stronger claim.
+
+A thread is the only thing a council carries into a later one on its own.
+A resumed role gets its saved conversation (Codex may have compacted it)
+plus the complete current prompt, and the collaboration brief tells it that
+the current context and workspace outrank its earlier turns. Other roles'
+replies, Claude's reconciliation, and earlier run directories reach a
+council only when Claude stages them into `context.md`.
+
+**Key decisions and why.**
+
+- *Session-scoped by default.* Separate terminals in one repository should
+  not share role threads, and nothing needs to be exported for that.
+- *Readable short ids, hashed long ones.* Short ids keep state and reply
+  filenames readable; hashing avoids the per-component filename limit
+  without limiting id length.
+- *No selection in state.* A routed choice must never become a role's
+  default for a later council.
+- *Fresh by default, reuse by choice.* The skill names each id for its
+  task's subject and lens, so an unrelated later council starts fresh roles
+  and inherits nothing it was not given; Claude reuses an id only when that
+  role's own earlier work helps.
+- *A lost thread is reported, not hidden.* A stale resume reruns the role
+  fresh rather than failing it, and the warning tells Claude the role no
+  longer holds its earlier turns.
+
+**Limits.** `VSCODE_PID` is window-scoped, so integrated terminals in one VS
+Code window share role threads unless `CODEX_COUNCIL_SESSION_KEY` separates
+them. A role id reused for a different lens resumes a thread built for the
+old one, and changing a role's label or instruction does not reset it; the
+skill mints a new id instead. Omitting a role does not retire its thread,
+and saved threads never expire. A resumed role's exact recall of its
+earlier turns is not guaranteed.
+
+## One attempt and its watchdog
+
+**Purpose.** Run one `codex exec`, notice a silent process without imposing
+a run-level deadline, and make sure codex's process group does not outlive
+the attempt.
+
+![d26-attempt: the prompt and argv, codex exec in its own process group, the output pumps and activity clock, the watchdog, live process-tree discovery, the termination owner, the post-exit drain, the group-only sweep, and the CodexRun result](docs/diagrams/d26-attempt.png)
+
+*d26-attempt — One subprocess attempt and its watchdog. Terminating a live
+codex reaches its descendants; after codex exits, only its group can be
+reached. Every invocation has its own copy of all of this. Source:
+[d26-attempt.mmd](docs/diagrams/d26-attempt.mmd).*
+
+**How it works.** The runner starts `codex exec` with
+`start_new_session=True`, so codex leads a process group that belongs to
+this attempt alone. The group signals and the sweep below reach codex and
+any child that stays in that group. Current codex starts each tool command
+in its own session and each MCP server in its own process group, so
+terminating a live codex also signals the groups of its descendants, found
+by walking parent links in one bounded `ps` snapshot (see Limits). Both pumps start before the prompt is written
+to stdin. They read stdout and stderr in fixed-size chunks (never
+line-buffered reads, which would cap JSONL line sizes), buffer the raw bytes,
+and decode once at the end, so a UTF-8 sequence split across chunks
+survives. Every byte on either stream resets this attempt's activity clock;
+another role's output never keeps this one alive. The stdout pump also
+scans JSONL events for the stall policy's flags. A non-blank line that is
+not a JSON object (it does not decode, is too deeply nested, holds an
+out-of-range number, or is another JSON value) could hide an item, so it
+counts as unknown work, and so does an item whose type is not a string;
+scanning never raises, so it never stops a pump. If a pump or the prompt
+writer still ends with an exception, the output may be incomplete: the
+attempt counts as unsafe to replay and carries the warning `an output
+reader or the prompt writer failed (<ExcType>); the output may be
+incomplete, so a stall is not retried`.
+
+The council has no total elapsed-time or run-level deadline. The
+output-inactivity watchdog fires after `CODEX_COUNCIL_STALL_SECS` seconds of
+silence on both streams (default 1800; a positive integer overrides it; 0
+disables it; anything else is a usage error). Every termination path, the
+watchdog, cancellation, and errors alike, goes through one idempotent owner.
+While codex is alive, the owner first takes one bounded `ps` snapshot of
+codex's descendants; then it sends SIGTERM to the group and to those
+descendants' groups (and by pid to any other descendant outside codex's
+group), waits briefly, and sends SIGKILL the same way.
+
+The runner watches codex's own exit rather than its pipes, because on some
+Python versions `Process.wait()` also waits for the pipes, which a
+descendant can hold open forever. After the exit, the pipes get
+`POST_EXIT_DRAIN_SECS` (10 s) to reach EOF, counted from the observed exit
+and never extended by more output. If they are still open at the bound, the
+runner terminates the group and stops the pumps, whoever holds the pipes;
+the output already read is kept with the warning `codex exited but its
+process group kept its output open; the group was terminated`. When the
+attempt ends, whatever is left in the group is swept. Codex has exited by
+then, so its descendants can no longer be found by walking the tree: the
+drain's termination and the sweep reach codex's own group only. A
+cancellation at any point, the drain and the sweep included, still tears the
+group down; SIGINT, SIGTERM, and SIGHUP cancel the whole fan-out and end the
+run without the `CODEX_COUNCIL_DONE` line.
+
+![d27-stall: a stalled attempt becomes ok with a warning, a terminal stall, or a retriable stall](docs/diagrams/d27-stall.png)
+
+*d27-stall — Classify a stalled attempt. Source:
+[d27-stall.mmd](docs/diagrams/d27-stall.mmd).*
+
+A stall is a structured verdict, handled before any text classification, so
+stale- or auth-looking stderr from a killed process can neither classify the
+failure nor clear saved state. If the turn had completed and a final message
+was buffered, the kill hit a wedged shutdown: the reply is kept as success
+with the warning "codex wedged after completing its turn; process
+terminated" and state is saved best-effort. Otherwise, if every item started
+or completed was an agent message, reasoning, or a Codex `error` notice (the
+resume advisory, for example), every non-blank stdout line was a JSON
+object, and neither an output reader nor the prompt writer failed, replay
+is safe and the attempt is `[retriable:stall]`. Any other item type, known
+or not (or not a string), a line that is not a JSON object, or such a
+failure makes it a terminal `[stall]`, and a buffered message without turn
+completion is quoted but never promoted to success.
+
+**Key decisions and why.**
+
+- *Bytes, not progress.* `codex exec --json` suppresses message and
+  reasoning deltas, so a working role can be byte-silent for long stretches;
+  the watchdog's claim is output-inactivity recovery only, never semantic
+  wedge detection. Codex's own provider stream-idle timeout
+  (`model_providers.<id>.stream_idle_timeout_ms`) stays a separate control in
+  the user's Codex configuration.
+- *No run-level deadline.* A long, productive role must not be killed for
+  taking long; the host bounds a run's lifetime.
+- *Conservative replay.* An unknown item type, a line that is not a JSON
+  object, or output a failed reader never saw counts as work, because
+  replaying a turn that did work could repeat its side effects.
+
+**Limits.** Terminating a live codex (the watchdog, a cancellation, or
+`--reap`) reaches its process group and the groups of its current
+descendants. A process that left the tree before that (its parent exited
+and it was reparented), or that sits outside the group and still holds
+codex's pipes when the drain bound ends after codex exited on its own,
+cannot be traced and keeps running until it ends. A process that keeps writing
+keepalive bytes resets the clock without making progress. Setting the
+watchdog to 0 permits an indefinitely silent role.
+
+## Failure classification and recovery
+
+**Purpose.** Name why a role failed, retry only what a retry can fix, and
+never lose a valid saved thread to a misread message.
+
+![d28-failures: the ordered classifier, terminal failures, stale resume and its fresh invocation with a prior continuity lost warning, the retry budget, the 5-second backoff, and exhausted failures](docs/diagrams/d28-failures.png)
+
+*d28-failures — Failure classification and saved-thread action. Source:
+[d28-failures.mmd](docs/diagrams/d28-failures.mmd).*
+
+**How it works.** A failed invocation that is not a stall is classified by
 `_failure_verdict` in one order, identical on the fresh and resume paths:
-auth → quota → anchored 429/5xx → model rejected → stale (resume only) →
-substring retriable fallback → untagged. Auth is recognized from structured
-evidence (HTTP 401, or an `authentication_error` / `invalid_api_key` type or
-code) as well as sign-in prose. Retry eligibility is structured data, like
-the stall verdict: `FailureVerdict.retriable` (rate-limit or 5xx) and the
-replay-safe stall set `RoleResult.retriable`, and `_run_role_attempts`
-reads only that flag. The tag text is for the report; an untagged failure
-keeps Codex's own text, which may itself begin with `[retriable:` without
-ever causing a retry.
 
-Classification uses stderr plus structured Codex JSONL stdout error
-events (`type:error`, `turn.failed`). The **primary** retriable signal
-is the numeric HTTP status parsed out of the JSONL error body
-(`_extract_statuses`), recognized in any *anchored* form — the JSON
-`"status"` key, a `HTTP NNN` / `status NNN` keyword, or a canonical
-reason phrase like `NNN Too Many Requests` — but never a bare digit run
-(so a `429` inside a thread id is ignored). The keyword needs at least one
-separator before the digits, and the requested model id is masked before
-every status scan, so a model named `future-status401` or
-`future-status:429` never reads as a status: status `429` → rate-limit,
-`500–599` → 5xx (so a `529` "overloaded" is retried even though it is
-not in the literal marker list). An anchored retriable status is trusted
-ahead of the stale-resume check, so a transient `HTTP 429 … thread not
-found` on resume backs off and retries instead of discarding the thread. A structured status is authoritative — when a
-non-retriable status (e.g. `400`) is present, the looser substring
-markers are **suppressed**, so a bare `429` or `service unavailable`
-echoed inside a 400 body no longer forces a wrong retry. A non-retriable
-error *type* (`invalid_request_error`) suppresses the fallback the same
-way, covering the 4xx bodies codex sometimes surfaces without a numeric
-status. The substring
-markers (`RATE_LIMIT_MARKERS` / `TRANSIENT_5XX_MARKERS`) are a
-**fallback** for failures that carry no parseable status — covering the
-current codex-cli code-less rewrites such as `experiencing high demand`,
-`server overloaded`, `selected model is at capacity`, and
-`request was throttled` (`backend overloaded` is retained as a legacy
-fallback for older codex/provider text). That coverage is deliberately
-scoped: an echoed status phrase inside an `error.message` has no
-provenance and remains a known limit, not something the markers try to
-guess at. Usage/quota
-limits are **not** retriable: a plan cap does not clear within a 5s
-backoff. The recognized forms, structured codes read from the failure
-records and codex's usage-limit prose, are tagged `[quota]` ahead of the
-anchored parser, because a provider can send them with HTTP 429. JSONL
-parsing intentionally skips malformed and non-object events while preserving
-later valid agent messages.
+auth → quota → anchored 429/5xx → model rejected → stale (resume only) → substring retriable fallback → untagged
 
-## Liveness: no run-level deadline, output-inactivity watchdog
+The evidence is the collected failure text (stderr plus the messages of
+Codex's JSONL `error` and `turn.failed` events) and those structured
+records; agent messages, reasoning, and tool output are never read.
 
-The council has no total elapsed-time or run-level deadline. A role may run
-indefinitely while its codex subprocess continues producing output bytes —
-the runner never ends it, though the host that launched it (for example a
-Claude Code background task) bounds its lifetime — and `codex exec` itself
-imposes no run-level timeout either. Separately, each codex subprocess has an
-**output-inactivity
-watchdog** based only on the time since its most recent stdout/stderr byte.
-Incremental readers pump both pipes in fixed-size chunks (never
-line-buffered reads, which would cap unrestricted JSONL line sizes) and stamp
-a shared last-activity clock; raw bytes are buffered per stream and decoded
-once after the pumps join, so a UTF-8 sequence split across chunks survives.
-After `CODEX_COUNCIL_STALL_SECS` seconds of council-visible silence
-(default 1800; positive integer override; 0 disables; anything else is a
-usage error, exit 2), the watchdog terminates that attempt — SIGTERM, a short
-grace, then SIGKILL to the process group, with every termination path
-converging on a single idempotent owner so watchdog, cancellation, and error
-teardowns never race — and the stall policy in the table above decides the
-outcome. Setting 0 may again permit an indefinitely silent role.
+| Tag | Recognized from | Retry | Saved thread |
+|---|---|---|---|
+| `[auth]` | HTTP 401 on a record or as an anchored status, an `authentication_error` or `invalid_api_key` type or code, or Codex's sign-in wording | never | kept, even when the text also looks stale |
+| `[quota]` | a structured code such as `insufficient_quota`, `usage_limit_reached`, or `credit_balance_exhausted`, or Codex's "hit your usage limit" wording, even with HTTP 429 | never | kept |
+| `[retriable:rate-limit]`, `[retriable:5xx]` | an anchored status 429 or 500–599, else a code-less substring marker | once, after 5 s | kept |
+| `[model-rejected]` | positive evidence that Codex refused the model this invocation sent | never, and no substitute | kept, even when the text also looks stale |
+| `[retriable:stall]` | the watchdog, before any side-effect-capable item | once, through the same budget | kept |
+| `[stall]` | the watchdog, after tool work began | never | kept |
+| `[orchestrator-exception]` | the role's own task raised | never | as it was |
+| untagged | anything else, with the collected failure text | never | kept |
 
-The watchdog measures **bytes, not progress**: current codex `exec --json`
-suppresses agent-message/reasoning `item.started` events and all
-token/exec-output deltas, so a healthy role can be byte-silent for long
-stretches — the claim is output-inactivity recovery only, never semantic
-wedge detection. Codex's per-provider stream-idle timeout
-(`model_providers.<id>.stream_idle_timeout_ms`, 5 min default, bounded
-retries) is a separate provider-side control left to the user's Codex
-configuration: it is provider-scoped and the active provider id
-varies, so the council cannot target it portably. `start_new_session=True` on
-each `codex exec` puts it in its own process group, so a Ctrl+C (or any
-other cancellation) sends SIGTERM, waits briefly, then sends SIGKILL
-to the group; any shell commands codex itself spawned for tool calls
-are also reaped. SIGINT/SIGTERM/SIGHUP to the council process cancel
-the fan-out first, then exit without emitting the final
-`CODEX_COUNCIL_DONE` sentinel; reply files already written stay on disk.
-POSIX-only.
+Stale resume (`STALE_RESUME_MARKERS`, resume path only) clears that role's
+state best-effort and runs a fresh invocation within the same attempt, and
+the role's result carries `STALE_RESUME_WARNING` ("saved Codex thread
+unavailable; started fresh with the current context (prior continuity
+lost)"); `_run_role_attempts` keeps it on a retried attempt's result too.
+A role gets at most `MAX_RETRY_ATTEMPTS = 2` attempts with one
+`RETRY_BACKOFF_SECS = 5` wait, shared by rate limits, 5xx, and replay-safe
+stalls. Retry eligibility is structured data: `FailureVerdict.retriable` or
+the stall verdict sets `RoleResult.retriable`, and `_run_role_attempts`
+reads only that flag, so Codex text that merely begins with `[retriable:`
+never forces a retry.
+
+The primary retriable signal is a numeric HTTP status parsed by
+`_extract_statuses` in an anchored form only: the JSON `"status"` key, an
+`HTTP NNN` or `status NNN` keyword, or a canonical reason phrase such as
+`NNN Too Many Requests`, never a bare digit run, and with the requested model
+id masked first, so a model named `future-status:429` never reads as a
+status. A structured non-retriable status (a 400, say) or an
+`invalid_request_error` type suppresses the substring markers, so a `429`
+echoed inside a 400 body cannot force a retry. The substring markers
+(`RATE_LIMIT_MARKERS`, `TRANSIENT_5XX_MARKERS`) are a fallback for failures
+with no parseable status, such as Codex's code-less rewrites
+(`experiencing high demand`, `server overloaded`,
+`selected model is at capacity`, `request was throttled`).
+
+A model rejection needs positive evidence: a structured `model_not_found`
+whose `param` is `model` or absent, with status 400, 404, or none, or one of
+Codex's complete sentences about the model this invocation sent ("The
+'<m>' model is not supported when using Codex with …", observed live; "The
+model '<m>' does not exist or you do not have access to it", the API's
+wording, not yet observed live), in single quotes or
+backticks, bare or after Codex's `unexpected status NNN …: ` prefix. Bare
+"not found" or "not supported", the "Model metadata for … not found"
+advisory, and "Selected model is at capacity" never qualify, and neither
+does a record whose structured `param` is `reasoning.effort`,
+`model_reasoning_effort`, or `service_tier`, or unstructured text naming one
+of those outside the quoted model id. Such a record is set aside on its own,
+never hiding a separate rejection, so a rejected effort alone stays
+untagged. The `[model-rejected]` message quotes Codex, says no substitute
+was tried, and ends with one action for the model that was refused: re-run
+without `model`, `effort`, and `selection` for a routed model; change or
+remove the pin for a user model pin; or ask the user to update the Codex
+configuration or name a model to pin for the natively configured model.
+That last case covers a native-effort role, an effort-only pin, native
+inheritance, and a routed or pinned model equal to the `native_model` its
+decision recorded, since an inheriting re-run would send the same model
+again. A `[quota]` for a usage limit for one model ("You've hit your usage
+limit for <label>. Switch to another model now, or try again at <time>.")
+ends with the same action for the model that was sent; its label is never
+compared with the model.
+
+**Key decisions and why.**
+
+- *Quota before the anchored parser.* A provider can send a usage limit as
+  HTTP 429, which would otherwise be retried; a plan cap does not clear in
+  5 seconds.
+- *Anchored retriable status before stale recovery.* A transient
+  `HTTP 429 … thread not found` on resume backs off and retries instead of
+  discarding a valid thread.
+- *Model rejection before stale recovery.* A rejection whose text also
+  mentions a missing thread must never clear a valid saved thread.
+- *No automatic model hopping.* A replay could repeat a writer role's side
+  effects, and the choice of another model belongs to the user and Claude.
+- *One verdict per attempt.* The verdict is computed once and formatted
+  as-is, so the printed tag always matches the branch taken.
+
+**Limits.** A status phrase echoed inside an error message has no provenance
+and is not guessed at. A usage-limit label is the server's name for the
+limit, so an inheriting re-run can meet the same `[quota]`.
+
+## Progress, replies, and reconciliation
+
+**Purpose.** Let Claude use finished work early without ever mistaking an
+early signal for the end of the run.
+
+![d29-progress: the runner writes a reply file then logs its completion line; the follower relays it to Claude's provisional work; the final report and the host's completion notification lead to reconciliation](docs/diagrams/d29-progress.png)
+
+*d29-progress — Progress, replies, follower, and reconciliation. Source:
+[d29-progress.mmd](docs/diagrams/d29-progress.mmd).*
+
+**How it works.** stdout carries only the report; everything else is
+best-effort stderr through one diagnostics helper: the dispatch line, the
+model-selection lines, per-attempt start lines, retry and adoption notices,
+stall lines, warnings, the heartbeat, completion lines, and the final
+`[codex-council] CODEX_COUNCIL_DONE ok=N total=M elapsed=…s exit=X
+version=…` sentinel. A dead stderr switches diagnostics to a no-op sink and
+never changes a result. The heartbeat runs every `min(1800, stall_secs //
+3)` seconds with a 300-second floor while the watchdog is on (600 s at the
+default, 1800 s when disabled) and lists completed, active, and queued
+roles, each active role's `quiet=Ns` (or `retry-wait`), the watchdog, and the
+plugin version.
+
+As each role settles (ok, failed, or crashed), the runner writes its report
+section to `RUNDIR/replies/<key>.md` through the atomic private writer and
+only then logs `[codex-council] K/N <id>: ok|FAILED (<secs>s)` with
+` reply=<path>` appended. The same renderer produces `out.md`'s section, so
+an early read and the final report cannot disagree. A one-line header
+records the id, status, elapsed time, attempts, selection, and the sent
+values. Reply files are best-effort: if `replies/` is not a private
+directory the runner owns, it logs one warning and the completion lines
+carry no `reply=`. Finished replies survive an interruption; the
+interrupted run has no sentinel, and because the shell opened `out.md`
+before the runner started and the report is written at the end, `out.md`
+may then be empty or partial.
+
+`--follow RUNDIR` is a read-only companion for Claude Code's Monitor tool.
+It relays the actionable `[codex-council` lines of `err.log` with a flush
+per line: dispatch, model selection, warnings, completions, retries,
+stalls, and the terminal line. Per-attempt start lines and the heartbeat
+stay in `err.log` unless `--verbose` is given, so a three-role happy path is
+six Monitor events. It drops a completion line whose `reply=` path is not
+directly inside `RUNDIR/replies/`, the only shape the runner prints.
+
+| Follower exit | Meaning |
+|---|---|
+| 0 | a terminal line (`CODEX_COUNCIL_DONE`, `interrupted by …`, `runner aborted …`) or a terminal state in `status.json` |
+| 1 | its stdout has no reader |
+| 2 | usage error: the directory is wrong or not private |
+| 3 | no dispatch line within 120 s |
+| 4 | the runner is gone or stopped ticking (see [Run liveness](#run-liveness-and-recovery)) |
+| 5 | its own parent went away |
+
+Monitor watches expire after at most 30 minutes interactively and 10 in
+`claude -p`; the skill re-arms the same follower only on that expiry while
+the task still runs, and a re-armed follower replays earlier lines, which
+Claude skips. Without Monitor, an interactive session uses a one-shot
+10-minute session cron that runs `--status`, and `claude -p` or a subagent
+keeps its turn open by running the follower as a foreground call with a
+600000 ms timeout.
+
+Claude may read a settled role's reply, tell the user, and act on work that
+does not depend on other roles. The final verdict, cross-role conflicts, and
+writes that overlap a running writer wait for the full report, which Claude
+reads after Claude Code's background-task notification.
+
+**Key decisions and why.**
+
+- *Reply file first, then its line.* A `reply=` path always points at a
+  complete file.
+- *The follower never writes.* It cannot forge the sentinel or change a run.
+- *The host's notification ends the run.* Roles run as the user and can
+  append to `err.log`, and no same-user check can authenticate those lines,
+  so `CODEX_COUNCIL_DONE` and the follower's exit are progress signals only.
+  Diagnostic lines that embed foreign text escape ` reply=` as
+  ` reply\x3d`, so the follower's filter never hides one.
+- *Fewer notifications.* Routine start lines and heartbeats are for humans
+  reading `err.log`; every relayed line costs Claude context.
+
+**Limits.** Follower exit 0 means the run ended, not that every role
+succeeded; the report Summary and the sentinel's `ok=N total=M exit=X` say
+which. A running role cannot be steered.
+
+## Run liveness and recovery
+
+**Purpose.** Notice within seconds when the runner itself dies, and within
+minutes when it stops responding, without adding a supervisor process, and
+give Claude a safe way to clean up.
+
+![d30-liveness: the runner writes status.json; the follower checks the runner every 2 seconds; a gone runner leads to --status, --reap, and a re-run in a new directory; a runner that is not responding is stopped through its tracked task first](docs/diagrams/d30-liveness.png)
+
+*d30-liveness — Runner liveness and recovery. A runner that is still
+present is never reaped: its tracked task is stopped first. Source:
+[d30-liveness.mmd](docs/diagrams/d30-liveness.mmd).*
+
+**How it works.** The launch publishes `RUNDIR/status.json` (mode 0600,
+replaced atomically) on every role transition and at least every 15 s from
+its event loop: the runner's pid and start identity, its state (`running`,
+then `done`, `interrupted`, or `aborted` with the exit code), a tick
+(sequence and time), and per role the state (`queued`, `active`,
+`retry-wait`, `settled`), attempt, live codex pid and process group with the
+leader's start identity, last-output time, and outcome. A process identity
+is the pid plus its `ps -o lstart=` start time, read in the C locale and UTC
+by one `ps` call bounded to 2 s; the same pid with another start time is
+another process. A `ps` that fails or times out means "cannot tell", never
+"gone". Readers ignore unknown fields and treat a field of the wrong type,
+or a number no float can hold, as unknown. A failed write is reported once
+in `err.log` (`status.json not written (<error>); ...`) and removes the file
+an earlier write left, so readers find no usable file rather than an ageing
+tick; a later successful write brings it back. The removal is best-effort:
+if it fails too, the old file keeps its last tick, so recovery reads a stale
+tick after that `err.log` line as a publishing failure, not a stuck
+runner.
+
+After dispatch the follower checks every 2 s. A runner whose pid is gone, or
+now belongs to another process, with no terminal line gives one
+`[codex-council-follow] runner gone: pid=<pid>; unfinished=<ids>; live codex groups=<pgids or none>; run --status`
+line and exit 4. A runner that is present but has published no tick for
+120 s gives one `runner not responding` line (and `runner responding again`
+on recovery), and exit 4 at 300 s. A wall-clock jump far beyond the
+monotonic time between polls is treated as a system suspend and restarts
+the tick age. With no usable `status.json` for 30 s after dispatch (or
+after its last usable read), the follower prints one
+`[codex-council-follow] runner liveness unavailable: no usable status.json; following err.log only; run --status`
+line and keeps relaying `err.log`, checking the runner again once a usable
+file appears. The follower also exits 5 when its own parent disappears.
+
+`--status RUNDIR` prints about ten lines of facts and exits 0: the runner's
+state (`running`, `not responding`, `gone`, `done`, `interrupted`,
+`aborted`, or `unknown`) with its pid and tick age, the settled count, up
+to `STATUS_ROLE_LINES` (5) unfinished roles, one line each with its state,
+attempt, quiet seconds, and codex pid, then a count of any others, the live
+codex groups when the runner is gone, and one `next:` action.
+Quiet seconds count from the last output recorded at the latest status
+tick, so they can read up to 15 s high; the heartbeat in `err.log` uses the
+live value.
+`--follow` and `--status` only read. `--reap RUNDIR` is the explicit
+cleanup action, and it acts only when the runner is gone: it sends SIGTERM,
+then SIGKILL, to each recorded group whose leader still has the recorded
+start identity and to the groups and processes descended from that live
+codex (one `ps` snapshot, as in d26), reports and leaves alone every other
+group (and never its own), and never touches saved threads, replies, or
+other files. Otherwise it refuses with exit 1. Claude then re-runs the
+unfinished roles in a new directory. A runner that is present but not
+responding is never reaped: Claude stops the council's tracked background
+task, confirms with `--status` that the runner is gone, and only then runs
+`--reap` if live codex groups remain (the skill's recovery triage, which
+decides the runner's state before any rule about role output).
+
+**Key decisions and why.**
+
+- *Facts, not health.* A fresh tick shows the runner's event loop is
+  turning; `quiet=Ns` shows time since the last output byte (in `--status`,
+  as of the latest tick). Neither shows that a role is making progress, so
+  no command claims health.
+- *Identity, never command-line matching.* A pid alone can be reused, and a
+  command line can be imitated; a pid plus its start time cannot.
+- *Recovery stays with Claude.* A supervisor process would need its own
+  supervision; the follower already watches the run, and `--reap` is an
+  explicit, verified action.
+
+**Limits.**
+
+- A SIGKILLed runner cannot clean up by itself; its codex groups keep
+  running until `--reap` ends them.
+- A runner killed within milliseconds of starting a codex process can leave
+  a group it never recorded.
+- `--status` lists only the recorded codex process groups; `--reap` also
+  ends the tool sessions a still-running codex started, but not a process
+  that was already reparented away from the codex process tree.
+- `--reap` leaves alone a group whose leader has exited, even if other
+  members remain, because it cannot verify them.
+- Liveness checks need a `ps` that supports `-A` and `-o pid,pgid,stat,lstart`;
+  without one, commands report "unknown" instead of guessing.
+
+## Testing and supported behavior
+
+The suite needs no Codex install and no network. `tests/fake_codex.py` puts
+a scripted `codex` (app-server and exec) with synthetic model ids on `PATH`,
+and `tests/council_testlib.py` holds the shared helpers. Test modules follow
+the concerns above: runner internals and the documentation contract
+(`test_codex_council.py`), the CLI end to end (`test_codex_council_cli.py`),
+discovery (`test_model_discovery.py`), selection (`test_model_selection.py`),
+reply files and overrides (`test_replies_and_overrides.py`), liveness
+(`test_liveness.py`), and the module layout (`test_module_layout.py`).
+`tests/liveness_scenarios.py` runs the liveness scenarios end to end against
+the real CLI and prints a verdict and the follower's line count for each: the
+happy path, a descendant holding codex's output open, a SIGKILLed runner, a
+stopped runner, a follower whose parent dies, a role that is silent for a
+while and then succeeds, and a role whose stdout carries lines no JSON
+parser accepts while its stderr keeps printing.
+
+The documentation tests (`DocsContractTests` in `test_codex_council.py`)
+check three kinds of thing:
+
+- *Against the runner.* Every runner command a document shows parses with
+  the runner's own parser; every example of discovery output, preflight
+  plans, `err.log` selection lines, report and reply lines, and failure
+  messages is regenerated from the runner and compared; the settings table,
+  the run-directory tables, the command table, the timing constants DESIGN
+  states, and the code names it mentions are compared with the code; and
+  `ContextRecipeBehaviorTests` runs the context recipes' fail-closed
+  skeleton in a shell.
+- *Wording pins.* SKILL.md keeps its sections in workflow order and stays
+  inside its compaction budget (17,500 characters and under 500 lines), and
+  named phrases that carry the launch, follow, recovery, and reconciliation
+  rules stay present in SKILL.md, the references, README, and DESIGN, as do
+  the recovery triage's rule order (runner state before role output) and
+  the absence of product model names and effort ladders. A pin catches a
+  deleted or reworded rule, not an inaccurate new sentence, so changed prose
+  is still reviewed against the code.
+- *Diagrams and the PDF.* Every `.mmd` has a PNG with the same id and draws
+  at most nine nodes; every PNG is opaque (no alpha channel) and fits the
+  PDF's page box at 60% scale or more; DESIGN embeds every diagram once,
+  captioned with its id and a link to its source, and README embeds d00 and
+  d10 and indexes all of them; the PDF build's link rules send links to
+  in-document anchors or GitHub; and the committed PDF has only web and
+  in-document links, bookmarks for at least each document, and at least
+  one image per diagram.
+
+Nothing checks that the committed PNGs and PDF were rebuilt after their
+sources changed: run `scripts/build-docs.sh --diagrams` after editing a
+`.mmd` file and `scripts/build-docs.sh` after editing any document it
+includes.
+
+CI runs the suite on Python 3.12, 3.13, 3.14, and 3.15 and a pinned ruff.
+`tests/test_live_codex.py` holds opt-in smoke tests against a real, signed-in
+Codex (`CODEX_COUNCIL_LIVE_TESTS=1`). `scripts/build-docs.sh` rebuilds
+`docs/codex-council.pdf` and, with `--diagrams`, re-renders the PNGs from
+their `.mmd` sources.
+
+## Non-goals
+
+- **No role catalog, default role count, model roster, or model ranking.**
+- **No peer messaging between roles** and no steering of a running role.
+- **No worktree isolation.** Roles share the working tree.
+- **No run-level deadline and no partial cancellation.**
+- **No runner model-hopping.** After `[model-rejected]`, or a `[quota]` for
+  one model's usage limit, the runner neither substitutes a model nor
+  replays the role; Claude re-runs only that role in a new directory or asks
+  the user.
+- **No `codex debug models` fallback.** It is a second, experimental catalog
+  format that cannot observe layered configuration, managed defaults, or the
+  account, so it would add weaker evidence without closing a gap.
+- **No post-run `thread/read` telemetry.** Its model and effort fields
+  describe current or persisted configuration, not what served a turn.
+- **No cross-run cache.** Each run discovers fresh evidence.
+- **No profile forwarding.** The app-server refuses `--profile`, so discovery
+  could not describe a profiled worker, and flattening a profile into `-c`
+  overrides would change provenance.
+- **No recommended-default routing.** The catalog's default marker is shown
+  as `recommended` and never picked automatically.
+- **No supervisor process.** Liveness is published by the runner and read by
+  the follower and `--status`.

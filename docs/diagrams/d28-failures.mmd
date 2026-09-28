@@ -1,0 +1,29 @@
+flowchart TD
+    Failed(["Failed invocation,<br/>not a stall"])
+    Classify{"Ordered classifier<br/>first match wins"}
+    Terminal(["Terminal failure<br/>state left as it was"])
+    Stale["Stale resume:<br/>clear state best-effort"]
+    Fresh["Fresh invocation<br/>in the same attempt,<br/>warning: prior continuity lost"]
+    Stall(["[retriable:stall]<br/>from d27"])
+    Budget{"First of the<br/>two attempts?"}
+    Backoff["Wait 5 s,<br/>then the next attempt"]
+    Exhausted(["Failed after two attempts<br/>state left as it was"])
+
+    Failed --> Classify
+    Classify -->|"auth, quota,<br/>model-rejected, untagged"| Terminal
+    Classify -->|"stale, resume only"| Stale
+    Stale --> Fresh
+    Fresh -->|"on failure"| Classify
+    Classify -->|"429 or 5xx"| Budget
+    Stall --> Budget
+    Budget -->|"yes"| Backoff
+    Budget -->|"no"| Exhausted
+
+    classDef step fill:#ffffff,stroke:#475569,color:#0f172a
+    classDef decision fill:#f8fafc,stroke:#475569,color:#0f172a
+    classDef soft fill:#fef9c3,stroke:#a16207,color:#0f172a
+    classDef stop fill:#fee2e2,stroke:#b91c1c,color:#0f172a
+    class Failed,Fresh step
+    class Classify,Budget decision
+    class Stale,Stall,Backoff soft
+    class Terminal,Exhausted stop
