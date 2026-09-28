@@ -526,7 +526,7 @@ the preflight there. It checks each automatic selection against
 `ABS_RUNDIR/model-snapshot.json` and prints the plan, one line per role:
 
 ```
-[codex-council] staging OK: ABS_RUNDIR (4 roles; max parallel 6) version=1.0.0
+[codex-council] staging OK: ABS_RUNDIR (4 roles; max parallel 6) version=1.0.1
 [codex-council] selection plan: inherited-lens: native inheritance
 [codex-council] selection plan: boundary-checks: routed (model future-vega-2033, effort brisk); revalidated at launch
 [codex-council] selection plan: design-judgment: native-model effort (effort adaptive-v2 on native model future-orion-2032); revalidated at launch
@@ -677,6 +677,15 @@ session falls back to a one-shot session-cron wake-up, while `claude -p` or
 a subagent, whose final response would end the council, keeps its turn open
 by running the same follower as a foreground command and re-running it after
 each timeout; either way progress surfaces without a shell polling loop.
+
+## 1.0.1 changes
+
+- Documentation only; the runner, skill contract (epoch 3), and behavior
+  are unchanged from 1.0.0.
+- DESIGN.md gains a module-layout diagram, and its state and discovery
+  diagrams now show the failures that keep a saved thread (auth, quota,
+  model-rejected) and the SIGTERM/SIGHUP teardown of discovery. README's
+  architecture diagram names the module behind each step.
 
 ## 1.0.0 changes
 

@@ -4176,7 +4176,7 @@ class DocsContractTests(unittest.TestCase):
             "schema": council_discovery.SNAPSHOT_SCHEMA,
             "snapshot_id": snapshot_id,
             "created_at": "2026-09-27T12:00:00Z",
-            "plugin_version": "1.0.0",
+            "plugin_version": "1.0.1",
             "status": "ok",
             "problems": [],
             "context": {"codex_cli_version": "9.9.9"},
@@ -5133,11 +5133,11 @@ class DocsContractTests(unittest.TestCase):
         unavailable = council_discovery._discovery_summary({
             "snapshot_id": "110d7ec3207fb567", "status": "unavailable",
             "problems": ["rpc_error:model/list:-32601"],
-            "plugin_version": "1.0.0",
+            "plugin_version": "1.0.1",
         })
         self.assertIn(unavailable[0] + "\n", raw)
         # Every first line carries the version, as the reference says.
-        self.assertIn("version=1.0.0;", unavailable[0])
+        self.assertIn("version=1.0.1;", unavailable[0])
         self.assertIn(
             "discovery snapshot not written (<error>); version=<plugin "
             f"version>; {council_discovery.NO_EVIDENCE_GUIDANCE}.",
@@ -5765,7 +5765,7 @@ class DocsContractTests(unittest.TestCase):
             with self.subTest(where=where):
                 self.assertEqual(description, self.CANONICAL_DESCRIPTION)
         self.assertEqual(manifest["keywords"], self.CANONICAL_KEYWORDS)
-        self.assertEqual(manifest["version"], "1.0.0")
+        self.assertEqual(manifest["version"], "1.0.1")
         self.assertEqual(council_common._plugin_version(), manifest["version"])
         # plugin.json owns the version; the marketplace entry points at it.
         self.assertNotIn("version", entry)
@@ -5848,7 +5848,7 @@ class DocsContractTests(unittest.TestCase):
         # One release section replaces the per-release v0.9/v0.10 notes.
         self.assertNotRegex(readme, r"v0\.(?:9|10)\.0 behavior change")
         self.assertEqual(self._json_file(*self.MANIFEST_PARTS)["version"],
-                         "1.0.0")
+                         "1.0.1")
 
     def test_design_documents_the_model_selection_architecture(self):
         design = self._read_repo_file("DESIGN.md")

@@ -1,7 +1,7 @@
 {
   "name": "codex-council",
   "displayName": "Codex Council",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Independent cross-model verification and collaboration for Claude Code: Claude briefs task-specific OpenAI Codex roles with decision-complete context, routes each role to a runtime-discovered model and reasoning effort or your native Codex configuration, checks their evidence, and reconciles the findings into one result.",
   "author": {"name": "ehzawad"},
   "homepage": "https://github.com/ehzawad/codex-council",
