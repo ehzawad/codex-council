@@ -450,9 +450,9 @@ SIGTERM, then SIGKILL, to each recorded codex process group whose leader is
 still this run's codex (same pid and start time), leaves any other group
 alone, prints what it did, and never touches saved threads, replies, or
 other files. Then re-run the unfinished roles in a new directory. Current
-codex runs each tool command in its own session, outside codex's group, so
-a tool command still running at that point keeps running until it ends;
-neither `--status` nor `--reap` sees it.
+codex runs each tool command in its own session, outside codex's group;
+`--reap` also ends those sessions by walking the live codex process's
+children. `--status` lists only the recorded codex groups.
 
 Without the Monitor tool, what works depends on whether the end of your
 turn ends the host. Never poll with a shell `sleep` loop in either case.
@@ -756,11 +756,12 @@ structured and handled before any text classification, so stale- or
 auth-looking fragments in a killed run's stderr neither classify the failure
 nor clear resume state.
 
-Each codex process group belongs to one attempt. Its signals and sweep
-reach codex and any child that stays in the group. Current codex starts
+Each codex process group belongs to one attempt. Current codex starts
 each tool command in its own session and each MCP server in its own process
-group, so a tool command that is running when codex is terminated (by the
-watchdog, a cancellation, or `--reap`) keeps running until it ends. Once
+group, so when the runner terminates a live codex (the watchdog, a
+cancellation, or `--reap`) it first takes one bounded `ps` snapshot, walks
+codex's descendants, and signals their groups too. A tool process whose
+codex already exited on its own has been reparented and cannot be traced. Once
 codex exits, its pipes get 10 seconds to reach EOF. If they are still open
 then (a process that inherited codex's output still holds them), the runner
 terminates the attempt's process group and stops reading; the reply already

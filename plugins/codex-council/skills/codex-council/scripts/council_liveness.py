@@ -117,12 +117,13 @@ RUN_DIR_RECOVERY = (
 # ---------- process identity ----------
 
 def _process_table(pid=None):
-    """{pid: (pgid, stat, start identity)} from one bounded ps call.
+    """{pid: (pgid, stat, start identity, ppid)} from one bounded ps call.
 
     All processes, or only `pid`. None when ps cannot tell (missing, timed
     out, or reporting an error); an empty table means no such process.
     """
-    args = ["-o", "pid=", "-o", "pgid=", "-o", "stat=", "-o", "lstart="]
+    args = ["-o", "pid=", "-o", "ppid=", "-o", "pgid=", "-o", "stat=",
+            "-o", "lstart="]
     args += ["-p", str(pid)] if pid is not None else ["-A"]
     try:
         done = subprocess.run(
@@ -136,14 +137,55 @@ def _process_table(pid=None):
     table = {}
     for line in done.stdout.splitlines():
         fields = line.split()
-        if len(fields) < 4:
+        if len(fields) < 5:
             continue
         try:
-            table[int(fields[0])] = (int(fields[1]), fields[2],
-                                     " ".join(fields[3:]))
+            table[int(fields[0])] = (int(fields[2]), fields[3],
+                                     " ".join(fields[4:]), int(fields[1]))
         except ValueError:
             continue
     return table
+
+
+def descendant_targets(root_pid, table=None):
+    """What else to signal so root_pid's whole process tree ends.
+
+    Returns (groups, pids) from one ps snapshot, walking parent links down
+    from root_pid while it is alive. A descendant that leads its own
+    process group (current codex starts each tool command in its own
+    session) contributes that group; any other descendant outside root's
+    group is named by pid. Root's own group, this process's group, and ids
+    <= 1 are never included. A descendant already reparented away from the
+    tree (its parent exited) cannot be traced.
+    """
+    table = _process_table() if table is None else table
+    if not table or root_pid not in table:
+        return [], []
+    children = {}
+    for pid, entry in table.items():
+        children.setdefault(entry[3], []).append(pid)
+    skip = {table[root_pid][0], os.getpgrp(), 0, 1}
+    tree, stack = set(), [root_pid]
+    while stack:
+        for child in children.get(stack.pop(), ()):
+            if child not in tree:
+                tree.add(child)
+                stack.append(child)
+    groups = sorted({table[pid][0] for pid in tree
+                     if table[pid][0] in tree and table[pid][0] not in skip})
+    pids = sorted(pid for pid in tree
+                  if table[pid][0] not in skip and table[pid][0] not in groups)
+    return groups, pids
+
+
+def signal_targets(groups, pids, sig):
+    """Best-effort signal to each group and pid; vanished ones are fine."""
+    for pgid in groups:
+        with contextlib.suppress(OSError):
+            os.killpg(pgid, sig)
+    for pid in pids:
+        with contextlib.suppress(OSError):
+            os.kill(pid, sig)
 
 
 def process_start_identity(pid):
@@ -190,7 +232,7 @@ def _codex_groups(view, table):
         pgid = role["pgid"]
         if role["state"] == "settled" or pgid is None:
             continue
-        members = sorted(pid for pid, (group, state, _) in table.items()
+        members = sorted(pid for pid, (group, state, *_) in table.items()
                          if group == pgid and not state.startswith("Z"))
         if not members:
             continue
@@ -206,21 +248,24 @@ def _codex_groups(view, table):
     return verified, unverified
 
 
-def _terminate_group(pgid):
-    """SIGTERM a process group, wait up to REAP_GRACE_SECS, then SIGKILL."""
-    try:
-        os.killpg(pgid, signal.SIGTERM)
-    except OSError:
-        return
+def _terminate_group(pgid, table=None):
+    """End a codex process group and its tool sessions; return how many
+    other groups and processes (its descendants) were signalled.
+
+    SIGTERM to all, wait up to REAP_GRACE_SECS for the codex group, then
+    SIGKILL whatever of them remains.
+    """
+    groups, pids = descendant_targets(pgid, table)
+    signal_targets([pgid, *groups], pids, signal.SIGTERM)
     deadline = time.monotonic() + REAP_GRACE_SECS
     while time.monotonic() < deadline:
         try:
             os.killpg(pgid, 0)
         except OSError:
-            return
+            break
         time.sleep(0.05)
-    with contextlib.suppress(OSError):
-        os.killpg(pgid, signal.SIGKILL)
+    signal_targets([pgid, *groups], pids, signal.SIGKILL)
+    return len(groups) + len(pids)
 
 
 # ---------- status.json: the runner's writer ----------
@@ -773,10 +818,12 @@ def reap_command(run_dir):
         return 1
     verified, unverified = _codex_groups(view, table)
     for role_id, pgid, members in verified:
-        _terminate_group(pgid)
+        tools = _terminate_group(pgid, table)
         count = f"{len(members)} process{'es' if len(members) != 1 else ''}"
+        extra = (f" and {tools} more process group"
+                 f"{'s' if tools != 1 else ''} it started" if tools else "")
         _print_stdout(f"reaped {_report_inline(role_id)}: process group "
-                      f"{pgid} ({count}) terminated")
+                      f"{pgid} ({count}){extra} terminated")
     for role_id, pgid, _ in unverified:
         _print_stdout(f"left alone {_report_inline(role_id)}: process group "
                       f"{pgid} is not verifiably this run's codex")

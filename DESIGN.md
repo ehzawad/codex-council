@@ -681,8 +681,9 @@ has its own copy of all of this. Source:
 `start_new_session=True`, so codex leads a process group that belongs to
 this attempt alone. The group signals and the sweep below reach codex and
 any child that stays in that group. Current codex starts each tool command
-in its own session and each MCP server in its own process group, so those
-are outside it (see Limits). Both pumps start before the prompt is written
+in its own session and each MCP server in its own process group, so
+terminating a live codex also signals the groups of its descendants, found
+by walking parent links in one bounded `ps` snapshot (see Limits). Both pumps start before the prompt is written
 to stdin. They read stdout and stderr in fixed-size chunks (never
 line-buffered reads, which would cap JSONL line sizes), buffer the raw bytes,
 and decode once at the end, so a UTF-8 sequence split across chunks
@@ -745,12 +746,12 @@ quoted but never promoted to success.
   JSON object, counts as work, because replaying a turn that did work could
   repeat its side effects.
 
-**Limits.** The group signals and the sweep reach codex and the children
-that stay in its process group, nothing else. Current codex runs each tool
-command in its own session, so a tool command that is running when codex is
-terminated (by the watchdog, a cancellation, or `--reap`) keeps running
-until it ends; the same holds for any process outside the group that still
-holds codex's pipes when the drain bound ends. A process that keeps writing
+**Limits.** Terminating a live codex (the watchdog, a cancellation, or
+`--reap`) reaches its process group and the groups of its current
+descendants. A process that left the tree before that (its parent exited
+and it was reparented), or that sits outside the group and still holds
+codex's pipes when the drain bound ends after codex exited on its own,
+cannot be traced and keeps running until it ends. A process that keeps writing
 keepalive bytes resets the clock without making progress. Setting the
 watchdog to 0 permits an indefinitely silent role.
 
@@ -999,10 +1000,9 @@ directory.
   running until `--reap` ends them.
 - A runner killed within milliseconds of starting a codex process can leave
   a group it never recorded.
-- `--status` and `--reap` see only the recorded codex process groups.
-  Current codex runs each tool command in its own session, so a tool
-  command still running when its codex is reaped keeps running until it
-  ends, and neither command lists it.
+- `--status` lists only the recorded codex process groups; `--reap` also
+  ends the tool sessions a still-running codex started, but not a process
+  that was already reparented away from the codex process tree.
 - `--reap` leaves alone a group whose leader has exited, even if other
   members remain, because it cannot verify them.
 - Liveness checks need a `ps` that supports `-A` and `-o pid,pgid,stat,lstart`;

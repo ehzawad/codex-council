@@ -192,8 +192,10 @@ from council_liveness import (  # noqa: E402
     TICK_GIVE_UP_SECS,
     TICK_WARN_SECS,
     RunStatus,
+    descendant_targets,
     follow,
     reap_command,
+    signal_targets,
     status_command,
 )
 from council_selection import (  # noqa: E402
@@ -911,8 +913,15 @@ async def _process_exit(proc, timeout=None):
 
 
 async def _terminate_process_group(proc, pgid=None):
-    """Best-effort SIGTERM then SIGKILL to the codex process group."""
+    """Best-effort SIGTERM then SIGKILL to the codex process group and to
+    the tool sessions a still-running codex started (descendant_targets)."""
+    tools = ([], [])
+    if proc.returncode is None:
+        with contextlib.suppress(Exception):
+            tools = await asyncio.to_thread(descendant_targets, proc.pid)
+
     def _signal_group(sig):
+        signal_targets(*tools, sig)
         if pgid is not None:
             try:
                 os.killpg(pgid, sig)

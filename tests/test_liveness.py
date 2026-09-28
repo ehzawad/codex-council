@@ -670,6 +670,59 @@ class ReapCommandTests(unittest.TestCase):
         self.assertNotIn("reaped", out)
 
 
+    def test_reap_also_ends_tool_sessions_the_codex_started(self):
+        path = os.path.join(self.run_dir, "tool.pid")
+        leader = subprocess.Popen([sys.executable, "-c", textwrap.dedent(f"""\
+            import subprocess, sys, time
+            tool = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                start_new_session=True, stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            with open({path!r}, "w") as f:
+                f.write(str(tool.pid))
+            time.sleep(60)
+            """)], start_new_session=True)
+        self.addCleanup(lambda: leader.poll() is None and leader.kill())
+        deadline = time.monotonic() + 10
+        while not os.path.exists(path) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        with open(path, encoding="utf-8") as f:
+            tool = int(f.read())
+        self.addCleanup(lambda: pid_running(tool) and os.kill(
+            tool, signal.SIGKILL))
+        _status(self.run_dir, pid=_dead_pid(), roles={"ours": {
+            "state": "active", "pid": leader.pid, "pgid": leader.pid,
+            "start_identity":
+                council_liveness.process_start_identity(leader.pid)}})
+        code, out = self._reap()
+        self.assertEqual(code, 0, out)
+        self.assertIn("and 1 more process group it started terminated", out)
+        leader.wait(timeout=5)
+        self.assertTrue(pid_gone(tool))
+
+
+class DescendantTargetsTests(unittest.TestCase):
+    def test_walks_the_tree_and_names_own_groups_and_stray_pids(self):
+        own = os.getpgrp()
+        table = {
+            100: (100, "S", "t", 1),      # codex, leading its group
+            101: (101, "Ss", "t", 100),   # tool command in its own session
+            102: (101, "S", "t", 101),    # that tool's child
+            103: (100, "S", "t", 100),    # in codex's group: killpg covers it
+            104: (999, "S", "t", 100),    # in a group it does not lead
+            105: (own, "S", "t", 100),    # in this process's group: never
+            200: (200, "S", "t", 1),      # unrelated
+        }
+        self.assertEqual(council_liveness.descendant_targets(100, table),
+                         ([101], [104]))
+
+    def test_unknown_root_or_table_means_nothing_to_signal(self):
+        self.assertEqual(council_liveness.descendant_targets(7, {}), ([], []))
+        self.assertEqual(
+            council_liveness.descendant_targets(7, {8: (8, "S", "t", 1)}),
+            ([], []))
+
+
 # ---------- the runner's codex lifecycle ----------
 
 class CodexLifecycleTests(unittest.IsolatedAsyncioTestCase):
@@ -754,6 +807,36 @@ class CodexLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 time.monotonic() < deadline:
             await asyncio.sleep(0.02)
         await asyncio.sleep(0.5)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertTrue(pid_gone(self._descendant()))
+
+    _TOOL_SESSION = (
+        "descendant(start_new_session=True, stdin=subprocess.DEVNULL,"
+        " stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n")
+
+    async def test_a_stall_kill_also_ends_tool_sessions_codex_started(self):
+        # Current codex runs each tool command in its own session, outside
+        # its process group: killing the group alone would leave it running.
+        cmd = self._script(self._TOOL_SESSION
+                           + "import time\ntime.sleep(60)\n")
+        with patch.dict(os.environ, {"CODEX_COUNCIL_STALL_SECS": "1"}), \
+                contextlib.redirect_stderr(io.StringIO()):
+            run = await codex_council._run_codex_subprocess(cmd, "p", "tool")
+        self.assertTrue(run.stalled)
+        self.assertTrue(pid_gone(self._descendant()))
+
+    async def test_cancellation_also_ends_tool_sessions_codex_started(self):
+        cmd = self._script(self._TOOL_SESSION
+                           + "import time\ntime.sleep(60)\n")
+        task = asyncio.create_task(
+            codex_council._run_codex_subprocess(cmd, "p", "tool"))
+        deadline = time.monotonic() + 10
+        while not os.path.exists(self.pid_file) and \
+                time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+        await asyncio.sleep(0.2)
         task.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await task
