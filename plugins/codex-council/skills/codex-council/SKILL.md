@@ -31,7 +31,7 @@ settings, or workflow mode to run a council.
 The skill is general-purpose with a programmatic center of gravity: project
 implementation, computer science, software and ML/AI engineering, DevSecOps,
 debugging and testing, and technical research. There is no built-in role
-catalog; roles come from the work in front of you.
+catalog.
 
 ## Disambiguation when the requested agent workflow is unclear
 
@@ -158,9 +158,11 @@ See [panel-design.md](references/panel-design.md).
 `selection`). The script rejects any other key and any duplicated key; if
 validation fails, rewrite the whole file with one Write call.
 
-- `id` — `^[a-z0-9_-]+$`, derived from this work's lens. Reusing an id
-  resumes that role's Codex thread, so reuse one only for a continuous lens
-  and task.
+- `id` — `^[a-z0-9_-]+$`, named for this task's subject and lens, so an
+  unrelated later council never lands on it. A new id starts a fresh Codex
+  thread; reusing one from earlier in this session resumes that role's
+  thread with everything it saw. Reuse an id only when that role's own
+  earlier work helps this turn.
 - `label` — a one-line title shown in the report.
 - `instruction` — a JSON array of short strings, one sentence per item,
   naming the claim or deliverable, its likely failure modes, and where to
@@ -184,8 +186,10 @@ verification question and the reviewed state; your conclusions labeled as
 claims to check, with the strongest evidence against them; then the
 in-flight work, recent working context at high fidelity, live primary
 evidence, older durable context as a faithful summary, and open unknowns.
-The script never truncates context; select for relevance. Never write an
-empty context file; with nothing to stage, write a self-contained question.
+The script never truncates context; select for relevance. Earlier council
+results are history like any other: stage only what bears on this turn.
+Never write an empty context file; with nothing to stage, write a
+self-contained question.
 See [context-staging.md](references/context-staging.md).
 
 **Two Bash calls.** Run the pre-flight in the foreground; launch only after
@@ -319,16 +323,6 @@ anything; it settles the runner's state before any role-output rule.
 
 ## Step 6 — Reconcile
 
-The report looks like this:
-
-```
-# Codex Council — N/M roles responded (T.Ts)
-
-## Summary
-- **<Label>** [<id>]: ok (routed: model <m>, effort <e>) — 12.3s
-- **<Label>** [<id>]: FAILED — 0.4s
-```
-
 Lead with the result. Reconcile against the acceptance
 criteria and the state the roles reviewed: for each material claim, say
 whether it is supported, contradicted, or still unverified, citing the
@@ -349,5 +343,5 @@ one), or ask the user to change the pin, update their Codex configuration,
 or name a model to pin (a refused pin, or a native model that inheriting
 would send again); never edit Codex configuration yourself.
 
-Stage one role's findings into fresh context only for the roles that need
-them, and repeat affected checks after changes. One round is usually enough.
+Stage findings for a follow-up only for the roles they bear on, and repeat
+affected checks after changes. One round is usually enough.

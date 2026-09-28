@@ -92,9 +92,11 @@ the same expectations. The brief frames the role as an independent
 cross-model check: the user's goal, requirements, and constraints are
 authoritative, while your account of the project state, your conclusions,
 and what was already tried are claims to verify against the workspace. It
-also tells the role the run is non-interactive, not to spawn subagents
-unless its instruction asks for them, and to say what it checked and what
-remains unverified. The instruction can therefore focus on the lens itself.
+ranks any earlier turns in the role's thread below the current context and
+the workspace. It also tells the role the run is non-interactive, not to
+spawn subagents unless its instruction asks for them, and to say what it
+checked and what remains unverified. The instruction can therefore focus on
+the lens itself.
 
 ## Verification instructions
 
@@ -370,11 +372,11 @@ thread id, never a model or effort, so no override carries over to a later
 invocation. Codex itself records the model a thread ran with in its own
 thread metadata, but that record is not an override either: a follow-up
 that reuses a role id and sends no override runs on the current native
-configuration, not on the model the thread was recorded with (verified on
-codex-cli 0.157.1). Automatic choices are made again from a new discovery for each council;
-repeat an explicit pin when continuity matters. When a resumed thread runs
-on a different model than it was recorded with, Codex prints an advisory,
-and the role's report shows it verbatim as a warning.
+configuration, not on the model the thread was recorded with. Automatic
+choices are made again from a new discovery for each council; repeat an
+explicit pin when continuity matters. When a resumed thread runs on a
+different model than it was recorded with, Codex prints an advisory, and
+the role's report shows it verbatim as a warning.
 
 ### Requested, sent, and reported
 
@@ -409,11 +411,17 @@ on work that cannot collide with a running role that may write.
 
 ## Follow-up rounds and continuity
 
-Each `(project, host session, role id)` keeps its Codex thread. Reuse an id
-only when the lens and task are continuous, so the role builds on what it
-already knows; otherwise mint a new id. Current staged evidence always
-overrides what a thread remembers. A reused id may carry a different
-selection in a later council, since overrides apply per invocation.
+Each `(project, host session, role id)` keeps its Codex thread. A resumed
+role gets its saved conversation, which Codex may have compacted, plus this
+call's complete prompt: its earlier prompts, answers, and tool results can
+still shape it, and exact recall is not guaranteed. Default to a new id
+named for the task. Reuse an id only when the lens and task are continuous
+and that role's own earlier work helps; mint a new id when the task has
+changed, when you want an independent reassessment, or when the role's
+history no longer helps. Changing the label or instruction does not reset a
+reused id. The collaboration brief tells every role that the current
+context outranks earlier turns. A reused id may carry a different selection
+in a later council, since overrides apply per invocation.
 
 When one round's findings should inform another role, stage the findings,
 decisions, and open questions into fresh context and re-invoke only the roles

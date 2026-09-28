@@ -668,7 +668,13 @@ class StatusCommandTests(unittest.TestCase):
         lines = self._lines()
         self.assertRegex(lines[0], r"^runner: not responding \(pid \d+ "
                                    r"present; last status tick 20\ds ago\)$")
-        self.assertIn("never reap it", lines[-1])
+        # Recovery triage rule 3: stop the tracked task first, reap only
+        # once --status shows the runner gone.
+        self.assertEqual(
+            lines[-1],
+            "next: unless err.log says status.json not written, stop the "
+            "council's background task, confirm with --status that the "
+            "runner is gone, then --reap if live codex groups remain")
 
     def test_gone_runner_names_live_groups_and_the_reap(self):
         sleeper, identity = _sleeper_group(self)

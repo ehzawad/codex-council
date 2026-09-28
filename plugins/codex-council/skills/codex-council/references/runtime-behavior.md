@@ -704,29 +704,38 @@ as Claude session IDs, `CODEX_THREAD_ID`, `TERM_SESSION_ID`, `TMUX_PANE`, `STY`,
 and `VSCODE_PID`. Multiple integrated terminals in the same VS Code window share
 `VSCODE_PID`; set `CODEX_COUNCIL_SESSION_KEY` when they need isolation.
 
-Stale resumes restart only the affected role. Reuse a role ID only when its lens
-and task remain semantically continuous; otherwise mint a new task-specific ID.
-Current staged context and verified workspace evidence override thread memory.
-A role ID of 32 characters or fewer is its own filename component; a longer
-ID uses a deterministic SHA-256 role key to avoid filesystem component
-limits.
+A new role ID starts a fresh thread, and reusing one resumes that role's
+thread, so mint a new task-specific ID unless the role's own earlier work
+helps this turn. Omitting a role from a later council does not retire its
+thread, and saved threads do not expire: a later council in the same scope
+that uses the ID again resumes it. The collaboration brief tells every role
+that where earlier turns in its thread conflict with the current staged
+context or the workspace, the current context and workspace win.
+
+A resume that finds its saved thread unavailable (a stale thread) clears
+that state and restarts only that role, fresh, in the same attempt and with
+the same prompt. The role's result carries the warning `saved Codex thread
+unavailable; started fresh with the current context (prior continuity
+lost)`, so its reply file and `out.md` show it; `err.log` names the stale
+thread.
 
 `CODEX_COUNCIL_SESSION_KEY` explicitly overrides automatic scoping, and the
 same value in several terminals shares their role threads. When no host
 session id is detectable, state is project-wide:
-`{project-hash}__{role-key}.json`.
+`{project-hash}__{role-key}.json`. A role ID of 32 characters or fewer is
+its own filename component; a longer ID uses a deterministic SHA-256 role
+key to avoid filesystem component limits.
 
 Model and effort overrides apply per invocation, and the council never
 persists them: its state files record the thread id, never a model or
 effort. Codex keeps its own record of the model a thread ran with in the
-thread's metadata, but that record is not reapplied as an override. On
-codex-cli 0.157.1, overrides the runner places
-before `resume` apply to the resumed turn. A resumed role that sends none
-runs on the current native configuration, not on the model its thread was
-recorded with. When the two differ, Codex prints an advisory ("This session
-was recorded with model ... but is resuming with ..."), and the report quotes
-it verbatim as a `codex reported:` warning without drawing any stronger
-conclusion from it.
+thread's metadata, but that record is not reapplied as an override.
+Overrides the runner places before `resume` apply to the resumed turn. A
+resumed role that sends none runs on the current native configuration, not
+on the model its thread was recorded with. When the two differ, Codex prints
+an advisory ("This session was recorded with model ... but is resuming with
+..."), and the report quotes it verbatim as a `codex reported:` warning
+without drawing any stronger conclusion from it.
 
 ## Retries and long runs
 

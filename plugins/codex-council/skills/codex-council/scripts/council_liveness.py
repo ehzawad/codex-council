@@ -785,8 +785,9 @@ def _status_lines(view, now, table):
     elif tick_age is None or tick_age >= TICK_WARN_SECS:
         age = "never" if tick_age is None else f"{tick_age:.0f}s ago"
         label = f"not responding (pid {view.pid} present; last status tick {age})"
-        action = ("check the council's background task; the runner process "
-                  "is present, so never reap it")
+        action = (f"unless err.log says {STATUS_FILENAME} not written, stop "
+                  "the council's background task, confirm with --status that "
+                  "the runner is gone, then --reap if live codex groups remain")
     else:
         label = f"running (pid {view.pid}; status tick {tick_age:.0f}s ago)"
         action = "keep following; do not relaunch"

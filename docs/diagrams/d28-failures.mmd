@@ -3,7 +3,7 @@ flowchart TD
     Classify{"Ordered classifier<br/>first match wins"}
     Terminal(["Terminal failure<br/>state left as it was"])
     Stale["Stale resume:<br/>clear state best-effort"]
-    Fresh["Fresh invocation<br/>in the same attempt"]
+    Fresh["Fresh invocation<br/>in the same attempt,<br/>warning: prior continuity lost"]
     Stall(["[retriable:stall]<br/>from d27"])
     Budget{"First of the<br/>two attempts?"}
     Backoff["Wait 5 s,<br/>then the next attempt"]

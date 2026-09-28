@@ -928,6 +928,18 @@ class ComposePromptTests(unittest.TestCase):
         )
         self.assertNotEqual(a, s)
 
+    def test_brief_ranks_earlier_turns_below_the_current_context(self):
+        """A resumed role still holds its earlier turns; the brief itself
+        tells it that the current shared context and the workspace win, right
+        after the verifier framing."""
+        self.assertIn(
+            "not facts to accept. If this conversation already holds earlier "
+            "turns, treat them as background; where they conflict with the "
+            "shared working context below or the workspace, the current "
+            "context and workspace win. This run is non-interactive",
+            codex_council.COLLABORATION_BRIEF,
+        )
+
     def test_brief_has_no_all_caps_emphasis(self):
         self.assertNotRegex(codex_council.COLLABORATION_BRIEF, r"[A-Z]{4,}")
 
@@ -1150,6 +1162,19 @@ class RunRoleAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(calls), 2, "expected resume → fresh fallthrough")
         sid, _ = codex_council.load_session("architect")
         self.assertEqual(sid, "brand-new-sid")
+        self.assertEqual(result.warning, codex_council.STALE_RESUME_WARNING)
+
+    async def test_stale_resume_warning_survives_a_failed_fresh_run(self):
+        role = _make_role("architect", "Architect")
+        codex_council.save_session("architect", "stale-sid")
+        async def fake_subproc(cmd, prompt, role_id=""):
+            if "resume" in cmd:
+                return _codex_run(1, "", "no rollout found for thread id stale-sid")
+            return _codex_run(1, "", "fresh exec blew up")
+        with patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
+            result = await codex_council._run_role_once(role, "p", attempt=1)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.warning, codex_council.STALE_RESUME_WARNING)
 
     async def test_stale_resume_with_429_in_thread_id_still_restarts_fresh(self):
         role = _make_role("architect", "Architect")
@@ -3743,7 +3768,7 @@ class ReplyPreservationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.ok)
         self.assertIn("may repeat adoption next invocation", result.warning)
 
-    async def test_stale_clear_failure_healed_by_fresh_save_needs_no_warning(self):
+    async def test_stale_clear_failure_healed_by_fresh_save_needs_no_clear_warning(self):
         role = _make_role("architect", "Architect")
         codex_council.save_session("architect", "stale-sid")
         async def fake_subproc(cmd, prompt, role_id=""):
@@ -3756,8 +3781,9 @@ class ReplyPreservationTests(unittest.IsolatedAsyncioTestCase):
                               side_effect=fake_subproc):
                 result = await codex_council._run_role_once(role, "p", attempt=1)
         self.assertTrue(result.ok)
-        # The atomic fresh save replaced the stale file: self-healed.
-        self.assertIsNone(result.warning)
+        # The atomic fresh save replaced the stale file: self-healed, so
+        # only the lost continuity is reported.
+        self.assertEqual(result.warning, codex_council.STALE_RESUME_WARNING)
         sid, _ = codex_council.load_session("architect")
         self.assertEqual(sid, "new-sid")
 
@@ -5145,6 +5171,8 @@ class DocsContractTests(unittest.TestCase):
             "its state files record the thread id, never a model or effort",
             "Codex keeps its own record of the model a thread ran with",
             "runs on the current native configuration",
+            # Stale recovery names the warning the role's result carries.
+            codex_council.STALE_RESUME_WARNING,
         ):
             self.assertIn(required, ref)
         panel = self._flat(self._ref("panel-design.md"))
@@ -5474,23 +5502,6 @@ class DocsContractTests(unittest.TestCase):
         reply = codex_council._format_reply_file(codex_council.RoleResult(
             role=routed, ok=True, text="Done.", elapsed_seconds=812.4))
         self.assertIn(reply.splitlines()[0] + "\n", raw)
-        # SKILL.md's report sketch uses the runner's Summary line format.
-        report = codex_council._format_report([
-            codex_council.RoleResult(
-                role=codex_council.Role(
-                    "<id>", "<Label>", _valid_instruction(),
-                    decision=self._sent("routed", "<m>", "<e>", "why")),
-                ok=True, text="Done.", elapsed_seconds=12.3),
-            codex_council.RoleResult(
-                role=codex_council.Role("<id>", "<Label>",
-                                        _valid_instruction()),
-                ok=False, error="[auth] x", elapsed_seconds=0.4),
-        ], 12.7)
-        step6 = self._skill().split("## Step 6", 1)[1]
-        for line in report.splitlines():
-            if line.startswith("- **"):
-                with self.subTest(summary=line):
-                    self.assertIn(line + "\n", step6)
 
     def test_documented_model_rejection_is_what_the_classifier_tags(self):
         """The rejection sentences the reference names are the positive

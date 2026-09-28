@@ -4,8 +4,9 @@
 Each role runs in its own `codex exec` subprocess with a distinct
 framing instruction. Sessions are isolated per (project, host session,
 role) when a terminal/session identifier is available, and persist
-across calls from that host session so each role accumulates its own
-thread of project knowledge.
+across calls from that host session: a role id used again resumes its
+thread, a new id starts fresh, and a saved thread Codex no longer has
+restarts the role fresh with a warning in its result.
 
 Results are aggregated into one structured markdown report on stdout
 for Claude to reconcile.
@@ -247,6 +248,12 @@ IO_FAILED_WARNING = (
     "an output reader or the prompt writer failed ({}); the output may be "
     "incomplete, so a stall is not retried"
 )
+# A resume whose saved thread Codex no longer has reruns the role fresh
+# with the same prompt; the role's result says its earlier turns are gone.
+STALE_RESUME_WARNING = (
+    "saved Codex thread unavailable; started fresh with the current context "
+    "(prior continuity lost)"
+)
 # How often an attempt looks for its codex process's exit while the pipes
 # are still open (Process.wait() may also wait for them; see _process_exit).
 EXIT_POLL_SECS = 0.1
@@ -270,9 +277,11 @@ REQUIRED_SCOPE_PHRASE = "nothing material"
 REQUIRED_CADENCE_SENTENCE = "Thoroughness beats speed."
 # Count-neutral on purpose: a council may have exactly one role. Verifier
 # framing: the user's requirements are authoritative, while Claude's account
-# of the work is a set of claims to check against the workspace. The role
-# instruction bookends the prompt (see _compose_prompt), so this brief stays
-# short and the lens-specific instruction is the last thing the model reads.
+# of the work is a set of claims to check against the workspace. A resumed
+# role also holds its earlier turns, so the brief ranks them below the
+# current shared context and the workspace. The role instruction bookends
+# the prompt (see _compose_prompt), so this brief stays short and the
+# lens-specific instruction is the last thing the model reads.
 COLLABORATION_BRIEF = (
     "You are working as one role in a Claude-orchestrated Codex council, an "
     "independent cross-model check on Claude Code's work; you may be the "
@@ -280,7 +289,10 @@ COLLABORATION_BRIEF = (
     "shared working context below, the user's goal, requirements, and "
     "constraints are authoritative; Claude's account of the project state, "
     "its conclusions, and what has already been tried are claims to verify "
-    "against the workspace, not facts to accept. This run is "
+    "against the workspace, not facts to accept. If this conversation "
+    "already holds earlier turns, treat them as background; where they "
+    "conflict with the shared working context below or the workspace, the "
+    "current context and workspace win. This run is "
     "non-interactive: do not ask the user questions or wait for input; "
     "state the assumptions you make and list any decision that needs the "
     "user as an open question. Do not spawn subagents unless your role "
@@ -631,11 +643,11 @@ def _model_overrides(model=None, effort=None):
     Callers pass only a SelectionDecision's dispatch_model/dispatch_effort.
     Empty when neither is sent, so an inheriting role gets no override at
     all and Codex resolves its native configuration in the worker's
-    execution context. Placed with `-C` BEFORE any `resume` subcommand
-    (verified against codex-cli 0.157.1: parent-placed `-m`/`-c` apply to
-    both fresh and resumed turns). The overrides are per-invocation, not
-    sticky: a resumed turn without them runs on the current native
-    configuration, not the thread's recorded model. Both values match
+    execution context. Placed with `-C` BEFORE any `resume` subcommand,
+    where parent-placed `-m`/`-c` apply to both fresh and resumed turns.
+    The overrides are per-invocation, not sticky: a resumed turn without
+    them runs on the current native configuration, not the thread's
+    recorded model. Both values match
     SELECTION_VALUE_PATTERN (checked at parse time, and for a pinned native
     model at resolution), so neither can start with "-" or hold whitespace,
     quotes, backslashes, or control characters: `-m <model>` stays one argv
@@ -1086,7 +1098,8 @@ async def _run_role_once(role, prompt, attempt):
 
 async def _run_role_invocation(role, attempt, run_codex):
     """One attempt for one role: a fresh run, or a resume that restarts
-    fresh when its saved thread is stale. No retry logic here.
+    fresh, with STALE_RESUME_WARNING, when its saved thread is stale. No
+    retry logic here.
 
     The command carries only the role's resolved dispatch values; the
     requested values and the selection never reach codex or saved state.
@@ -1208,15 +1221,19 @@ async def _run_role_invocation(role, attempt, run_codex):
                 retriable=verdict.retriable,
             )
 
-        # Stale: log, clear, fall through to fresh. A failed clear is only
-        # worth a warning in the outcomes where stale state actually remains
-        # on disk (a later successful save atomically replaces it anyway).
+        # Stale: log, warn, clear, fall through to fresh. The warning rides
+        # every outcome of the fresh run, so the report and the reply file
+        # show that the role lost its prior continuity. A failed clear is
+        # only worth a warning in the outcomes where stale state actually
+        # remains on disk (a later successful save atomically replaces it
+        # anyway).
         updated = (meta or {}).get("updated_at", "unknown")
         _diag(
             f"[codex-council:{role.id}] session {_log_inline(session_id)} "
             f"(last used {_log_inline(updated)}) "
             f"is stale ({_log_inline(failure_text)}) — starting fresh."
         )
+        warning = _append_warning(warning, STALE_RESUME_WARNING)
         stale_clear_error = None
         current_id, _ = load_session(role.id)
         if current_id == session_id:

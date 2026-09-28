@@ -81,6 +81,16 @@ plugin; there is no plugin size budget. The model, provider, OS, and memory
 still have real limits: if one is hit, keep the staged material and surface
 the actual downstream error.
 
+**Earlier councils.** A new council starts only from what you stage.
+Earlier replies and your reconciliation are optional history: stage the part
+that bears on this turn (a finding still open, a decision the work depends
+on, or a rejected finding with the evidence that decided it) and leave the
+rest out, whatever its age. A reused role still remembers what it said
+before, so say what changed since then and, where it matters now, how you
+disposed of that role's earlier findings. Earlier run directories keep
+`out.md` and `replies/`; after compaction, read the ones the summary points
+to, and only when they bear on the current work.
+
 Common scopes:
 
 - **Project context** — what the codebase is: purpose, architecture, key

@@ -180,8 +180,11 @@ requirements, and constraints are authoritative, while Claude's account of
 the state and its conclusions are claims to verify against the workspace. It
 says the run is non-interactive, tells the role not to spawn subagents
 unless asked, to stay within its lens, to separate verified evidence from
-inference, and to finish with plain paragraphs Claude can reconcile. It is
-count-neutral ("you may be the only role, or one of several").
+inference, and to finish with plain paragraphs Claude can reconcile. It
+tells a role that any earlier turns in its thread are background: where
+they conflict with the shared context or the workspace, the current context
+and workspace win. It is count-neutral ("you may be the only role, or one
+of several").
 
 **Key decisions and why.**
 
@@ -610,7 +613,8 @@ steered on its own.
 ## Thread continuity
 
 **Purpose.** Let a role resume its Codex thread across councils in the same
-project and host session, and never let two councils race on one thread.
+project and host session when Claude deliberately reuses its id, and never
+let two councils race on one thread.
 
 ![d25-continuity: project root, session scope, and role id form the state key; the key names the role lock and the state file; the attempt resumes or starts fresh and saves when the outcome allows](docs/diagrams/d25-continuity.png)
 
@@ -639,7 +643,7 @@ model, effort, or selection.
 | any failed fresh invocation | its new id is not saved |
 | resume success whose emitted id is non-empty and different | the new id is adopted and saved, even without a final message, with a warning |
 | resume success with no emitted id, or the same id | saved when a final message arrived |
-| stale resume (the thread is gone) | the state is cleared best-effort (only if it still holds that id) and a fresh invocation runs in the same attempt |
+| stale resume (the thread is gone) | the state is cleared best-effort (only if it still holds that id), a fresh invocation runs in the same attempt with the same prompt, and the role's result carries `STALE_RESUME_WARNING` |
 | a stall after a completed turn (ok with a warning) | the emitted or resumed id is saved best-effort |
 | auth, quota, model rejection, rate limit, 5xx, any other stall, or untagged failure | state is left as it was |
 | a save that fails | the reply is kept, with a warning |
@@ -655,10 +659,17 @@ thread.
 
 Model and effort overrides sit on the parent command
 (`codex exec -C <root> [-m <model>] [-c model_reasoning_effort="<effort>"] resume <id>`)
-and are sent on every invocation, never persisted. On codex-cli 0.157.1 a
-resumed thread that sends none runs on the current native configuration,
-and Codex's advisory about the changed model is kept verbatim as a role
-warning (`codex reported: …`), never parsed into a stronger claim.
+and are sent on every invocation, never persisted. A resumed thread that
+sends none runs on the current native configuration, and Codex's advisory
+about the changed model is kept verbatim as a role warning
+(`codex reported: …`), never parsed into a stronger claim.
+
+A thread is the only thing a council carries into a later one on its own.
+A resumed role gets its saved conversation (Codex may have compacted it)
+plus the complete current prompt, and the collaboration brief tells it that
+the current context and workspace outrank its earlier turns. Other roles'
+replies, Claude's reconciliation, and earlier run directories reach a
+council only when Claude stages them into `context.md`.
 
 **Key decisions and why.**
 
@@ -669,11 +680,21 @@ warning (`codex reported: …`), never parsed into a stronger claim.
   without limiting id length.
 - *No selection in state.* A routed choice must never become a role's
   default for a later council.
+- *Fresh by default, reuse by choice.* The skill names each id for its
+  task's subject and lens, so an unrelated later council starts fresh roles
+  and inherits nothing it was not given; Claude reuses an id only when that
+  role's own earlier work helps.
+- *A lost thread is reported, not hidden.* A stale resume reruns the role
+  fresh rather than failing it, and the warning tells Claude the role no
+  longer holds its earlier turns.
 
 **Limits.** `VSCODE_PID` is window-scoped, so integrated terminals in one VS
 Code window share role threads unless `CODEX_COUNCIL_SESSION_KEY` separates
 them. A role id reused for a different lens resumes a thread built for the
-old one; the skill mints a new id instead.
+old one, and changing a role's label or instruction does not reset it; the
+skill mints a new id instead. Omitting a role does not retire its thread,
+and saved threads never expire. A resumed role's exact recall of its
+earlier turns is not guaranteed.
 
 ## One attempt and its watchdog
 
@@ -782,7 +803,7 @@ watchdog to 0 permits an indefinitely silent role.
 **Purpose.** Name why a role failed, retry only what a retry can fix, and
 never lose a valid saved thread to a misread message.
 
-![d28-failures: the ordered classifier, terminal failures, stale resume, the retry budget, the 5-second backoff, and exhausted failures](docs/diagrams/d28-failures.png)
+![d28-failures: the ordered classifier, terminal failures, stale resume and its fresh invocation with a prior continuity lost warning, the retry budget, the 5-second backoff, and exhausted failures](docs/diagrams/d28-failures.png)
 
 *d28-failures — Failure classification and saved-thread action. Source:
 [d28-failures.mmd](docs/diagrams/d28-failures.mmd).*
@@ -808,7 +829,10 @@ records; agent messages, reasoning, and tool output are never read.
 | untagged | anything else, with the collected failure text | never | kept |
 
 Stale resume (`STALE_RESUME_MARKERS`, resume path only) clears that role's
-state best-effort and runs a fresh invocation within the same attempt.
+state best-effort and runs a fresh invocation within the same attempt, and
+the role's result carries `STALE_RESUME_WARNING` ("saved Codex thread
+unavailable; started fresh with the current context (prior continuity
+lost)").
 A role gets at most `MAX_RETRY_ATTEMPTS = 2` attempts with one
 `RETRY_BACKOFF_SECS = 5` wait, shared by rate limits, 5xx, and replay-safe
 stalls. Retry eligibility is structured data: `FailureVerdict.retriable` or

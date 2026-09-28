@@ -235,8 +235,12 @@ No model is hardcoded anywhere in the plugin.
 ### Saved role threads
 
 Each role keeps its Codex thread per project, host session, and role id, in
-`$XDG_STATE_HOME/codex-council/`. Reusing a role id in a later council
-resumes that role's thread. The scope is chosen in this order:
+`$XDG_STATE_HOME/codex-council/`. Claude names each role id for its task, so
+a later council starts fresh roles and sees only the context Claude stages
+for it; Claude reuses a role id only when that role's own earlier work
+helps, and the reused id resumes the role's thread. A saved thread Codex no
+longer has restarts the role fresh, with a `prior continuity lost` warning
+in its reply. The scope is chosen in this order:
 
 | When | Scope |
 |---|---|
@@ -248,7 +252,9 @@ Integrated terminals in the same VS Code window share `VSCODE_PID`, so set
 `CODEX_COUNCIL_SESSION_KEY` to keep them apart. A role id of 32 characters
 or fewer names its state and reply files directly; a longer one is hashed.
 State holds the thread id and bookkeeping, never a model, effort, or
-selection, so a routed choice never becomes a role's default later.
+selection, so a routed choice never becomes a role's default later. Saved
+threads do not expire, and leaving a role out of a council does not retire
+its thread.
 
 ## Results and failures
 

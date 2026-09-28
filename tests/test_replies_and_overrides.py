@@ -422,6 +422,43 @@ class RunCouncilReplyFilesTests(unittest.IsolatedAsyncioTestCase):
             body = content.partition("\n\n")[2].rstrip()
             self.assertIn(body, report)
 
+    async def test_stale_resume_warning_reaches_reply_file_and_report(self):
+        """A saved thread Codex no longer has: the role reruns fresh, and its
+        result, reply file, and report section all say continuity was
+        lost."""
+        codex_council.save_session("architect", "stale-sid")
+
+        async def fake_subproc(cmd, prompt, role_id=None):
+            if "resume" in cmd:
+                return codex_council.CodexRun(
+                    1, "", "Error: thread/resume failed: no rollout found "
+                    "for thread id stale-sid (code -32600)")
+            return codex_council.CodexRun(0, "\n".join([
+                json.dumps({"type": "thread.started", "thread_id": "new-sid"}),
+                json.dumps({"type": "item.completed", "item": {
+                    "type": "agent_message", "text": "fresh reply"}}),
+            ]), "")
+
+        with patch.object(codex_council, "_run_codex_subprocess",
+                          side_effect=fake_subproc), \
+             patch.object(codex_council, "_diag"):
+            results = await codex_council.run_council(
+                [_make_role("architect")], "body", max_parallel=1,
+                replies_dir=self.replies)
+        warning = codex_council.STALE_RESUME_WARNING
+        self.assertTrue(results[0].ok)
+        self.assertEqual(results[0].warning, warning)
+        self.assertEqual(codex_council.load_session("architect")[0], "new-sid")
+        with open(os.path.join(self.replies, "architect.md"),
+                  encoding="utf-8") as f:
+            reply = f.read()
+        self.assertIn(" warning=yes", reply.splitlines()[0])
+        self.assertIn(f"_Warning: {warning}_\n\nfresh reply", reply)
+        # out.md is this report.
+        report = codex_council._format_report(results, 1.0)
+        self.assertIn("[architect]: ok — WARNING — ", report)
+        self.assertIn(f"_Warning: {warning}_\n\nfresh reply", report)
+
     async def test_crashed_role_gets_a_reply_file_too(self):
         async def fake_role(role, prompt):
             raise RuntimeError("kaboom")
