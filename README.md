@@ -20,13 +20,14 @@ external Codex workers.
 
 - [Claude Code](https://claude.ai/code) — authenticated (`claude` in terminal)
 - [OpenAI Codex CLI](https://learn.chatgpt.com/docs/codex/cli) — authenticated (`codex` in terminal)
-- Python 3.10 or later on macOS or Linux (the runner uses only the standard
+- Python 3.12 or later on macOS or Linux (the runner uses only the standard
   library and POSIX process groups)
 
-Both CLIs must be logged in and working in your terminal before using this
-plugin. Model discovery was verified against codex-cli 0.157.1. If a Codex
-build cannot answer it, discovery reports itself unavailable and roles
-inherit your native configuration unless you pinned a model or effort.
+Supported versions: Claude Code 2.1.x, codex-cli 0.157 or later, and Python
+3.12 or later. Both CLIs must be logged in and working in your terminal
+before using this plugin. If a Codex build cannot answer model discovery,
+discovery reports itself unavailable and roles inherit your native
+configuration unless you pinned a model or effort.
 
 ## Install
 
@@ -46,12 +47,9 @@ Persists across sessions — no flags needed.
 /codex-council:codex-council
 ```
 
-The plugin ships a single skill (no separate `commands/` directory), so the
-slash form relies on Claude Code exposing plugin skills as slash commands — a
-capability of current Claude Code releases whose exact minimum version is not
-documented in the changelog. If the slash command is not available on your
-version, invoke the skill with the natural-language triggers below instead;
-they work on any plugin-capable release.
+The plugin ships a single skill (no separate `commands/` directory); Claude
+Code exposes it as the slash command above and also invokes it from the
+natural-language triggers below.
 
 Claude reads the live work before composing roles: what the user is trying to
 achieve, what is in flight, what is failing or uncertain, and which
@@ -266,11 +264,10 @@ flowchart TD
 
     Explicit["CODEX_COUNCIL_SESSION_KEY"] --> Scope{"explicit key set?"}
     Auto["Auto-detected host session<br/>Claude session, CODEX_THREAD_ID,<br/>TERM_SESSION_ID, TMUX_PANE, STY, VSCODE_PID"] --> Scope
-    Disable["CODEX_COUNCIL_DISABLE_AUTO_SESSION_KEY=1"] --> Scope
 
     Scope -->|"explicit"| SessionHash["session hash"]
     Scope -->|"auto"| SessionHash
-    Scope -->|"disabled or unavailable"| ProjectOnly["project-wide scope"]
+    Scope -->|"none detectable"| ProjectOnly["project-wide scope"]
 
     ProjectHash --> StatePath["state path"]
     SessionHash --> StatePath
@@ -297,9 +294,10 @@ deterministic hashed filename key, while the full ID is preserved in reports,
 prompts, and state metadata; this avoids filesystem filename-length failures
 without imposing an ID-length limit.
 
-`CODEX_COUNCIL_SESSION_KEY` remains an explicit override for custom scoping
-per branch or task. Set `CODEX_COUNCIL_DISABLE_AUTO_SESSION_KEY=1` only if you
-want the older project-wide state file shape:
+The scope is chosen in this order: `CODEX_COUNCIL_SESSION_KEY` when set (an
+explicit key for custom scoping per branch or task; the same value in several
+terminals shares their role threads), else the detected host session, else,
+when no session id is detectable, project-wide state at
 `{project-hash}__{role-key}.json`.
 
 State records a role's Codex thread id and bookkeeping (role id, project
@@ -486,8 +484,12 @@ Each role declares where its values came from in a `selection` object:
 | `effort` only, with `"selection": {"mode": "native_effort", "snapshot_id": ..., "reason": ...}` | `-m <proven native model>` and the effort | this run's snapshot, then launch discovery |
 
 `snapshot_id` is the id `--discover` printed for this run, and `reason` is a
-non-empty single line. For example, one role object (synthetic ids; real
-values are copied from your snapshot):
+non-empty single line. A `model` or `effort` without a `selection` is refused
+(exit 2). Both values share one grammar, `^[A-Za-z0-9][A-Za-z0-9._:/@+-]*$`,
+with case preserved, and `inherit` and `default`, in any case, are refused
+as model values: inheritance is omission. A key repeated at any level of
+`roles.json`, or a `NaN` or `Infinity` value, is also refused. For example,
+one role object (synthetic ids; real values are copied from your snapshot):
 
 ```json
 {
@@ -527,7 +529,7 @@ the preflight there. It checks each automatic selection against
 `ABS_RUNDIR/model-snapshot.json` and prints the plan, one line per role:
 
 ```
-[codex-council] staging OK: ABS_RUNDIR (4 roles; max parallel 6) version=1.0.1
+[codex-council] staging OK: ABS_RUNDIR (4 roles; max parallel 6) version=<plugin version>
 [codex-council] selection plan: inherited-lens: native inheritance
 [codex-council] selection plan: boundary-checks: routed (model future-vega-2033, effort brisk); revalidated at launch
 [codex-council] selection plan: design-judgment: native-model effort (effort adaptive-v2 on native model future-orion-2032); revalidated at launch
@@ -630,20 +632,12 @@ stall are retried; the decision is never read back from Codex's message text.
 
 ### Other settings
 
-Codex CLI 0.156.0 deprecated the `personality` setting (it no longer selects
-a response style), so a `personality = ...` line in your Codex `config.toml`
-is inert. You can leave it or remove it.
-
-Active role concurrency defaults to 6. If a positive user-level
-`agents.max_threads` is set in `$CODEX_HOME/config.toml`, the runner uses it
-as a conservative local concurrency signal (current Codex documentation lists
-that key as a legacy alias of `agents.max_concurrent_threads_per_session`,
-which the runner does not read); set `CODEX_COUNCIL_MAX_PARALLEL` to a
-positive integer for an explicit council-only override. Panels may be larger
-than active concurrency: excess roles queue in the runner rather than being
-rejected or launched simultaneously. Because this plugin launches separate
-`codex exec` processes, Codex's in-process agent setting is a useful local
-preference, not a provider-capacity guarantee.
+Active role concurrency is `CODEX_COUNCIL_MAX_PARALLEL` (a positive integer)
+when set, else 6; Codex's own configuration does not change it. Panels may be
+larger than active concurrency: excess roles queue in the runner rather than
+being rejected or launched simultaneously. The limit is a local concurrency
+choice for separate `codex exec` processes, not a provider-capacity
+guarantee.
 
 The council has no total elapsed-time or run-level deadline. A role may run
 indefinitely while its codex subprocess continues producing output bytes, and
@@ -657,7 +651,7 @@ of council-visible silence (default 1800; positive integer override; 0
 disables), the runner terminates that attempt and applies the stall policy —
 retried as `[retriable:stall]` when no tool work had begun,
 success-with-warning when the turn had already completed, terminal `[stall]`
-otherwise. Setting 0 may again permit an indefinitely silent role. Byte
+otherwise. Setting 0 permits an indefinitely silent role. Byte
 silence is not proof of a wedge: current codex `exec --json` suppresses
 agent-message/reasoning deltas, so a healthy role can be byte-silent for long
 stretches — the heartbeat's `quiet=Ns` measures bytes, not progress. Codex's
@@ -670,8 +664,9 @@ heartbeat to the staged `err.log` — cadence adapts to the watchdog
 (`stall_secs / 3`, bounded 300–1800s; every 600s at the default watchdog,
 every 1800s when disabled) and each line carries per-role `quiet=Ns` (or
 `retry-wait` during backoff), the `watchdog=` threshold, and the plugin
-`version=`. Each completion line ends with `reply=<path>` pointing at that
-role's reply file. The skill follows the run with a Claude Code Monitor on
+`version=`. A completion line ends with `reply=<path>` pointing at that
+role's reply file when the file was written (reply files are best-effort; the
+report always carries the section). The skill follows the run with a Claude Code Monitor on
 `codex_council.py --follow <run dir>`, re-armed whenever a monitor expires
 while the background task is still running; `--status <run dir>` gives a
 spot check, and `--reap <run dir>` ends the codex process groups of a runner
@@ -682,75 +677,6 @@ its turn open by running the same follower as a foreground command and
 re-running it after each timeout; either way progress surfaces without a
 shell polling loop.
 
-## 1.0.1 changes
-
-- Documentation only; the runner, skill contract (epoch 3), and behavior
-  are unchanged from 1.0.0.
-- DESIGN.md gains a module-layout diagram, and its state and discovery
-  diagrams now show the failures that keep a saved thread (auth, quota,
-  model-rejected) and the SIGTERM/SIGHUP teardown of discovery. README's
-  architecture diagram names the module behind each step.
-
-## 1.0.0 changes
-
-- **Runtime model discovery.** `codex_council.py --discover RUNDIR` records
-  this run's native configuration and model catalog in
-  `RUNDIR/model-snapshot.json`, using metadata only.
-- **Per-role selection.** Role objects accept a `selection` object next to
-  the optional `model` and `effort`: `user` for an explicit pin, `routed` or
-  `native_effort` for a choice grounded in this run's snapshot. Omitting all
-  three inherits native configuration. Adaptive routing is on by default and
-  `CODEX_COUNCIL_MODEL_ROUTING=off` turns it off.
-- **Launch revalidation.** Automatic choices are checked again by one fresh
-  discovery at launch and fall back to native inheritance, with the reason
-  logged, when the evidence changed.
-- **Honest reporting.** `err.log`, the report, and reply-file headers say
-  what each role was sent and why; nothing claims which model ran.
-- **New failure tags.** `[model-rejected]` and `[quota]` are terminal and
-  never retried, and a model rejection never clears a saved thread.
-- **One launch per run directory.** Every launch, including a re-run of one
-  rejected role or a follow-up round, gets its own `mktemp -d` directory;
-  `--discover` and the preflight refuse a directory that already launched.
-  The launch itself does not check for an earlier launch, so the skill runs
-  the preflight as its own call and launches only after it exits 0.
-- **Verifier framing.** The collaboration brief tells each role it is an
-  independent cross-model check: the user's requirements are authoritative,
-  Claude's account of the work is a set of claims to verify, and verified
-  evidence stays separate from inference.
-- **No model roster.** The skill and its references name no models and carry
-  no effort tables; capability comes from discovery.
-- **Skill contract epoch 3.** The SKILL templates pass `--skill-contract 3`.
-
-### Migration notes for direct CLI users upgrading from v0.10.0
-
-- A role file without `--skill-contract` keeps working: a `model` or `effort`
-  with no `selection` is still an explicit user pin, and a role without them
-  still inherits.
-- With `--skill-contract 3`, every `model` or `effort` must declare a
-  `selection` object. The previous epoch is refused as a stale SKILL/script
-  pair.
-- `model` and `effort` share one grammar,
-  `^[A-Za-z0-9][A-Za-z0-9._:/@+-]*$`, with case preserved. Effort values are
-  no longer limited to lowercase letters (`High` and `x-high` are accepted),
-  and model values may contain `@` and `+`. `inherit` and `default`, in any
-  case, are refused as model values; omit the keys to inherit.
-- A key repeated at any level of `roles.json`, or a `NaN` or `Infinity`
-  value, is rejected (exit 2).
-- A quota or credit failure that carries HTTP 429 is now `[quota]` and is not
-  retried; before, it could be retried once as `[retriable:rate-limit]`.
-- `--check-staging-dir` (and the new `--discover`) refuse, with exit 2, a
-  directory that already holds a launch (`out.md`, `err.log`, or `replies/`
-  present). Stage each launch in its own `mktemp -d` directory; the launch
-  command itself still accepts a directory it has run in before.
-- Each role section in `out.md` and in its reply file now starts with a
-  `_Model selection: ..._` line, the report adds a `Model selection:`
-  paragraph after the Summary, and reply-file headers add `selection=`. Their
-  `model=` and `effort=` fields mean the values sent.
-- Unchanged since v0.9.0: every on-disk input's parent directory must be a
-  private (0700), user-owned, non-symlink directory at launch as well as at
-  preflight, for example one created by `mktemp -d`. A public or symlinked
-  parent is refused with an abandon-this-directory recovery.
-
 ## For development
 
 ```bash
@@ -759,12 +685,12 @@ cd codex-council
 claude plugins marketplace add ehzawad/codex-council    # skip if already added
 claude plugins install codex-council@codex-council       # skip if already installed
 ./scripts/dev-link.sh
-# restart Claude Code once
+# then start a new Claude Code session
 ```
 
 `scripts/dev-link.sh` does three things:
 
-1. Creates a symlink at `~/.claude/plugins/cache/codex-council/codex-council/<version>/` → this repo's working tree, so edits are live at runtime.
+1. Creates a symlink at `~/.claude/plugins/cache/codex-council/codex-council/<version>/` → this repo's `plugins/codex-council/`, so edits are live at runtime. The version must be one safe path component, or the script refuses to run.
 2. Rewrites `~/.claude/plugins/installed_plugins.json` so the harness's `installPath` and `version` fields point at the symlinked version.
 3. Prunes any stale sibling entries in the cache dir for other versions, so bumping `plugin.json` and re-running dev-link doesn't leave old directories or symlinks behind.
 
@@ -782,11 +708,11 @@ checkout, re-run `scripts/dev-link.sh` and restart the session; an installed
 plugin is updated from its marketplace, then plugins are reloaded or a fresh
 session is started. Never change the epoch to get past it.
 
-After the one-time restart, edits to `plugins/codex-council/**` are live on the next `/codex-council:codex-council` invocation. **SKILL.md caveat:** the Claude Code harness's skill-content caching behavior is not documented, so `SKILL.md` edits may still require a session restart; the script and the rest of the plugin files update live.
+Once a session has loaded the linked plugin, edits to `plugins/codex-council/**` are live on the next `/codex-council:codex-council` invocation. **SKILL.md caveat:** the Claude Code harness's skill-content caching behavior is not documented, so `SKILL.md` edits may still require a session restart; the script and the rest of the plugin files update live.
 
 **Startup-overwrites-symlink caveat.** Claude Code re-validates the plugin cache on every session start and **replaces the symlink with a freshly-fetched copy from origin**. The documented "symlinks are preserved" property applies to runtime resolution, not startup validation. Two ways to handle it:
 
-1. **Manual:** re-run `./scripts/dev-link.sh` after every Claude Code restart, any `claude plugins update`, any version bump in `plugin.json` (the cache path changes with the version), or any cache wipe.
+1. **Manual:** re-run `./scripts/dev-link.sh` after every Claude Code session start, any `claude plugins update`, any version bump in `plugin.json` (the cache path changes with the version), or any cache wipe.
 2. **Automatic (recommended):** add a `SessionStart` hook to `~/.claude/settings.json` so the symlink is re-established on every session:
 
 ```json
@@ -817,7 +743,7 @@ should fail closed with `set -euo pipefail`. Merge into your existing
 The test suite needs no Codex install or network: `tests/fake_codex.py`
 puts a scripted `codex` (app-server and exec) on `PATH` with synthetic model
 ids, and `tests/council_testlib.py` holds the helpers the test modules share.
-CI runs it on Python 3.10, 3.12, and 3.14, plus a pinned ruff:
+CI runs it on Python 3.12, 3.13, 3.14, and 3.15, plus a pinned ruff:
 
 ```bash
 python3 -m unittest discover -s tests -p 'test_*.py'

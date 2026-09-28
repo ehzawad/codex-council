@@ -1367,8 +1367,7 @@ def _read_snapshot(run_dir):
         return None, f"cannot inspect {SNAPSHOT_FILENAME} ({e.strerror or e})"
     if problem:
         return None, problem
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    flags |= getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
     try:
         with open(os.open(path, flags), "rb") as f:
             problem = _snapshot_file_problem(os.fstat(f.fileno()))

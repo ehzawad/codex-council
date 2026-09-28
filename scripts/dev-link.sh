@@ -9,15 +9,16 @@
 #      step, the harness keeps loading whichever version it originally
 #      registered (typically whatever first `claude plugins install`
 #      recorded), ignoring newer sibling versions that dev-link creates.
+#      Skipped, with a note, when the plugin is not installed yet.
 #   3. Prune stale sibling entries in the cache dir for any other
 #      version — real directories from prior `claude plugins install`
 #      or symlinks from prior dev-link runs — so the cache doesn't
 #      accumulate orphaned entries after version bumps.
 #
-# Re-run after any version bump in plugin.json, any `claude plugins update`,
-# or any cache wipe. Restart Claude Code once afterward so the session
-# rebinds; SKILL.md in-session caching behavior is not documented, so
-# SKILL edits may still need a session restart.
+# Claude Code may replace the symlink with a fresh copy when a session
+# starts, so run this from a SessionStart hook (see README.md, "For
+# development"), or re-run it by hand after each session start, version
+# bump in plugin.json, `claude plugins update`, or cache wipe.
 
 set -euo pipefail
 
@@ -32,8 +33,10 @@ if [[ ! -f "$MANIFEST" ]]; then
 fi
 
 VERSION=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$MANIFEST")
-if [[ -z "$VERSION" ]]; then
-    echo "dev-link: could not read version from $MANIFEST" >&2
+# The version becomes one path component under the cache root (and the
+# directory step 1 may delete), so it must be exactly one safe component.
+if [[ ! "$VERSION" =~ ^[0-9A-Za-z][0-9A-Za-z._+-]*$ ]]; then
+    echo "dev-link: refusing version '$VERSION' from $MANIFEST: not a single safe path component" >&2
     exit 1
 fi
 
@@ -41,15 +44,6 @@ CACHE_ROOT="$HOME/.claude/plugins/cache/codex-council/codex-council"
 CACHE_DIR="$CACHE_ROOT/$VERSION"
 INSTALLED_MANIFEST="$HOME/.claude/plugins/installed_plugins.json"
 PLUGIN_KEY="codex-council@codex-council"
-
-# Guard: never touch a path outside the expected cache root prefix.
-case "$CACHE_DIR" in
-    "$HOME/.claude/plugins/cache/codex-council/codex-council/"*) ;;
-    *)
-        echo "dev-link: refusing to touch unexpected path $CACHE_DIR" >&2
-        exit 1
-        ;;
-esac
 
 # --- Step 1: symlink the versioned cache dir to the repo ---
 
@@ -80,9 +74,7 @@ fi
 if [[ ! -f "$INSTALLED_MANIFEST" ]]; then
     echo "dev-link: $INSTALLED_MANIFEST not found — skipping manifest update."
     echo "dev-link: (the symlink alone is not enough; run 'claude plugins install codex-council@codex-council' first, then re-run this script)"
-    exit 0
-fi
-
+else
 python3 - "$INSTALLED_MANIFEST" "$PLUGIN_KEY" "$VERSION" "$CACHE_DIR" <<'PYEOF'
 import json
 import os
@@ -131,16 +123,14 @@ with open(tmp, "w") as f:
 os.replace(tmp, path)
 print("dev-link: installed_plugins.json updated.", file=sys.stderr)
 PYEOF
+fi
 
 # --- Step 3: prune stale cache entries for other versions ---
+# find lists only direct children of CACHE_ROOT, so nothing outside it.
 find "$CACHE_ROOT" -mindepth 1 -maxdepth 1 ! -name "$VERSION" -print0 \
     | while IFS= read -r -d '' stale; do
-        case "$stale" in
-            "$HOME/.claude/plugins/cache/codex-council/codex-council/"*)
-                rm -rf "$stale"
-                echo "dev-link: pruned stale cache entry $stale"
-                ;;
-        esac
+        rm -rf "$stale"
+        echo "dev-link: pruned stale cache entry $stale"
     done
 
-echo "dev-link: done. Restart Claude Code so the session rebinds."
+echo "dev-link: done. Start a new Claude Code session to load the linked plugin."

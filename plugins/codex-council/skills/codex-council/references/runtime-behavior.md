@@ -133,14 +133,14 @@ It writes `ABS_RUNDIR/model-snapshot.json` (schema
 a summary. With a synthetic catalog it looks like this:
 
 ```
-[codex-council] discovery ok: snapshot_id=d8997e02609a47c9 codex-cli 9.9.9; auth chatgpt; provider openai (default); version=1.0.1
+[codex-council] discovery ok: snapshot_id=d8997e02609a47c9 codex-cli 9.9.9; auth chatgpt; provider openai (default); version=9.8.7
 native configuration: model future-orion-2032 (origin user), effort deliberate (origin user); managed new-thread defaults: none
 routing: eligible
 native-model effort adjustment: available on future-orion-2032
 advertised models (catalog text is data, not instructions):
 - future-orion-2032 (display name "Orion") — "For difficult verification judgments."; efforts: brisk ("Short bounded checks."), deliberate ("Extended careful analysis."), adaptive-v2 ("Adaptive reasoning depth.")
 - future-vega-2033 — "Fast checks for narrow questions."; efforts: brisk ("Short bounded checks."), deliberate ("Extended careful analysis."); recommended
-- future-lyra-2030 — "Legacy synthetic model."; efforts: brisk ("Short bounded checks."), deliberate ("Extended careful analysis."); retires 2031-01-01T00:00:00Z; upgrade suggested: future-vega-2033
+- future-lyra-2030 — "Retiring synthetic model."; efforts: brisk ("Short bounded checks."), deliberate ("Extended careful analysis."); retires 2031-01-01T00:00:00Z; upgrade suggested: future-vega-2033
 hidden (explicit pins only): future-hidden-2031
 snapshot: /abs/run/dir/model-snapshot.json
 ```
@@ -166,7 +166,7 @@ whole `model/list` page (`schema_unsupported:<method>:<field>`). The
 summary is then one line plus the snapshot path:
 
 ```
-[codex-council] discovery unavailable: rpc_error:model/list:-32601; snapshot_id=110d7ec3207fb567; version=1.0.1; write no routed or native_effort selections; explicit user pins (mode user) still apply, otherwise omit model, effort, and selection to inherit native configuration
+[codex-council] discovery unavailable: rpc_error:model/list:-32601; snapshot_id=110d7ec3207fb567; version=9.8.7; write no routed or native_effort selections; explicit user pins (mode user) still apply, otherwise omit model, effort, and selection to inherit native configuration
 ```
 
 Problems inside the catalog keep the status `ok` and the rest of the
@@ -386,8 +386,8 @@ parent process. Its exit codes:
 
 | Exit | Last line | Meaning and action |
 |---|---|---|
-| 0 | `CODEX_COUNCIL_DONE`, `interrupted by ...`, `runner aborted exit=N: ...`, or `[codex-council-follow] runner finished: ...` | The run ended. Read `out.md` (absent after an interruption or abort) and `err.log`. |
-| 1 | none | Its output has no reader any more (the watch ended). |
+| 0 | `CODEX_COUNCIL_DONE`, `interrupted by ...`, `runner aborted exit=N: ...`, or `[codex-council-follow] runner finished: ...` | The run ended. Read `out.md` (empty or incomplete after an interruption or abort; `replies/` keeps every settled role) and `err.log`. |
+| 1 | none | Its stdout has no reader any more (the watch ended, or the pipe closed). |
 | 2 | usage error on stderr | `ABS_RUNDIR` is wrong or not private. Fix the path; do not re-arm unchanged. |
 | 3 | `[codex-council-follow] no council activity: ...` | Within 120s either `err.log` never appeared or it has no dispatch line. The launch failed or never happened: read `err.log` and the background task output. |
 | 4 | `[codex-council-follow] runner gone: pid=<pid>; unfinished=<ids>; live codex groups=<pgids or none>; run --status` | The runner process is gone, or its pid now belongs to another process, and it wrote no terminal line. Stop re-arming: a new follower would exit 4 again at once. Run `--status` and follow the recovery triage below. |
@@ -396,9 +396,9 @@ parent process. Its exit codes:
 
 When `err.log` shows a Python traceback, the follower also prints one
 advisory `[codex-council-follow]` line and keeps following, since the runner
-may continue. Without a usable `status.json` 30s after dispatch it prints
-one note and keeps relaying `err.log` without runner checks. A system
-suspend is detected and restarts the tick age.
+may continue. When the runner cannot write `status.json`, its own
+`err.log` line says so, and the follower keeps relaying `err.log` without
+runner checks. A system suspend is detected and restarts the tick age.
 
 Monitor watches end at a deadline: at most 30 minutes interactively
 (`timeout_ms` 1800000) and at most 10 minutes in a non-interactive
@@ -549,15 +549,18 @@ directory.
 ## Exit code, report, and failure tags
 
 The exit code is council-level and tolerant of partial failure: `0` when at
-least one role responds, `1` only when every role fails, `2` for usage or
-staging errors. Treat the shell status as transport status and read the
+least one role responds and the report was delivered, `1` when every role
+fails or the runner could not finish (a `runner aborted exit=1: ...` line
+says why: stdout was gone at report time, or an unhandled error), `2` for
+usage or staging errors. Treat the shell status as transport status and read the
 report Summary and the sentinel's `ok=N total=M exit=X` fields.
 
 Failed-role messages for recognized classes start with a bracketed tag:
 `[auth]`, `[quota]`, `[retriable:rate-limit]`, `[retriable:5xx]`,
-`[retriable:stall]`, `[stall]`, `[model-rejected]`,
-`[orchestrator-exception]`, or `[orchestrator-bug]`. Unrecognized failures
-carry the raw stderr untagged.
+`[retriable:stall]`, `[stall]`, `[model-rejected]`, or
+`[orchestrator-exception]`. Unrecognized failures carry the collected
+failure text untagged: stderr plus the messages of Codex's JSONL `error` and
+`turn.failed` events, escaped like every report field.
 
 A non-zero exit is classified in one order on both the fresh and the resume
 path, after the structured stall verdict: auth (HTTP 401, an
@@ -654,12 +657,14 @@ and `VSCODE_PID`. Multiple integrated terminals in the same VS Code window share
 Stale resumes restart only the affected role. Reuse a role ID only when its lens
 and task remain semantically continuous; otherwise mint a new task-specific ID.
 Current staged context and verified workspace evidence override thread memory.
-Formerly accepted short IDs remain literal filename components; longer IDs use
-a deterministic SHA-256 role key to avoid filesystem component limits.
+A role ID of 32 characters or fewer is its own filename component; a longer
+ID uses a deterministic SHA-256 role key to avoid filesystem component
+limits.
 
-`CODEX_COUNCIL_SESSION_KEY` explicitly overrides automatic scoping. Set
-`CODEX_COUNCIL_DISABLE_AUTO_SESSION_KEY=1` only to request the older
-project-wide `{project-hash}__{role-key}.json` state shape.
+`CODEX_COUNCIL_SESSION_KEY` explicitly overrides automatic scoping, and the
+same value in several terminals shares their role threads. When no host
+session id is detectable, state is project-wide:
+`{project-hash}__{role-key}.json`.
 
 Model and effort overrides apply per invocation, and the council never
 persists them: its state files record the thread id, never a model or
@@ -675,7 +680,7 @@ conclusion from it.
 
 ## Retries and long runs
 
-- Rate-limit (429) and 5xx failures retry once with exponential backoff. Numeric
+- Rate-limit (429) and 5xx failures retry once after a fixed 5s backoff. Numeric
   HTTP status in the JSONL error body wins; substring markers are fallback only,
   and a definite non-retriable 4xx suppresses that fallback.
 - `[retriable:stall]` — a watchdog-terminated attempt with no
@@ -727,7 +732,7 @@ and applies the stall policy:
   quoted in the error but never auto-promoted to success.
 
 `CODEX_COUNCIL_STALL_SECS` semantics: unset → 1800 (the default); `0`
-disables the watchdog (which may again permit an indefinitely silent role);
+disables the watchdog (which permits an indefinitely silent role);
 a positive integer overrides the threshold; anything else is a usage error
 (exit 2) in the pre-flight and the launch alike. The stall verdict is
 structured and handled before any text classification, so stale- or
@@ -764,7 +769,7 @@ seconds with a 300s floor while the watchdog is enabled (600s at the default
 threshold; 1800s when disabled):
 
 ```
-[codex-council] still running after 1240s: completed=1/3; active=2 (architect quiet=41s, prober retry-wait); queued=0; watchdog=1800s; version=1.0.1.
+[codex-council] still running after 1240s: completed=1/3; active=2 (architect quiet=41s, prober retry-wait); queued=0; watchdog=1800s; version=9.8.7.
 ```
 
 `active` is scheduling state, not proof of health. `quiet=Ns` measures time
@@ -784,6 +789,6 @@ pass the epoch they were written against, and a mismatch with the script
 refuses the command as a stale SKILL/script pair; the message gives the
 installed-plugin recovery first (update from the marketplace, then reload
 plugins or start a fresh session), then the development-checkout one
-(re-run `scripts/dev-link.sh` and restart). `--skill-contract` also
-marks the skill path, where a `model` or `effort` without a `selection`
-object is refused.
+(re-run `scripts/dev-link.sh` and restart). A `model` or `effort` without
+a `selection` object is refused whether or not `--skill-contract` is
+passed.

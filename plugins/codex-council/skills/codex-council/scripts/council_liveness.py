@@ -32,7 +32,6 @@ import stat
 import subprocess
 import sys
 import time
-from typing import Optional
 
 from council_common import (
     _READ_CHUNK_BYTES,
@@ -61,14 +60,12 @@ _PS_ENV = {"LC_ALL": "C", "TZ": "UTC0"}
 
 # --follow timing: read err.log every FOLLOW_POLL_SECS, look at the runner
 # and the follower's own parent every FOLLOW_CHECK_SECS; no dispatch line
-# within FOLLOW_START_SECS means no council activity; a dispatched run
-# without status.json after FOLLOW_STATUS_WAIT_SECS is followed on err.log
-# alone. A tick older than TICK_WARN_SECS while the runner is present is
-# reported once; at TICK_GIVE_UP_SECS the follower stops (exit 4).
+# within FOLLOW_START_SECS means no council activity. A tick older than
+# TICK_WARN_SECS while the runner is present is reported once; at
+# TICK_GIVE_UP_SECS the follower stops (exit 4).
 FOLLOW_POLL_SECS = 0.5
 FOLLOW_CHECK_SECS = 2
 FOLLOW_START_SECS = 120
-FOLLOW_STATUS_WAIT_SECS = 30
 TICK_WARN_SECS = 120
 TICK_GIVE_UP_SECS = 300
 # A wall-clock jump this much larger than the monotonic advance between two
@@ -339,11 +336,11 @@ class RunStatus:
 @dataclasses.dataclass
 class RunView:
     """The status.json fields the commands below use."""
-    pid: Optional[int]
-    identity: Optional[str]
+    pid: int | None
+    identity: str | None
     state: str
-    exit: Optional[int]
-    tick_at: Optional[float]
+    exit: int | None
+    tick_at: float | None
     roles: dict
 
 
@@ -496,7 +493,6 @@ class _Follower:
         self.pending = b""
         self.dispatched_at = None
         self.traceback_noted = False
-        self.status_noted = False
         self.stale = False
         self.suspend_floor = 0.0
         self.last_wall, self.last_mono = time.time(), time.monotonic()
@@ -577,14 +573,8 @@ class _Follower:
             return FOLLOW_EXIT_NO_ACTIVITY
         view = read_status(self.status_path)
         if view is None or view.pid is None:
-            if not self.status_noted and (
-                time.monotonic() - self.dispatched_at
-                >= FOLLOW_STATUS_WAIT_SECS
-            ):
-                self.status_noted = True
-                self.note(f"no usable {STATUS_FILENAME} "
-                          f"{FOLLOW_STATUS_WAIT_SECS}s after dispatch; "
-                          "following err.log only, runner liveness unknown")
+            # Nothing to check yet, or the runner could not write the file
+            # (it says so in err.log, which is relayed): err.log alone.
             return None
         runner = runner_state(view.pid, view.identity)
         if runner == "gone":

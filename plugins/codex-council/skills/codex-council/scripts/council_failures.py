@@ -15,10 +15,8 @@ runner before any of this runs.
 import json
 import re
 from dataclasses import dataclass
-from typing import Optional
 
 from council_common import _dedupe_preserve_order, _iter_json_objects
-from council_selection import _INHERIT_DECISION
 
 # Substring markers (matched case-insensitively) classifying failure modes.
 # These are the FALLBACK signal; the primary signal is the numeric HTTP status
@@ -38,11 +36,8 @@ AUTH_ERROR_MARKERS = (
     "401 unauthorized",
     "incorrect api key",
     "authentication failed",
-    "auth: token rejected",
-    "please run `codex login`",
-    "please run codex login",
-    # current codex-cli terminal refresh-token failure wording ("Your access
-    # token could not be refreshed because your refresh token ...").
+    # codex-cli's terminal refresh-token failure ("Your access token could
+    # not be refreshed because your refresh token ...").
     "access token could not be refreshed",
 )
 # Structured authentication failures, matched against a failure record's
@@ -71,9 +66,10 @@ RATE_LIMIT_MARKERS = (
     # NB: "quota exceeded" / usage caps are deliberately NOT retriable markers —
     # a plan/usage cap does not clear within a 5s backoff, so it is surfaced
     # terminal (see "Retries and long runs" in references/runtime-behavior.md
-    # and DESIGN.md); the recognized quota forms are tagged [quota] ahead of
-    # the anchored parser (QUOTA_ERROR_CODES). Genuine transient
-    # 429s are caught by the anchored parser or the rate-limit phrases above.
+    # and "Failure-class tagging" in DESIGN.md); the recognized quota forms
+    # are tagged [quota] ahead of the anchored parser (QUOTA_ERROR_CODES).
+    # Genuine transient 429s are caught by the anchored parser or the
+    # rate-limit phrases above.
 )
 TRANSIENT_5XX_MARKERS = (
     "500 internal",
@@ -82,18 +78,16 @@ TRANSIENT_5XX_MARKERS = (
     "504 gateway timeout",
     "internal server error",
     "service unavailable",
-    # current codex-cli friendly-rewrites some upstream 5xx/overload errors to
-    # prose that carries no status code (HTTP 500 -> "...experiencing high
-    # demand..."; overload -> "...server overloaded..."; HTTP 503
+    # codex-cli rewrites some upstream 5xx/overload errors to prose that
+    # carries no status code (HTTP 500 -> "...experiencing high demand...";
+    # overload -> "...server overloaded..."; HTTP 503
     # server_is_overloaded/slow_down -> "Selected model is at capacity. Please
-    # try a different model."). "backend overloaded" is kept as a fallback for
-    # older codex/provider text. These phrases are version-coupled fallbacks
-    # for the code-less case; the numeric range in _structured_retriable_class
-    # handles every 5xx that DOES carry a status. The overload markers are
-    # intentionally specific (not bare "overloaded") so unrelated text like
-    # "operator overloaded" is not matched.
+    # try a different model."). These phrases cover only the code-less case;
+    # the anchored status range (_anchored_retriable_class) handles every 5xx
+    # that DOES carry a status. The overload marker is intentionally specific
+    # (not bare "overloaded") so unrelated text like "operator overloaded" is
+    # not matched.
     "server overloaded",
-    "backend overloaded",
     "experiencing high demand",
     "selected model is at capacity",
 )
@@ -106,7 +100,7 @@ STALE_RESUME_MARKERS = (
 )
 
 # A definitively non-retriable error TYPE that codex/OpenAI put in the JSONL
-# error body for 4xx client errors. current codex-cli sometimes surfaces a 400
+# error body for 4xx client errors. codex-cli sometimes surfaces a 400
 # as raw JSON with this type but NO numeric status; its presence (when no
 # anchored retriable status is found) suppresses the substring retriable
 # fallback, so a 400 whose message text merely contains a 5xx reason phrase or
@@ -128,7 +122,7 @@ QUOTA_ERROR_CODES = frozenset({
     "project_spend_limit_exceeded",
     "organization_usage_limit_exceeded",
 })
-# current codex-cli rewrites a ChatGPT plan usage cap to code-less prose
+# codex-cli rewrites a ChatGPT plan usage cap to code-less prose
 # ("You've hit your usage limit. ...").
 QUOTA_MARKERS = (
     "hit your usage limit",
@@ -225,11 +219,11 @@ class FailureRecord:
     Fields are None when absent; `status` is the HTTP status of the nearest
     enclosing level that carried one.
     """
-    status: Optional[int] = None
-    type: Optional[str] = None
-    code: Optional[str] = None
-    param: Optional[str] = None
-    message: Optional[str] = None
+    status: int | None = None
+    type: str | None = None
+    code: str | None = None
+    param: str | None = None
+    message: str | None = None
 
 
 # codex exec reports a failed request as a message string that is often
@@ -319,8 +313,9 @@ def _failure_records(jsonl_output):
 
 # ---------- error classifiers ----------
 
-def _stderr_contains(stderr_text, markers):
-    lowered = stderr_text.lower()
+def _text_contains(text, markers):
+    """True when the combined failure text holds any marker (any case)."""
+    lowered = text.lower()
     return any(m in lowered for m in markers)
 
 
@@ -334,22 +329,22 @@ def _is_auth_error(failure_text, records=()):
             return True
     if 401 in _extract_statuses(failure_text):
         return True
-    return _stderr_contains(failure_text, AUTH_ERROR_MARKERS)
+    return _text_contains(failure_text, AUTH_ERROR_MARKERS)
 
 
-def _is_rate_limit_error(stderr_text):
-    return _stderr_contains(stderr_text, RATE_LIMIT_MARKERS)
+def _is_rate_limit_error(text):
+    return _text_contains(text, RATE_LIMIT_MARKERS)
 
 
-def _is_transient_5xx_error(stderr_text):
-    return _stderr_contains(stderr_text, TRANSIENT_5XX_MARKERS)
+def _is_transient_5xx_error(text):
+    return _text_contains(text, TRANSIENT_5XX_MARKERS)
 
 
-def _is_stale_resume_error(stderr_text):
-    return _stderr_contains(stderr_text, STALE_RESUME_MARKERS)
+def _is_stale_resume_error(text):
+    return _text_contains(text, STALE_RESUME_MARKERS)
 
 
-# Numeric HTTP status as codex surfaces it. current codex-cli does NOT put a
+# Numeric HTTP status as codex surfaces it. codex-cli does NOT put a
 # status on the top-level JSONL event, so we scan the combined failure text for
 # an ANCHORED status — one in a recognizable status context, so a bare digit run
 # (e.g. "429" inside a thread id like "stale-429-sid") is never mistaken for one.
@@ -395,18 +390,9 @@ def _extract_statuses(text):
     return out
 
 
-def _structured_retriable_class(text):
-    """Retriable class from an ANCHORED HTTP status only (never a bare substring).
-
-    "Anchored" = a status in keyword (`HTTP 429`, `status 529`) or reason-phrase
-    (`429 Too Many Requests`) context, per _extract_statuses. Returns
-    "rate-limit" (429), "5xx" (500-599), or None. Used ahead of the stale check
-    on the resume path so a genuine anchored 429/5xx (e.g.
-    "HTTP 429 Too Many Requests; thread not found") is retried, while a stale
-    message whose only digits are a thread id (e.g. "stale-429-sid") names no
-    status and so does not fire here.
-    """
-    statuses = _extract_statuses(text)
+def _anchored_retriable_class(statuses):
+    """Retriable class of anchored HTTP statuses: "rate-limit" (429), "5xx"
+    (500-599), or None."""
     if any(s == 429 for s in statuses):
         return "rate-limit"
     if any(500 <= s <= 599 for s in statuses):
@@ -414,30 +400,20 @@ def _structured_retriable_class(text):
     return None
 
 
-def _retriable_class(text):
-    """Full retriable classification: structured status first, then substrings.
+def _substring_retriable_class(text):
+    """Retriable class from the phrase markers, for text with no anchored
+    status (e.g. stderr-only transport errors, or codex's code-less overload
+    phrases), or None.
 
-    A structured status is authoritative when present: a non-retriable status
-    (e.g. 400/403) returns None and SUPPRESSES the substring fallback, so a bare
-    "429" or "service unavailable" echoed inside a 400 body no longer forces a
-    wrong retry. A non-retriable error TYPE ("invalid_request_error") suppresses
-    the fallback the same way, for 4xx bodies codex surfaces without a numeric
-    status. Substring markers apply only when codex emitted no parseable status
-    and no client-error type (e.g. stderr-only transport errors, or the
-    version-coupled overload phrases above).
+    Text that names any anchored status never reaches the markers: a
+    non-retriable status (e.g. 400/403) is authoritative, so a "429" or
+    "service unavailable" echoed inside a 400 body cannot force a retry. A
+    non-retriable error TYPE ("invalid_request_error", a 4xx body codex can
+    surface without a numeric status) suppresses the markers the same way.
     """
-    statuses = _extract_statuses(text)
-    if statuses:
-        if any(s == 429 for s in statuses):
-            return "rate-limit"
-        if any(500 <= s <= 599 for s in statuses):
-            return "5xx"
+    if _extract_statuses(text):
         return None
-    # No anchored status. A definitively non-retriable error TYPE (a 4xx client
-    # error codex surfaces as `"type": "invalid_request_error"`, sometimes
-    # without a numeric status) also suppresses the substring fallback, so a 400
-    # whose message text merely contains a 5xx reason phrase is not retried.
-    if _stderr_contains(text, NONRETRIABLE_ERROR_TYPE_MARKERS):
+    if _text_contains(text, NONRETRIABLE_ERROR_TYPE_MARKERS):
         return None
     if _is_rate_limit_error(text):
         return "rate-limit"
@@ -452,7 +428,7 @@ def _is_quota_error(failure_text, records):
     for record in records:
         if record.code in QUOTA_ERROR_CODES or record.type in QUOTA_ERROR_CODES:
             return True
-    return _stderr_contains(failure_text, QUOTA_MARKERS)
+    return _text_contains(failure_text, QUOTA_MARKERS)
 
 
 def _names_excluded_param(text):
@@ -566,8 +542,8 @@ class FailureVerdict:
     "stale", or None (untagged); `rejection` is Codex's own rejection
     message when kind is "model-rejected", else None.
     """
-    kind: Optional[str]
-    rejection: Optional[str] = None
+    kind: str | None
+    rejection: str | None = None
 
     @property
     def retriable(self):
@@ -594,7 +570,11 @@ def _failure_verdict(failure_text, records, requested_model, resume=False):
         return FailureVerdict("auth")
     if _is_quota_error(failure_text, records):
         return FailureVerdict("quota")
-    anchored = _structured_retriable_class(scan_text)
+    # Ahead of the stale check, so a genuine anchored 429/5xx (e.g. "HTTP 429
+    # Too Many Requests; thread not found") is retried, while a stale
+    # message whose only digits are a thread id ("stale-429-sid") names no
+    # status and still restarts fresh.
+    anchored = _anchored_retriable_class(_extract_statuses(scan_text))
     if anchored:
         return FailureVerdict(anchored)
     rejection = _model_rejection(failure_text, records, requested_model)
@@ -602,12 +582,14 @@ def _failure_verdict(failure_text, records, requested_model, resume=False):
         return FailureVerdict("model-rejected", rejection)
     if resume and _is_stale_resume_error(failure_text):
         return FailureVerdict("stale")
-    return FailureVerdict(_retriable_class(scan_text))
+    return FailureVerdict(_substring_retriable_class(scan_text))
 
 
 def _mask_model(text, model):
     """Replace every occurrence of the requested model id with a neutral
-    placeholder so status and marker scans read only the provider's words."""
+    placeholder, so the auth and retriable scans (statuses and phrase
+    markers) read only the provider's words. The quota, rejection, and stale
+    checks read the unmasked text."""
     if not model:
         return text
     return text.replace(model, "<model>")
@@ -676,24 +658,16 @@ def _model_rejected_error(decision, provider_message, phase):
     )
 
 
-def _classify_failure(failure_text, rc, phase, records=(), decision=None,
-                      verdict=None):
+def _classify_failure(failure_text, rc, phase, decision, verdict):
     """Return a tagged error string for a non-zero codex exit.
 
-    `records` are the attempt's _failure_records and `decision` the role's
-    SelectionDecision (inheritance when omitted). `verdict` is the
-    attempt's FailureVerdict when the caller already has one: the resume
-    path passes the verdict it branched on, so the tag always matches that
-    branch. Without it the fresh-path order is applied here. A stale
-    resume is never formatted: the resume path restarts fresh instead.
-    A [quota] whose text is Codex's usage limit for one model ends with
-    the action for the model that was sent; any other [quota] keeps
-    Codex's text alone.
+    `decision` is the role's SelectionDecision and `verdict` the attempt's
+    FailureVerdict, the one the caller already branched on, so the tag
+    always matches that branch. A stale resume is never formatted: the
+    resume path restarts fresh instead. A [quota] whose text is Codex's
+    usage limit for one model ends with the action for the model that was
+    sent; any other [quota] keeps Codex's text alone.
     """
-    decision = decision or _INHERIT_DECISION
-    if verdict is None:
-        verdict = _failure_verdict(failure_text, records,
-                                   decision.dispatch_model)
     detail = failure_text or f"codex {phase} exited {rc}"
     if verdict.kind == "quota" and _MODEL_USAGE_LIMIT_RE.search(detail):
         return f"[quota] {detail} {_refused_model_action(decision)}"

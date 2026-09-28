@@ -37,14 +37,13 @@ flowchart LR
     Selection --> Common
     Selection --> Discovery
     Failures --> Common
-    Failures --> Selection
     Liveness --> Common
 ```
 
 Imports point one way: `council_discovery` uses `council_common`,
-`council_selection` uses both, `council_failures` uses `council_common` and
-`council_selection`, `council_liveness` uses `council_common`, and only
-`codex_council.py` imports all five. Module state has one owner and is used
+`council_selection` uses both, `council_failures` and `council_liveness`
+each use only `council_common`, and only `codex_council.py` imports all
+five. Module state has one owner and is used
 through it: the diagnostics sink and the cached project root live in
 `council_common`, the run's live state (`_RUN`) and `STATE_DIR` in
 `codex_council.py`. Siblings import names directly, so a test
@@ -52,10 +51,10 @@ patches the module whose global the calling code reads (for example
 `council_discovery._project_root` for discovery's `config/read` cwd).
 `codex_council.py` puts its own directory first on `sys.path` before it
 imports the siblings, because `python3 -P` and `PYTHONSAFEPATH=1` leave that
-directory off. It imports them with bytecode writes off, so, like the
-single-file runner (Python never caches bytecode for the script it runs), a
-run writes no `__pycache__` into the plugin directory; the interpreter's
-setting is restored right after the sibling imports.
+directory off. Python never caches bytecode for the script it runs, and the
+entry imports the siblings with bytecode writes off, so a run writes no
+`__pycache__` into the plugin directory; the interpreter's setting is
+restored right after the sibling imports.
 
 ## No catalog, no defaults
 
@@ -100,8 +99,8 @@ directory whose council is still running (the natural move for a
 run) would tear that council's report, log, and follower apart, and a
 relaunch after it finished would replace its report and mix two runs in
 `replies/`. Only a step that runs before the launch command can refuse in
-time; the launch itself keeps accepting an existing `replies/`, so direct
-CLI use is unchanged. The rule is therefore enforced by `--discover` and
+time; the launch itself accepts an existing `replies/`. The rule is
+therefore enforced by `--discover` and
 the pre-flight, not atomically at launch (see Known limits): SKILL.md makes
 the pre-flight its own Bash call and the launch a separate one made only
 after the pre-flight exits 0, because in one combined call a refused
@@ -124,8 +123,7 @@ validation or reads to an external path. Keeping the panel and context in files
 also keeps a large role array and multiline context out of the shell, where a
 stray quote, brace, or missing redirection target would otherwise break the
 call before the runner can diagnose it. There is no
-built-in role catalog, no positional shortcuts, and no `--list-roles`
-flag. Bare invocation (no `--roles-file`, with context piped or staged)
+built-in role catalog. Bare invocation (no `--roles-file`, with context piped or staged)
 exits 2 — the script's way of telling Claude to go compose a panel.
 
 The orchestrator deliberately has no plugin-imposed content-size or panel-count
@@ -192,24 +190,19 @@ against this run's discovered data, and passes what it decides to send as
 parent `codex exec` options, `-m <model>` and
 `-c model_reasoning_effort="<effort>"`, ahead of `resume` so fresh and resumed
 attempts carry the same values. A role that omits all three inherits Codex's
-native configuration in the worker's execution context, and its commands are
-byte-identical to those of earlier releases.
+native configuration in the worker's execution context: its commands carry
+no `-m` and no `-c` at all.
 
-Codex itself has a stable in-process `multi_agent` capability (on by
-default) and a `multi_agent_v2` feature (stable but off by default, as of
-codex-cli 0.156.1). The council deliberately
-uses external `codex exec` fan-out because each role needs an independently
-persisted thread id and process-level failure/cancellation isolation. A
-positive user-level `agents.max_threads` is still used as a conservative
-concurrency signal; it is not treated as proof of provider capacity because
-these are separate processes.
+The council uses external `codex exec` fan-out rather than Codex's own
+in-process agents because each role needs an independently persisted thread
+id and process-level failure/cancellation isolation.
 
 A single fan-out is parallel contribution, not direct peer messaging. Claude
 mediates collaboration by giving every role the same situational context,
 reconciling the report, and staging material findings into selective follow-up
 rounds. Because all subprocesses share the working directory, implementation
 panels with several roles assign one write-owning role; multiple writers must
-use serialized phases (the runner does not yet use Codex's `--worktree`). This
+use serialized phases (the runner does not use Codex's `--worktree`). This
 also limits duplicate side effects when a transient failure causes a role
 retry.
 
@@ -301,17 +294,11 @@ plain paragraphs Claude can reconcile.
 ## Adaptive concurrency and progress
 
 Panels have no count cap, but `run_council` wraps role execution in an
-`asyncio.Semaphore`. The active limit resolves in this order:
-
-1. positive `CODEX_COUNCIL_MAX_PARALLEL` override;
-2. positive user-level Codex `agents.max_threads` from
-   `$CODEX_HOME/config.toml` (or `~/.codex/config.toml`); current Codex
-   documentation lists it as a legacy alias of
-   `agents.max_concurrent_threads_per_session`, which the runner does not
-   read;
-3. `DEFAULT_MAX_PARALLEL=6`, the default Codex documented for
-   `agents.max_threads` when the runner adopted it (current documentation
-   leaves the default to Codex).
+`asyncio.Semaphore`. The active limit is a positive
+`CODEX_COUNCIL_MAX_PARALLEL`, else `DEFAULT_MAX_PARALLEL=6`. Codex's own
+configuration does not set it: the roles are separate `codex exec`
+processes, so no Codex setting describes their concurrency, and the limit
+is a local choice, not a provider-capacity promise.
 
 Each queued role makes a nonblocking continuity-lock probe while it briefly
 holds a subprocess permit. If another council owns the same persisted thread,
@@ -338,9 +325,10 @@ Claude Code redirects it to `err.log`. Per-role completion lines keep the
 
 ## Per-role reply files and the follower
 
-Before v0.10.0 no reply reached disk until every role finished, so Claude
-waited on the slowest role and an interrupted run lost all finished work.
-Now, as each role settles (ok, failed, or crashed), the runner writes
+A reply reaches disk as soon as its role settles, so Claude never waits on
+the slowest role to read a finished one and an interrupted run keeps every
+finished reply. As each role settles (ok, failed, or crashed), the runner
+writes
 `<RUNDIR>/replies/<key>.md`, where `RUNDIR` is the directory of
 `--context-file` (or of `--roles-file` in stdin mode), both already
 privacy-checked at launch. `<key>` reuses the state-file role component: the
@@ -425,17 +413,15 @@ final verdict, cross-role conflicts, and writes that overlap a running writer
 role wait for the full report. The runner has no partial-cancellation
 feature.
 
-The SKILL templates depend on `--follow` and reply files (epoch 2) and on
-`--discover` and the `selection` contract (epoch 3), so the skill contract
-epoch is 3. `--skill-contract` also marks the skill path for the selection
-rules below.
+The skill contract epoch is 3: the SKILL templates depend on `--follow`,
+reply files, `--discover`, and the `selection` contract.
 
 ## Model selection architecture
 
 Model selection has three parts: an optional discovery adapter that turns the
 installed Codex's metadata into a run-scoped snapshot, one pure resolver that
-decides what each role sends, and the unchanged `codex exec` runner, which
-sends only the resolver's dispatch values. A few rules shape all three:
+decides what each role sends, and the `codex exec` runner, which sends only
+the resolver's dispatch values. A few rules shape all three:
 
 - **Native configuration is the baseline and the universal fallback.**
   Inheritance is omission: no `-m`, no `-c model_reasoning_effort`, and never
@@ -774,12 +760,10 @@ non-empty single line with no length cap; its meaning is not validated, and
 `mode: "user"` is the orchestrator's own label (see Known limits).
 Inheritance is omission of all three keys.
 
-`--skill-contract` marks the skill path, where a `model` or `effort` without
-`selection` exits 2. That check runs before the value grammar, so a malformed
-untagged pin is first asked for its provenance, not told how to inherit.
-Direct CLI use without it reads such an untagged pin as `{"mode": "user"}`,
-which keeps earlier role files working, and a malformed value there gets the
-same repair-the-pin hint as a `mode: user` pin.
+A `model` or `effort` without `selection` exits 2 on every path, with or
+without `--skill-contract`. That check runs before the value grammar, so a
+malformed untagged pin is first asked for its provenance, not told how to
+inherit.
 
 Both values share
 `SELECTION_VALUE_PATTERN = ^[A-Za-z0-9][A-Za-z0-9._:/@+-]*\Z`: no leading `-`,
@@ -861,10 +845,10 @@ both.
 
 ```mermaid
 flowchart TD
-    Role["role: model, effort, selection"] --> Any{"any of the three?"}
-    Any -->|"none"| Native["native: send nothing"]
+    Role["role: model, effort, selection"] --> Any{"selection present?"}
+    Any -->|"no: none of the three"| Native["native: send nothing"]
     Any -->|"yes"| Mode{"selection.mode"}
-    Mode -->|"user, or untagged in direct CLI use"| User["user: send the pin unchanged<br/>advisories only"]
+    Mode -->|"user"| User["user: send the pin unchanged<br/>advisories only"]
     Mode -->|"routed or native_effort"| Off{"routing mode off?"}
     Off -->|"yes"| Fallback["fallback: send nothing<br/>record the reason"]
     Off -->|"no"| Evidence{"launch snapshot if taken,<br/>else the planning snapshot:<br/>status ok?"}
@@ -881,8 +865,6 @@ flowchart TD
 
 `SelectionDecision` keeps the request and the dispatch apart. Its fields are:
 
-- `mode`, what the role asked for: `inherit`, `user`, `routed`, or
-  `native_effort`;
 - `provenance`, what the council does: `native`, `user`, `routed`,
   `native_effort`, or `fallback`;
 - `requested_model` and `requested_effort`;
@@ -913,11 +895,11 @@ User-pin advisories are notes, never rejections:
 
 Every surface reports what was sent, never what ran:
 
-- **err.log.** After the unchanged dispatch line comes
+- **err.log.** After the dispatch line comes
   `[codex-council] model selection: routing=<auto|off>; discovery=<ok|unavailable|not-run>[ (<reason>)]; native=N user=N routed=N native_effort=N fallback=N`,
   then one `[codex-council:<id>] routing fell back to native inheritance: <reason>`
-  line per fallback. The follower's dispatch detection depends on the
-  dispatch line's prefix, which is why it stays unchanged.
+  line per fallback. The follower detects dispatch by the dispatch line's
+  `[codex-council] dispatching ` prefix, so that prefix is a contract.
 - **Report Summary.** Each line notes what the role sent: ` (explicit: …)`,
   ` (routed: …)`, ` (routed effort: <e> on native model <m>)`, or
   ` (native inheritance; routing fell back)`. Inherited roles get no note.
@@ -1137,15 +1119,6 @@ are placeholders:
 - **No recommended-default routing.** The catalog's `isDefault` marker is
   recorded as `recommended` for display only. It is never read as the user's
   configured model and never picked automatically.
-- **A future native-subagent adapter needs its own tests.** Claude Code
-  resolves subagent models differently from Codex workers. Omitting a model,
-  an explicit `inherit` (the main conversation's model), and the special
-  `default` (which clears an override) are not interchangeable, and an
-  environment default such as `CLAUDE_CODE_SUBAGENT_MODEL` can take part.
-  Any such adapter must test omission, `inherit`, and `default` separately
-  and must not reuse the Codex worker rule that refuses those words as model
-  ids.
-
 ## Staging validation
 
 ```mermaid
@@ -1165,9 +1138,7 @@ flowchart TD
     Launched -->|"yes"| NewDir["exit 2: every launch needs<br/>a new mktemp -d directory"]
     Launched -->|"no"| Exists{"both files exist?"}
     Exists -->|"no"| StageError["exit 2 with staging hint"]
-    Exists -->|"yes"| SameDir{"same mktemp dir?"}
-    SameDir -->|"no"| StageError
-    SameDir -->|"yes"| Parse["parse roles + validate context"]
+    Exists -->|"yes"| Parse["parse roles + validate context"]
     Parse -->|"empty or non-UTF-8 context"| StageError
     Parse -->|"bad roles JSON, unknown or duplicate key,<br/>malformed selection"| RolesError["exit 2 with whole-file<br/>rewrite recovery"]
     Parse -->|"ok"| Authoring{"automatic selections supported<br/>by this run's snapshot?"}
@@ -1175,7 +1146,9 @@ flowchart TD
     Authoring -->|"no"| RolesError
     Authoring -->|"yes: staging OK + selection plan, exit 0;<br/>launch in a separate Bash call"| LaunchGate["launch path re-validates privacy<br/>lexical parent of every on-disk input<br/>before any content read"]
     LaunchGate -->|"public, symlinked, or foreign-owned parent"| StageError
-    LaunchGate -->|"private"| Revalidate["re-parse, re-check authoring,<br/>one launch discovery when a role is automatic"]
+    LaunchGate -->|"private"| SameDir{"roles.json and context.md<br/>in the same directory?"}
+    SameDir -->|"no"| StageError
+    SameDir -->|"yes"| Revalidate["re-parse, re-check authoring,<br/>one launch discovery when a role is automatic"]
     Revalidate --> Launch["launch fan-out"]
 
     Launch --> Replies
@@ -1191,7 +1164,7 @@ flowchart TD
 flowchart LR
     Root["project root"] --> RootHash["sha256 root prefix"]
     Env["explicit or auto session key"] --> SessionHash["optional sha256 session prefix"]
-    Role["role id"] --> RoleKey["literal legacy id or sha256 key"]
+    Role["role id"] --> RoleKey["short id as is, or sha256 key"]
 
     RootHash --> Filename
     SessionHash --> Filename
@@ -1220,8 +1193,8 @@ state + restart fresh); only a value that is **not** a valid UUID is
 treated as a thread *name* and silently starts a **new** thread (rc==0,
 fresh `thread.started`). The council only ever stores real UUIDs emitted
 by `thread.started`, so the silent-spawn case is unreachable via normal
-state — the mismatch check is **defense-in-depth** against a
-corrupt/hand-edited state file or future CLI drift. After every resume
+state — the mismatch check is **defense-in-depth** against a corrupt or
+hand-edited state file. After every resume
 the script extracts `thread.started.thread_id`; if it doesn't equal the
 requested ID, it adopts the new ID and warns. It does **not** re-run —
 the turn has already completed on the new thread; re-running burns
@@ -1236,11 +1209,11 @@ text also looks stale (see
 [Failure classification](#failure-classification)).
 
 Per-role state is protected by a POSIX advisory lock keyed by
-`(project, session key, role)`. Role IDs longer than the formerly accepted
-32-character range use a deterministic SHA-256 filename component, avoiding
-the operating system's filename-length limit while preserving the full role ID
-in memory, reports, prompts, and state metadata. Short-role state filenames
-remain unchanged for thread-continuity compatibility. The session key is explicit when
+`(project, session key, role)`. A role ID of 32 characters or fewer is its
+own filename component, so state and reply filenames stay readable; a longer
+ID uses a deterministic SHA-256 component, avoiding the operating system's
+filename-length limit while preserving the full role ID in memory, reports,
+prompts, and state metadata. The session key is explicit when
 `CODEX_COUNCIL_SESSION_KEY` is set; otherwise the runner auto-detects common
 host-session identifiers such as Claude session ids, `CODEX_THREAD_ID`,
 `TERM_SESSION_ID`, `TMUX_PANE`, `STY`, and `VSCODE_PID`. That gives normal
@@ -1249,7 +1222,9 @@ calls from the same terminal/session keep continuity. `VSCODE_PID` is the
 lowest-priority fallback and is **window-scoped**, not tab-scoped: multiple
 integrated terminals in one VS Code window share it and therefore share role
 threads — set `CODEX_COUNCIL_SESSION_KEY` (or rely on a finer identifier such as
-`TERM_SESSION_ID`) to isolate those. The lock is held across
+`TERM_SESSION_ID`) to isolate those. When no session id is detectable (a
+headless shell with none of those variables), the state is project-wide:
+`{project-hash}__{role-key}.json`. The lock is held across
 the whole load/resume-or-fresh/save retry loop, not just individual file reads
 or writes, so two council processes cannot concurrently resume the same role
 thread and then last-writer-wins the state file. Different roles still run in
@@ -1260,18 +1235,19 @@ a truncated state file that `load_session` would read as no thread.
 ## Failure-class tagging
 
 Recognized failure classes are tagged before they hit the report;
-unrecognized failures carry the raw stderr untagged:
+unrecognized failures carry the collected failure text (stderr plus the
+messages of Codex's JSONL `error` and `turn.failed` events, escaped like
+every report field) untagged:
 
 | Tag | Behavior |
 |---|---|
 | `[auth]` | Never clears state, never retries — caller must fix auth then re-run. Recognized structurally (HTTP 401 on a failure record or as an anchored status, or an `authentication_error` / `invalid_api_key` error type or code) as well as by Codex's sign-in wording, and checked first, so a 401 whose message also looks stale never clears a thread |
 | `[quota]` | Terminal: never retried, never clears state. A usage, quota, or credit limit — a structured `error.code` or `error.type` such as `insufficient_quota`, `usage_limit_reached`, or `credit_balance_exhausted`, or codex's "hit your usage limit" prose — even when it carries HTTP 429. A usage limit codex names for one model also ends with the `[model-rejected]` action for the model that was sent |
-| `[retriable:rate-limit]` / `[retriable:5xx]` | One retry after a 5s backoff (MAX_RETRY_ATTEMPTS=2; bumping that adds 10s, 20s, … via `backoff *= 2`) |
+| `[retriable:rate-limit]` / `[retriable:5xx]` | One retry after a fixed 5s backoff (`MAX_RETRY_ATTEMPTS=2`, `RETRY_BACKOFF_SECS=5`) |
 | `[model-rejected]` | Terminal: never retried, no substitute model, and it never clears saved thread state, even when its text also looks stale. Codex rejected the model this invocation sent (or the natively configured one); the message quotes Codex and names one action for the model that was refused |
 | `[retriable:stall]` | Output-inactivity watchdog fired before any side-effect-capable tool work began (only agent_message, reasoning, or Codex `error` notice items such as the resume advisory, or none); replay is safe, so it retries through the same shared budget as rate-limit/5xx |
 | `[stall]` | Watchdog fired after tool work began — terminal, because an automatic replay could duplicate side effects; a buffered agent_message without turn completion is quoted but never auto-promoted to success |
 | `[orchestrator-exception]` | A role's coroutine raised — siblings still complete via `gather(..., return_exceptions=True)` |
-| `[orchestrator-bug]` | A role task returned something other than a `RoleResult`; reported as a failure instead of crashing the report |
 | (untagged stale) | Detected via `STALE_RESUME_MARKERS` on the resume path only; that role's state is cleared and a fresh thread is started for it only |
 
 A stall verdict is structured (from the watchdog), not text-sniffed, and is
@@ -1309,16 +1285,15 @@ ahead of the stale-resume check, so a transient `HTTP 429 … thread not
 found` on resume backs off and retries instead of discarding the thread. A structured status is authoritative — when a
 non-retriable status (e.g. `400`) is present, the looser substring
 markers are **suppressed**, so a bare `429` or `service unavailable`
-echoed inside a 400 body no longer forces a wrong retry. A non-retriable
+echoed inside a 400 body cannot force a wrong retry. A non-retriable
 error *type* (`invalid_request_error`) suppresses the fallback the same
 way, covering the 4xx bodies codex sometimes surfaces without a numeric
 status. The substring
 markers (`RATE_LIMIT_MARKERS` / `TRANSIENT_5XX_MARKERS`) are a
-**fallback** for failures that carry no parseable status — covering the
-current codex-cli code-less rewrites such as `experiencing high demand`,
+**fallback** for failures that carry no parseable status — covering
+codex-cli's code-less rewrites such as `experiencing high demand`,
 `server overloaded`, `selected model is at capacity`, and
-`request was throttled` (`backend overloaded` is retained as a legacy
-fallback for older codex/provider text). That coverage is deliberately
+`request was throttled`. That coverage is deliberately
 scoped: an echoed status phrase inside an `error.message` has no
 provenance and remains a known limit, not something the markers try to
 guess at. Usage/quota
@@ -1348,7 +1323,7 @@ usage error, exit 2), the watchdog terminates that attempt — SIGTERM, a short
 grace, then SIGKILL to the process group, with every termination path
 converging on a single idempotent owner so watchdog, cancellation, and error
 teardowns never race — and the stall policy in the table above decides the
-outcome. Setting 0 may again permit an indefinitely silent role.
+outcome. Setting 0 permits an indefinitely silent role.
 
 The watchdog measures **bytes, not progress**: current codex `exec --json`
 suppresses agent-message/reasoning `item.started` events and all

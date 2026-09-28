@@ -491,15 +491,11 @@ class FollowTests(unittest.TestCase):
             code, lines = self._follow()
         self.assertEqual((code, lines), (0, [DISPATCH_LINE, DONE_LINE]))
 
-    def test_missing_status_is_one_note_then_err_log_alone(self):
+    def test_missing_status_follows_err_log_alone(self):
         self._write(DISPATCH_LINE + "\n")
         self._later(0.6, lambda: self._write(DONE_LINE + "\n"))
-        with patch.object(council_liveness, "FOLLOW_STATUS_WAIT_SECS", 0.2):
-            code, lines = self._follow()
-        self.assertEqual(code, 0)
-        self.assertEqual(len(lines), 3, lines)
-        self.assertTrue(lines[1].startswith(
-            "[codex-council-follow] no usable status.json"))
+        code, lines = self._follow()
+        self.assertEqual((code, lines), (0, [DISPATCH_LINE, DONE_LINE]))
 
     def test_a_new_parent_ends_the_follower_quietly(self):
         self._write(DISPATCH_LINE + "\n")
@@ -819,8 +815,8 @@ class CodexLifecycleTests(unittest.IsolatedAsyncioTestCase):
 # ---------- the scenarios, end to end ----------
 
 def _golden_s0():
-    """S0's out.md and reply files as the 1.0.1 runner wrote them (timings
-    and the run path normalized): the happy path must not change."""
+    """S0's exact out.md and reply files (timings and the run path
+    normalized): the happy path's output must not change."""
     native = ("_Model selection: native inheritance (no model or effort "
               "override sent)_")
 
@@ -846,8 +842,9 @@ def _golden_s0():
 class LivenessScenarioTests(unittest.TestCase):
     """Every scenario in liveness_scenarios.py, run once, concurrently."""
 
-    # Follower lines the 1.0.1 runner's follower emitted for S0.
-    S0_LINES_BEFORE = 9
+    # Follower lines S0 gives when every routine line is relayed too
+    # (dispatch, model selection, three starts, three completions, done).
+    S0_ALL_LINES = 9
 
     @classmethod
     def setUpClass(cls):
@@ -863,7 +860,7 @@ class LivenessScenarioTests(unittest.TestCase):
         outcome = self._assert_passed("S0")
         self.assertEqual(outcome.outputs, _golden_s0())
         self.assertEqual(outcome.follower_lines, 6)
-        self.assertLess(outcome.follower_lines, self.S0_LINES_BEFORE)
+        self.assertLess(outcome.follower_lines, self.S0_ALL_LINES)
 
     def test_s1_held_pipe(self):
         self._assert_passed("S1")

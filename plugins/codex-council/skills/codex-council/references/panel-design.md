@@ -152,11 +152,8 @@ command-line overrides (none are sent), trusted project
 root (closest wins; one in a subdirectory below the `-C` root is not part
 of the council's baseline, even when you launch from that subdirectory),
 the user's `$CODEX_HOME/config.toml`, cloud-managed and system defaults,
-built-in defaults, and any managed new-thread defaults. For model and
-effort, the runner reads none of those files itself; discovery asks Codex
-what it resolved. (The one configuration value the runner reads is a
-positive `agents.max_threads` in the user's `$CODEX_HOME/config.toml`, as a
-concurrency signal.)
+built-in defaults, and any managed new-thread defaults. The runner reads
+none of those files itself; discovery asks Codex what it resolved.
 
 Inheritance is always valid. It is the right choice when the user has not
 asked for anything different and the evidence does not support a better
@@ -326,13 +323,13 @@ pre-flight and the report add advisory notes instead:
 Codex does not validate effort values on the client: in a live probe on
 codex-cli 0.157.1, an effort outside a model's advertised list ran without
 an error, so the service may accept, adjust, or reject an unverified effort.
-A pin that Codex rejects fails the role as `[model-rejected]`; nothing else
-is tried.
+A pinned model that Codex rejects fails the role as `[model-rejected]`; a
+rejected effort or service tier is not a model rejection, so that failure
+keeps Codex's own text untagged. Nothing else is tried either way.
 
-Never relabel an automatic choice as a user pin to get past validation. In
-direct CLI use without `--skill-contract`, a `model` or `effort` with no
-`selection` is still read as an explicit user pin; on the skill path it is
-refused before its value is checked.
+Never relabel an automatic choice as a user pin to get past validation. A
+`model` or `effort` with no `selection` is refused before its value is
+checked.
 
 ### Partial pins and managed defaults
 
@@ -390,8 +387,8 @@ All roles run in the same working directory. When there are several roles
 and any of them edits files, let one role own writes and have the others
 inspect, test, research, or propose. Multiple writers need serialized phases
 (one council after another). Codex also has its own `--worktree` option for
-isolated checkouts, but this runner does not use it yet, so do not plan a
-panel around per-role worktrees.
+isolated checkouts, but this runner does not use it, so do not plan a panel
+around per-role worktrees.
 
 Retries can repeat side effects. The runner never auto-retries a role that
 had begun tool work before a stall, but rate-limit and 5xx retries do replay

@@ -4,9 +4,8 @@ codex_council.py is the only entry point; it imports the sibling
 council_*.py modules from its own directory. These tests pin that the
 siblings resolve even when Python leaves the script's directory off
 sys.path (python3 -P, PYTHONSAFEPATH=1), that a run caches no bytecode in
-the scripts directory (as the single-file runner did), that the import
-graph is acyclic and layered, and that module-level state has exactly one
-owner.
+the installed scripts directory, that the import graph is acyclic and
+layered, and that module-level state has exactly one owner.
 
 Run from repo root:
     python3 -m unittest discover -s tests -p 'test_*.py'
@@ -39,7 +38,7 @@ ALLOWED_IMPORTS = {
     "council_common": set(),
     "council_discovery": {"council_common"},
     "council_selection": {"council_common", "council_discovery"},
-    "council_failures": {"council_common", "council_selection"},
+    "council_failures": {"council_common"},
     "council_liveness": {"council_common"},
     "codex_council": {
         "council_common", "council_discovery", "council_selection",
@@ -83,7 +82,6 @@ class SafePathEntryTests(unittest.TestCase):
     def test_pythonsafepath_env_still_resolves_siblings(self):
         self._assert_siblings_resolved(*self._run(PYTHONSAFEPATH="1"))
 
-    @unittest.skipIf(sys.version_info < (3, 11), "python -P needs 3.11+")
     def test_dash_p_flag_still_resolves_siblings(self):
         self._assert_siblings_resolved(*self._run("-P"))
 
@@ -122,10 +120,10 @@ with open(report, "w", encoding="utf-8") as f:
 
 
 class BytecodeCacheTests(unittest.TestCase):
-    """Python never caches bytecode for the script it runs, so the
-    single-file runner wrote nothing into its (installed plugin) scripts
-    directory. The entry imports its siblings with bytecode writes off and
-    restores the interpreter's setting afterwards. Each run uses a private
+    """A run writes nothing into the installed plugin's scripts directory:
+    Python never caches bytecode for the script it runs, and the entry
+    imports its siblings with bytecode writes off, restoring the
+    interpreter's setting afterwards. Each run uses a private
     copy of the runner modules and Python's default caching."""
 
     def _copy_runner(self, root):

@@ -21,7 +21,6 @@ import collections
 import re
 import time
 from dataclasses import dataclass, replace
-from typing import Optional
 
 from council_common import (
     LINEBREAK_CHARS,
@@ -92,18 +91,17 @@ class Selection:
     runtime-grounded choices bound to this run's discovery snapshot.
     """
     mode: str
-    snapshot_id: Optional[str] = None
-    reason: Optional[str] = None
+    snapshot_id: str | None = None
+    reason: str | None = None
 
 
 @dataclass(frozen=True)
 class SelectionDecision:
     """How one role's model and effort resolve (see _resolve_selection).
 
-    `mode` is what the role asked for (inherit, user, routed,
-    native_effort); `provenance` is what the council does (native, user,
-    routed, native_effort, or fallback when an automatic request resolved
-    to native inheritance). Dispatch uses ONLY dispatch_model and
+    `provenance` is what the council does (native, user, routed,
+    native_effort, or fallback when an automatic request resolved to native
+    inheritance). Dispatch uses ONLY dispatch_model and
     dispatch_effort (None = that override is not sent); the requested
     values are kept for reporting. `note` is a fallback reason or a user-pin
     advisory. `native_model` is the native model the resolving evidence
@@ -111,15 +109,14 @@ class SelectionDecision:
     a refusal of a sent model that equals it (a routed or pinned model that
     is the native one) that an inheriting re-run would send it again.
     """
-    mode: str
     provenance: str
-    requested_model: Optional[str] = None
-    requested_effort: Optional[str] = None
-    dispatch_model: Optional[str] = None
-    dispatch_effort: Optional[str] = None
-    reason: Optional[str] = None
-    note: Optional[str] = None
-    native_model: Optional[str] = None
+    requested_model: str | None = None
+    requested_effort: str | None = None
+    dispatch_model: str | None = None
+    dispatch_effort: str | None = None
+    reason: str | None = None
+    note: str | None = None
+    native_model: str | None = None
 
 
 @dataclass(frozen=True)
@@ -136,29 +133,26 @@ class Role:
     id: str
     label: str
     instruction: str
-    model: Optional[str] = None
-    effort: Optional[str] = None
-    selection: Optional[Selection] = None
-    decision: Optional[SelectionDecision] = None
+    model: str | None = None
+    effort: str | None = None
+    selection: Selection | None = None
+    decision: SelectionDecision | None = None
 
 
-_INHERIT_DECISION = SelectionDecision("inherit", "native")
+_INHERIT_DECISION = SelectionDecision("native")
 
 
 # ---------- the roles.json selection object ----------
 
-def _parse_role_selection(entry, ctx, require_selection):
+def _parse_role_selection(entry, ctx):
     """Validate a role's model, effort, and selection; return
     (model, effort, Selection or None).
 
-    On the skill path (require_selection, i.e. --skill-contract was passed)
-    a 'model' or 'effort' key with no 'selection' is refused first, before
+    A 'model' or 'effort' key with no 'selection' is refused first, before
     its value is checked, so the first error for an untagged malformed pin
     asks for its provenance instead of pointing at inheritance.
     """
-    if require_selection and "selection" not in entry and (
-        "model" in entry or "effort" in entry
-    ):
+    if "selection" not in entry and ("model" in entry or "effort" in entry):
         _roles_usage_exit(
             f"--roles-file {ctx}: 'model'/'effort' without 'selection': "
             "declare selection.mode: 'user' for an explicit user "
@@ -173,18 +167,16 @@ def _parse_role_selection(entry, ctx, require_selection):
 def _validate_optional_role_field(entry, field, ctx):
     """Return a validated model/effort value, or None when omitted.
 
-    A grammar failure in an explicit user pin (selection.mode 'user', or
-    no selection at all, which direct CLI use reads as a user pin) says how
-    to repair the pin; any other says how to inherit.
+    A grammar failure in an explicit user pin (selection.mode 'user') says
+    how to repair the pin; any other says how to inherit.
     """
     if field not in entry:
         return None
     value = entry[field]
     if not isinstance(value, str) or not SELECTION_VALUE_PATTERN.match(value):
         selection = entry.get("selection")
-        user_pin = "selection" not in entry or (
-            isinstance(selection, dict) and selection.get("mode") == "user"
-        )
+        user_pin = (isinstance(selection, dict)
+                    and selection.get("mode") == "user")
         _roles_usage_exit(
             f"--roles-file {ctx}: optional field {field!r} must be a "
             "non-empty string matching "
@@ -219,14 +211,12 @@ def _parse_selection(entry, model, effort, ctx):
     {"mode": "user"} (optionally with "reason") is an explicit pin and
     needs model and/or effort. {"mode": "routed", "snapshot_id", "reason"}
     needs both; {"mode": "native_effort", "snapshot_id", "reason"} needs
-    effort and forbids model (the runner pins the proven native model). A
-    model or effort with no selection is read as an explicit user pin; the
-    skill path has already refused it (see _parse_role_selection).
+    effort and forbids model (the runner pins the proven native model). No
+    selection means inheritance: a model or effort without one was already
+    refused (see _parse_role_selection).
     """
     if "selection" not in entry:
-        if model is None and effort is None:
-            return None
-        return Selection("user")
+        return None
     value = entry["selection"]
     if not isinstance(value, dict):
         _roles_usage_exit(
@@ -466,12 +456,12 @@ def _proven_native_model(evidence):
     return evidence["native"]["model"]
 
 
-def _decision(role, mode, provenance, model=None, effort=None, note=None,
+def _decision(role, provenance, model=None, effort=None, note=None,
               native_model=None):
     """A SelectionDecision that keeps the role's request for reporting."""
     reason = role.selection.reason if role.selection else None
     return SelectionDecision(
-        mode, provenance, role.model, role.effort, model, effort, reason, note,
+        provenance, role.model, role.effort, model, effort, reason, note,
         native_model,
     )
 
@@ -494,30 +484,29 @@ def _resolve_selection(role, planning, launch, routing_mode, now):
     proves, so a refusal can tell whether that model was the native one.
     """
     selection = role.selection
-    if selection is None and role.model is None and role.effort is None:
+    if selection is None:
         return _INHERIT_DECISION
     evidence = launch if launch is not None else planning
-    if selection is None or selection.mode == "user":
-        # An untagged pin gets here only from direct CLI use.
-        return _decision(role, "user", "user", role.model, role.effort,
+    if selection.mode == "user":
+        return _decision(role, "user", role.model, role.effort,
                          _user_pin_advisory(role, evidence, now),
                          _proven_native_model(evidence))
     mode = selection.mode
     if routing_mode == "off":
-        return _decision(role, mode, "fallback", note=ROUTING_OFF_NOTE)
+        return _decision(role, "fallback", note=ROUTING_OFF_NOTE)
     if evidence is None:
-        return _decision(role, mode, "fallback",
+        return _decision(role, "fallback",
                          note="no discovery snapshot for this run")
     stage = "launch discovery" if launch is not None else "discovery snapshot"
     if evidence["status"] != "ok":
         problems = ", ".join(evidence["problems"]) or "no detail recorded"
-        return _decision(role, mode, "fallback",
+        return _decision(role, "fallback",
                          note=f"{stage} unavailable: {problems}")
     if mode == "routed":
         if not evidence["routing"]["eligible"]:
             reasons = "; ".join(evidence["routing"]["reasons"])
             return _decision(
-                role, mode, "fallback",
+                role, "fallback",
                 note=f"{stage} reports routing unavailable: {reasons}",
             )
         # At launch the snapshot id is in memory only: name the stage.
@@ -535,8 +524,8 @@ def _resolve_selection(role, planning, launch, routing_mode, now):
     if gap:
         if launch is not None:
             gap = f"selection evidence changed since discovery: {gap}"
-        return _decision(role, mode, "fallback", note=gap)
-    return _decision(role, mode, mode, model, role.effort,
+        return _decision(role, "fallback", note=gap)
+    return _decision(role, mode, model, role.effort,
                      native_model=_proven_native_model(evidence))
 
 

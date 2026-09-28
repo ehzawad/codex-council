@@ -42,19 +42,17 @@ import sys
 import tempfile
 import unittest
 
-TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
-SCRIPTS_DIR = os.path.abspath(os.path.join(
-    TESTS_DIR, "..", "plugins", "codex-council", "skills", "codex-council",
-    "scripts",
-))
-sys.path.insert(0, SCRIPTS_DIR)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import codex_council  # noqa: E402
+# council_testlib puts the runner's scripts directory on sys.path, so it is
+# imported before the runner modules.
+import council_testlib  # noqa: E402
 import council_discovery  # noqa: E402
 import council_selection  # noqa: E402
 
-SCRIPT = os.path.join(SCRIPTS_DIR, "codex_council.py")
-EPOCH = str(codex_council.SKILL_CONTRACT_EPOCH)
+SCRIPT = council_testlib.SCRIPT
+EPOCH = council_testlib.EPOCH
+TESTS_DIR = council_testlib.TESTS_DIR
 LIVE_ENV = "CODEX_COUNCIL_LIVE_TESTS"
 LIVE_SKIP_REASON = (
     f"live Codex smoke tests are opt-in: set {LIVE_ENV}=1 to run them "
