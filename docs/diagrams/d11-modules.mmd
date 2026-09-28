@@ -1,0 +1,21 @@
+flowchart TD
+    Entry("codex_council<br/>the only entry point")
+    Selection("council_selection")
+    Discovery("council_discovery")
+    Failures("council_failures")
+    Liveness("council_liveness")
+    Common("council_common")
+
+    Entry --> Selection
+    Entry --> Discovery
+    Entry --> Failures
+    Entry --> Liveness
+    Entry --> Common
+    Selection --> Discovery
+    Selection --> Common
+    Discovery --> Common
+    Failures --> Common
+    Liveness --> Common
+
+    classDef ours fill:#dbeafe,stroke:#1d4ed8,color:#0f172a
+    class Entry,Selection,Discovery,Failures,Liveness,Common ours

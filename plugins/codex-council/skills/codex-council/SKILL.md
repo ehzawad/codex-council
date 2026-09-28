@@ -67,8 +67,7 @@ check, and which assumptions might be wrong. Use the conversation first,
 then cheap probes such as `git status --short`. Ask the user only when a
 missing choice would materially change the panel or the authorized outcome;
 otherwise infer and proceed. Re-read the situation on every invocation. If
-the user named a panel (for example `2 agents: <lens-a>, <lens-b>`), use it
-as given.
+the user named a panel, use it as given.
 
 ## Step 2 — Size and compose the panel
 
@@ -114,8 +113,8 @@ redirects would truncate a running council's files, so the pre-flight
 refuses it.
 
 **Discovery.** Always run metadata-only discovery from the directory you
-will launch from, even with routing off. It starts no Codex thread or turn
-and is bounded at about 20 seconds:
+will launch from, even with routing off. It starts no Codex thread or turn;
+its work has a 20-second budget, then a brief bounded cleanup:
 
 ```bash
 python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
@@ -193,10 +192,11 @@ See [context-staging.md](references/context-staging.md).
 it exits 0, in a separate call. Never combine them: a refused pre-flight
 would not stop the launch. Launch with the Bash parameter
 `run_in_background: true` and keep the command itself in the foreground,
-with stdout and stderr redirected to files in `ABS_RUNDIR`. A second detach
-layer (a trailing `&`, `nohup`, `setsid`, `disown`, and the other forms
-runtime-behavior.md lists) makes the tracked wrapper exit at once with a
-false "completed", orphans the runner, and loses the real notification.
+with stdout and stderr redirected to files in `ABS_RUNDIR`. Add no second
+detach layer (a trailing `&`, `nohup`, `setsid`, `disown`, and the other
+forms runtime-behavior.md lists): one that returns at once gives a false
+"completed", orphans the runner, and loses the real notification; the rest
+change how the host tracks or signals it.
 
 ```bash
 # 1. With the Write tool, write ABS_RUNDIR/roles.json and ABS_RUNDIR/context.md.

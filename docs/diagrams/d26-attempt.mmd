@@ -1,0 +1,32 @@
+flowchart TD
+    Cmd(["Prompt on stdin,<br/>argv with sent values"])
+    Group[["codex exec<br/>in its own process group"]]
+    Pumps["stdout and stderr pumps<br/>event flags from stdout"]
+    Clock["Activity clock<br/>this attempt only"]
+    Watchdog{"Silent past the<br/>watchdog threshold?"}
+    Drain{"Pipes at EOF within<br/>10 s of the exit?"}
+    Owner["Termination owner<br/>TERM, then KILL the group"]
+    Sweep["Sweep the group<br/>as the attempt ends"]
+    Result(["CodexRun<br/>exit, output, flags"])
+
+    Cmd --> Group
+    Group --> Pumps
+    Pumps -->|"every byte"| Clock
+    Clock --> Watchdog
+    Watchdog -->|"yes: stalled"| Owner
+    Group -->|"codex exits"| Drain
+    Drain -->|"no: warn"| Owner
+    Drain -->|"yes"| Sweep
+    Owner --> Sweep
+    Sweep --> Result
+
+    classDef step fill:#ffffff,stroke:#475569,color:#0f172a
+    classDef ext fill:#ffedd5,stroke:#c2410c,color:#0f172a
+    classDef decision fill:#f8fafc,stroke:#475569,color:#0f172a
+    classDef soft fill:#fef9c3,stroke:#a16207,color:#0f172a
+    classDef ok fill:#dcfce7,stroke:#15803d,color:#0f172a
+    class Cmd,Pumps,Clock,Sweep step
+    class Group ext
+    class Watchdog,Drain decision
+    class Owner soft
+    class Result ok

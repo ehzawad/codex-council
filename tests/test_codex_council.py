@@ -3937,7 +3937,8 @@ class DocsContractTests(unittest.TestCase):
         r"(?:,\s*(?:and\s+|or\s+)?(?:minimal|low|medium|high|xhigh|max)\b)"
         r"{2,})"
     )
-    TEXT_SUFFIXES = (".md", ".py", ".json", ".sh", ".yml", ".yaml", ".toml")
+    TEXT_SUFFIXES = (".md", ".py", ".json", ".sh", ".yml", ".yaml", ".toml",
+                     ".mmd")
 
     # How every documented template invokes the runner; ${CLAUDE_PLUGIN_ROOT}
     # is the directory that holds .claude-plugin/plugin.json.
@@ -4001,12 +4002,12 @@ class DocsContractTests(unittest.TestCase):
 
     def _repo_text_files(self):
         """Repo-relative paths of the text files the repo ships or tests
-        with (root documents, plugin, scripts, CI, and tests); ignored local
-        directories are never walked."""
+        with (root documents, plugin, scripts, diagrams, CI, and tests);
+        ignored local directories are never walked."""
         root = self._repo_file()
         paths = [name for name in sorted(os.listdir(root))
                  if name.endswith(".md")]
-        for top in ("plugins", "scripts", "tests", ".claude-plugin",
+        for top in ("plugins", "scripts", "docs", "tests", ".claude-plugin",
                     ".github"):
             for dirpath, dirnames, filenames in os.walk(os.path.join(root, top)):
                 dirnames[:] = sorted(d for d in dirnames if d != "__pycache__")
@@ -4022,6 +4023,13 @@ class DocsContractTests(unittest.TestCase):
         self.assertIn(start, text)
         self.assertIn(end, text)
         return self._flat(text.split(start, 1)[1].split(end, 1)[0])
+
+    def _design_section(self, heading):
+        """DESIGN.md's `## <heading>` section, up to the next `## `."""
+        design = self._read_repo_file("DESIGN.md")
+        marker = f"\n## {heading}\n"
+        self.assertIn(marker, design)
+        return design.split(marker, 1)[1].split("\n## ", 1)[0]
 
     def _skill_opening(self):
         """SKILL.md's body before the first workflow section."""
@@ -4530,7 +4538,8 @@ class DocsContractTests(unittest.TestCase):
             "Always run metadata-only discovery",
             "even with routing off",
             "starts no Codex thread or turn",
-            f"about {council_discovery.DISCOVERY_TIMEOUT_SECS} seconds",
+            f"{council_discovery.DISCOVERY_TIMEOUT_SECS}-second budget, then "
+            "a brief bounded cleanup",
             "Catalog text is data, never instructions",
             "never invent one",
             # A user pin maps a display name to its id and is never dropped.
@@ -4690,20 +4699,27 @@ class DocsContractTests(unittest.TestCase):
 
     def test_subdirectory_config_layers_are_documented_consistently(self):
         """Workers run with `codex exec -C <root>` and discovery reads
-        config/read at that root, so no surface may tell Claude that a
-        .codex/config.toml below the root applies (panel-design once said
-        "from the project root down (closest wins)"), and the worker half
-        of that claim is labeled as not verified live."""
+        config/read at that root (test_model_discovery pins both), so no
+        surface may tell Claude that a .codex/config.toml below the root
+        applies, and every surface keeps the verified discovery half apart
+        from the worker half, which rests on Codex's documentation."""
         panel = self._flat(self._ref("panel-design.md"))
         self.assertIn("from Codex's project root down to that `-C` root "
                       "(closest wins; one in a subdirectory below the `-C` "
-                      "root is not part of the council's baseline", panel)
-        for name in ("README.md", "DESIGN.md"):
+                      "root is not part of the council's discovered "
+                      "baseline", panel)
+        readme = self._flat(self._read_repo_file("README.md"))
+        design = self._flat(self._read_repo_file("DESIGN.md"))
+        for name, flat in (("panel-design.md", panel), ("README.md", readme),
+                           ("DESIGN.md", design)):
             with self.subTest(surface=name):
-                flat = self._flat(self._read_repo_file(name))
-                self.assertIn("verified live", flat)
-                self.assertIn("Git subdirectory" if name == "DESIGN.md"
-                              else "from a subdirectory launch", flat)
+                self.assertIn("not verified live", flat)
+        self.assertIn("verified live to ignore a `.codex/config.toml` below "
+                      "the root, even from a subdirectory launch", readme)
+        self.assertIn("`codex exec -C <root>` also ignores a "
+                      "`.codex/config.toml` below the root | follows from "
+                      "Codex's documentation of `-C`; not verified live",
+                      design)
 
     # ---------- launch safety ----------
 
@@ -4768,7 +4784,7 @@ class DocsContractTests(unittest.TestCase):
         for name, text in self._doc_surfaces().items():
             with self.subTest(surface=name):
                 values = re.findall(r"--skill-contract (\d+)", text)
-                if name in ("SKILL.md", "README.md", "runtime-behavior.md"):
+                if name in ("SKILL.md", "runtime-behavior.md"):
                     self.assertTrue(values)
                 self.assertLessEqual(set(values), {epoch})
         skill = self._skill()
@@ -4795,7 +4811,6 @@ class DocsContractTests(unittest.TestCase):
             "codex_council.py")))
         expected = {
             "SKILL.md": {"discover", "check-staging-dir", "launch", "follow"},
-            "README.md": {"discover"},
             "runtime-behavior.md": {"follow", "status", "reap"},
         }
         for name, text in self._doc_surfaces().items():
@@ -5161,14 +5176,14 @@ class DocsContractTests(unittest.TestCase):
                                model="acme/future-review-2034:rev2",
                                selection=council_selection.Selection("user")),
         )
-        readme = self._read_repo_file("README.md")
+        staging = self._design_section("Staging and preflight")
         for role in roles:
             decision = council_selection._resolve_selection(
                 role, planning, None, "auto", None)
             line = (f"[codex-council] selection plan: {role.id}: "
                     f"{council_selection._selection_plan_text(decision)}")
             with self.subTest(role=role.id):
-                self.assertIn(line + "\n", readme)
+                self.assertIn(line + "\n", staging)
         example = council_selection._selection_plan_text(
             self._sent("routed", "<m>", "<e>"))
         self.assertIn(f"`<id>: {example}`",
@@ -5438,8 +5453,8 @@ class DocsContractTests(unittest.TestCase):
         listing = self._flat(runtime).split("start with a bracketed tag:", 1)[1]
         self.assertEqual(set(re.findall(tag_re, listing.split(".", 1)[0])),
                          tags)
-        table = design.split("\n## Failure-class tagging\n", 1)[1]
-        rows = [line for line in table.split("\n## ", 1)[0].splitlines()
+        table = self._design_section("Failure classification and recovery")
+        rows = [line for line in table.splitlines()
                 if line.startswith("| `")]
         self.assertLessEqual(tags, set(re.findall(tag_re, "\n".join(rows))))
         for name, text in (("runtime-behavior.md", runtime),
@@ -5603,9 +5618,12 @@ class DocsContractTests(unittest.TestCase):
         """User-pin provenance and a reason's meaning are trusted to the
         orchestrator, and one launch per directory is enforced by
         discovery and the pre-flight, not atomically at launch."""
-        design = self._read_repo_file("DESIGN.md")
-        limits = self._flat(design.split("\n### Known limits\n", 1)[1]
-                            .split("\n### ", 1)[0])
+        def limits(section):
+            text = self._flat(self._design_section(section))
+            self.assertIn("**Limits.**", text)
+            return text.split("**Limits.**", 1)[1]
+
+        selection = limits("Choosing and validating selections")
         for required in (
             "**User-pin provenance and semantic grounding rest on the "
             "orchestrator.**",
@@ -5613,10 +5631,14 @@ class DocsContractTests(unittest.TestCase):
             "`reason` is checked only as a non-empty single line, never for "
             "meaning",
             "not on runner enforcement",
+        ):
+            self.assertIn(required, selection)
+        staging = limits("Staging and preflight")
+        for required in (
             "**One launch per directory is not enforced atomically.**",
             "the launch itself does not check",
         ):
-            self.assertIn(required, limits)
+            self.assertIn(required, staging)
         # The runner really does accept any non-empty single-line reason.
         role = self._parse_skill_role({
             **_role_json("probe", "Probe"), "model": "future-vega-2033",
@@ -5645,7 +5667,6 @@ class DocsContractTests(unittest.TestCase):
         paths = (
             self.SKILL_PARTS,
             ("README.md",),
-            ("DESIGN.md",),
         )
         for parts in paths:
             flat = self._flat(self._read_repo_file(*parts)).lower()
@@ -5659,7 +5680,8 @@ class DocsContractTests(unittest.TestCase):
                 "technical research",
             ):
                 self.assertIn(required, flat, f"missing {required!r} in {parts}")
-        combined = "\n".join(self._read_repo_file(*parts) for parts in paths)
+        combined = "\n".join(self._flat(self._read_repo_file(*parts))
+                             for parts in paths)
         self.assertIn("no built-in role catalog", combined.lower())
 
     def test_plugin_copy_is_synced_on_verification_and_routing(self):
@@ -5692,80 +5714,267 @@ class DocsContractTests(unittest.TestCase):
             for trigger in ("codex council", "codex coterie", "codex team"):
                 self.assertIn(trigger, lowered)
 
-    def test_readme_and_design_document_every_surface(self):
-        for name in ("README.md", "DESIGN.md"):
-            flat = self._flat(self._read_repo_file(name))
-            with self.subTest(doc=name):
-                for required in (
-                    "--follow", "replies/", "reply=", "`model`", "`effort`",
-                    "`selection`", "model_reasoning_effort", "--discover",
-                    council_discovery.SNAPSHOT_FILENAME,
-                    "CODEX_COUNCIL_MODEL_ROUTING", "native_effort",
-                    "[model-rejected]", "[quota]", "epoch", "no default",
-                ):
-                    self.assertIn(required, flat)
-        readme = self._flat(self._read_repo_file("README.md"))
-        self.assertIn("one or more role-framed OpenAI Codex agents",
-                      readme.replace("**", ""))
+    # ---------- README and DESIGN structure ----------
 
-    def test_readme_intro_and_configuration_document_native_resolution(self):
+    README_SECTIONS = (
+        "Requirements", "Install", "Usage", "How a run works",
+        "Configuration", "Results and failures", "Security", "Diagrams",
+        "Development", "License",
+    )
+    DESIGN_CONCERNS = (
+        "Panel and context contract", "Model discovery",
+        "Choosing and validating selections", "Staging and preflight",
+        "Launch and fan-out", "Thread continuity",
+        "One attempt and its watchdog",
+        "Failure classification and recovery",
+        "Progress, replies, and reconciliation",
+        "Run liveness and recovery",
+    )
+    DIAGRAM_NODE_BUDGET = 9
+
+    @staticmethod
+    def _top_sections(text):
+        return re.findall(r"^## (.+)$", text, re.M)
+
+    def test_readme_introduces_then_configures_in_order(self):
+        """README introduces the plugin, then runs from requirements to
+        development in the documented order, and its intro names the
+        adaptive, verification-first product."""
         readme = self._read_repo_file("README.md")
         self.assertTrue(self._flat(readme).startswith(
             "# codex-council Independent cross-model verification and "
             "collaboration"))
-        config = self._flat(
-            readme.split("\n## Configuration\n", 1)[1].split("\n## ", 1)[0])
-        for required in (
-            "### Native configuration in the worker's execution context",
-            "### Runtime model routing",
-            "learn.chatgpt.com/docs/config-file/config-basic",
-            "`codex exec -C <root>`",
-            "forwards no `--profile`",
-            "`CODEX_API_KEY`",
-            "--discover 'ABS_RUNDIR' --skill-contract 3",
-            "`CODEX_COUNCIL_MODEL_ROUTING`",
-            "Explicit pins.",
-            "`[model-rejected]`",
-            "`[quota]`",
-        ):
-            self.assertIn(required, config)
-        diagrams = "\n".join(re.findall(r"```mermaid\n(.*?)```", readme, re.S))
-        for required in ("--discover", "model-snapshot.json", "selection"):
-            self.assertIn(required, diagrams)
-        self.assertIn("\n## For development\n", readme)
+        self.assertIn("one or more role-framed OpenAI Codex agents",
+                      self._flat(readme).replace("**", ""))
+        self.assertEqual(tuple(self._top_sections(readme)),
+                         self.README_SECTIONS)
 
-    def test_design_documents_the_model_selection_architecture(self):
+    def test_readme_settings_table_matches_the_runner(self):
+        """Every environment variable the runner reads is in README's
+        table, with the runner's own default."""
+        config = self._flat(self._read_repo_file("README.md").split(
+            "\n### Environment variables\n", 1)[1].split("\n### ", 1)[0])
+        defaults = {
+            council_discovery.MODEL_ROUTING_ENV: "`auto`",
+            codex_council.MAX_PARALLEL_ENV:
+                f"`{codex_council.DEFAULT_MAX_PARALLEL}`",
+            codex_council.STALL_SECS_ENV:
+                f"`{codex_council.DEFAULT_STALL_SECS}`",
+            codex_council.SESSION_KEY_ENV: "unset",
+            "XDG_STATE_HOME": "`~/.local/state`",
+        }
+        runner = self._runner_source()
+        for variable, default in defaults.items():
+            with self.subTest(variable=variable):
+                self.assertIn(variable, runner)
+                self.assertIn(f"| `{variable}` | {default} |", config)
+        # And no variable the runner does not read.
+        documented = set(re.findall(r"\| `([A-Z_]+)` \|", config))
+        self.assertEqual(documented, set(defaults))
+
+    def test_run_directory_tables_name_what_the_runner_writes(self):
+        """README and DESIGN list every entry a launch creates in the run
+        directory, under the names the runner uses."""
+        entries = (council_discovery.SNAPSHOT_FILENAME,
+                   council_liveness.STATUS_FILENAME,
+                   *council_common.LAUNCH_OUTPUTS)
+        for name in ("README.md", "DESIGN.md"):
+            text = self._read_repo_file(name)
+            rows = "\n".join(line for line in text.splitlines()
+                             if line.startswith("| `"))
+            for entry in entries:
+                with self.subTest(doc=name, entry=entry):
+                    self.assertIn(f"`{entry}", rows)
+
+    def test_design_command_table_covers_every_command(self):
+        """DESIGN's command table has a row for every command mode the
+        runner's parser accepts."""
+        commands = self._design_section("Architecture").split(
+            "\n### Commands\n", 1)[1]
+        rows = [line for line in commands.splitlines()
+                if line.startswith("| ")]
+        for flag in ("--discover RUNDIR", "--check-staging-dir RUNDIR",
+                     "--roles-file", "--follow RUNDIR", "--status RUNDIR",
+                     "--reap RUNDIR"):
+            with self.subTest(flag=flag):
+                self.assertTrue(any(flag in row for row in rows), flag)
+                args = codex_council._parse_args(
+                    [flag.split()[0], "ABS_RUNDIR"] if " " in flag else
+                    ["--roles-file", "ABS_RUNDIR/roles.json",
+                     "--context-file", "ABS_RUNDIR/context.md"])
+                self.assertNotEqual(self._command_mode(args), "other")
+
+    def test_design_concerns_follow_one_template(self):
+        """DESIGN goes overview, architecture, one section per concern,
+        testing, non-goals; every concern states its purpose, how it
+        works, its key decisions, and its limits, in that order."""
         design = self._read_repo_file("DESIGN.md")
-        for heading in (
-            "## Model selection architecture",
-            "### The discovery adapter",
-            "### The snapshot",
-            "### Authoring versus evidence validation",
-            "### Provenance and reporting",
-            "### Failure classification",
-            "### Deliberately not done",
-        ):
-            self.assertIn(f"\n{heading}\n", design)
-        not_done = self._flat(design.split("\n### Deliberately not done\n", 1)[1]
-                              .split("\n## ", 1)[0])
+        self.assertEqual(
+            tuple(self._top_sections(design)),
+            ("Overview", "Architecture", *self.DESIGN_CONCERNS,
+             "Testing and supported behavior", "Non-goals"))
+        for concern in self.DESIGN_CONCERNS:
+            section = self._design_section(concern)
+            with self.subTest(concern=concern):
+                positions = [section.find(label) for label in (
+                    "**Purpose.**", "**How it works.**",
+                    "**Key decisions and why.**", "**Limits.**")]
+                self.assertNotIn(-1, positions)
+                self.assertEqual(positions, sorted(positions))
+        not_done = self._flat(self._design_section("Non-goals"))
         for required in (
             "codex debug models", "thread/read", "model-hopping",
             "cross-run cache", "profile forwarding",
         ):
             self.assertIn(required, not_done)
-        # The classification order is stated exactly once, in the
-        # Failure-class tagging section, so no second copy can drift.
+
+    def test_classification_order_is_stated_once_where_it_is_explained(self):
+        """The classifier order appears exactly once in DESIGN, in its
+        failure section, and its steps are the verdict kinds the
+        classifier produces, in the order the resume path tries them."""
         order = ("auth → quota → anchored 429/5xx → model rejected → stale "
                  "(resume only) → substring retriable fallback → untagged")
-        self.assertEqual(self._flat(design).count(order), 1)
-        tagging = design.split("\n## Failure-class tagging\n", 1)[1]
-        self.assertIn(order, self._flat(tagging.split("\n## ", 1)[0]))
-        self.assertIn("[Failure-class tagging](#failure-class-tagging)",
-                      design.split("\n### Failure classification\n", 1)[1]
-                      .split("\n### ", 1)[0])
-        diagrams = "\n".join(re.findall(r"```mermaid\n(.*?)```", design, re.S))
-        for required in ("model/list", "selection.mode", "--discover"):
-            self.assertIn(required, diagrams)
+        design = self._flat(self._read_repo_file("DESIGN.md"))
+        self.assertEqual(design.count(order), 1)
+        self.assertIn(order, self._flat(
+            self._design_section("Failure classification and recovery")))
+        # A text that is both stale-looking and a model rejection is a
+        # rejection, and an anchored 429 beats a stale-looking message.
+        routed = self._sent("routed", "future-vega-2033", "brisk", "why")
+        self.assertTrue(_classify(
+            "The model 'future-vega-2033' does not exist or you do not have "
+            "access to it. thread not found", phase="resume",
+            decision=routed).startswith("[model-rejected] "))
+        self.assertEqual(council_failures._failure_verdict(
+            "HTTP 429 Too Many Requests: thread not found", (), None,
+            resume=True).kind, "rate-limit")
+
+    def test_design_names_only_code_that_exists(self):
+        """Every private function or constant DESIGN names in code spans
+        exists in the runner, and every `NAME = value` it states is the
+        runner's value, so the explanation cannot drift from the code."""
+        design = self._read_repo_file("DESIGN.md")
+        modules = (codex_council, council_common, council_discovery,
+                   council_selection, council_failures, council_liveness)
+        names = set(re.findall(r"`(_[a-z][a-z0-9_]*)[`(]", design))
+        self.assertIn("_failure_verdict", names)
+        for name in sorted(names):
+            with self.subTest(name=name):
+                self.assertTrue(any(hasattr(m, name) for m in modules), name)
+        stated = re.findall(r"`([A-Z][A-Z0-9_]+) = ([^`]+)`", design)
+        self.assertTrue(stated)
+        for name, value in stated:
+            with self.subTest(constant=name):
+                owners = [m for m in modules if hasattr(m, name)]
+                self.assertTrue(owners, name)
+                actual = getattr(owners[0], name)
+                if isinstance(actual, re.Pattern):
+                    actual = actual.pattern
+                self.assertEqual(str(actual), value)
+
+    def test_design_states_the_runners_timing_constants(self):
+        """The numbers DESIGN gives for discovery, the drain, and liveness
+        are the runner's."""
+        discovery = self._flat(self._design_section("Model discovery"))
+        for text in (
+            f"| {council_discovery.DISCOVERY_TIMEOUT_SECS} s, monotonic",
+            f"| {council_common.PROJECT_ROOT_TIMEOUT_SECS} s, falling back",
+            f"{council_discovery.DISCOVERY_MAX_PAGES} pages or "
+            f"{council_discovery.DISCOVERY_MAX_MODELS:,} entries",
+            f"at most {council_discovery.DISCOVERY_CLOSE_GRACE_SECS} s",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(text, discovery)
+        attempt = self._flat(self._design_section(
+            "One attempt and its watchdog"))
+        self.assertIn(f"`POST_EXIT_DRAIN_SECS` "
+                      f"({codex_council.POST_EXIT_DRAIN_SECS} s)", attempt)
+        liveness = self._flat(self._design_section("Run liveness and recovery"))
+        for text in (
+            f"at least every {council_liveness.STATUS_TICK_SECS} s",
+            f"bounded to {council_liveness.PS_TIMEOUT_SECS} s",
+            f"checks every {council_liveness.FOLLOW_CHECK_SECS} s",
+            f"no tick for {council_liveness.TICK_WARN_SECS} s",
+            f"exit 4 at {council_liveness.TICK_GIVE_UP_SECS} s",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(text, liveness)
+
+    # ---------- diagrams and the PDF ----------
+
+    def _diagram_ids(self):
+        folder = self._repo_file("docs", "diagrams")
+        return sorted(name[:-4] for name in os.listdir(folder)
+                      if name.endswith(".mmd"))
+
+    def test_every_diagram_has_a_source_a_png_and_a_small_budget(self):
+        """Each diagram id has its Mermaid source and a PNG export, and no
+        diagram draws more than DIAGRAM_NODE_BUDGET nodes (details belong
+        in the tables beside it)."""
+        ids = self._diagram_ids()
+        self.assertTrue(ids)
+        folder = self._repo_file("docs", "diagrams")
+        pngs = sorted(name[:-4] for name in os.listdir(folder)
+                      if name.endswith(".png"))
+        self.assertEqual(pngs, ids)
+        for ident in ids:
+            with self.subTest(diagram=ident):
+                self.assertRegex(ident, r"^d\d\d-[a-z0-9-]+$")
+                with open(os.path.join(folder, f"{ident}.png"), "rb") as f:
+                    self.assertEqual(f.read(8), b"\x89PNG\r\n\x1a\n")
+                source = self._read_repo_file("docs", "diagrams",
+                                              f"{ident}.mmd")
+                self.assertRegex(source, r"^flowchart (?:LR|TD)\n")
+                nodes = set()
+                for line in source.splitlines():
+                    line = line.strip()
+                    if line.startswith(("classDef ", "class ")):
+                        continue
+                    nodes.update(re.findall(
+                        r"\b([A-Za-z][A-Za-z0-9_]*)(?=\(|\[|\{)", line))
+                self.assertTrue(nodes)
+                self.assertLessEqual(len(nodes), self.DIAGRAM_NODE_BUDGET)
+
+    def test_docs_embed_every_diagram_with_its_source_beside_it(self):
+        """README embeds the level 0 and level 1 views and indexes every
+        diagram; DESIGN embeds every diagram once, each followed by a
+        caption naming its id and linking its Mermaid source."""
+        ids = self._diagram_ids()
+        readme = self._read_repo_file("README.md")
+        design = self._read_repo_file("DESIGN.md")
+        embed = r"!\[[^\]]*\]\(docs/diagrams/({0})\.png\)"
+        for name, text, expected in (
+                ("README.md", readme, {"d00-context", "d10-components"}),
+                ("DESIGN.md", design, set(ids))):
+            embedded = re.findall(embed.format(r"[a-z0-9-]+"), text)
+            with self.subTest(doc=name):
+                self.assertEqual(set(embedded), expected)
+                self.assertEqual(len(embedded), len(set(embedded)))
+            for ident in embedded:
+                with self.subTest(doc=name, diagram=ident):
+                    after = text.split(f"(docs/diagrams/{ident}.png)", 1)[1]
+                    caption = self._flat(after.split("\n\n", 2)[1])
+                    self.assertTrue(caption.startswith(f"*{ident} — "))
+                    self.assertIn(f"[{ident}.mmd](docs/diagrams/{ident}.mmd)",
+                                  caption)
+        index = self._flat(readme.split("\n## Diagrams\n", 1)[1]
+                           .split("\n## ", 1)[0])
+        for ident in ids:
+            with self.subTest(index=ident):
+                self.assertIn(f"[{ident}](docs/diagrams/{ident}.png)", index)
+
+    def test_docs_pdf_and_its_build_script_ship(self):
+        """The combined PDF ships beside its repeatable build script, which
+        includes every document the PDF promises."""
+        script = self._repo_file("scripts", "build-docs.sh")
+        self.assertTrue(os.access(script, os.X_OK))
+        text = self._read_repo_file("scripts", "build-docs.sh")
+        for doc in ("README.md", "DESIGN.md", "SKILL.md",
+                    *sorted(os.listdir(self._repo_file(*self.REF_PARTS)))):
+            with self.subTest(doc=doc):
+                self.assertIn(doc, text)
+        with open(self._repo_file("docs", "codex-council.pdf"), "rb") as f:
+            self.assertEqual(f.read(5), b"%PDF-")
 
     # ---------- other docs ----------
 
@@ -5777,23 +5986,14 @@ class DocsContractTests(unittest.TestCase):
     def test_design_md_resume_footgun_describes_uuid_error_path(self):
         """The wording must describe the real codex-cli behavior (unknown
         UUID errors; only a non-UUID name silently spawns)."""
-        text = self._read_repo_file("DESIGN.md")
+        text = self._flat(self._read_repo_file("DESIGN.md"))
         self.assertIn("no rollout found", text)
         self.assertIn("thread *name*", text)
-
-    def test_design_md_documents_structured_status_classification(self):
-        text = self._read_repo_file("DESIGN.md")
-        self.assertIn("_extract_statuses", text)
-        self.assertIn("500", text)
-        self.assertIn("Usage/quota", text)
 
     def test_runtime_reference_documents_vscode_pid_caveat(self):
         text = self._ref("runtime-behavior.md")
         self.assertIn("same VS Code window", text)
         self.assertIn("CODEX_COUNCIL_SESSION_KEY", text)
-
-    def test_runtime_reference_documents_usage_limit_nonretriable(self):
-        self.assertIn("Usage/quota-limit", self._ref("runtime-behavior.md"))
 
     def test_docs_distinguish_output_inactivity_watchdog_from_run_level_deadline(self):
         """The liveness contract is stated the same way on every surface:

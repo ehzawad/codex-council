@@ -16,8 +16,8 @@
 #      accumulate orphaned entries after version bumps.
 #
 # Claude Code may replace the symlink with a fresh copy when a session
-# starts, so run this from a SessionStart hook (see README.md, "For
-# development"), or re-run it by hand after each session start, version
+# starts, so run this from a SessionStart hook (see README.md,
+# "Development"), or re-run it by hand after each session start, version
 # bump in plugin.json, `claude plugins update`, or cache wipe.
 
 set -euo pipefail

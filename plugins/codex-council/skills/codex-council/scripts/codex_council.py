@@ -1074,12 +1074,14 @@ async def _run_role_invocation(role, attempt, run_codex):
             # -32600", exit 1) and is handled by the stale-resume branch below;
             # only a value that is NOT a valid UUID is treated as a thread NAME
             # and silently starts a NEW thread (rc==0, fresh thread.started).
-            # Stored ids are always real UUIDs, so silent-spawn is unreachable
-            # via normal state — this check is defense-in-depth against
-            # corrupt or hand-edited state. Detect by comparing the emitted
-            # thread.started.thread_id to what we asked to resume; if mismatched,
-            # adopt the new id (no benefit re-running an already-completed turn)
-            # and warn — the role lost its prior accumulated framing.
+            # The runner stores whatever non-empty id thread.started emitted
+            # and does not check that it is a UUID; Codex emits UUIDs, so
+            # silent-spawn needs an unexpected id or a hand-edited state
+            # file. Detect it by comparing a non-empty emitted
+            # thread.started.thread_id to what we asked to resume; if it
+            # differs, adopt the new id (no benefit re-running an
+            # already-completed turn) and warn — the role lost its prior
+            # accumulated framing.
             # The reply is extracted BEFORE any state write so persistence
             # failures can never cost a completed reply.
             msg = extract_final_message(run.stdout)

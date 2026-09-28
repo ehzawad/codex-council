@@ -1,0 +1,26 @@
+flowchart LR
+    Root["Project root<br/>Git top level or cwd"]
+    Scope["Session scope<br/>key, host session, or none"]
+    RoleId["Role id"]
+    Key("State key")
+    Lock["Role lock<br/>held for every attempt"]
+    File[("State file<br/>thread id, bookkeeping")]
+    Attempt("Role attempt<br/>resume, else fresh")
+    Save["Atomic save<br/>never a model or effort"]
+
+    Root --> Key
+    Scope --> Key
+    RoleId --> Key
+    Key --> Lock
+    Key --> File
+    Lock --> Attempt
+    File -->|"saved thread id"| Attempt
+    Attempt -->|"outcome allows"| Save
+    Save --> File
+
+    classDef step fill:#ffffff,stroke:#475569,color:#0f172a
+    classDef ours fill:#dbeafe,stroke:#1d4ed8,color:#0f172a
+    classDef data fill:#ede9fe,stroke:#6d28d9,color:#0f172a
+    class Root,Scope,RoleId,Lock,Save step
+    class Key,Attempt ours
+    class File data

@@ -1,0 +1,36 @@
+flowchart TD
+    Runner("Runner event loop")
+    Status[("status.json<br/>tick every 15 s,<br/>pids and start times")]
+    Check{"Follower, every 2 s:<br/>runner still there?"}
+    Tick{"Tick age?"}
+    Stuck(["runner not responding<br/>120 s warn, 300 s exit 4"])
+    Gone(["runner gone<br/>exit 4 at once"])
+    StatusCmd["--status<br/>facts and one next: action"]
+    Reap["--reap<br/>TERM, KILL verified groups"]
+    Rerun(["Re-run unfinished roles<br/>in a new directory"])
+
+    Runner -->|"writes"| Status
+    Status --> Check
+    Check -->|"no: gone, or its pid<br/>is another process"| Gone
+    Check -->|"yes"| Tick
+    Tick -->|"fresh"| Check
+    Tick -->|"stale"| Stuck
+    Gone --> StatusCmd
+    Stuck --> StatusCmd
+    StatusCmd -->|"gone, task ended"| Reap
+    Reap --> Rerun
+
+    classDef ours fill:#dbeafe,stroke:#1d4ed8,color:#0f172a
+    classDef data fill:#ede9fe,stroke:#6d28d9,color:#0f172a
+    classDef decision fill:#f8fafc,stroke:#475569,color:#0f172a
+    classDef soft fill:#fef9c3,stroke:#a16207,color:#0f172a
+    classDef stop fill:#fee2e2,stroke:#b91c1c,color:#0f172a
+    classDef step fill:#ffffff,stroke:#475569,color:#0f172a
+    classDef ok fill:#dcfce7,stroke:#15803d,color:#0f172a
+    class Runner ours
+    class Status data
+    class Check,Tick decision
+    class Stuck soft
+    class Gone stop
+    class StatusCmd,Reap step
+    class Rerun ok

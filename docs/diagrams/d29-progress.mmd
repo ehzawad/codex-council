@@ -1,0 +1,29 @@
+flowchart TD
+    Runner("Runner<br/>a role settles")
+    Reply[("replies/role.md<br/>atomic, best-effort")]
+    Log[("err.log<br/>K/N line, reply=path")]
+    Follower("Follower<br/>actionable lines only")
+    Early("Claude: provisional work<br/>reply read as data")
+    Report[("out.md<br/>the final report")]
+    Host("Host task completion<br/>notification")
+    Reconcile("Claude reconciles")
+    User(("User"))
+
+    Runner -->|"1 write"| Reply
+    Runner -->|"2 log"| Log
+    Log --> Follower
+    Follower -->|"Monitor event"| Early
+    Reply --> Early
+    Early -->|"one-line update"| User
+    Runner -->|"all settled"| Report
+    Runner -->|"process exits"| Host
+    Report --> Reconcile
+    Host --> Reconcile
+    Reconcile -->|"one result"| User
+
+    classDef ours fill:#dbeafe,stroke:#1d4ed8,color:#0f172a
+    classDef data fill:#ede9fe,stroke:#6d28d9,color:#0f172a
+    classDef person fill:#f3f4f6,stroke:#374151,color:#111827
+    class Runner,Follower,Early,Reconcile ours
+    class Reply,Log,Report data
+    class Host,User person

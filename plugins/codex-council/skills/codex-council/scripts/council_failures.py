@@ -66,8 +66,9 @@ RATE_LIMIT_MARKERS = (
     # NB: "quota exceeded" / usage caps are deliberately NOT retriable markers —
     # a plan/usage cap does not clear within a 5s backoff, so it is surfaced
     # terminal (see "Retries and long runs" in references/runtime-behavior.md
-    # and "Failure-class tagging" in DESIGN.md); the recognized quota forms
-    # are tagged [quota] ahead of the anchored parser (QUOTA_ERROR_CODES).
+    # and "Failure classification and recovery" in DESIGN.md); the
+    # recognized quota forms are tagged [quota] ahead of the anchored parser
+    # (QUOTA_ERROR_CODES).
     # Genuine transient 429s are caught by the anchored parser or the
     # rate-limit phrases above.
 )
