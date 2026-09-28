@@ -3,6 +3,36 @@
 Implementation details for contributors. User-facing docs live in
 [README.md](README.md).
 
+## Module layout
+
+The runner is standard-library Python in
+`plugins/codex-council/skills/codex-council/scripts/`. `codex_council.py` is
+the only entry point; it imports four sibling modules, and nothing imports
+it:
+
+| Module | Owns |
+|---|---|
+| `codex_council.py` | CLI parsing and `main`, the staging and launch privacy gates, roles-file parsing, continuity state and locks, the `codex exec` runner with its output-inactivity watchdog and retries, fan-out, the report and reply files, and the `--follow` follower |
+| `council_common.py` | Shared primitives: `_report_inline` over `LINEBREAK_CHARS`, the advisory stderr sink (`_diag`), `_usage_exit` and `_roles_usage_exit` with the uniform recovery texts, `_check_private_dir`, `_atomic_write_private`, strict JSON loading, JSONL record iteration, `_project_root`, and `_plugin_version` |
+| `council_discovery.py` | The discovery adapter: execution context, app-server transport, the `_normalize_*` helpers, building, writing, and reading the snapshot, the `--discover` summary and command, and `CODEX_COUNCIL_MODEL_ROUTING` |
+| `council_selection.py` | `Selection` and `SelectionDecision`, the `selection` grammar, authoring validation, the pure `_resolve_selection`, launch-time resolution, and the selection text in reports and the preflight plan |
+| `council_failures.py` | Failure records from `error` and `turn.failed` events, the marker lists, `_failure_verdict`, and the failure tags |
+
+Imports point one way: `council_discovery` uses `council_common`,
+`council_selection` uses both, `council_failures` uses `council_common` and
+`council_selection`, and only `codex_council.py` imports all four. Module
+state has one owner and is used through it: the diagnostics sink and the
+cached project root live in `council_common`, per-role liveness and
+`STATE_DIR` in `codex_council.py`. Siblings import names directly, so a test
+patches the module whose global the calling code reads (for example
+`council_discovery._project_root` for discovery's `config/read` cwd).
+`codex_council.py` puts its own directory first on `sys.path` before it
+imports the siblings, because `python3 -P` and `PYTHONSAFEPATH=1` leave that
+directory off. It imports them with bytecode writes off, so, like the
+single-file runner (Python never caches bytecode for the script it runs), a
+run writes no `__pycache__` into the plugin directory; the interpreter's
+setting is restored right after the sibling imports.
+
 ## No catalog, no defaults
 
 The script accepts roles **only** via `--roles-file` (a path to a JSON

@@ -42,11 +42,15 @@ sys.path.insert(0, SCRIPTS_DIR)
 sys.path.insert(0, TESTS_DIR)
 
 import codex_council  # noqa: E402
+import council_common  # noqa: E402
+import council_discovery  # noqa: E402
+import council_failures  # noqa: E402
+import council_selection  # noqa: E402
 import fake_codex  # noqa: E402
 
 SCRIPT = os.path.join(SCRIPTS_DIR, "codex_council.py")
 EPOCH = str(codex_council.SKILL_CONTRACT_EPOCH)
-ROUTING_ENV = codex_council.MODEL_ROUTING_ENV
+ROUTING_ENV = council_discovery.MODEL_ROUTING_ENV
 NATIVE = fake_codex.NATIVE_MODEL          # future-orion-2032, the native model
 VEGA = "future-vega-2033"                 # visible, recommended
 LYRA = "future-lyra-2030"                 # visible, retires 2031-01-01
@@ -105,9 +109,9 @@ def _role(rid="architect", model=None, effort=None, mode=None,
     """A parsed Role (selection attached) without going through JSON."""
     selection = None
     if mode == "user":
-        selection = codex_council.Selection("user")
+        selection = council_selection.Selection("user")
     elif mode is not None:
-        selection = codex_council.Selection(mode, snapshot_id, reason)
+        selection = council_selection.Selection(mode, snapshot_id, reason)
     return codex_council.Role(
         rid, rid.title(), " ".join(_instruction()), model, effort, selection)
 
@@ -139,10 +143,10 @@ def _clean_env(**extra):
 # ---------- synthetic snapshots (built by the real snapshot builder) ----------
 
 def _catalog(entries):
-    catalog = codex_council._new_catalog()
-    page, problem = codex_council._normalize_model_page({"data": entries})
+    catalog = council_discovery._new_catalog()
+    page, problem = council_discovery._normalize_model_page({"data": entries})
     assert problem is None, problem
-    codex_council._merge_model_page(catalog, page, [])
+    council_discovery._merge_model_page(catalog, page, [])
     return catalog
 
 
@@ -151,7 +155,7 @@ def _snapshot(snapshot_id=SNAPSHOT_ID, routing_mode="auto", entries=None,
     """A discovery snapshot; keyword args override the observations."""
     base = {
         "context": dict(
-            codex_council._EMPTY_DISCOVERY_CONTEXT, project_root="/proj",
+            council_discovery._EMPTY_DISCOVERY_CONTEXT, project_root="/proj",
             launch_cwd="/proj", codex_executable="/bin/codex",
             codex_cli_version="9.9.9", codex_home="/home/.codex",
         ),
@@ -167,7 +171,7 @@ def _snapshot(snapshot_id=SNAPSHOT_ID, routing_mode="auto", entries=None,
             fake_codex.default_catalog() if entries is None else entries),
     }
     base.update(observed)
-    return codex_council._build_snapshot(
+    return council_discovery._build_snapshot(
         snapshot_id=snapshot_id, created_at="2026-09-27T12:00:00Z",
         plugin_version="9.8.7", routing_mode=routing_mode, **base,
     )
@@ -184,7 +188,7 @@ def _managed_present():
 
 
 def _resolve(role, planning=None, launch=None, routing_mode="auto", now=NOW):
-    return codex_council._resolve_selection(
+    return council_selection._resolve_selection(
         role, planning, launch, routing_mode, now)
 
 
@@ -253,7 +257,7 @@ class SelectionObjectParsingTests(unittest.TestCase):
         self.assertIsNone(role.model)
         self.assertIsNone(role.effort)
         self.assertIsNone(role.selection)
-        decision = codex_council._role_decision(role)
+        decision = council_selection._role_decision(role)
         self.assertEqual(decision.provenance, "native")
         self.assertIsNone(decision.dispatch_model)
         self.assertIsNone(decision.dispatch_effort)
@@ -264,7 +268,7 @@ class SelectionObjectParsingTests(unittest.TestCase):
             with self.subTest(extra=extra):
                 role = _parse([_entry(selection={"mode": "user"}, **extra)])[0]
                 self.assertEqual(role.selection,
-                                 codex_council.Selection("user"))
+                                 council_selection.Selection("user"))
         role = _parse([_entry(model=CUSTOM, selection={
             "mode": "user", "reason": "the user asked for this model"})])[0]
         self.assertEqual(role.selection.reason, "the user asked for this model")
@@ -285,7 +289,7 @@ class SelectionObjectParsingTests(unittest.TestCase):
         role = _parse([_routed()])[0]
         self.assertEqual(role.model, VEGA)
         self.assertEqual(role.effort, "brisk")
-        self.assertEqual(role.selection, codex_council.Selection(
+        self.assertEqual(role.selection, council_selection.Selection(
             "routed", SNAPSHOT_ID, "narrow checks fit the fast model"))
 
     def test_routed_needs_both_values_a_snapshot_id_and_a_reason(self):
@@ -357,7 +361,7 @@ class SelectionObjectParsingTests(unittest.TestCase):
                     expect_in_stderr="'selection' must be an object")
 
     def test_reason_is_single_line_with_no_length_cap(self):
-        for ch in codex_council.LINEBREAK_CHARS:
+        for ch in council_common.LINEBREAK_CHARS:
             entry = _routed()
             entry["selection"]["reason"] = f"first{ch}second"
             with self.subTest(char=hex(ord(ch))):
@@ -371,7 +375,7 @@ class SelectionObjectParsingTests(unittest.TestCase):
 
     def test_untagged_pins_are_user_pins_only_for_direct_cli_use(self):
         role = _parse([_entry(model=CUSTOM, effort="brisk")])[0]
-        self.assertEqual(role.selection, codex_council.Selection("user"))
+        self.assertEqual(role.selection, council_selection.Selection("user"))
         for extra in ({"model": CUSTOM}, {"effort": "brisk"}):
             with self.subTest(extra=extra):
                 err = _assert_usage_exit(
@@ -448,7 +452,7 @@ class ResolverTests(unittest.TestCase):
             with self.subTest(mode=mode):
                 self.assertEqual(
                     _resolve(_role(), planning, launch, mode),
-                    codex_council.SelectionDecision("inherit", "native"))
+                    council_selection.SelectionDecision("inherit", "native"))
 
     def test_explicit_pin_is_forwarded_unchanged_even_off_catalog(self):
         """AC9: catalog absence never rejects or replaces an explicit pin."""
@@ -462,7 +466,7 @@ class ResolverTests(unittest.TestCase):
                     (decision.dispatch_model, decision.dispatch_effort),
                     (CUSTOM, "brisk"))
         decision = _resolve(_role(model=CUSTOM, mode="user"), _snapshot())
-        self.assertEqual(decision.note, codex_council.UNVERIFIED_MODEL_ADVISORY)
+        self.assertEqual(decision.note, council_selection.UNVERIFIED_MODEL_ADVISORY)
 
     def test_untagged_pin_resolves_as_a_user_pin(self):
         decision = _resolve(_role(model=VEGA, effort="brisk"), _snapshot())
@@ -500,7 +504,7 @@ class ResolverTests(unittest.TestCase):
             with self.subTest(status=snapshot["managed_defaults"]["status"]):
                 note = _resolve(partial, snapshot).note or ""
                 self.assertEqual(
-                    codex_council.PARTIAL_PIN_ADVISORY in note, flagged)
+                    council_selection.PARTIAL_PIN_ADVISORY in note, flagged)
         both = _role(model=VEGA, effort="brisk", mode="user")
         self.assertIsNone(_resolve(both, _snapshot(
             managed=_managed_present())).note)
@@ -509,7 +513,7 @@ class ResolverTests(unittest.TestCase):
     def test_routed_pair_is_dispatched_exactly_as_authored(self):
         role = _role(model=VEGA, effort="deliberate", mode="routed")
         decision = _resolve(role, _snapshot())
-        self.assertEqual(decision, codex_council.SelectionDecision(
+        self.assertEqual(decision, council_selection.SelectionDecision(
             "routed", "routed", VEGA, "deliberate", VEGA, "deliberate",
             "grounded in the snapshot", None))
 
@@ -636,12 +640,12 @@ class ResolverTests(unittest.TestCase):
             _role("e", model=CUSTOM, mode="user"),
             _role("f", model=HIDDEN, effort="brisk", mode="routed"),
         ]
-        automatic = [r for r in roles if codex_council._is_automatic(r)]
+        automatic = [r for r in roles if council_selection._is_automatic(r)]
 
         def verdicts(snapshot):
             return (
                 [_resolve(r, snapshot) for r in roles],
-                [codex_council._authoring_problem(r, snapshot, None, NOW)
+                [council_selection._authoring_problem(r, snapshot, None, NOW)
                  for r in automatic],
             )
 
@@ -706,14 +710,15 @@ class ResolverTests(unittest.TestCase):
 
     def test_decision_without_attachment_follows_the_request(self):
         self.assertEqual(
-            codex_council._role_decision(_role(model=VEGA)).provenance, "user")
-        routed = codex_council._role_decision(
+            council_selection._role_decision(_role(model=VEGA)).provenance,
+            "user")
+        routed = council_selection._role_decision(
             _role(model=VEGA, effort="brisk", mode="routed"))
         self.assertEqual(routed.provenance, "fallback")
         attached = codex_council.Role(
-            "x", "X", "i", decision=codex_council.SelectionDecision(
+            "x", "X", "i", decision=council_selection.SelectionDecision(
                 "routed", "routed", VEGA, "brisk", VEGA, "brisk", "r"))
-        self.assertIs(codex_council._role_decision(attached),
+        self.assertIs(council_selection._role_decision(attached),
                       attached.decision)
 
 
@@ -722,7 +727,7 @@ class ResolverTests(unittest.TestCase):
 class AuthoringValidationTests(unittest.TestCase):
     def _validate(self, roles, planning=None, problem=None,
                   routing_mode="auto", now=NOW):
-        codex_council._validate_selection_authoring(
+        council_selection._validate_selection_authoring(
             roles, planning, problem, routing_mode, now)
 
     def _rejects(self, roles, expected, **kwargs):
@@ -750,7 +755,7 @@ class AuthoringValidationTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         run_dir = tmp.name
-        path = os.path.join(run_dir, codex_council.SNAPSHOT_FILENAME)
+        path = os.path.join(run_dir, council_discovery.SNAPSHOT_FILENAME)
         role = _role(model=VEGA, effort="brisk", mode="routed")
 
         def write(text, mode=0o600):
@@ -769,7 +774,7 @@ class AuthoringValidationTests(unittest.TestCase):
             with contextlib.suppress(FileNotFoundError):
                 os.remove(path)
             setup()
-            planning, problem = codex_council._read_snapshot(run_dir)
+            planning, problem = council_discovery._read_snapshot(run_dir)
             with self.subTest(fragment=fragment):
                 self.assertIsNone(planning)
                 err = self._rejects([role], "requires this run's discovery "
@@ -890,7 +895,9 @@ class PreflightPlanTests(unittest.TestCase):
             patch("shutil.which", return_value="/fake/bin/codex"),
             patch.dict(os.environ, _clean_env(CODEX_HOME=codex_home),
                        clear=True),
-            patch.object(codex_council, "_discover",
+            patch.object(council_selection, "_discover",
+                         side_effect=AssertionError("preflight discovered")),
+            patch.object(council_discovery, "_discover",
                          side_effect=AssertionError("preflight discovered")),
         ):
             patcher.start()
@@ -904,7 +911,7 @@ class PreflightPlanTests(unittest.TestCase):
                   encoding="utf-8") as f:
             json.dump(entries, f)
         if snapshot is not None:
-            codex_council._write_snapshot(self.run_dir, snapshot)
+            council_discovery._write_snapshot(self.run_dir, snapshot)
 
     def _preflight(self, require_selection=True):
         out = io.StringIO()
@@ -988,9 +995,9 @@ class LaunchSelectionTests(unittest.TestCase):
             calls.append(mode)
             return launch if launch is not None else _snapshot()
 
-        with patch.object(codex_council, "_discover",
+        with patch.object(council_selection, "_discover",
                           side_effect=fake_discover):
-            resolved, snapshot = codex_council._resolve_launch_selections(
+            resolved, snapshot = council_selection._resolve_launch_selections(
                 roles, self.run_dir, routing_mode)
         return resolved, snapshot, calls
 
@@ -1003,7 +1010,7 @@ class LaunchSelectionTests(unittest.TestCase):
                          ["native", "user"])
 
     def test_one_frozen_discovery_serves_every_automatic_role(self):
-        codex_council._write_snapshot(self.run_dir, _snapshot())
+        council_discovery._write_snapshot(self.run_dir, _snapshot())
         roles = [_role("a", model=VEGA, effort="brisk", mode="routed"),
                  _role("b", effort="adaptive-v2", mode="native_effort"),
                  _role("c", model=LYRA, effort="deliberate", mode="routed")]
@@ -1014,7 +1021,7 @@ class LaunchSelectionTests(unittest.TestCase):
              for r in resolved],
             [("routed", VEGA), ("native_effort", NATIVE), ("routed", LYRA)])
         # The launch snapshot is never written over the planning one.
-        planning, _ = codex_council._read_snapshot(self.run_dir)
+        planning, _ = council_discovery._read_snapshot(self.run_dir)
         self.assertEqual(planning["snapshot_id"], SNAPSHOT_ID)
 
     def test_routing_off_skips_launch_discovery(self):
@@ -1051,8 +1058,8 @@ class FailureRecordTests(unittest.TestCase):
     def test_nested_json_message_becomes_one_structured_record(self):
         stdout = "\n".join([_api_failure(404, NOT_FOUND, event="error"),
                             _api_failure(404, NOT_FOUND)])
-        self.assertEqual(codex_council._failure_records(stdout), [
-            codex_council.FailureRecord(
+        self.assertEqual(council_failures._failure_records(stdout), [
+            council_failures.FailureRecord(
                 404, "invalid_request_error", "model_not_found", "model",
                 NOT_FOUND["message"])])
 
@@ -1062,10 +1069,10 @@ class FailureRecordTests(unittest.TestCase):
                 "code": "insufficient_quota", "message": "No credit."}}),
             json.dumps({"type": "turn.failed", "error": "plain failure"}),
         ])
-        self.assertEqual(codex_council._failure_records(stdout), [
-            codex_council.FailureRecord(None, None, "insufficient_quota",
-                                        None, "No credit."),
-            codex_council.FailureRecord(message="plain failure"),
+        self.assertEqual(council_failures._failure_records(stdout), [
+            council_failures.FailureRecord(None, None, "insufficient_quota",
+                                           None, "No credit."),
+            council_failures.FailureRecord(message="plain failure"),
         ])
 
     def test_json_in_message_decoding_is_bounded(self):
@@ -1073,7 +1080,7 @@ class FailureRecordTests(unittest.TestCase):
         message = json.dumps(inner)
         for _ in range(3):
             message = json.dumps({"error": {"message": message}})
-        records = codex_council._failure_records(
+        records = council_failures._failure_records(
             json.dumps({"type": "error", "message": message}))
         self.assertFalse(any(r.code == "model_not_found" for r in records))
         self.assertEqual(records[-1].message, json.dumps(inner))
@@ -1081,7 +1088,7 @@ class FailureRecordTests(unittest.TestCase):
         message = json.dumps(inner)
         for _ in range(2):
             message = json.dumps({"error": {"message": message}})
-        records = codex_council._failure_records(
+        records = council_failures._failure_records(
             json.dumps({"type": "error", "message": message}))
         self.assertEqual(records[-1].code, "model_not_found")
 
@@ -1092,19 +1099,19 @@ class FailureRecordTests(unittest.TestCase):
                 "message": _api_failure(404, NOT_FOUND)}})
             for item_type in ("agent_message", "reasoning", "error",
                               "command_execution"))
-        self.assertEqual(codex_council._failure_records(stdout), [])
+        self.assertEqual(council_failures._failure_records(stdout), [])
 
 
 # ---------- failure classification (both paths) ----------
 
 class FailureClassificationTests(unittest.TestCase):
     def _classify(self, stdout, stderr="", model=None, resume=False):
-        text = codex_council._failure_text(stdout, stderr)
-        records = codex_council._failure_records(stdout)
-        return codex_council._failure_verdict(text, records, model, resume)
+        text = council_failures._failure_text(stdout, stderr)
+        records = council_failures._failure_records(stdout)
+        return council_failures._failure_verdict(text, records, model, resume)
 
     def test_quota_codes_and_prose_are_terminal_even_with_429(self):
-        for code in sorted(codex_council.QUOTA_ERROR_CODES):
+        for code in sorted(council_failures.QUOTA_ERROR_CODES):
             for field in ("code", "type"):
                 stdout = _api_failure(429, {field: code, "message": "limit"})
                 with self.subTest(code=code, field=field):
@@ -1214,8 +1221,8 @@ class FailureClassificationTests(unittest.TestCase):
 
     def test_rejection_message_names_what_was_sent_and_one_action(self):
         stdout = _api_failure(404, NOT_FOUND)
-        text = codex_council._failure_text(stdout, "")
-        records = codex_council._failure_records(stdout)
+        text = council_failures._failure_text(stdout, "")
+        records = council_failures._failure_records(stdout)
         provider = NOT_FOUND["message"].rstrip(".")
         for provenance, model, action in (
             ("user", VEGA, "Change or remove the explicit pin."),
@@ -1230,7 +1237,7 @@ class FailureClassificationTests(unittest.TestCase):
             ("fallback", None, "Update the Codex configuration (model) or "
                                "pin an available model."),
         ):
-            decision = codex_council.SelectionDecision(
+            decision = council_selection.SelectionDecision(
                 "user", provenance, dispatch_model=model)
             subject = (f"requested model '{model}'" if model
                        else "natively configured model")
@@ -1238,7 +1245,7 @@ class FailureClassificationTests(unittest.TestCase):
                                 ("exec", "")):
                 with self.subTest(provenance=provenance, phase=phase):
                     self.assertEqual(
-                        codex_council._classify_failure(
+                        council_failures._classify_failure(
                             text, 1, phase, records, decision),
                         f"[model-rejected] Codex rejected the {subject} for "
                         f"this invocation: {provider}. No substitute model "
@@ -1247,15 +1254,15 @@ class FailureClassificationTests(unittest.TestCase):
     def test_quota_and_legacy_tags_keep_the_failure_text(self):
         stdout = _api_failure(429, {"code": "insufficient_quota",
                                     "message": "No credit."})
-        text = codex_council._failure_text(stdout, "")
-        records = codex_council._failure_records(stdout)
+        text = council_failures._failure_text(stdout, "")
+        records = council_failures._failure_records(stdout)
         self.assertEqual(
-            codex_council._classify_failure(text, 1, "exec", records),
+            council_failures._classify_failure(text, 1, "exec", records),
             f"[quota] {text}")
         self.assertEqual(
-            codex_council._classify_failure("502 bad gateway", 1, "exec"),
+            council_failures._classify_failure("502 bad gateway", 1, "exec"),
             "[retriable:5xx] 502 bad gateway")
-        self.assertEqual(codex_council._classify_failure("", 7, "resume"),
+        self.assertEqual(council_failures._classify_failure("", 7, "resume"),
                          "codex resume exited 7")
 
 
@@ -1299,7 +1306,7 @@ class RunRoleSelectionTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def _decided(role, provenance, model=None, effort=None):
         """The role with a launch decision sending (model, effort)."""
-        return dataclasses.replace(role, decision=codex_council.SelectionDecision(
+        return dataclasses.replace(role, decision=council_selection.SelectionDecision(
             role.selection.mode if role.selection else "inherit",
             provenance, role.model, role.effort, model, effort))
 
@@ -1398,9 +1405,9 @@ def _decided_role(rid, provenance, *, model=None, effort=None, mode=None,
                   dispatch=(None, None), reason=None, note=None):
     selection = None
     if mode is not None:
-        selection = codex_council.Selection(
+        selection = council_selection.Selection(
             mode, SNAPSHOT_ID if mode != "user" else None, reason)
-    decision = codex_council.SelectionDecision(
+    decision = council_selection.SelectionDecision(
         mode or "inherit", provenance, model, effort, dispatch[0],
         dispatch[1], reason, note)
     return codex_council.Role(rid, rid.title(), "i", model, effort, selection,
@@ -1412,7 +1419,7 @@ def _provenance_roles():
         _decided_role("plain", "native"),
         _decided_role("pin", "user", model=CUSTOM, effort="brisk",
                       mode="user", dispatch=(CUSTOM, "brisk"),
-                      note=codex_council.UNVERIFIED_MODEL_ADVISORY),
+                      note=council_selection.UNVERIFIED_MODEL_ADVISORY),
         _decided_role("route", "routed", model=VEGA, effort="deliberate",
                       mode="routed", dispatch=(VEGA, "deliberate"),
                       reason="narrow checks"),
@@ -1483,10 +1490,11 @@ class ReportingTests(unittest.TestCase):
         )
         for args, state, sentence in cases:
             with self.subTest(args=args[:2]):
-                got = codex_council._launch_discovery_state(*args)
+                got = council_selection._launch_discovery_state(*args)
                 self.assertEqual(got, state)
                 self.assertEqual(
-                    codex_council._discovery_sentence(*got, args[2]), sentence)
+                    council_selection._discovery_sentence(*got, args[2]),
+                    sentence)
 
     def test_role_section_selection_line_for_every_provenance(self):
         lines = [
@@ -1563,14 +1571,14 @@ class ReportingTests(unittest.TestCase):
             _results([role]), 1.0, f"launch discovery unavailable: {note}")
         self.assertNotIn("\n## Forged", report)
         self.assertEqual(report.count("\\n## Forged\\u2028x"), 2)
-        lines = codex_council._model_selection_lines(
+        lines = council_selection._model_selection_lines(
             [role], "auto", "unavailable", "x\ny")
         self.assertEqual(len(lines), 2)
         for line in lines:
             self.assertEqual(line.splitlines(), [line])
 
     def test_model_selection_err_log_lines(self):
-        lines = codex_council._model_selection_lines(
+        lines = council_selection._model_selection_lines(
             _provenance_roles(), "auto", "unavailable", "codex_missing")
         self.assertEqual(lines, [
             "[codex-council] model selection: routing=auto; "
@@ -1580,7 +1588,7 @@ class ReportingTests(unittest.TestCase):
             "launch discovery unavailable: codex_missing",
         ])
         self.assertEqual(
-            codex_council._model_selection_lines(
+            council_selection._model_selection_lines(
                 [_decided_role("plain", "native")], "off", "not-run",
                 "no runtime-grounded selections"),
             ["[codex-council] model selection: routing=off; discovery=not-run "
@@ -1654,7 +1662,7 @@ class LaunchEndToEndTests(unittest.TestCase):
         proc = self.run_script("--discover", self.run_dir,
                                "--skill-contract", EPOCH)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        snapshot, problem = codex_council._read_snapshot(self.run_dir)
+        snapshot, problem = council_discovery._read_snapshot(self.run_dir)
         self.assertIsNone(problem)
         self.forget_discovery()
         return snapshot["snapshot_id"]

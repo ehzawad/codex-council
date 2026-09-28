@@ -50,6 +50,8 @@ SCRIPTS_DIR = os.path.abspath(os.path.join(
 sys.path.insert(0, SCRIPTS_DIR)
 
 import codex_council  # noqa: E402
+import council_discovery  # noqa: E402
+import council_selection  # noqa: E402
 
 SCRIPT = os.path.join(SCRIPTS_DIR, "codex_council.py")
 EPOCH = str(codex_council.SKILL_CONTRACT_EPOCH)
@@ -183,7 +185,7 @@ def _exec_calls(run):
 
 def _dispatchable(value):
     return (isinstance(value, str)
-            and bool(codex_council.SELECTION_VALUE_PATTERN.match(value)))
+            and bool(council_selection.SELECTION_VALUE_PATTERN.match(value)))
 
 
 def _catalog_default_effort(entry):
@@ -483,7 +485,7 @@ class LiveCouncilCase(unittest.TestCase):
         run = self.invoke(run_dir, "discover", "--discover", run_dir,
                           "--skill-contract", EPOCH)
         self.assertEqual(run.returncode, 0, _transcript(run))
-        snapshot, problem = codex_council._read_snapshot(run_dir)
+        snapshot, problem = council_discovery._read_snapshot(run_dir)
         self.assertIsNone(problem, _transcript(run))
         _note_once("account type",
                    snapshot["account"]["type"] or "none (signed out)")
@@ -610,7 +612,7 @@ class LiveDiscoveryTests(LiveCouncilCase):
     def test_real_snapshot_keeps_account_identity_out(self):
         run_dir = self.new_run_dir()
         snapshot, run = self.discover(run_dir)
-        path = os.path.join(run_dir, codex_council.SNAPSHOT_FILENAME)
+        path = os.path.join(run_dir, council_discovery.SNAPSHOT_FILENAME)
         self.assertEqual(snapshot["status"], "ok", snapshot["problems"])
         self.assertTrue(run.stdout.startswith(
             "[codex-council] discovery ok: snapshot_id="
@@ -796,7 +798,7 @@ class LiveRejectionTests(LiveCouncilCase):
         expected_plan = (f"[codex-council] selection plan: {role_id}: "
                          f"explicit override (model {REJECTED_MODEL})")
         if snapshot["status"] == "ok":
-            expected_plan += f"; {codex_council.UNVERIFIED_MODEL_ADVISORY}"
+            expected_plan += f"; {council_selection.UNVERIFIED_MODEL_ADVISORY}"
         self.assertIn(expected_plan, plan)
         self.assert_settled(rejected, role_id, ok=False)
         self.assert_selection_line(

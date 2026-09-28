@@ -1,8 +1,8 @@
 """v1.0.0 model discovery: --discover, the model snapshot, and its summary.
 
-In-process tests drive codex_council._discover() and the pure normalizers /
-snapshot builder directly; end-to-end tests run the REAL script's
---discover mode as a subprocess. Both use the fake `codex` from
+In-process tests drive council_discovery._discover() and the pure
+normalizers / snapshot builder directly; end-to-end tests run the REAL
+script's --discover mode as a subprocess. Both use the fake `codex` from
 tests/fake_codex.py on PATH (no network, no real Codex) and synthetic
 model ids only. Every fake-server test also asserts (as a cleanup) that
 discovery sent nothing but its five read-only methods.
@@ -35,13 +35,15 @@ sys.path.insert(0, SCRIPTS_DIR)
 sys.path.insert(0, TESTS_DIR)
 
 import codex_council  # noqa: E402
+import council_common  # noqa: E402
+import council_discovery  # noqa: E402
 import fake_codex  # noqa: E402
 
 SCRIPT = os.path.join(SCRIPTS_DIR, "codex_council.py")
 EPOCH = str(codex_council.SKILL_CONTRACT_EPOCH)
 NATIVE = fake_codex.NATIVE_MODEL
-ROUTING_ENV = codex_council.MODEL_ROUTING_ENV
-API_KEY_REASON = codex_council._EXEC_API_KEY_REASON
+ROUTING_ENV = council_discovery.MODEL_ROUTING_ENV
+API_KEY_REASON = council_discovery._EXEC_API_KEY_REASON
 UNAVAILABLE_TAIL = "roles must inherit (omit model, effort, and selection)"
 # Methods discovery must never send (inference or account-changing).
 FORBIDDEN_METHODS = ("thread/start", "thread/resume", "turn/start")
@@ -127,10 +129,10 @@ def _config_result(**config):
 
 def _catalog(entries, problems=None):
     """Catalog accumulator built from wire entries via the real helpers."""
-    catalog = codex_council._new_catalog()
-    page, problem = codex_council._normalize_model_page({"data": entries})
+    catalog = council_discovery._new_catalog()
+    page, problem = council_discovery._normalize_model_page({"data": entries})
     assert problem is None, problem
-    codex_council._merge_model_page(
+    council_discovery._merge_model_page(
         catalog, page, [] if problems is None else problems)
     return catalog
 
@@ -138,7 +140,7 @@ def _catalog(entries, problems=None):
 def _observed(**overrides):
     observed = {
         "context": dict(
-            codex_council._EMPTY_DISCOVERY_CONTEXT, project_root="/proj",
+            council_discovery._EMPTY_DISCOVERY_CONTEXT, project_root="/proj",
             launch_cwd="/proj", codex_executable="/bin/codex",
             codex_cli_version="9.9.9", codex_home="/home/.codex",
         ),
@@ -157,7 +159,7 @@ def _observed(**overrides):
 
 
 def _snapshot(routing_mode="auto", **overrides):
-    return codex_council._build_snapshot(
+    return council_discovery._build_snapshot(
         snapshot_id="0123456789abcdef", created_at="2026-09-27T12:00:00Z",
         plugin_version="9.8.7", routing_mode=routing_mode,
         **_observed(**overrides),
@@ -172,7 +174,7 @@ class RoutingModeTests(unittest.TestCase):
         if value is not None:
             env[ROUTING_ENV] = value
         with patch.dict(os.environ, env, clear=True):
-            return codex_council._model_routing_mode()
+            return council_discovery._model_routing_mode()
 
     def test_unset_empty_and_auto_mean_auto(self):
         for value in (None, "", "   ", "auto", " auto\n"):
@@ -242,7 +244,7 @@ class DiscoverArgTests(unittest.TestCase):
 
 class NormalizeModelEntryTests(unittest.TestCase):
     def _entry(self, **overrides):
-        return codex_council._normalize_model_entry(
+        return council_discovery._normalize_model_entry(
             fake_codex.model_entry("future-orion-2032", **overrides))
 
     def test_projects_dispatch_identity_separately_from_picker_id(self):
@@ -312,9 +314,9 @@ class NormalizeModelEntryTests(unittest.TestCase):
     def test_missing_required_field_is_malformed(self):
         raw = fake_codex.model_entry("future-orion-2032")
         del raw["description"]
-        self.assertEqual(codex_council._normalize_model_entry(raw),
+        self.assertEqual(council_discovery._normalize_model_entry(raw),
                          (None, "description"))
-        self.assertEqual(codex_council._normalize_model_entry(["x"]),
+        self.assertEqual(council_discovery._normalize_model_entry(["x"]),
                          (None, "entry"))
 
     def test_upgrade_retirement_is_iso_utc_or_null(self):
@@ -339,19 +341,19 @@ class NormalizeModelPageTests(unittest.TestCase):
         ):
             with self.subTest(result=result):
                 self.assertEqual(
-                    codex_council._normalize_model_page(result),
+                    council_discovery._normalize_model_page(result),
                     (None, problem))
 
     def test_next_cursor_is_optional_and_opaque(self):
-        page, problem = codex_council._normalize_model_page({"data": []})
+        page, problem = council_discovery._normalize_model_page({"data": []})
         self.assertIsNone(problem)
         self.assertIsNone(page["next_cursor"])
-        page, _ = codex_council._normalize_model_page(
+        page, _ = council_discovery._normalize_model_page(
             {"data": [], "nextCursor": "b64/=+?"})
         self.assertEqual(page["next_cursor"], "b64/=+?")
 
     def test_malformed_entry_keeps_its_readable_model(self):
-        page, _ = codex_council._normalize_model_page({"data": [
+        page, _ = council_discovery._normalize_model_page({"data": [
             fake_codex.model_entry("future-orion-2032", hidden="false"),
             {"model": 7},
         ]})
@@ -363,14 +365,14 @@ class NormalizeModelPageTests(unittest.TestCase):
 class NormalizeSourceTests(unittest.TestCase):
     def test_account_reads_only_type_and_auth_requirement(self):
         result = fake_codex.default_scenario()["methods"]["account/read"]
-        value, problem = codex_council._normalize_account(result["result"])
+        value, problem = council_discovery._normalize_account(result["result"])
         self.assertIsNone(problem)
         self.assertEqual(value, {"type": "chatgpt",
                                  "requires_openai_auth": True})
 
     def test_account_null_is_signed_out(self):
         self.assertEqual(
-            codex_council._normalize_account(
+            council_discovery._normalize_account(
                 {"account": None, "requiresOpenaiAuth": True}),
             ({"type": None, "requires_openai_auth": True}, None))
 
@@ -387,12 +389,12 @@ class NormalizeSourceTests(unittest.TestCase):
         ):
             with self.subTest(result=result):
                 self.assertEqual(
-                    codex_council._normalize_account(result),
+                    council_discovery._normalize_account(result),
                     (None, f"schema_unsupported:account/read:{field}"))
 
     def test_config_records_values_and_layer_kinds_only(self):
         result = fake_codex.default_scenario()["methods"]["config/read"]
-        value, problem = codex_council._normalize_config(result["result"])
+        value, problem = council_discovery._normalize_config(result["result"])
         self.assertIsNone(problem)
         self.assertEqual(value, {
             "model": NATIVE, "effort": "deliberate", "provider": None,
@@ -402,7 +404,7 @@ class NormalizeSourceTests(unittest.TestCase):
 
     def test_config_nulls_stay_null(self):
         self.assertEqual(
-            codex_council._normalize_config({"config": {}, "origins": {}}),
+            council_discovery._normalize_config({"config": {}, "origins": {}}),
             (dict.fromkeys(("model", "effort", "provider", "model_origin",
                             "effort_origin")), None))
 
@@ -422,7 +424,7 @@ class NormalizeSourceTests(unittest.TestCase):
         ):
             with self.subTest(result=result):
                 self.assertEqual(
-                    codex_council._normalize_config(result),
+                    council_discovery._normalize_config(result),
                     (None, f"schema_unsupported:config/read:{field}"))
 
     def test_requirements_null_or_without_new_thread_is_absent(self):
@@ -434,7 +436,7 @@ class NormalizeSourceTests(unittest.TestCase):
                                       "serviceTier": "priority"}}},
         ):
             with self.subTest(requirements=requirements):
-                value, problem = codex_council._normalize_requirements(
+                value, problem = council_discovery._normalize_requirements(
                     {"requirements": requirements})
                 self.assertIsNone(problem)
                 self.assertEqual(value["status"], "absent")
@@ -449,7 +451,7 @@ class NormalizeSourceTests(unittest.TestCase):
             ({"model": "future-managed-2035"}, "future-managed-2035", None),
         ):
             with self.subTest(new_thread=new_thread):
-                value, _ = codex_council._normalize_requirements(
+                value, _ = council_discovery._normalize_requirements(
                     {"requirements": {"models": {"newThread": new_thread}}})
                 self.assertEqual(
                     (value["status"], value["model"], value["effort"]),
@@ -465,7 +467,7 @@ class NormalizeSourceTests(unittest.TestCase):
             ({"modelCatalogJson": "{}"}, ["modelCatalogJson"]),
         ):
             with self.subTest(requirements=requirements):
-                value, _ = codex_council._normalize_requirements(
+                value, _ = council_discovery._normalize_requirements(
                     {"requirements": requirements})
                 self.assertEqual(value["provider_keys"], keys)
 
@@ -485,17 +487,17 @@ class NormalizeSourceTests(unittest.TestCase):
         ):
             with self.subTest(result=result):
                 self.assertEqual(
-                    codex_council._normalize_requirements(result),
+                    council_discovery._normalize_requirements(result),
                     (None, base + suffix))
 
     def test_initialize_codex_home(self):
         self.assertEqual(
-            codex_council._normalize_initialize({"codexHome": "/h"}),
+            council_discovery._normalize_initialize({"codexHome": "/h"}),
             ("/h", None))
-        self.assertEqual(codex_council._normalize_initialize({}),
+        self.assertEqual(council_discovery._normalize_initialize({}),
                          (None, None))
         self.assertEqual(
-            codex_council._normalize_initialize(["x"]),
+            council_discovery._normalize_initialize(["x"]),
             (None, "schema_unsupported:initialize:result"))
 
     def test_codex_version_parsing(self):
@@ -510,20 +512,21 @@ class NormalizeSourceTests(unittest.TestCase):
         ):
             with self.subTest(output=output):
                 self.assertEqual(
-                    codex_council._parse_codex_version(output), version)
+                    council_discovery._parse_codex_version(output), version)
 
     def test_stderr_excerpt_is_single_line_bounded_and_redacted(self):
         tail = bytearray(
             b"first\nerror: bad login for council-sentinel@example.invalid"
             b"\x1b[0m\xe2\x80\xa8tail\n\n")
-        excerpt = codex_council._stderr_excerpt(tail)
+        excerpt = council_discovery._stderr_excerpt(tail)
         self.assertNotIn(fake_codex.EMAIL_SENTINEL, excerpt)
         self.assertIn("<redacted>", excerpt)
         self.assertEqual(excerpt, " ".join(excerpt.split()))
-        self.assertIsNone(codex_council._stderr_excerpt(bytearray(b"\n \n")))
+        self.assertIsNone(
+            council_discovery._stderr_excerpt(bytearray(b"\n \n")))
         self.assertEqual(
-            len(codex_council._stderr_excerpt(bytearray(b"x" * 5000))),
-            codex_council.DISCOVERY_STDERR_EXCERPT_CHARS)
+            len(council_discovery._stderr_excerpt(bytearray(b"x" * 5000))),
+            council_discovery.DISCOVERY_STDERR_EXCERPT_CHARS)
 
 
 # ---------- pure snapshot builder: eligibility and native resolution ----------
@@ -546,7 +549,7 @@ class BuildSnapshotTests(unittest.TestCase):
         self.assertEqual(snapshot["native"], {
             "resolution": "proven", "model": NATIVE, "reason": None})
         self.assertTrue(snapshot["catalog"]["complete"])
-        self.assertIsNone(codex_council._snapshot_shape_problem(snapshot))
+        self.assertIsNone(council_discovery._snapshot_shape_problem(snapshot))
 
     def test_routing_off_is_recorded_and_ineligible(self):
         snapshot = _snapshot(routing_mode="off")
@@ -670,7 +673,7 @@ class BuildSnapshotTests(unittest.TestCase):
                              problems=["timeout:model/list"])
         self.assertEqual(snapshot["catalog"],
                          {"complete": False, "models": []})
-        self.assertIsNone(codex_council._snapshot_shape_problem(snapshot))
+        self.assertIsNone(council_discovery._snapshot_shape_problem(snapshot))
 
     def test_problems_are_deduplicated_in_order(self):
         snapshot = _snapshot(problems=["b", "a", "b"])
@@ -684,7 +687,8 @@ class BuildSnapshotTests(unittest.TestCase):
             _snapshot(catalog=_catalog(
                 [fake_codex.model_entry(NATIVE, hidden=True)])),
         ):
-            self.assertIsNone(codex_council._snapshot_shape_problem(snapshot))
+            self.assertIsNone(
+                council_discovery._snapshot_shape_problem(snapshot))
 
 
 # ---------- discovery against the fake app-server ----------
@@ -744,13 +748,13 @@ class FakeCodexTestCase(unittest.TestCase):
     def fake_env(self, scenario, **env):
         fake_codex.write_scenario(self.scenario_path, scenario)
         with patch.dict(os.environ, {**self.env, **env}, clear=True), \
-             patch.object(codex_council, "_project_root",
+             patch.object(council_discovery, "_project_root",
                           return_value=self.project_root):
             yield
 
     def discover(self, scenario, mode="auto", **env):
         with self.fake_env(scenario, **env):
-            return codex_council._discover(mode)
+            return council_discovery._discover(mode)
 
     def timed_discover(self, scenario, **env):
         started = time.monotonic()
@@ -773,7 +777,7 @@ class FakeCodexTestCase(unittest.TestCase):
         self.assertIn(problem, snapshot["problems"])
         self.assertFalse(snapshot["routing"]["eligible"])
         self.assertEqual(snapshot["native"]["resolution"], "unknown")
-        self.assertIsNone(codex_council._snapshot_shape_problem(snapshot))
+        self.assertIsNone(council_discovery._snapshot_shape_problem(snapshot))
 
 
 class DiscoveryProtocolTests(FakeCodexTestCase):
@@ -784,7 +788,7 @@ class DiscoveryProtocolTests(FakeCodexTestCase):
         self.assertRegex(snapshot["created_at"],
                          r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
         self.assertEqual(snapshot["plugin_version"],
-                         codex_council._plugin_version())
+                         council_common._plugin_version())
         self.assertEqual(snapshot["status"], "ok")
         self.assertEqual(snapshot["problems"], [])
         self.assertEqual(snapshot["context"], {
@@ -819,7 +823,7 @@ class DiscoveryProtocolTests(FakeCodexTestCase):
         self.assertEqual(catalog["models"][2]["upgrade"], {
             "model": "future-vega-2033",
             "retirement_at": "2031-01-01T00:00:00Z"})
-        self.assertIsNone(codex_council._snapshot_shape_problem(snapshot))
+        self.assertIsNone(council_discovery._snapshot_shape_problem(snapshot))
         self.assertTrue(_pid_gone(self.pid("server.pid")))
 
     def test_wire_sequence_and_params(self):
@@ -831,7 +835,7 @@ class DiscoveryProtocolTests(FakeCodexTestCase):
         self.assertEqual(requests["initialize"]["id"], 1)
         self.assertEqual(requests["initialize"]["params"], {
             "clientInfo": {"name": "codex-council", "title": "Codex Council",
-                           "version": codex_council._plugin_version()},
+                           "version": council_common._plugin_version()},
             "capabilities": {"experimentalApi": False}})
         self.assertNotIn("id", requests["initialized"])
         self.assertNotIn("params", requests["initialized"])
@@ -916,9 +920,9 @@ class DiscoveryProtocolTests(FakeCodexTestCase):
         snapshot = self.discover(
             _with_pages(fake_codex.default_scenario(), pages))
         self.assertEqual(self.methods().count("model/list"),
-                         codex_council.DISCOVERY_MAX_PAGES)
+                         council_discovery.DISCOVERY_MAX_PAGES)
         self.assertEqual(len(snapshot["catalog"]["models"]),
-                         codex_council.DISCOVERY_MAX_PAGES)
+                         council_discovery.DISCOVERY_MAX_PAGES)
         self.assertIn("catalog_incomplete:page_bound", snapshot["problems"])
         self.assertFalse(snapshot["routing"]["eligible"])
         self.assertEqual(snapshot["status"], "ok")
@@ -926,12 +930,12 @@ class DiscoveryProtocolTests(FakeCodexTestCase):
     def test_entry_bound_marks_catalog_incomplete(self):
         entries = [fake_codex.model_entry(f"future-m{i}-2040")
                    for i in range(5)]
-        with patch.object(codex_council, "DISCOVERY_MAX_MODELS", 3):
+        with patch.object(council_discovery, "DISCOVERY_MAX_MODELS", 3):
             truncated = self.discover(_with_pages(
                 fake_codex.default_scenario(), {"": _page(entries)}))
         self.assertEqual(len(truncated["catalog"]["models"]), 3)
         self.assertIn("catalog_incomplete:entry_bound", truncated["problems"])
-        with patch.object(codex_council, "DISCOVERY_MAX_MODELS", 2):
+        with patch.object(council_discovery, "DISCOVERY_MAX_MODELS", 2):
             outstanding = self.discover(_with_pages(
                 fake_codex.default_scenario(),
                 {"": _page(entries[:2], "more"), "more": _page(entries[2:])}))
@@ -1133,7 +1137,7 @@ class DiscoveryProtocolTests(FakeCodexTestCase):
         self.assertIsNone(snapshot["context"]["codex_cli_version"])
         self.assertEqual(snapshot["problems"], ["codex_version_unavailable"])
         scenario["version"] = {"hang": True}
-        with patch.object(codex_council, "DISCOVERY_VERSION_TIMEOUT_SECS",
+        with patch.object(council_discovery, "DISCOVERY_VERSION_TIMEOUT_SECS",
                           0.3):
             snapshot, elapsed = self.timed_discover(scenario)
         self.assertEqual(snapshot["status"], "ok")
@@ -1153,7 +1157,7 @@ class DiscoveryProtocolTests(FakeCodexTestCase):
                 self.assertLess(elapsed, 5.0)  # well inside the 20s budget
 
     def test_oversized_line_and_stdout_bounds(self):
-        with patch.object(codex_council, "DISCOVERY_MAX_LINE_BYTES", 4096):
+        with patch.object(council_discovery, "DISCOVERY_MAX_LINE_BYTES", 4096):
             snapshot = self.discover(_with_method(
                 fake_codex.default_scenario(), "initialize",
                 {"oversize": 20000}))
@@ -1161,7 +1165,8 @@ class DiscoveryProtocolTests(FakeCodexTestCase):
         flood = [{"method": "fake/noise", "params": {"pad": "x" * 200}}] * 40
         scenario = fake_codex.default_scenario()
         scenario["methods"]["initialize"]["before"] = flood
-        with patch.object(codex_council, "DISCOVERY_MAX_STDOUT_BYTES", 2048):
+        with patch.object(council_discovery, "DISCOVERY_MAX_STDOUT_BYTES",
+                          2048):
             snapshot = self.discover(scenario)
         self.assert_unavailable(snapshot, "protocol_error:stdout_limit")
 
@@ -1169,7 +1174,7 @@ class DiscoveryProtocolTests(FakeCodexTestCase):
         scenario = fake_codex.default_scenario()
         scenario["methods"]["initialize"]["before"] = [
             {"method": "fake/noise", "params": {}}] * 10
-        with patch.object(codex_council, "DISCOVERY_MAX_UNSOLICITED", 5):
+        with patch.object(council_discovery, "DISCOVERY_MAX_UNSOLICITED", 5):
             snapshot = self.discover(scenario)
         self.assert_unavailable(snapshot, "protocol_error:notification_limit")
 
@@ -1197,12 +1202,12 @@ class DiscoveryProtocolTests(FakeCodexTestCase):
         self.assertEqual(snapshot["managed_defaults"]["status"], "unknown")
 
     def test_discover_never_raises_on_internal_error(self):
-        with patch.object(codex_council, "_execution_context",
+        with patch.object(council_discovery, "_execution_context",
                           side_effect=RuntimeError("boom")):
-            snapshot = codex_council._discover("auto")
+            snapshot = council_discovery._discover("auto")
         self.assert_unavailable(snapshot, "internal_error:RuntimeError")
         self.assertEqual(snapshot["context"],
-                         codex_council._EMPTY_DISCOVERY_CONTEXT)
+                         council_discovery._EMPTY_DISCOVERY_CONTEXT)
 
 
 class DiscoveryDeadlineAndTeardownTests(FakeCodexTestCase):
@@ -1215,10 +1220,10 @@ class DiscoveryDeadlineAndTeardownTests(FakeCodexTestCase):
 
     TIMEOUT = 1.0
     # Budget + three teardown grace waits + process start-up slack.
-    BOUND = TIMEOUT + 3 * codex_council.DISCOVERY_CLOSE_GRACE_SECS + 1.5
+    BOUND = TIMEOUT + 3 * council_discovery.DISCOVERY_CLOSE_GRACE_SECS + 1.5
 
     def timed_discover_with_deadline(self, scenario):
-        with patch.object(codex_council, "DISCOVERY_TIMEOUT_SECS",
+        with patch.object(council_discovery, "DISCOVERY_TIMEOUT_SECS",
                           self.TIMEOUT):
             return self.timed_discover(scenario)
 
@@ -1278,7 +1283,7 @@ class DiscoveryDeadlineAndTeardownTests(FakeCodexTestCase):
         self.assertEqual(snapshot["status"], "ok")
         # stdin EOF and SIGTERM were both ignored: SIGKILL was needed.
         self.assertGreaterEqual(
-            elapsed, 2 * codex_council.DISCOVERY_CLOSE_GRACE_SECS)
+            elapsed, 2 * council_discovery.DISCOVERY_CLOSE_GRACE_SECS)
         self.assertLess(elapsed, self.BOUND)
         self.assertTrue(_pid_gone(self.pid("server.pid")))
 
@@ -1316,8 +1321,8 @@ class SnapshotFileTests(unittest.TestCase):
             replaced.append((src, dst))
             return real_replace(src, dst)
 
-        with patch.object(codex_council.os, "replace", side_effect=spy):
-            path = codex_council._write_snapshot(self.run_dir, snapshot)
+        with patch.object(council_common.os, "replace", side_effect=spy):
+            path = council_discovery._write_snapshot(self.run_dir, snapshot)
         self.assertEqual(path, self.path)
         self.assertEqual(len(replaced), 1)
         src, dst = replaced[0]
@@ -1327,30 +1332,31 @@ class SnapshotFileTests(unittest.TestCase):
             ".model-snapshot.json."))
         self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
         self.assertEqual(os.listdir(self.run_dir), ["model-snapshot.json"])
-        self.assertEqual(codex_council._read_snapshot(self.run_dir),
+        self.assertEqual(council_discovery._read_snapshot(self.run_dir),
                          (snapshot, None))
 
     def test_rewrite_replaces_the_previous_snapshot(self):
-        codex_council._write_snapshot(self.run_dir, _snapshot())
+        council_discovery._write_snapshot(self.run_dir, _snapshot())
         newer = _snapshot(routing_mode="off")
-        codex_council._write_snapshot(self.run_dir, newer)
-        self.assertEqual(codex_council._read_snapshot(self.run_dir)[0], newer)
+        council_discovery._write_snapshot(self.run_dir, newer)
+        self.assertEqual(
+            council_discovery._read_snapshot(self.run_dir)[0], newer)
         self.assertEqual(os.listdir(self.run_dir), ["model-snapshot.json"])
 
     def test_catalog_text_with_lone_surrogates_stays_writable(self):
         catalog = _catalog([fake_codex.model_entry(
             NATIVE, description="bad \udc80 text \u2028 here")])
         snapshot = _snapshot(catalog=catalog)
-        codex_council._write_snapshot(self.run_dir, snapshot)
-        self.assertEqual(codex_council._read_snapshot(self.run_dir)[0],
+        council_discovery._write_snapshot(self.run_dir, snapshot)
+        self.assertEqual(council_discovery._read_snapshot(self.run_dir)[0],
                          snapshot)
 
     def test_write_failure_removes_a_stale_snapshot(self):
         self._write_raw('{"stale": true}')
-        with patch.object(codex_council.os, "replace",
+        with patch.object(council_common.os, "replace",
                           side_effect=OSError("disk full")):
             with self.assertRaises(OSError):
-                codex_council._write_snapshot(self.run_dir, _snapshot())
+                council_discovery._write_snapshot(self.run_dir, _snapshot())
         self.assertEqual(os.listdir(self.run_dir), [])
 
     def test_read_rejects_what_discover_did_not_write(self):
@@ -1359,7 +1365,7 @@ class SnapshotFileTests(unittest.TestCase):
         target = os.path.join(self.run_dir, "elsewhere.json")
 
         def symlink():
-            codex_council._write_snapshot(self.run_dir, _snapshot())
+            council_discovery._write_snapshot(self.run_dir, _snapshot())
             os.rename(self.path, target)
             os.symlink(target, self.path)
 
@@ -1375,7 +1381,8 @@ class SnapshotFileTests(unittest.TestCase):
             with self.subTest(case=name):
                 if make is not None:
                     make()
-                snapshot, found = codex_council._read_snapshot(self.run_dir)
+                snapshot, found = council_discovery._read_snapshot(
+                    self.run_dir)
                 self.assertIsNone(snapshot)
                 self.assertIn(problem, found)
                 for path in (self.path, target):
@@ -1396,7 +1403,8 @@ class SnapshotFileTests(unittest.TestCase):
                 with open(self.path, "wb") as f:
                     f.write(text.encode("utf-8", errors="surrogatepass"))
                 os.chmod(self.path, 0o600)
-                snapshot, problem = codex_council._read_snapshot(self.run_dir)
+                snapshot, problem = council_discovery._read_snapshot(
+                    self.run_dir)
                 self.assertIsNone(snapshot)
                 self.assertIn(detail, problem)
 
@@ -1431,7 +1439,8 @@ class SnapshotFileTests(unittest.TestCase):
         for path, value in cases:
             with self.subTest(path=path):
                 self._write_raw(json.dumps(mutate(path, value)))
-                snapshot, problem = codex_council._read_snapshot(self.run_dir)
+                snapshot, problem = council_discovery._read_snapshot(
+                    self.run_dir)
                 self.assertIsNone(snapshot)
                 self.assertIn(f"(field {path!r})", problem)
 
@@ -1456,7 +1465,8 @@ class SnapshotFileTests(unittest.TestCase):
         for mutator in (dup, bad_retirement, bad_effort, hidden_str):
             with self.subTest(case=mutator.__name__):
                 self._write_raw(json.dumps(with_models(mutator)))
-                snapshot, problem = codex_council._read_snapshot(self.run_dir)
+                snapshot, problem = council_discovery._read_snapshot(
+                    self.run_dir)
                 self.assertIsNone(snapshot)
                 self.assertIn("(field 'catalog.models')", problem)
 
@@ -1465,12 +1475,12 @@ class SnapshotFileTests(unittest.TestCase):
         snapshot["native"]["model"] = "future-nowhere-2099"
         self._write_raw(json.dumps(snapshot))
         self.assertIn("(field 'native.model')",
-                      codex_council._read_snapshot(self.run_dir)[1])
+                      council_discovery._read_snapshot(self.run_dir)[1])
 
     def test_read_rejects_oversized_files(self):
         self._write_raw(json.dumps(_snapshot()))
-        with patch.object(codex_council, "SNAPSHOT_MAX_BYTES", 64):
-            snapshot, problem = codex_council._read_snapshot(self.run_dir)
+        with patch.object(council_discovery, "SNAPSHOT_MAX_BYTES", 64):
+            snapshot, problem = council_discovery._read_snapshot(self.run_dir)
         self.assertIsNone(snapshot)
         self.assertIn("exceeds 64 bytes", problem)
 
@@ -1479,7 +1489,7 @@ class SnapshotFileTests(unittest.TestCase):
 
 class DiscoverySummaryTests(unittest.TestCase):
     def test_ok_summary_lines(self):
-        lines = codex_council._discovery_summary(_snapshot())
+        lines = council_discovery._discovery_summary(_snapshot())
         self.assertEqual(lines, [
             "[codex-council] discovery ok: snapshot_id=0123456789abcdef "
             "codex-cli 9.9.9; auth chatgpt; provider openai (default); "
@@ -1506,7 +1516,7 @@ class DiscoverySummaryTests(unittest.TestCase):
     def test_unavailable_summary_is_one_inherit_line(self):
         snapshot = _snapshot(conclusive=False,
                              problems=["timeout:initialize", "stderr: x"])
-        self.assertEqual(codex_council._discovery_summary(snapshot), [
+        self.assertEqual(council_discovery._discovery_summary(snapshot), [
             "[codex-council] discovery unavailable: timeout:initialize, "
             "stderr: x; snapshot_id=0123456789abcdef; " + UNAVAILABLE_TAIL])
 
@@ -1514,7 +1524,7 @@ class DiscoverySummaryTests(unittest.TestCase):
         managed = {"status": "present", "model": "future-managed-2035",
                    "effort": None, "provider_keys": []}
         context = dict(_observed()["context"], codex_cli_version=None)
-        lines = codex_council._discovery_summary(
+        lines = council_discovery._discovery_summary(
             _snapshot(managed=managed, context=context,
                       account={"type": None, "requires_openai_auth": True}))
         self.assertIn("codex-cli version unknown; auth none;", lines[0])
@@ -1530,7 +1540,7 @@ class DiscoverySummaryTests(unittest.TestCase):
             "managed new-thread defaults present")
 
     def test_routing_off_disables_the_native_effort_action(self):
-        lines = codex_council._discovery_summary(
+        lines = council_discovery._discovery_summary(
             _snapshot(routing_mode="off"))
         self.assertEqual(
             lines[2], "routing: unavailable — CODEX_COUNCIL_MODEL_ROUTING=off")
@@ -1539,7 +1549,8 @@ class DiscoverySummaryTests(unittest.TestCase):
 
     def test_hidden_native_model_shows_its_efforts(self):
         catalog = _catalog([fake_codex.model_entry(NATIVE, hidden=True)])
-        lines = codex_council._discovery_summary(_snapshot(catalog=catalog))
+        lines = council_discovery._discovery_summary(
+            _snapshot(catalog=catalog))
         self.assertEqual(
             lines[3],
             "native-model effort adjustment: available on future-orion-2032 "
@@ -1557,7 +1568,8 @@ class DiscoverySummaryTests(unittest.TestCase):
             fake_codex.model_entry(NATIVE, description=hostile),
             fake_codex.model_entry("future-vega-2033\nforged"),
         ])
-        lines = codex_council._discovery_summary(_snapshot(catalog=catalog))
+        lines = council_discovery._discovery_summary(
+            _snapshot(catalog=catalog))
         for line in lines:
             self.assertEqual(line.splitlines(), [line])
         orion = next(ln for ln in lines if ln.startswith("- future-orion"))
@@ -1603,14 +1615,14 @@ class DiscoverCommandTests(FakeCodexTestCase):
                          0o600)
         self.assertEqual(sorted(os.listdir(self.run_dir)),
                          ["model-snapshot.json", "roles.json"])
-        snapshot, problem = codex_council._read_snapshot(self.run_dir)
+        snapshot, problem = council_discovery._read_snapshot(self.run_dir)
         self.assertIsNone(problem)
         self.assertEqual(snapshot["snapshot_id"], match.group(1))
         # Not a git repo: the root is the process cwd (a physical path).
         self.assertEqual(snapshot["context"]["project_root"],
                          os.path.realpath(self.project_root))
         self.assertEqual(lines[:-1],
-                         codex_council._discovery_summary(snapshot))
+                         council_discovery._discovery_summary(snapshot))
 
     def test_leak_sentinels_never_reach_any_output(self):
         scenario = fake_codex.default_scenario()
@@ -1635,7 +1647,7 @@ class DiscoverCommandTests(FakeCodexTestCase):
         self.assertRegex(first, r"^\[codex-council\] discovery unavailable: "
                          r"codex_missing; snapshot_id=[0-9a-f]{16}; ")
         self.assertTrue(first.endswith(UNAVAILABLE_TAIL))
-        snapshot, _ = codex_council._read_snapshot(self.run_dir)
+        snapshot, _ = council_discovery._read_snapshot(self.run_dir)
         self.assertEqual(snapshot["status"], "unavailable")
 
     def test_unavailable_discovery_still_exits_0(self):
@@ -1652,7 +1664,7 @@ class DiscoverCommandTests(FakeCodexTestCase):
         self.assertIn(
             "routing: unavailable — CODEX_COUNCIL_MODEL_ROUTING=off",
             proc.stdout.splitlines())
-        snapshot, _ = codex_council._read_snapshot(self.run_dir)
+        snapshot, _ = council_discovery._read_snapshot(self.run_dir)
         self.assertEqual(snapshot["routing"]["mode"], "off")
 
     def test_invalid_routing_env_is_a_usage_error_before_discovery(self):
@@ -1698,7 +1710,7 @@ class DiscoverCommandTests(FakeCodexTestCase):
         ids = [re.search(r"snapshot_id=([0-9a-f]{16})", p.stdout).group(1)
                for p in (first, second)]
         self.assertNotEqual(ids[0], ids[1])
-        snapshot, _ = codex_council._read_snapshot(self.run_dir)
+        snapshot, _ = council_discovery._read_snapshot(self.run_dir)
         self.assertEqual(snapshot["snapshot_id"], ids[1])
 
     def test_write_failure_removes_a_stale_snapshot_and_says_inherit(self):
@@ -1707,10 +1719,10 @@ class DiscoverCommandTests(FakeCodexTestCase):
         os.chmod(self.snapshot_path, 0o600)
         out = io.StringIO()
         with self.fake_env(fake_codex.default_scenario()), \
-             patch.object(codex_council.os, "replace",
+             patch.object(council_common.os, "replace",
                           side_effect=OSError("disk full")), \
              contextlib.redirect_stdout(out):
-            codex_council._discover_command(self.run_dir)
+            council_discovery._discover_command(self.run_dir)
         self.assertEqual(out.getvalue().splitlines(), [
             "[codex-council] discovery snapshot not written (disk full); "
             "write no automatic selections — omit model, effort, and "

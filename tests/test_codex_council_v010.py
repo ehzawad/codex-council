@@ -38,6 +38,7 @@ SCRIPTS_DIR = os.path.abspath(os.path.join(
 sys.path.insert(0, SCRIPTS_DIR)
 
 import codex_council  # noqa: E402
+import council_common  # noqa: E402
 
 SCRIPT = os.path.join(SCRIPTS_DIR, "codex_council.py")
 EPOCH = str(codex_council.SKILL_CONTRACT_EPOCH)
@@ -473,7 +474,7 @@ class WriteReplyFileTests(unittest.TestCase):
 
     def test_failed_replace_removes_temp_file(self):
         buf = io.StringIO()
-        with patch.object(codex_council.os, "replace",
+        with patch.object(council_common.os, "replace",
                           side_effect=OSError("boom")), \
              contextlib.redirect_stderr(buf):
             self.assertIsNone(

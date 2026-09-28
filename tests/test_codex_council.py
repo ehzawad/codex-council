@@ -1,4 +1,4 @@
-"""Unit tests for codex_council.py.
+"""Unit tests for codex_council.py and the sibling modules it imports.
 
 Runs without the Codex CLI installed. Covers helper behavior:
 key/state per role, JSONL parsing, error classifiers, prompt
@@ -7,7 +7,8 @@ retry-on-retriable, fan-out aggregation, and (DocsContractTests) the
 documentation contract of SKILL.md, its references, README, and DESIGN.
 v0.10.0 surfaces (reply files, --follow, model/effort) are covered in
 tests/test_codex_council_v010.py; v1.0.0 model discovery and the selection
-contract in tests/test_model_discovery.py and tests/test_model_selection.py.
+contract in tests/test_model_discovery.py and tests/test_model_selection.py;
+the module layout in tests/test_module_layout.py.
 
 Lives outside the plugin subtree so end-user installs don't bundle it.
 Run from repo root:
@@ -37,6 +38,10 @@ SCRIPTS_DIR = os.path.abspath(os.path.join(
 sys.path.insert(0, SCRIPTS_DIR)
 
 import codex_council  # noqa: E402
+import council_common  # noqa: E402
+import council_discovery  # noqa: E402
+import council_failures  # noqa: E402
+import council_selection  # noqa: E402
 
 
 FIXED_PROJECT_ROOT = "/fixed/project/root"
@@ -507,12 +512,12 @@ class ExtractFinalMessageTests(unittest.TestCase):
 class ExtractErrorMessagesTests(unittest.TestCase):
     def test_extracts_error_message(self):
         jsonl = '{"type":"error","message":"401 unauthorized"}'
-        self.assertEqual(codex_council.extract_error_messages(jsonl), ["401 unauthorized"])
+        self.assertEqual(council_failures.extract_error_messages(jsonl), ["401 unauthorized"])
 
     def test_extracts_turn_failed_error_message(self):
         jsonl = '{"type":"turn.failed","error":{"message":"HTTP 429 Too Many Requests"}}'
         self.assertEqual(
-            codex_council.extract_error_messages(jsonl),
+            council_failures.extract_error_messages(jsonl),
             ["HTTP 429 Too Many Requests"],
         )
 
@@ -527,7 +532,7 @@ class ExtractErrorMessagesTests(unittest.TestCase):
             json.dumps({"type": "turn.failed", "error": {"message": inner}}),
         ])
         self.assertEqual(
-            codex_council.extract_error_messages(jsonl),
+            council_failures.extract_error_messages(jsonl),
             [inner, "The model is unsupported."],
         )
 
@@ -536,56 +541,58 @@ class ExtractErrorMessagesTests(unittest.TestCase):
 
 class ClassifierTests(unittest.TestCase):
     def test_auth_markers_match(self):
-        self.assertTrue(codex_council._is_auth_error("401 Unauthorized: incorrect api key sk-..."))
-        self.assertTrue(codex_council._is_auth_error("Please run `codex login`"))
+        self.assertTrue(council_failures._is_auth_error("401 Unauthorized: incorrect api key sk-..."))
+        self.assertTrue(council_failures._is_auth_error("Please run `codex login`"))
 
     def test_rate_limit_markers_match(self):
-        self.assertTrue(codex_council._is_rate_limit_error("HTTP 429 too many requests"))
-        self.assertTrue(codex_council._is_rate_limit_error("rate_limit_exceeded"))
+        self.assertTrue(council_failures._is_rate_limit_error("HTTP 429 too many requests"))
+        self.assertTrue(council_failures._is_rate_limit_error("rate_limit_exceeded"))
 
     def test_5xx_markers_match(self):
-        self.assertTrue(codex_council._is_transient_5xx_error("502 bad gateway"))
-        self.assertTrue(codex_council._is_transient_5xx_error("Service unavailable, retry later"))
+        self.assertTrue(council_failures._is_transient_5xx_error("502 bad gateway"))
+        self.assertTrue(council_failures._is_transient_5xx_error("Service unavailable, retry later"))
 
     def test_server_overloaded_is_5xx_phrase(self):
         """Current codex-cli rewrites code-less overload errors to 'server
         overloaded'; 'backend overloaded' is older codex/provider text."""
         self.assertEqual(
-            codex_council._retriable_class(
+            council_failures._retriable_class(
                 "stream disconnected before completion: server overloaded"),
             "5xx",
         )
         self.assertEqual(
-            codex_council._retriable_class("Server overloaded, retry shortly"),
+            council_failures._retriable_class(
+                "Server overloaded, retry shortly"),
             "5xx",
         )
 
     def test_backend_overloaded_kept_as_legacy_marker(self):
         self.assertEqual(
-            codex_council._retriable_class("backend overloaded"), "5xx")
+            council_failures._retriable_class("backend overloaded"), "5xx")
 
     def test_operator_overloaded_not_matched(self):
         self.assertIsNone(
-            codex_council._retriable_class("error: operator overloaded in C++"))
+            council_failures._retriable_class("error: operator overloaded in C++"))
 
     def test_stale_markers_match(self):
-        self.assertTrue(codex_council._is_stale_resume_error(
+        self.assertTrue(council_failures._is_stale_resume_error(
             "Error: thread/resume failed: no rollout found for thread id abc (code -32600)"
         ))
-        self.assertTrue(codex_council._is_stale_resume_error("THREAD NOT FOUND"))
+        self.assertTrue(council_failures._is_stale_resume_error("THREAD NOT FOUND"))
 
     def test_retriable_helper_covers_both(self):
         # Bare "429" is no longer a marker (anchored parser covers numeric 429s),
         # so the substring helper now keys off the phrase forms.
-        self.assertTrue(codex_council._is_retriable_error("429 too many requests"))
-        self.assertTrue(codex_council._is_retriable_error("503 service unavailable"))
-        self.assertFalse(codex_council._is_retriable_error("401 unauthorized"))
+        self.assertTrue(council_failures._is_retriable_error("429 too many requests"))
+        self.assertTrue(council_failures._is_retriable_error("503 service unavailable"))
+        self.assertFalse(
+            council_failures._is_retriable_error("401 unauthorized"))
 
     def test_distinct_classes_dont_overlap(self):
         s = "no rollout found for thread id x"
-        self.assertTrue(codex_council._is_stale_resume_error(s))
-        self.assertFalse(codex_council._is_auth_error(s))
-        self.assertFalse(codex_council._is_retriable_error(s))
+        self.assertTrue(council_failures._is_stale_resume_error(s))
+        self.assertFalse(council_failures._is_auth_error(s))
+        self.assertFalse(council_failures._is_retriable_error(s))
 
 
 # ---------- structured (HTTP-status-aware) classification ----------
@@ -596,7 +603,7 @@ def _nested_status_failure_text(status, message):
     nested = json.dumps({"type": "error", "status": status,
                          "error": {"message": message}})
     stdout = json.dumps({"type": "turn.failed", "error": {"message": nested}})
-    return codex_council._failure_text(stdout, "")
+    return council_failures._failure_text(stdout, "")
 
 
 class StructuredStatusClassifierTests(unittest.TestCase):
@@ -612,20 +619,20 @@ class StructuredStatusClassifierTests(unittest.TestCase):
     # --- status extraction ---
     def test_extract_statuses_from_nested_json_key(self):
         self.assertEqual(
-            codex_council._extract_statuses('{"type":"error","status":429,"error":{}}'),
+            council_failures._extract_statuses('{"type":"error","status":429,"error":{}}'),
             [429],
         )
 
     def test_extract_statuses_from_unexpected_status_prose(self):
         self.assertEqual(
-            codex_council._extract_statuses(
+            council_failures._extract_statuses(
                 "unexpected status 529 <unknown status code>: backend overloaded"),
             [529],
         )
 
     def test_extract_statuses_from_last_status_prose(self):
         self.assertEqual(
-            codex_council._extract_statuses(
+            council_failures._extract_statuses(
                 "exceeded retry limit, last status: 429 Too Many Requests"),
             [429],
         )
@@ -634,133 +641,135 @@ class StructuredStatusClassifierTests(unittest.TestCase):
         # The '429' inside a thread id must NOT be read as a status — this is
         # what keeps the stale-resume reorder safe.
         self.assertEqual(
-            codex_council._extract_statuses(
+            council_failures._extract_statuses(
                 "no rollout found for thread id stale-429-sid (code -32600)"),
             [],
         )
 
     def test_extract_statuses_ignores_longer_digit_runs(self):
-        self.assertEqual(codex_council._extract_statuses("status 4290 widgets"), [])
+        self.assertEqual(council_failures._extract_statuses("status 4290 widgets"), [])
 
     # --- false positives fixed (status present, non-retriable) ---
     def test_status_400_with_bare_429_text_not_retriable(self):
         ft = _nested_status_failure_text(400, "branch revision 429 is invalid")
-        self.assertIsNone(codex_council._retriable_class(ft))
+        self.assertIsNone(council_failures._retriable_class(ft))
         self.assertFalse(
-            codex_council._classify_failure(ft, 1, "exec").startswith("[retriable:"))
+            council_failures._classify_failure(ft, 1, "exec").startswith("[retriable:"))
 
     def test_status_400_service_unavailable_text_not_retriable(self):
         ft = _nested_status_failure_text(
             400, "plugin service unavailable for this account tier")
-        self.assertIsNone(codex_council._retriable_class(ft))
+        self.assertIsNone(council_failures._retriable_class(ft))
 
     # --- false negatives fixed (real retriable status) ---
     def test_status_429_is_rate_limit(self):
         ft = _nested_status_failure_text(429, "rate limited")
-        self.assertEqual(codex_council._retriable_class(ft), "rate-limit")
+        self.assertEqual(council_failures._retriable_class(ft), "rate-limit")
 
     def test_status_503_is_5xx(self):
         ft = _nested_status_failure_text(503, "temporarily down")
-        self.assertEqual(codex_council._retriable_class(ft), "5xx")
+        self.assertEqual(council_failures._retriable_class(ft), "5xx")
 
     def test_status_529_overloaded_is_5xx(self):
         ft = _nested_status_failure_text(529, "backend overloaded")
-        self.assertEqual(codex_council._retriable_class(ft), "5xx")
+        self.assertEqual(council_failures._retriable_class(ft), "5xx")
 
     def test_unexpected_status_529_prose_is_5xx(self):
-        ft = codex_council._failure_text(
+        ft = council_failures._failure_text(
             "", "unexpected status 529 <unknown status code>: backend overloaded")
-        self.assertEqual(codex_council._retriable_class(ft), "5xx")
+        self.assertEqual(council_failures._retriable_class(ft), "5xx")
 
     def test_http500_friendly_rewrite_is_5xx_via_phrase_fallback(self):
         # current codex-cli rewrites HTTP 500 to a code-less phrase; the
         # version-coupled marker catches it as a fallback (no status present).
-        ft = codex_council._failure_text(
+        ft = council_failures._failure_text(
             "", "We're currently experiencing high demand, which may cause temporary errors.")
-        self.assertIsNone(codex_council._structured_retriable_class(ft))
-        self.assertEqual(codex_council._retriable_class(ft), "5xx")
+        self.assertIsNone(council_failures._structured_retriable_class(ft))
+        self.assertEqual(council_failures._retriable_class(ft), "5xx")
 
     # --- substring fallback preserved when no status present ---
     def test_plain_429_stderr_still_retriable_via_fallback(self):
         self.assertEqual(
-            codex_council._retriable_class("HTTP 429 too many requests"), "rate-limit")
+            council_failures._retriable_class("HTTP 429 too many requests"), "rate-limit")
 
     def test_literal_5xx_strings_still_retriable_via_fallback(self):
-        self.assertEqual(codex_council._retriable_class("502 bad gateway"), "5xx")
+        self.assertEqual(council_failures._retriable_class("502 bad gateway"), "5xx")
         self.assertEqual(
-            codex_council._retriable_class("Service unavailable, retry later"), "5xx")
+            council_failures._retriable_class("Service unavailable, retry later"), "5xx")
 
     # --- resume-reorder guard: structured-retriable must NOT fire on stale ---
     def test_structured_retriable_does_not_fire_on_stale_429_message(self):
-        self.assertIsNone(codex_council._structured_retriable_class(
+        self.assertIsNone(council_failures._structured_retriable_class(
             "Error: no rollout found for thread id stale-429-sid (code -32600)"))
 
     # --- pins: no bare 529 marker; usage-limit never retriable-by-substring ---
     def test_no_bare_529_substring_marker(self):
-        self.assertNotIn("529", codex_council.TRANSIENT_5XX_MARKERS)
-        self.assertNotIn("529", codex_council.RATE_LIMIT_MARKERS)
+        self.assertNotIn("529", council_failures.TRANSIENT_5XX_MARKERS)
+        self.assertNotIn("529", council_failures.RATE_LIMIT_MARKERS)
 
     def test_usage_limit_tokens_not_in_retriable_markers(self):
         for tok in ("usage_limit", "usage limit", "usage_limit_reached"):
-            self.assertNotIn(tok, codex_council.RATE_LIMIT_MARKERS)
-            self.assertNotIn(tok, codex_council.TRANSIENT_5XX_MARKERS)
+            self.assertNotIn(tok, council_failures.RATE_LIMIT_MARKERS)
+            self.assertNotIn(tok, council_failures.TRANSIENT_5XX_MARKERS)
 
     def test_quota_exceeded_is_not_retriable(self):
         # Usage/quota caps do not clear within a 5s backoff, so they are NOT
         # retriable — matching the documented Retries contract (DESIGN/SKILL).
-        self.assertIsNone(codex_council._retriable_class("quota exceeded"))
-        self.assertIsNone(codex_council._retriable_class(
+        self.assertIsNone(council_failures._retriable_class("quota exceeded"))
+        self.assertIsNone(council_failures._retriable_class(
             "You have exceeded your monthly quota exceeded for this plan"))
-        self.assertNotIn("quota exceeded", codex_council.RATE_LIMIT_MARKERS)
+        self.assertNotIn("quota exceeded", council_failures.RATE_LIMIT_MARKERS)
 
     def test_codeless_overload_markers_pinned_and_no_false_positive(self):
         # Confirmed code-less fallback phrases (current and legacy) are caught...
-        self.assertEqual(codex_council._retriable_class("backend overloaded"), "5xx")
+        self.assertEqual(council_failures._retriable_class("backend overloaded"), "5xx")
         self.assertEqual(
-            codex_council._retriable_class(
+            council_failures._retriable_class(
                 "We're currently experiencing high demand, please retry"), "5xx")
         # ...but the markers are specific enough not to match unrelated text.
         self.assertIsNone(
-            codex_council._retriable_class("operator overloaded method failed"))
+            council_failures._retriable_class("operator overloaded method failed"))
 
     # --- anchored detection: keyword + reason phrase (robustness caveat) ---
     def test_anchored_http_keyword_status_detected(self):
         self.assertEqual(
-            codex_council._extract_statuses("HTTP 429 too many requests"), [429])
+            council_failures._extract_statuses("HTTP 429 too many requests"), [429])
         self.assertEqual(
-            codex_council._extract_statuses("status code 429 returned"), [429])
+            council_failures._extract_statuses("status code 429 returned"),
+            [429])
         self.assertEqual(
-            codex_council._structured_retriable_class("HTTP 429 Too Many Requests"),
+            council_failures._structured_retriable_class("HTTP 429 Too Many Requests"),
             "rate-limit")
 
     def test_anchored_reason_phrase_status_detected(self):
         self.assertEqual(
-            codex_council._extract_statuses("got 503 Service Unavailable"), [503])
+            council_failures._extract_statuses("got 503 Service Unavailable"), [503])
         self.assertEqual(
-            codex_council._structured_retriable_class("502 Bad Gateway from upstream"),
+            council_failures._structured_retriable_class("502 Bad Gateway from upstream"),
             "5xx")
 
     def test_anchored_status_beats_stale_text(self):
         # Caveat-2: a real anchored 429 alongside a stale-looking phrase is
         # retriable, so on the resume path it beats the stale branch.
         self.assertEqual(
-            codex_council._structured_retriable_class(
+            council_failures._structured_retriable_class(
                 "HTTP 429 Too Many Requests; thread not found"),
             "rate-limit")
 
     def test_bare_digit_runs_are_not_anchored_statuses(self):
         # No keyword and no reason phrase -> not a status -> stale routing safe.
         self.assertEqual(
-            codex_council._extract_statuses("commit 4291 merged at 503abc"), [])
+            council_failures._extract_statuses("commit 4291 merged at 503abc"), [])
         self.assertEqual(
-            codex_council._extract_statuses("ticket #503 about checkout"), [])
-        self.assertIsNone(codex_council._structured_retriable_class(
+            council_failures._extract_statuses("ticket #503 about checkout"),
+            [])
+        self.assertIsNone(council_failures._structured_retriable_class(
             "no rollout found for thread id stale-429-sid (code -32600)"))
 
     def test_extract_statuses_dedupes_keyword_and_reason(self):
         # "last status: 429 Too Many Requests" matches BOTH anchors -> one 429.
         self.assertEqual(
-            codex_council._extract_statuses(
+            council_failures._extract_statuses(
                 "exceeded retry limit, last status: 429 Too Many Requests"),
             [429])
 
@@ -768,19 +777,20 @@ class StructuredStatusClassifierTests(unittest.TestCase):
         # A URL host/port must not be read as an HTTP status (the keyword
         # separator class excludes "/", so "http://..." does not match).
         self.assertEqual(
-            codex_council._extract_statuses("url: http://127.0.0.1:49818/v1/responses"), [])
+            council_failures._extract_statuses("url: http://127.0.0.1:49818/v1/responses"), [])
         self.assertEqual(
-            codex_council._extract_statuses("http://429.example.invalid/path"), [])
+            council_failures._extract_statuses("http://429.example.invalid/path"), [])
         self.assertIsNone(
-            codex_council._retriable_class("bad request, url: http://503.example.test/v1"))
+            council_failures._retriable_class("bad request, url: http://503.example.test/v1"))
 
     def test_no_bare_digit_run_false_positive_in_retriable_class(self):
         # Anchored detection covers real 429 forms, so a bare digit run is not
         # retriable at the _retriable_class level either (not just _extract_*).
-        self.assertIsNone(codex_council._retriable_class("commit 4291 merged"))
-        self.assertIsNone(codex_council._retriable_class(
+        self.assertIsNone(
+            council_failures._retriable_class("commit 4291 merged"))
+        self.assertIsNone(council_failures._retriable_class(
             "no rollout found for thread id stale-429-sid (code -32600)"))
-        self.assertNotIn("429", codex_council.RATE_LIMIT_MARKERS)
+        self.assertNotIn("429", council_failures.RATE_LIMIT_MARKERS)
 
     def test_statusless_400_invalid_request_error_suppresses_fallback(self):
         # current codex-cli can surface a 4xx as raw JSON with NO status key but
@@ -788,22 +798,22 @@ class StructuredStatusClassifierTests(unittest.TestCase):
         # its message text contains a 5xx reason phrase or rate-limit wording.
         raw_su = ('{"error": {"message": "service unavailable for this account '
                   'tier", "type": "invalid_request_error"}}')
-        self.assertEqual(codex_council._extract_statuses(raw_su), [])
-        self.assertIsNone(codex_council._retriable_class(raw_su))
+        self.assertEqual(council_failures._extract_statuses(raw_su), [])
+        self.assertIsNone(council_failures._retriable_class(raw_su))
         raw_tmr = ('{"error": {"message": "too many requests in batch payload", '
                    '"type": "invalid_request_error"}}')
-        self.assertIsNone(codex_council._retriable_class(raw_tmr))
+        self.assertIsNone(council_failures._retriable_class(raw_tmr))
 
     def test_invalid_request_error_does_not_block_real_retriable(self):
         # An anchored retriable status wins regardless of any type...
         self.assertEqual(
-            codex_council._retriable_class(
+            council_failures._retriable_class(
                 '{"status":429,"error":{"type":"rate_limit_error"}}'),
             "rate-limit")
         # ...and a status-less rate-limit phrase with no client-error type still
         # retries (suppression only fires on the non-retriable type).
         self.assertEqual(
-            codex_council._retriable_class("upstream says too many requests, slow down"),
+            council_failures._retriable_class("upstream says too many requests, slow down"),
             "rate-limit")
 
 
@@ -816,7 +826,7 @@ class ObservedCodexStringClassifierTests(unittest.TestCase):
         # codex rewrites an HTTP 503 server_is_overloaded/slow_down to this
         # exact code-less sentence.
         self.assertEqual(
-            codex_council._retriable_class(
+            council_failures._retriable_class(
                 "Selected model is at capacity. Please try a different model."),
             "5xx",
         )
@@ -825,15 +835,15 @@ class ObservedCodexStringClassifierTests(unittest.TestCase):
         # codex SSE response.failed handling discards code/status_code/
         # statusCode and keeps only the message.
         self.assertEqual(
-            codex_council._retriable_class(
+            council_failures._retriable_class(
                 "stream disconnected before completion: Request was throttled"),
             "rate-limit",
         )
 
     def test_bare_throttled_is_not_a_marker(self):
-        self.assertIsNone(
-            codex_council._retriable_class("the deploy was throttled by CI"))
-        self.assertNotIn("throttled", codex_council.RATE_LIMIT_MARKERS)
+        self.assertIsNone(council_failures._retriable_class(
+            "the deploy was throttled by CI"))
+        self.assertNotIn("throttled", council_failures.RATE_LIMIT_MARKERS)
 
     def test_raw_400_body_with_status_code_key_is_suppressed(self):
         # Observed raw HTTP-400 surface: the transport status only appears as
@@ -841,34 +851,37 @@ class ObservedCodexStringClassifierTests(unittest.TestCase):
         # The anchored 400 must suppress the 5xx phrase fallback.
         raw = ('{"error":{"status_code":400,"message":"Plugin service '
                'unavailable for this account tier","type":"bad_request"}}')
-        self.assertEqual(codex_council._extract_statuses(raw), [400])
-        self.assertIsNone(codex_council._retriable_class(raw))
+        self.assertEqual(council_failures._extract_statuses(raw), [400])
+        self.assertIsNone(council_failures._retriable_class(raw))
 
     def test_status_code_spelling_variants_are_anchored(self):
         self.assertEqual(
-            codex_council._extract_statuses('{"statusCode":503,"x":1}'), [503])
+            council_failures._extract_statuses('{"statusCode":503,"x":1}'),
+            [503])
         self.assertEqual(
-            codex_council._extract_statuses("status-code 429 returned"), [429])
+            council_failures._extract_statuses("status-code 429 returned"),
+            [429])
         self.assertEqual(
-            codex_council._extract_statuses("status_code: 429"), [429])
+            council_failures._extract_statuses("status_code: 429"), [429])
         self.assertEqual(
-            codex_council._extract_statuses("status code 429 returned"), [429])
+            council_failures._extract_statuses("status code 429 returned"),
+            [429])
 
     def test_error_code_prefix_is_not_anchored(self):
         # "Error code:" is SDK wording, not current codex wording; adding it
         # would misread SDK errors quoted inside raw 400 bodies.
-        self.assertEqual(codex_council._extract_statuses("Error code: 429"), [])
+        self.assertEqual(council_failures._extract_statuses("Error code: 429"), [])
 
     def test_refresh_token_failure_is_auth(self):
         msg = ("Your access token could not be refreshed because your "
                "refresh token has expired. Please run codex login.")
-        self.assertTrue(codex_council._is_auth_error(msg))
+        self.assertTrue(council_failures._is_auth_error(msg))
         self.assertTrue(
-            codex_council._classify_failure(msg, 1, "exec").startswith("[auth]"))
+            council_failures._classify_failure(msg, 1, "exec").startswith("[auth]"))
 
     def test_no_bad_request_suppression_marker(self):
         self.assertNotIn(
-            "bad_request", codex_council.NONRETRIABLE_ERROR_TYPE_MARKERS)
+            "bad_request", council_failures.NONRETRIABLE_ERROR_TYPE_MARKERS)
 
 
 # ---------- prompt composition ----------
@@ -2284,10 +2297,10 @@ class ResolveRolesJsonIntegrationTests(unittest.TestCase):
 
 class ProjectRootCacheTests(unittest.TestCase):
     def setUp(self):
-        codex_council._project_root.cache_clear()
+        council_common._project_root.cache_clear()
 
     def tearDown(self):
-        codex_council._project_root.cache_clear()
+        council_common._project_root.cache_clear()
 
     def test_only_one_git_call_across_many_lookups(self):
         calls = {"count": 0}
@@ -2295,9 +2308,9 @@ class ProjectRootCacheTests(unittest.TestCase):
             calls["count"] += 1
             from subprocess import CompletedProcess
             return CompletedProcess(args=args[0], returncode=0, stdout="/x\n", stderr="")
-        with patch.object(codex_council.subprocess, "run", side_effect=fake_run):
+        with patch.object(council_common.subprocess, "run", side_effect=fake_run):
             for _ in range(5):
-                codex_council._project_root()
+                council_common._project_root()
         self.assertEqual(calls["count"], 1)
 
 
@@ -2893,32 +2906,17 @@ class NoRunLevelDeadlineTests(unittest.TestCase):
     def test_source_uses_no_run_level_timeout_primitive(self):
         """No run-level deadline, by design: pin the absence of any named
         timeout primitive so adding one is a conscious choice (this test
-        fails) rather than a silent regression. Scans executable code only —
-        comment and string/docstring spans are masked out, since this file is
-        deliberately comment-heavy about the deadline it does NOT have. The
-        output-inactivity watchdog must stay hand-rolled (an asyncio.sleep
-        loop over time.monotonic): the named APIs below would impose a
-        deadline on the subprocess await itself, which is exactly what the
-        design forbids."""
+        fails) rather than a silent regression. Scans the executable code of
+        every runner module (the entry script and its sibling modules) —
+        comment and string/docstring spans are masked out, since the runner
+        is deliberately comment-heavy about the deadline it does NOT have.
+        The output-inactivity watchdog must stay hand-rolled (an
+        asyncio.sleep loop over time.monotonic): the named APIs below would
+        impose a deadline on the subprocess await itself, which is exactly
+        what the design forbids."""
         import io as _io
         import re as _re
         import tokenize as _tokenize
-        with open(codex_council.__file__, encoding="utf-8") as f:
-            src = f.read()
-        # Mask COMMENT and STRING token spans (preserving byte offsets) so the
-        # scan sees executable code only, not prose that names these APIs.
-        masked = list(src)
-        offsets = [0]
-        for line in src.splitlines(keepends=True):
-            offsets.append(offsets[-1] + len(line))
-        for tok in _tokenize.generate_tokens(_io.StringIO(src).readline):
-            if tok.type in (_tokenize.COMMENT, _tokenize.STRING):
-                start = offsets[tok.start[0] - 1] + tok.start[1]
-                end = offsets[tok.end[0] - 1] + tok.end[1]
-                for i in range(start, end):
-                    if masked[i] != "\n":
-                        masked[i] = " "
-        code = "".join(masked)
         # (label, regex). Identifier boundaries avoid matching benign names
         # like `idle_timeout = N`; \s* tolerates spaced kwargs / calls.
         forbidden = (
@@ -2929,8 +2927,32 @@ class NoRunLevelDeadlineTests(unittest.TestCase):
             (".settimeout(", r"\.\s*settimeout\s*\("),
             ("timeout=", r"\btimeout\s*="),
         )
-        found = [name for name, pat in forbidden if _re.search(pat, code)]
-        self.assertEqual(found, [], f"unexpected timeout primitive(s): {found}")
+        modules = sorted(name for name in os.listdir(SCRIPTS_DIR)
+                         if name.endswith(".py"))
+        self.assertIn("codex_council.py", modules)
+        for module in modules:
+            with open(os.path.join(SCRIPTS_DIR, module),
+                      encoding="utf-8") as f:
+                src = f.read()
+            # Mask COMMENT and STRING token spans (preserving byte offsets)
+            # so the scan sees executable code only, not prose that names
+            # these APIs.
+            masked = list(src)
+            offsets = [0]
+            for line in src.splitlines(keepends=True):
+                offsets.append(offsets[-1] + len(line))
+            for tok in _tokenize.generate_tokens(_io.StringIO(src).readline):
+                if tok.type in (_tokenize.COMMENT, _tokenize.STRING):
+                    start = offsets[tok.start[0] - 1] + tok.start[1]
+                    end = offsets[tok.end[0] - 1] + tok.end[1]
+                    for i in range(start, end):
+                        if masked[i] != "\n":
+                            masked[i] = " "
+            code = "".join(masked)
+            found = [name for name, pat in forbidden if _re.search(pat, code)]
+            with self.subTest(module=module):
+                self.assertEqual(
+                    found, [], f"unexpected timeout primitive(s): {found}")
 
 
 # ---------- output-inactivity watchdog (env, flags, policy) ----------
@@ -3327,7 +3349,7 @@ class DiagnosticsHelperTests(unittest.TestCase):
 
     def _restore(self):
         sys.stderr = self._real_stderr
-        codex_council._diagnostics["stream"] = None
+        council_common._diagnostics["stream"] = None
 
     def _fail_stream(self, exc):
         class Failing:
@@ -3351,28 +3373,28 @@ class DiagnosticsHelperTests(unittest.TestCase):
     def test_broken_pipe_redirects_permanently(self):
         failing = self._fail_stream(BrokenPipeError())
         sys.stderr = failing
-        codex_council._diag("one")
-        self.assertIsNotNone(codex_council._diagnostics["stream"])
+        council_common._diag("one")
+        self.assertIsNotNone(council_common._diagnostics["stream"])
         # Subsequent writes are no-ops against the retired stream.
-        codex_council._diag("two")
+        council_common._diag("two")
         self.assertEqual(failing.writes, 1)
 
     def test_closed_stream_valueerror_redirects_permanently(self):
         sys.stderr = self._fail_stream(ValueError("I/O operation on closed file"))
-        codex_council._diag("one")
-        self.assertIsNotNone(codex_council._diagnostics["stream"])
+        council_common._diag("one")
+        self.assertIsNotNone(council_common._diagnostics["stream"])
 
     def test_ebadf_redirects_permanently(self):
         sys.stderr = self._fail_stream(OSError(9, "Bad file descriptor"))
-        codex_council._diag("one")
-        self.assertIsNotNone(codex_council._diagnostics["stream"])
+        council_common._diag("one")
+        self.assertIsNotNone(council_common._diagnostics["stream"])
 
     def test_transient_oserror_is_suppressed_but_stream_stays_live(self):
         failing = self._fail_stream(OSError(11, "Resource temporarily unavailable"))
         sys.stderr = failing
-        codex_council._diag("one")  # suppressed, no redirect
-        self.assertIsNone(codex_council._diagnostics["stream"])
-        codex_council._diag("two")  # the stream is still being used
+        council_common._diag("one")  # suppressed, no redirect
+        self.assertIsNone(council_common._diagnostics["stream"])
+        council_common._diag("two")  # the stream is still being used
         self.assertEqual(failing.writes, 2)
 
     def test_retry_still_happens_when_stderr_dies_before_the_notice(self):
@@ -3577,12 +3599,12 @@ class ReportInlineBoundaryTests(unittest.TestCase):
 
     def test_linebreak_chars_constant_covers_full_boundary_set(self):
         self.assertEqual(
-            tuple(codex_council.LINEBREAK_CHARS), self._BOUNDARY_CHARS)
+            tuple(council_common.LINEBREAK_CHARS), self._BOUNDARY_CHARS)
 
     def test_every_boundary_char_is_escaped_to_one_line(self):
         for ch in self._BOUNDARY_CHARS:
             with self.subTest(char=hex(ord(ch))):
-                out = codex_council._report_inline(f"left{ch}right")
+                out = council_common._report_inline(f"left{ch}right")
                 self.assertEqual(len(out.splitlines()), 1)
                 self.assertNotIn(ch, out)
 
@@ -3676,16 +3698,16 @@ class RolesRewriteRecoveryTests(unittest.TestCase):
 class PluginVersionTests(unittest.TestCase):
     def test_resolves_manifest_three_levels_above_scripts(self):
         manifest = os.path.abspath(os.path.join(
-            os.path.dirname(codex_council.__file__),
+            os.path.dirname(council_common.__file__),
             "..", "..", "..", ".claude-plugin", "plugin.json",
         ))
         with open(manifest, encoding="utf-8") as f:
             expected = json.load(f)["version"]
-        self.assertEqual(codex_council._plugin_version(), expected)
+        self.assertEqual(council_common._plugin_version(), expected)
 
     def test_unknown_on_unresolvable_manifest(self):
-        with patch.object(codex_council, "__file__", "/x.py"):
-            self.assertEqual(codex_council._plugin_version(), "unknown")
+        with patch.object(council_common, "__file__", "/x.py"):
+            self.assertEqual(council_common._plugin_version(), "unknown")
 
 
 class DocsContractTests(unittest.TestCase):
@@ -3754,6 +3776,15 @@ class DocsContractTests(unittest.TestCase):
     def _json_file(self, *parts):
         with open(self._repo_file(*parts), encoding="utf-8") as f:
             return json.load(f)
+
+    def _runner_files(self):
+        """Repo-relative parts of every runner module: the entry script and
+        the sibling modules it imports, so source checks cover all of them."""
+        scripts = self.RUNNER_PARTS[:-1]
+        names = sorted(name for name in os.listdir(self._repo_file(*scripts))
+                       if name.endswith(".py"))
+        self.assertIn(self.RUNNER_PARTS[-1], names)
+        return [scripts + (name,) for name in names]
 
     def _skill(self):
         return self._read_repo_file(*self.SKILL_PARTS)
@@ -3862,13 +3893,13 @@ class DocsContractTests(unittest.TestCase):
         """The decision of a role that sent (model, effort) as `provenance`
         (user, routed, or native_effort, which requests no model)."""
         requested = None if provenance == "native_effort" else model
-        return codex_council.SelectionDecision(
+        return council_selection.SelectionDecision(
             provenance, provenance, requested, effort, model, effort, reason)
 
     @staticmethod
     def _fell_back(model, effort, note):
         """A routed request that resolved to native inheritance."""
-        return codex_council.SelectionDecision(
+        return council_selection.SelectionDecision(
             "routed", "fallback", model, effort, note=note)
 
     def _documented_selections(self, text):
@@ -3904,7 +3935,7 @@ class DocsContractTests(unittest.TestCase):
             }
 
         return {
-            "schema": codex_council.SNAPSHOT_SCHEMA,
+            "schema": council_discovery.SNAPSHOT_SCHEMA,
             "snapshot_id": snapshot_id,
             "plugin_version": "1.0.0",
             "status": "ok",
@@ -3942,7 +3973,8 @@ class DocsContractTests(unittest.TestCase):
         document, manifest, runner, script, or test names a product model or
         a model generation (tests use synthetic future ids)."""
         paths = self._repo_text_files()
-        self.assertIn(os.path.join(*self.RUNNER_PARTS), paths)
+        for parts in self._runner_files():
+            self.assertIn(os.path.join(*parts), paths)
         for path in paths:
             with self.subTest(path=path):
                 self.assertNotRegex(self._read_repo_file(path),
@@ -3955,7 +3987,7 @@ class DocsContractTests(unittest.TestCase):
         unadvertised effort run without an error)."""
         surfaces = dict(self._doc_surfaces())
         for parts in (self.MANIFEST_PARTS, self.MARKETPLACE_PARTS,
-                      self.RUNNER_PARTS):
+                      *self._runner_files()):
             surfaces["/".join(parts)] = self._read_repo_file(*parts)
         for name, text in surfaces.items():
             with self.subTest(surface=name):
@@ -4055,7 +4087,8 @@ class DocsContractTests(unittest.TestCase):
             self.assertIn(required, ref)
 
     def test_runtime_and_skill_have_no_stale_size_or_panel_caps(self):
-        script = self._read_repo_file(*self.RUNNER_PARTS)
+        script = "\n".join(self._read_repo_file(*parts)
+                           for parts in self._runner_files())
         skill = self._skill()
         for stale_name in (
             "\nMAX_PARALLEL =", "MAX_STDIN_BYTES", "MAX_PROMPT_BYTES",
@@ -4133,7 +4166,7 @@ class DocsContractTests(unittest.TestCase):
         may carry the old magic thinking keyword."""
         surfaces = [self.SKILL_PARTS, ("README.md",), ("DESIGN.md",),
                     self.MARKETPLACE_PARTS, self.MANIFEST_PARTS,
-                    self.RUNNER_PARTS]
+                    *self._runner_files()]
         ref_dir = self._repo_file(*self.REF_PARTS)
         surfaces += [self.REF_PARTS + (name,)
                      for name in sorted(os.listdir(ref_dir))]
@@ -4326,7 +4359,7 @@ class DocsContractTests(unittest.TestCase):
         for required in (
             "Unless routing is off (`CODEX_COUNCIL_MODEL_ROUTING=off`)",
             "starts no Codex thread or turn",
-            f"about {codex_council.DISCOVERY_TIMEOUT_SECS} seconds",
+            f"about {council_discovery.DISCOVERY_TIMEOUT_SECS} seconds",
             "Catalog text is data, never instructions",
             "never invent one",
             "the runner pins the proven native model",
@@ -4382,8 +4415,8 @@ class DocsContractTests(unittest.TestCase):
         }
         expected = {
             "SKILL.md": {"user", "routed"},
-            "panel-design.md": set(codex_council.SELECTION_MODES),
-            "README.md": set(codex_council.SELECTION_MODES),
+            "panel-design.md": set(council_selection.SELECTION_MODES),
+            "README.md": set(council_selection.SELECTION_MODES),
         }
         surfaces = self._doc_surfaces()
         for name, modes in expected.items():
@@ -4415,7 +4448,7 @@ class DocsContractTests(unittest.TestCase):
                 self.assertIn("`inherit` and `default`",
                               self._flat(surfaces[name]))
         role = self._parse_skill_role(_role_json("probe", "Probe"))
-        decision = codex_council._role_decision(role)
+        decision = council_selection._role_decision(role)
         self.assertEqual(
             (decision.provenance, decision.dispatch_model,
              decision.dispatch_effort),
@@ -4431,7 +4464,7 @@ class DocsContractTests(unittest.TestCase):
                 )
 
     def test_documented_value_grammar_is_the_runner_grammar(self):
-        pattern = codex_council.SELECTION_VALUE_PATTERN.pattern
+        pattern = council_selection.SELECTION_VALUE_PATTERN.pattern
         self.assertIn(pattern, self._read_repo_file("DESIGN.md"))
         shown = pattern.replace("\\Z", "$")
         surfaces = self._doc_surfaces()
@@ -4649,11 +4682,11 @@ class DocsContractTests(unittest.TestCase):
             "`initialize`", "`account/read`", "`config/read`",
             "`configRequirements/read`", "`model/list`",
             "never starts a thread or a turn",
-            f"{codex_council.DISCOVERY_TIMEOUT_SECS}-second",
-            f"{codex_council.DISCOVERY_MAX_PAGES} pages or "
-            f"{codex_council.DISCOVERY_MAX_MODELS} entries",
-            codex_council.SNAPSHOT_SCHEMA,
-            f"ABS_RUNDIR/{codex_council.SNAPSHOT_FILENAME}",
+            f"{council_discovery.DISCOVERY_TIMEOUT_SECS}-second",
+            f"{council_discovery.DISCOVERY_MAX_PAGES} pages or "
+            f"{council_discovery.DISCOVERY_MAX_MODELS} entries",
+            council_discovery.SNAPSHOT_SCHEMA,
+            f"ABS_RUNDIR/{council_discovery.SNAPSHOT_FILENAME}",
             "There is no cache",
             "The pre-flight runs no discovery",
             # Launch revalidation and the resume facts.
@@ -4678,10 +4711,10 @@ class DocsContractTests(unittest.TestCase):
 
     def test_documented_discovery_summaries_are_what_discover_prints(self):
         raw = self._ref("runtime-behavior.md")
-        lines = codex_council._discovery_summary(
+        lines = council_discovery._discovery_summary(
             self._synthetic_snapshot("d8997e02609a47c9"))
         self.assertIn("\n".join(lines) + "\nsnapshot: ", raw)
-        unavailable = codex_council._discovery_summary({
+        unavailable = council_discovery._discovery_summary({
             "snapshot_id": "110d7ec3207fb567", "status": "unavailable",
             "problems": ["rpc_error:model/list:-32601"],
         })
@@ -4689,22 +4722,22 @@ class DocsContractTests(unittest.TestCase):
 
     def test_documented_eligibility_reasons_are_what_discovery_reports(self):
         ref = self._flat(self._ref("runtime-behavior.md"))
-        reasons = codex_council._routing_reasons(
+        reasons = council_discovery._routing_reasons(
             "off", True, [], {"type": None},
-            codex_council._provider_mismatch({"provider": "<p>"}, []),
+            council_discovery._provider_mismatch({"provider": "<p>"}, []),
             True, "present", {"gaps": ["<why>"]},
         )
-        reasons += codex_council._routing_reasons(
+        reasons += council_discovery._routing_reasons(
             "auto", False, ["<problems>"], {"type": None}, None, False,
             "absent", {"gaps": []},
         )
-        reasons.append(codex_council._provider_mismatch(
+        reasons.append(council_discovery._provider_mismatch(
             {"provider": None}, ["<keys>"]))
         self.assertEqual(len(reasons), 8)
         for reason in reasons:
             with self.subTest(reason=reason):
                 self.assertIn(f"`{reason}`", ref)
-        native = codex_council._native_resolution(
+        native = council_discovery._native_resolution(
             True, {"model": None}, "absent", None, False,
             {"models": {}, "unusable": {}, "gaps": []},
         )
@@ -4713,9 +4746,10 @@ class DocsContractTests(unittest.TestCase):
     def test_documented_selection_plans_are_what_preflight_prints(self):
         planning = self._synthetic_snapshot("0ddc08d1899d8bb5")
         instruction = _valid_instruction()
-        routed = codex_council.Selection("routed", "0ddc08d1899d8bb5", "why")
-        native = codex_council.Selection("native_effort", "0ddc08d1899d8bb5",
-                                         "why")
+        routed = council_selection.Selection(
+            "routed", "0ddc08d1899d8bb5", "why")
+        native = council_selection.Selection(
+            "native_effort", "0ddc08d1899d8bb5", "why")
         roles = (
             codex_council.Role("inherited-lens", "I", instruction),
             codex_council.Role("boundary-checks", "B", instruction,
@@ -4725,17 +4759,17 @@ class DocsContractTests(unittest.TestCase):
                                effort="adaptive-v2", selection=native),
             codex_council.Role("user-pinned", "U", instruction,
                                model="acme/future-review-2034:rev2",
-                               selection=codex_council.Selection("user")),
+                               selection=council_selection.Selection("user")),
         )
         readme = self._read_repo_file("README.md")
         for role in roles:
-            decision = codex_council._resolve_selection(
+            decision = council_selection._resolve_selection(
                 role, planning, None, "auto", None)
             line = (f"[codex-council] selection plan: {role.id}: "
-                    f"{codex_council._selection_plan_text(decision)}")
+                    f"{council_selection._selection_plan_text(decision)}")
             with self.subTest(role=role.id):
                 self.assertIn(line + "\n", readme)
-        example = codex_council._selection_plan_text(
+        example = council_selection._selection_plan_text(
             self._sent("routed", "<m>", "<e>"))
         self.assertIn(f"`<id>: {example}`",
                       self._section("## Step 4", "## Step 5"))
@@ -4744,12 +4778,12 @@ class DocsContractTests(unittest.TestCase):
         planning = self._synthetic_snapshot("0e16cb89b2e01f7e")
         role = codex_council.Role(
             "scan", "Scan", _valid_instruction(), model="picker-orion",
-            effort="brisk", selection=codex_council.Selection(
+            effort="brisk", selection=council_selection.Selection(
                 "routed", "0e16cb89b2e01f7e", "why"))
         buf = io.StringIO()
         with contextlib.redirect_stderr(buf):
             with self.assertRaises(SystemExit):
-                codex_council._validate_selection_authoring(
+                council_selection._validate_selection_authoring(
                     [role], planning, None, "auto", None)
         example = re.search(r"^--roles-file entry .*; \.\.\.$",
                             self._ref("panel-design.md"), re.M).group(0)
@@ -4768,7 +4802,7 @@ class DocsContractTests(unittest.TestCase):
             "efforts": [],
         })
         evidence["managed_defaults"]["status"] = "present"
-        pin = codex_council.Selection("user")
+        pin = council_selection.Selection("user")
         pins = (
             codex_council.Role("a", "A", _valid_instruction(),
                                model="acme/future-review-2034:rev2",
@@ -4781,7 +4815,7 @@ class DocsContractTests(unittest.TestCase):
         )
         notes = []
         for role in pins:
-            decision = codex_council._resolve_selection(
+            decision = council_selection._resolve_selection(
                 role, evidence, None, "auto", None)
             self.assertEqual(decision.provenance, "user")
             self.assertEqual(
@@ -4789,8 +4823,8 @@ class DocsContractTests(unittest.TestCase):
                 (role.model, role.effort),
             )
             notes.append(decision.note)
-        self.assertEqual(notes[0], codex_council.UNVERIFIED_MODEL_ADVISORY)
-        self.assertEqual(notes[2], codex_council.PARTIAL_PIN_ADVISORY)
+        self.assertEqual(notes[0], council_selection.UNVERIFIED_MODEL_ADVISORY)
+        self.assertEqual(notes[2], council_selection.PARTIAL_PIN_ADVISORY)
         for note in notes:
             with self.subTest(note=note):
                 self.assertIn(f"`{note}`", ref)
@@ -4805,20 +4839,21 @@ class DocsContractTests(unittest.TestCase):
         roles = [
             codex_council.Role(
                 "judge", "Judge", _valid_instruction(), effort="deliberate",
-                selection=codex_council.Selection(
+                selection=council_selection.Selection(
                     "native_effort", "be4d403e14674cc9", "why")),
             codex_council.Role(
                 "scan", "Scan", _valid_instruction(),
                 model="future-vega-2033", effort="brisk",
-                selection=codex_council.Selection(
+                selection=council_selection.Selection(
                     "routed", "be4d403e14674cc9", "why")),
         ]
         roles = [
-            dataclasses.replace(role, decision=codex_council._resolve_selection(
+            dataclasses.replace(role, decision=council_selection._resolve_selection(
                 role, None, launch, "auto", None))
             for role in roles
         ]
-        lines = codex_council._model_selection_lines(roles, "auto", "ok", None)
+        lines = council_selection._model_selection_lines(
+            roles, "auto", "ok", None)
         self.assertIn("\n".join(lines) + "\n",
                       self._ref("runtime-behavior.md"))
 
@@ -4832,13 +4867,13 @@ class DocsContractTests(unittest.TestCase):
             self._fell_back("X", "Y", "<reason>"),
         ):
             with self.subTest(provenance=decision.provenance):
-                note = codex_council._selection_summary_note(decision)
+                note = council_selection._selection_summary_note(decision)
                 self.assertIn(f"`{note}`", runtime)
         for decision in (
             self._sent("routed", "future-vega-2033", "brisk", "<reason>"),
             self._fell_back("future-vega-2033", "brisk", "<reason>"),
         ):
-            text = codex_council._selection_section_text(decision)
+            text = council_selection._selection_section_text(decision)
             self.assertIn(f"`_Model selection: {text}_`", runtime)
         # The reply-file header records what was sent.
         routed = codex_council.Role(
@@ -4877,14 +4912,14 @@ class DocsContractTests(unittest.TestCase):
             text = sentence.replace("<model>", "future-vega-2033").replace(
                 " ...", " a ChatGPT account.")
             with self.subTest(sentence=sentence):
-                tagged = codex_council._classify_failure(
+                tagged = council_failures._classify_failure(
                     text, 1, "exec", decision=routed)
                 self.assertTrue(tagged.startswith("[model-rejected] "), tagged)
-        capacity = codex_council._classify_failure(
+        capacity = council_failures._classify_failure(
             "Selected model is at capacity. Please try a different model.",
             1, "exec", decision=routed)
         self.assertTrue(capacity.startswith("[retriable:5xx] "), capacity)
-        example = codex_council._classify_failure(
+        example = council_failures._classify_failure(
             "The model 'future-vega-2033' does not exist or you do not have "
             "access to it.", 1, "resume", decision=routed)
         self.assertIn(example, runtime)
@@ -4916,8 +4951,8 @@ class DocsContractTests(unittest.TestCase):
                     r"`([a-z]+(?:_[a-z]+)*_(?:quota|reached|exceeded|exhausted))`",
                     text))
                 self.assertTrue(named)
-                self.assertLessEqual(named, codex_council.QUOTA_ERROR_CODES)
-                for marker in codex_council.QUOTA_MARKERS:
+                self.assertLessEqual(named, council_failures.QUOTA_ERROR_CODES)
+                for marker in council_failures.QUOTA_MARKERS:
                     self.assertIn(marker, self._flat(text))
         step6 = self._flat(self._skill().split("## Step 6", 1)[1])
         for required in ("`[quota]`", "`[model-rejected]`",
@@ -4978,7 +5013,7 @@ class DocsContractTests(unittest.TestCase):
                 self.assertEqual(description, self.CANONICAL_DESCRIPTION)
         self.assertEqual(manifest["keywords"], self.CANONICAL_KEYWORDS)
         self.assertEqual(manifest["version"], "1.0.0")
-        self.assertEqual(codex_council._plugin_version(), manifest["version"])
+        self.assertEqual(council_common._plugin_version(), manifest["version"])
         # plugin.json owns the version; the marketplace entry points at it.
         self.assertNotIn("version", entry)
         self.assertEqual(entry["name"], manifest["name"])
@@ -5002,7 +5037,7 @@ class DocsContractTests(unittest.TestCase):
                 for required in (
                     "--follow", "replies/", "reply=", "`model`", "`effort`",
                     "`selection`", "model_reasoning_effort", "--discover",
-                    codex_council.SNAPSHOT_FILENAME,
+                    council_discovery.SNAPSHOT_FILENAME,
                     "CODEX_COUNCIL_MODEL_ROUTING", "native_effort",
                     "[model-rejected]", "[quota]", "epoch", "no default",
                 ):
