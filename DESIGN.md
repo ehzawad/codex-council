@@ -1243,7 +1243,10 @@ is the numeric HTTP status parsed out of the JSONL error body
 (`_extract_statuses`), recognized in any *anchored* form — the JSON
 `"status"` key, a `HTTP NNN` / `status NNN` keyword, or a canonical
 reason phrase like `NNN Too Many Requests` — but never a bare digit run
-(so a `429` inside a thread id is ignored): status `429` → rate-limit,
+(so a `429` inside a thread id is ignored). The keyword needs at least one
+separator before the digits, and the requested model id is masked before
+every status scan, so a model named `future-status401` or
+`future-status:429` never reads as a status: status `429` → rate-limit,
 `500–599` → 5xx (so a `529` "overloaded" is retried even though it is
 not in the literal marker list). An anchored retriable status is trusted
 ahead of the stale-resume check, so a transient `HTTP 429 … thread not

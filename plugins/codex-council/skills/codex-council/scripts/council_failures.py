@@ -364,9 +364,11 @@ def _is_stale_resume_error(stderr_text):
 # substring) is trusted ahead of the stale check on the resume path.
 # The separator class excludes "/" so a URL like `http://127.0.0.1:8080/...`
 # is NOT read as "http" + status 127; only real `HTTP 429` / `status: 429`
-# forms match.
+# forms match. At least one separator is required, so an identifier such as
+# `future-status401` or `custom/http401` never names a status; the classifier
+# also masks the requested model id before any status scan (_mask_model).
 _STATUS_KEYWORD_RE = re.compile(
-    r"(?:^|[^0-9a-z_])(?:http|status(?:[\s_-]*code)?)[\s:=\"']*([0-9]{3})(?![0-9])",
+    r"(?:^|[^0-9a-z_])(?:http|status(?:[\s_-]*code)?)[\s:=\"']+([0-9]{3})(?![0-9])",
     re.IGNORECASE,
 )
 _STATUS_REASON_RE = re.compile(
@@ -585,11 +587,14 @@ def _failure_verdict(failure_text, records, requested_model, resume=False):
     message is parsed here, once per attempt, and whose `retriable` is the
     runner's retry decision.
     """
-    if _is_auth_error(failure_text, records):
+    # Status scans never see the model id: its text is the user's or the
+    # catalog's, and an id like `future-status:429` must not name a status.
+    scan_text = _mask_model(failure_text, requested_model)
+    if _is_auth_error(scan_text, records):
         return FailureVerdict("auth")
     if _is_quota_error(failure_text, records):
         return FailureVerdict("quota")
-    anchored = _structured_retriable_class(failure_text)
+    anchored = _structured_retriable_class(scan_text)
     if anchored:
         return FailureVerdict(anchored)
     rejection = _model_rejection(failure_text, records, requested_model)
@@ -597,7 +602,15 @@ def _failure_verdict(failure_text, records, requested_model, resume=False):
         return FailureVerdict("model-rejected", rejection)
     if resume and _is_stale_resume_error(failure_text):
         return FailureVerdict("stale")
-    return FailureVerdict(_retriable_class(failure_text))
+    return FailureVerdict(_retriable_class(scan_text))
+
+
+def _mask_model(text, model):
+    """Replace every occurrence of the requested model id with a neutral
+    placeholder so status and marker scans read only the provider's words."""
+    if not model:
+        return text
+    return text.replace(model, "<model>")
 
 
 # ---------- failure tags ----------

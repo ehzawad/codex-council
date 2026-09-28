@@ -1430,6 +1430,28 @@ class FailureClassificationTests(unittest.TestCase):
         # Unrecognized quota prose stays untagged (and never retriable).
         self.assertIsNone(self._classify("", "quota exceeded"))
 
+    def test_model_ids_shaped_like_statuses_never_name_a_status(self):
+        # A valid model id may contain status-looking text; a rejection of
+        # it must stay [model-rejected], not [auth] or a retriable class.
+        for model in ("future-status401", "custom/http401",
+                      "future-status:429", "acme/http:503"):
+            stdout = _api_failure(400, dict(
+                NOT_FOUND, message=f"The model '{model}' does not exist or "
+                                   "you do not have access to it."))
+            for resume in (False, True):
+                with self.subTest(model=model, resume=resume):
+                    self.assertEqual(
+                        self._classify(stdout, model=model, resume=resume),
+                        "model-rejected")
+        # Controls: genuine statuses still classify.
+        self.assertEqual(self._classify("", "HTTP 401 Unauthorized",
+                                        model="future-status401"), "auth")
+        self.assertEqual(self._classify("", "status: 429 Too Many Requests",
+                                        model="future-status:429"),
+                         "rate-limit")
+        self.assertEqual(self._classify("", "HTTP 503 Service Unavailable",
+                                        model="acme/http:503"), "5xx")
+
     def test_structured_model_not_found_is_a_rejection(self):
         for status in (400, 404, None):
             error = dict(NOT_FOUND, message="gone")
