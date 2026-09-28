@@ -44,7 +44,9 @@ from council_testlib import (  # noqa: E402
     assert_usage_exit as _assert_usage_exit,
     catalog as _catalog,
     clean_env as _clean_env,
+    kill_quietly as _kill_quietly,
     observed as _observed,
+    pid_gone as _pid_gone,
     snapshot as _snapshot,
 )
 
@@ -60,44 +62,6 @@ UNAVAILABLE_TAIL = (
     "(mode user) still apply, otherwise omit model, effort, and selection "
     "to inherit native configuration"
 )
-
-
-def _pid_running(pid):
-    """False once pid has exited; a zombie awaiting its reaper is dead."""
-    try:
-        os.kill(pid, 0)
-    except (ProcessLookupError, PermissionError):
-        return False
-    try:
-        with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
-            return f.read().rpartition(")")[2].split()[0] != "Z"
-    except OSError:
-        pass
-    state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)],
-                           capture_output=True, text=True).stdout.strip()
-    return bool(state) and not state.startswith("Z")
-
-
-def _pid_gone(pid, timeout=5.0):
-    """True once pid is no longer running (polls up to `timeout`)."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if not _pid_running(pid):
-            return True
-        time.sleep(0.02)
-    return False
-
-
-def _kill_quietly(pid):
-    """SIGKILL pid if it is still a fake codex process (a test cleanup).
-
-    The command-line check keeps a recycled pid from ever being signalled.
-    """
-    command = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
-                             capture_output=True, text=True).stdout
-    if "fake_codex_impl.py" in command:
-        with contextlib.suppress(ProcessLookupError):
-            os.kill(pid, signal.SIGKILL)
 
 
 def _without(scenario, method):
@@ -549,19 +513,27 @@ class NormalizeSourceTests(unittest.TestCase):
                 self.assertEqual(
                     council_discovery._parse_codex_version(output), version)
 
-    def test_stderr_excerpt_is_single_line_bounded_and_redacted(self):
-        tail = bytearray(
-            b"first\nerror: bad login for council-sentinel@example.invalid"
-            b"\x1b[0m\xe2\x80\xa8tail\n\n")
-        excerpt = council_discovery._stderr_excerpt(tail)
-        self.assertNotIn(fake_codex.EMAIL_SENTINEL, excerpt)
-        self.assertIn("<redacted>", excerpt)
-        self.assertEqual(excerpt, " ".join(excerpt.split()))
-        self.assertIsNone(
-            council_discovery._stderr_excerpt(bytearray(b"\n \n")))
-        self.assertEqual(
-            len(council_discovery._stderr_excerpt(bytearray(b"x" * 5000))),
-            council_discovery.DISCOVERY_STDERR_EXCERPT_CHARS)
+    def test_stderr_category_is_a_fixed_vocabulary(self):
+        """Only a category ever leaves discovery, never stderr text: any
+        line can carry an account id, a plan, or a token."""
+        secrets_line = (
+            f"account_id={fake_codex.ACCOUNT_ID_SENTINEL} "
+            f"plan={fake_codex.PLAN_SENTINEL} "
+            f"access_token={fake_codex.TOKEN_SENTINEL} "
+            f"email={fake_codex.EMAIL_SENTINEL}\n").encode()
+        for tail, category in (
+            (b"error: unrecognized subcommand 'app-server'\n", "usage_error"),
+            (b"error: unexpected argument '--listen' found\n", "usage_error"),
+            (b"thread 'main' panicked at src/main.rs:1:1\n", "panic"),
+            (secrets_line, "other"),
+            (b"\x1b[0m\xe2\x80\xa8\xff tail\n", "other"),
+            (b"\n \n", None),
+            (b"", None),
+        ):
+            with self.subTest(tail=tail[:24]):
+                self.assertEqual(
+                    council_discovery._stderr_category(bytearray(tail)),
+                    category)
 
 
 # ---------- pure snapshot builder: eligibility and native resolution ----------
@@ -603,11 +575,48 @@ class BuildSnapshotTests(unittest.TestCase):
         self.assert_native_unknown(snapshot, "discovery unavailable")
 
     def test_signed_out_catalog_is_not_account_grounded(self):
+        """An unauthenticated app-server still lists models, so a signed-out
+        catalog proves neither a routed pair nor the native model."""
+        reason = "not signed in: catalog is not account-grounded"
         snapshot = _snapshot(account={"type": None,
                                       "requires_openai_auth": True})
-        self.assert_ineligible(
-            snapshot, "not signed in: catalog is not account-grounded")
-        self.assertEqual(snapshot["native"]["resolution"], "proven")
+        self.assert_ineligible(snapshot, reason)
+        self.assert_native_unknown(snapshot, reason)
+        self.assertEqual(snapshot["native"]["reason"], reason)
+
+    def test_managed_layers_that_override_cli_flags_block_both(self):
+        """macOS managed preferences (mdm) and the legacy managed_config.toml
+        (from a file or from MDM) outrank CLI overrides, so a model or
+        effort one of them sets would replace what the council sends."""
+        for kind in ("mdm", "legacyManagedConfigTomlFromFile",
+                     "legacyManagedConfigTomlFromMdm"):
+            for key in ("model", "effort"):
+                configured = dict(_observed()["configured"],
+                                  **{f"{key}_origin": kind})
+                snapshot = _snapshot(configured=configured)
+                reason = (f"managed layer overrides CLI flags ({key} origin "
+                          f"{kind})")
+                with self.subTest(kind=kind, key=key):
+                    self.assertEqual(snapshot["routing"]["reasons"], [reason])
+                    self.assert_native_unknown(snapshot, reason)
+                    self.assertIsNone(
+                        council_discovery._snapshot_shape_problem(snapshot))
+        both = dict(_observed()["configured"], model_origin="mdm",
+                    effort_origin="legacyManagedConfigTomlFromMdm")
+        self.assertEqual(
+            _snapshot(configured=both)["native"]["reason"],
+            "managed layer overrides CLI flags (model origin mdm, effort "
+            "origin legacyManagedConfigTomlFromMdm)")
+        # Layers CLI flags outrank stay eligible, cloud-managed ones
+        # included.
+        for kind in ("user", "project", "system", "enterpriseManaged",
+                     "packagedDefaults", "sessionFlags", None):
+            configured = dict(_observed()["configured"], model_origin=kind,
+                              effort_origin=kind)
+            snapshot = _snapshot(configured=configured)
+            with self.subTest(kind=kind):
+                self.assertTrue(snapshot["routing"]["eligible"])
+                self.assertEqual(snapshot["native"]["resolution"], "proven")
 
     def test_custom_provider_has_no_verified_catalog(self):
         configured = dict(_observed()["configured"], provider="acme-local")
@@ -1270,6 +1279,30 @@ class DiscoveryProtocolTests(FakeCodexTestCase):
         self.assertEqual(snapshot["managed_defaults"]["status"], "absent")
         self.assertTrue(snapshot["routing"]["eligible"])
 
+    def test_origins_from_managed_layers_that_override_cli_flags(self):
+        """The origin kind is read from config/read's wire origins: each
+        layer kind that outranks CLI overrides, for the model or the
+        effort, blocks routing and native proof."""
+        for kind in ("mdm", "legacyManagedConfigTomlFromFile",
+                     "legacyManagedConfigTomlFromMdm"):
+            for wire, key in (("model", "model"),
+                              ("model_reasoning_effort", "effort")):
+                scenario = fake_codex.default_scenario()
+                origins = scenario["methods"]["config/read"]["result"][
+                    "origins"]
+                origins[wire]["name"]["type"] = kind
+                snapshot = self.discover(scenario)
+                reason = (f"managed layer overrides CLI flags ({key} origin "
+                          f"{kind})")
+                with self.subTest(kind=kind, key=key):
+                    self.assertEqual(snapshot["status"], "ok")
+                    self.assertEqual(snapshot["configured"][f"{key}_origin"],
+                                     kind)
+                    self.assertEqual(snapshot["routing"]["reasons"], [reason])
+                    self.assertEqual(snapshot["native"], {
+                        "resolution": "unknown", "model": None,
+                        "reason": reason})
+
     def test_codex_api_key_env_is_recorded_as_presence_only(self):
         secret = "sk-" + fake_codex.TOKEN_SENTINEL
         snapshot = self.discover(fake_codex.default_scenario(),
@@ -1356,7 +1389,7 @@ class DiscoveryProtocolTests(FakeCodexTestCase):
             snapshot = self.discover(scenario)
         self.assert_unavailable(snapshot, "protocol_error:notification_limit")
 
-    def test_early_exit_reports_the_redacted_stderr_line(self):
+    def test_early_exit_reports_a_stderr_category_never_its_text(self):
         scenario = fake_codex.default_scenario()
         scenario["server"] = {
             "startup_stderr": ("error: unrecognized subcommand 'app-server' "
@@ -1365,10 +1398,33 @@ class DiscoveryProtocolTests(FakeCodexTestCase):
         }
         snapshot, elapsed = self.timed_discover(scenario)
         self.assert_unavailable(snapshot, "server_exited:initialize")
-        self.assertIn("stderr: error: unrecognized subcommand 'app-server' "
-                      "for <redacted>", snapshot["problems"])
-        self.assertNotIn(fake_codex.EMAIL_SENTINEL, json.dumps(snapshot))
+        self.assertEqual(snapshot["problems"], [
+            "server_exited:initialize", "server_stderr:usage_error"])
+        self.assertNotIn("unrecognized", json.dumps(snapshot))
         self.assertLess(elapsed, 5.0)
+
+    def test_stderr_sentinels_never_reach_the_snapshot(self):
+        """A server's stderr is free-form and can carry account ids, plans,
+        and tokens: whether it exits early or keeps serving, no stderr text
+        reaches the snapshot."""
+        noisy = (f"account_id={fake_codex.ACCOUNT_ID_SENTINEL} "
+                 f"plan={fake_codex.PLAN_SENTINEL} "
+                 f"access_token={fake_codex.TOKEN_SENTINEL} "
+                 f"email={fake_codex.EMAIL_SENTINEL} "
+                 f"config={fake_codex.CONFIG_PATH_SENTINEL}")
+        for server, status in (({"startup_stderr": noisy, "startup_exit": 2},
+                                "unavailable"),
+                               ({"startup_stderr": noisy}, "ok")):
+            scenario = fake_codex.default_scenario()
+            scenario["server"] = server
+            with self.subTest(server=sorted(server)):
+                snapshot = self.discover(scenario)
+                self.assertEqual(snapshot["status"], status)
+                if status == "unavailable":
+                    self.assertIn("server_stderr:other", snapshot["problems"])
+                text = json.dumps(snapshot)
+                for sentinel in fake_codex.LEAK_SENTINELS:
+                    self.assertNotIn(sentinel, text)
 
     def test_exit_mid_session_keeps_earlier_observations(self):
         snapshot = self.discover(_with_method(
@@ -1497,6 +1553,82 @@ class DiscoveryDeadlineAndTeardownTests(FakeCodexTestCase):
         self.assert_unavailable(snapshot, "timeout:initialize")
         self.assertLess(elapsed, self.BOUND)
         self.assertTrue(_pid_gone(self.pid("server.pid")))
+
+
+class ProjectRootDeadlineTests(FakeCodexTestCase):
+    """The git root lookup is bounded and charged to discovery's deadline.
+
+    Runs the real council_common._project_root (not the fixed root the
+    other fake-server tests patch in) against a `git` that hangs.
+    """
+
+    def setUp(self):
+        super().setUp()
+        saved = dict(council_common._project_root_cache)
+        council_common._project_root_cache.clear()
+
+        def restore():
+            council_common._project_root_cache.clear()
+            council_common._project_root_cache.update(saved)
+
+        self.addCleanup(restore)
+        git_dir = self._mkdir("slow-git")
+        git = os.path.join(git_dir, "git")
+        with open(git, "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\n"
+                    f"exec {sys.executable} -c 'import time; time.sleep(30)'\n")
+        os.chmod(git, 0o755)
+        self.slow_path = git_dir + os.pathsep + self.env["PATH"]
+
+    def discover_with_slow_git(self, **patches):
+        fake_codex.write_scenario(self.scenario_path,
+                                  fake_codex.default_scenario())
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.dict(
+                os.environ, {**self.env, "PATH": self.slow_path}, clear=True))
+            for name, value in patches.items():
+                module = (council_common if name == "PROJECT_ROOT_TIMEOUT_SECS"
+                          else council_discovery)
+                stack.enter_context(patch.object(module, name, value))
+            started = time.monotonic()
+            snapshot = council_discovery._discover("auto")
+            return snapshot, time.monotonic() - started
+
+    def test_a_hung_git_is_charged_to_the_discovery_deadline(self):
+        snapshot, elapsed = self.discover_with_slow_git(
+            DISCOVERY_TIMEOUT_SECS=0.3)
+        self.assert_unavailable(snapshot, "timeout:project_root")
+        self.assertEqual(snapshot["problems"], ["timeout:project_root"])
+        self.assertIsNone(snapshot["context"]["project_root"])
+        self.assertLess(elapsed, 3.0)
+        # Codex never started, and no root the lookup did not establish
+        # was cached for the workers.
+        self.assertEqual(self.methods(), [])
+        self.assertEqual(council_common._project_root_cache, {})
+
+    def test_git_hitting_its_own_cap_falls_back_to_the_cwd(self):
+        """A timeout on git's own cap is a git failure: the launch
+        directory is the root, for discovery and workers alike."""
+        snapshot, elapsed = self.discover_with_slow_git(
+            PROJECT_ROOT_TIMEOUT_SECS=0.3)
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["context"]["project_root"], os.getcwd())
+        (config_read,) = [r for r in self.requests()
+                          if r["method"] == "config/read"]
+        self.assertEqual(config_read["params"]["cwd"], os.getcwd())
+        self.assertLess(elapsed, 5.0)
+        with patch.dict(os.environ, {"PATH": self.slow_path}):
+            self.assertEqual(council_common._project_root(), os.getcwd())
+
+    def test_the_lookup_without_a_deadline_is_capped_and_cached(self):
+        with patch.dict(os.environ, {"PATH": self.slow_path}), \
+             patch.object(council_common, "PROJECT_ROOT_TIMEOUT_SECS", 0.3):
+            started = time.monotonic()
+            self.assertEqual(council_common._project_root(), os.getcwd())
+            self.assertLess(time.monotonic() - started, 3.0)
+            started = time.monotonic()
+            self.assertEqual(council_common._project_root(), os.getcwd())
+            self.assertLess(time.monotonic() - started, 0.1)
 
 
 # ---------- the snapshot file ----------
@@ -1786,11 +1918,12 @@ class DiscoverySummaryTests(unittest.TestCase):
 
     def test_unavailable_summary_is_one_inherit_line(self):
         snapshot = _snapshot(conclusive=False,
-                             problems=["timeout:initialize", "stderr: x"])
+                             problems=["server_exited:initialize",
+                                       "server_stderr:other"])
         self.assertEqual(council_discovery._discovery_summary(snapshot), [
-            "[codex-council] discovery unavailable: timeout:initialize, "
-            "stderr: x; snapshot_id=0123456789abcdef; version=9.8.7; "
-            + UNAVAILABLE_TAIL])
+            "[codex-council] discovery unavailable: server_exited:initialize, "
+            "server_stderr:other; snapshot_id=0123456789abcdef; "
+            "version=9.8.7; " + UNAVAILABLE_TAIL])
 
     def test_ineligible_reasons_and_unknown_native(self):
         managed = {"status": "present", "model": "future-managed-2035",
@@ -1807,6 +1940,10 @@ class DiscoverySummaryTests(unittest.TestCase):
             lines[2],
             "routing: unavailable — not signed in: catalog is not "
             "account-grounded; managed new-thread defaults present")
+        self.assertEqual(
+            lines[3], "native-model effort adjustment: unavailable — "
+            "not signed in: catalog is not account-grounded")
+        lines = council_discovery._discovery_summary(_snapshot(managed=managed))
         self.assertEqual(
             lines[3], "native-model effort adjustment: unavailable — "
             "managed new-thread defaults present")
@@ -1979,20 +2116,37 @@ class DiscoverCommandTests(FakeCodexTestCase):
             self.assertEqual(f.read(), planning)
 
     def test_leak_sentinels_never_reach_any_output(self):
+        """Account data in responses and notifications, and the same
+        values on the server's stderr (whether it then exits or keeps
+        serving), never reach the snapshot or any output."""
         scenario = fake_codex.default_scenario()
         scenario["methods"]["account/read"]["before"] = [{
             "method": "account/updated",
             "params": {"email": fake_codex.EMAIL_SENTINEL}}]
-        proc = self.run_discover(scenario)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        with open(self.snapshot_path, encoding="utf-8") as f:
-            written = f.read()
-        for sentinel in fake_codex.LEAK_SENTINELS:
-            for name, text in (("stdout", proc.stdout),
-                               ("stderr", proc.stderr),
-                               ("snapshot", written)):
-                with self.subTest(sentinel=sentinel, surface=name):
-                    self.assertNotIn(sentinel, text)
+        noisy = " ".join(fake_codex.LEAK_SENTINELS)
+        exits = copy.deepcopy(scenario)
+        exits["server"] = {"startup_stderr": noisy, "startup_exit": 2}
+        serves = copy.deepcopy(scenario)
+        serves["server"] = {"startup_stderr": noisy}
+        for case, scenario, first in (
+            ("responses", scenario, "discovery ok"),
+            ("stderr-then-exit", exits,
+             "discovery unavailable: server_exited:initialize, "
+             "server_stderr:other;"),
+            ("stderr-while-serving", serves, "discovery ok"),
+        ):
+            proc = self.run_discover(scenario)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn(first, proc.stdout.splitlines()[0])
+            with open(self.snapshot_path, encoding="utf-8") as f:
+                written = f.read()
+            for sentinel in fake_codex.LEAK_SENTINELS:
+                for name, text in (("stdout", proc.stdout),
+                                   ("stderr", proc.stderr),
+                                   ("snapshot", written)):
+                    with self.subTest(case=case, sentinel=sentinel,
+                                      surface=name):
+                        self.assertNotIn(sentinel, text)
 
     def test_codex_missing_still_exits_0_and_writes_the_snapshot(self):
         proc = self.run_discover(PATH=self._mkdir("empty"))
@@ -2118,6 +2272,57 @@ class DiscoverCommandTests(FakeCodexTestCase):
         self.assertTrue(_pid_gone(self.pid("server.pid")))
         with open(self.snapshot_path, "rb") as f:
             self.assertEqual(f.read(), earlier)
+
+    def test_sigterm_and_sighup_exit_after_teardown(self):
+        """SIGTERM or SIGHUP during discovery unwinds through the same
+        teardown as Ctrl+C, whether the version probe or the app-server
+        (and the grandchild holding its pipes) is running: nothing is left
+        behind, no snapshot is written, and the exit is 128 + signum."""
+        hung_server = _with_method(fake_codex.default_scenario(),
+                                   "initialize", {"hang": True})
+        hung_server["server"] = {"grandchild": "ignore_sigterm"}
+        hung_version = fake_codex.default_scenario()
+        hung_version["version"] = {"hang": True}
+        for signum, stage, scenario, pids in (
+            (signal.SIGTERM, "app-server", hung_server,
+             ("server.pid", "grandchild.pid")),
+            (signal.SIGHUP, "app-server", hung_server,
+             ("server.pid", "grandchild.pid")),
+            (signal.SIGTERM, "version probe", hung_version, ("version.pid",)),
+        ):
+            for name in os.listdir(self.pid_dir):
+                os.remove(os.path.join(self.pid_dir, name))
+            proc = self.popen_discover(
+                scenario,
+                preexec_fn=council_testlib.default_signal_dispositions)
+            try:
+                deadline = time.monotonic() + 30
+                while not all(os.path.exists(os.path.join(self.pid_dir, p))
+                              for p in pids) or (
+                        stage == "app-server"
+                        and "initialize" not in self.methods()):
+                    self.assertIsNone(proc.poll(), "--discover ended early")
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(0.02)
+                children = [self.pid(p) for p in pids]
+                for pid in children:
+                    self.addCleanup(_kill_quietly, pid)
+                proc.send_signal(signum)
+                stdout, stderr = proc.communicate(timeout=30)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.communicate()
+            name = signal.Signals(signum).name
+            with self.subTest(signal=name, stage=stage):
+                self.assertEqual(proc.returncode, 128 + signum)
+                self.assertEqual(stdout, b"")
+                self.assertEqual(
+                    stderr.decode(),
+                    f"[codex-council] --discover interrupted by {name}\n")
+                for pid in children:
+                    self.assertTrue(_pid_gone(pid), pid)
+                self.assertFalse(os.path.exists(self.snapshot_path))
 
     def test_write_failure_removes_a_stale_snapshot_and_says_inherit(self):
         with open(self.snapshot_path, "w", encoding="utf-8") as f:

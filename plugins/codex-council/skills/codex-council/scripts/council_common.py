@@ -7,8 +7,8 @@ stderr sink (_diag), stdout output that ends quietly when nobody reads it
 any more (_print_stdout), usage exits with the uniform recovery texts, the
 one private-path policy (_private_stat_problem) and the private-directory
 gate built on it, the one-launch-per-directory gate, atomic 0600 writes, strict JSON loading, JSONL record
-iteration, the UTC timestamp format (_utc_iso), the project root, and the
-plugin version. Its module-level state
+iteration, the UTC timestamp format (_utc_iso), the project root (a
+bounded, cached git lookup), and the plugin version. Its module-level state
 (the diagnostics sink and the cached project root) exists only here.
 """
 
@@ -21,10 +21,12 @@ import stat
 import subprocess
 import sys
 import time
-from functools import cache
 from pathlib import Path
 
 _READ_CHUNK_BYTES = 65536
+# The most `git rev-parse --show-toplevel` may take (see _project_root); a
+# timeout falls back to the working directory, as any git failure does.
+PROJECT_ROOT_TIMEOUT_SECS = 5
 # Every line-boundary character str.splitlines() recognizes (beyond the plain
 # space): CR, LF, VT, FF, FS, GS, RS, NEL, LS, PS. Labels reject the full set
 # and _report_inline escapes the same set, so the two contracts agree.
@@ -32,15 +34,25 @@ LINEBREAK_CHARS = (
     "\r", "\n", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e",
     "\x85", "\u2028", "\u2029",
 )
+# What a new run directory needs before its pre-flight: its own discovery
+# snapshot, and a roles.json whose automatic selections name that snapshot
+# (the old snapshot_id identifies the abandoned directory's snapshot, so the
+# pre-flight would refuse it). Every new-directory recovery below ends with
+# this sequence.
+NEW_DIR_SNAPSHOT_CLAUSE = (
+    "with the new snapshot_id in every routed or native_effort selection"
+)
 # Action-first recovery text for a rejected staging DIRECTORY. The orchestrator
 # is an LLM; the cheapest literal reading of "create it with mktemp -d" is
 # satisfiable by mkdir/chmod on the same predictable path, so the recovery must
-# forbid exactly those moves and demand a NEW path.
+# forbid exactly those moves and demand a NEW path, then give the complete
+# sequence there: discovery, both files, the pre-flight.
 STAGING_DIR_RECOVERY = (
     "Recovery: abandon this directory — do not chmod it, do not mkdir it, "
     "and do not reuse its name. Run `mktemp -d` again, copy the NEW printed "
-    "absolute path, re-Write BOTH roles.json and context.md into that new "
-    "directory, and re-run --check-staging-dir on it."
+    "absolute path, run --discover in that new directory, re-Write BOTH "
+    f"roles.json and context.md there ({NEW_DIR_SNAPSHOT_CLAUSE}), and "
+    "re-run --check-staging-dir on it."
 )
 # A run directory holds exactly one launch. A launch leaves these behind: its
 # command's own stdout and stderr redirections and the runner's reply
@@ -54,8 +66,8 @@ LAUNCH_OUTPUTS = ("out.md", "err.log", REPLIES_SUBDIR)
 LAUNCHED_DIR_RECOVERY = (
     "Recovery: every launch needs its own directory, so leave this one and "
     "its files as they are. Run `mktemp -d` again, run --discover in the "
-    "NEW directory, Write roles.json and context.md there, and run "
-    "--check-staging-dir on it."
+    "NEW directory, Write roles.json and context.md there "
+    f"({NEW_DIR_SNAPSHOT_CLAUSE}), and run --check-staging-dir on it."
 )
 # Uniform recovery appended to EVERY roles-file validation failure. The only
 # production writer of roles.json is an LLM; partial patches of a file that
@@ -81,7 +93,7 @@ STAGED_LAUNCH_RESTART = (
     "created out.md and err.log in this one, so the pre-flight refuses it "
     "now. Leave it and its files as they are, run `mktemp -d` again, run "
     "--discover in the NEW directory, Write roles.json and context.md "
-    "there, and run --check-staging-dir on it."
+    f"there ({NEW_DIR_SNAPSHOT_CLAUSE}), and run --check-staging-dir on it."
 )
 # ROLES_REWRITE_RECOVERY's staged-launch form: the same whole-file rule,
 # applied to the roles.json written in the new directory.
@@ -196,21 +208,44 @@ def _plugin_version():
     return "unknown"
 
 
-@cache
-def _project_root():
+# The project root once _project_root has established it (key "root").
+_project_root_cache = {}
+
+
+def _project_root(deadline=None):
     """Return the git repo root for the current dir, falling back to cwd.
 
-    Cached because _project_key is called once per role; without the
-    cache, git rev-parse runs N+ times per invocation.
+    `git rev-parse --show-toplevel` gets at most PROJECT_ROOT_TIMEOUT_SECS;
+    a timeout falls back to the cwd exactly as a git failure does. The
+    answer is cached (_project_key asks once per role), so git runs at most
+    once per invocation. `deadline` (a time.monotonic() value; discovery
+    passes its own) also caps git at the time left before it: when that
+    budget, not git's own cap, runs out first, nothing is cached and None
+    is returned, so discovery reports inconclusive evidence instead of a
+    root it never established.
     """
+    if "root" in _project_root_cache:
+        return _project_root_cache["root"]
+    timeout, budget_bound = PROJECT_ROOT_TIMEOUT_SECS, False
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        if remaining < timeout:
+            timeout, budget_bound = remaining, True
     try:
         root = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
-            capture_output=True, text=True,
+            capture_output=True, text=True, timeout=timeout,
         ).stdout.strip()
+    except subprocess.TimeoutExpired:
+        if budget_bound:
+            return None
+        root = ""
     except OSError:
         root = ""
-    return root or os.getcwd()
+    _project_root_cache["root"] = root or os.getcwd()
+    return _project_root_cache["root"]
 
 
 # ---------- single-line report text ----------

@@ -304,6 +304,15 @@ STAGING_PATH_HINT = (
     "out.md, and err.log under the same mktemp directory. Shell variables do "
     "not persist across Claude Code Bash calls."
 )
+# STAGING_PATH_HINT's staged-launch form, for an input or path defect found
+# before the launch reads its inputs (a missing, unreadable, or misplaced
+# roles.json or context.md). The launch command's own redirections already
+# created out.md and err.log, so the fix goes into a NEW directory, exactly
+# as for every later staged-launch refusal; the pre-flight and stdin mode
+# keep the plain hint.
+STAGED_LAUNCH_PATH_HINT = (
+    f"{STAGING_PATH_HINT} Recovery: {STAGED_LAUNCH_RESTART}"
+)
 # STAGING_DIR_RECOVERY's action, phrased for the stdin launch mode, where
 # roles.json is the only on-disk input: no context.md and no preflight
 # exist to mention.
@@ -330,6 +339,9 @@ STDIN_DIR_RECOVERY = (
 
 @dataclass
 class RoleResult:
+    """One role's outcome. `retriable` is the retry decision for a failed
+    attempt (a rate limit, a 5xx, or a replay-safe stall), set from the
+    structured verdict and never inferred from the error text."""
     role: Role
     ok: bool
     text: Optional[str] = None
@@ -338,6 +350,7 @@ class RoleResult:
     elapsed_seconds: float = 0.0
     attempts: int = 1
     warning: Optional[str] = None
+    retriable: bool = False
 
 
 @dataclass
@@ -1025,7 +1038,7 @@ def _stalled_role_result(role, run, stored_id, attempt, started, warning=None):
                 f"{stall}s); no tool work had begun, so replay is safe"
             ),
             thread_id=stored_id, elapsed_seconds=elapsed, attempts=attempt,
-            warning=warning,
+            warning=warning, retriable=True,
         )
     error = (
         f"[stall] no output for {stall}s (watchdog {stall}s); not "
@@ -1158,7 +1171,8 @@ async def _run_role_once(role, prompt, attempt):
         # substring fallback sits after the stale check so a stale error that
         # merely contains a bare digit run (e.g. "...thread id stale-429-sid")
         # still restarts fresh. The verdict is computed once and formatted
-        # as-is, so the tag always matches the branch taken here.
+        # as-is, so the tag always matches the branch taken here, and the
+        # retry decision is the verdict's, never the tag text's.
         records = _failure_records(run.stdout)
         verdict = _failure_verdict(failure_text, records, model, resume=True)
         if verdict.kind != "stale":
@@ -1169,6 +1183,7 @@ async def _run_role_once(role, prompt, attempt):
             return RoleResult(
                 role=role, ok=False, error=err,
                 elapsed_seconds=time.monotonic() - started, attempts=attempt,
+                retriable=verdict.retriable,
             )
 
         # Stale: log, clear, fall through to fresh. A failed clear is only
@@ -1214,14 +1229,17 @@ async def _run_role_once(role, prompt, attempt):
 
     if run.returncode != 0:
         # Same order as the resume path, minus the stale branch.
+        records = _failure_records(run.stdout)
+        verdict = _failure_verdict(failure_text, records, model)
         return RoleResult(
             role=role, ok=False,
             error=_classify_failure(
-                failure_text, run.returncode, "exec",
-                _failure_records(run.stdout), decision,
+                failure_text, run.returncode, "exec", records, decision,
+                verdict,
             ),
             elapsed_seconds=time.monotonic() - started, attempts=attempt,
             warning=_with_stale_clear_warning(warning),
+            retriable=verdict.retriable,
         )
 
     msg = extract_final_message(run.stdout)
@@ -1258,14 +1276,20 @@ async def _run_role_once(role, prompt, attempt):
 
 
 async def _run_role_attempts(role, prompt):
-    """Run one already-locked role with retry on rate-limit/5xx."""
+    """Run one already-locked role with retry on rate-limit/5xx.
+
+    A failed attempt is retried only when its RoleResult says so
+    (`retriable`, from the structured verdict or the stall policy); the
+    error text is never consulted, so Codex text that merely starts with
+    "[retriable:" cannot forge a retry.
+    """
     last_result = None
     backoff = INITIAL_BACKOFF_SECS
 
     for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
         result = await _run_role_once(role, prompt, attempt)
         last_result = result
-        if result.ok or not (result.error or "").startswith("[retriable:"):
+        if result.ok or not result.retriable:
             return result
         if attempt >= MAX_RETRY_ATTEMPTS:
             return result
@@ -1506,7 +1530,7 @@ def _format_report(results, total_elapsed, discovery_sentence=None):
         )
     lines.append("")
     sentence = discovery_sentence or (
-        f"discovery not run ({NO_AUTOMATIC_SELECTIONS})"
+        f"launch discovery not run ({NO_AUTOMATIC_SELECTIONS})"
     )
     lines.append(_report_inline(
         f"Model selection: {sentence}. {MODEL_SELECTION_CAVEAT}"
@@ -1685,8 +1709,10 @@ def _parse_args(argv):
             f"{SNAPSHOT_FILENAME} here and revalidated at launch; no "
             "discovery runs. A DIR that already holds a launch (out.md, "
             "err.log, or replies/) is refused: every launch needs its own "
-            "directory. Use this after writing the per-run staging files "
-            "and before the background council launch."
+            "directory. Use this after writing the per-run staging files, "
+            "as its own call, and launch the background council in a "
+            "separate call only after it exits 0 (the launch itself does "
+            "not check for an earlier launch)."
         ),
     )
     parser.add_argument(
@@ -1723,8 +1749,9 @@ def _parse_args(argv):
             f"{DISCOVERY_TIMEOUT_SECS}s), write RUNDIR/{SNAPSHOT_FILENAME} "
             "atomically (0600), and print a compact summary. Exits 0 "
             "whenever RUNDIR is valid, even when discovery is unavailable "
-            "(130 on Ctrl+C, 1 when stdout is closed); exits 2 when RUNDIR "
-            "already holds a launch. "
+            "(130 on Ctrl+C, 128 + the signal number on SIGTERM or SIGHUP, "
+            "1 when stdout is closed); exits 2 when RUNDIR already holds a "
+            "launch. "
             "Cannot be combined with --roles-file, --context-file, "
             "--check-staging-dir, or --follow."
         ),
@@ -1816,8 +1843,12 @@ def _file_arg_problem(arg_name, path):
     return None
 
 
-def _usage_exit_if_file_arg_problems(*arg_pairs):
-    """Aggregate missing staged-input errors before attempting reads."""
+def _usage_exit_if_file_arg_problems(*arg_pairs, hint=STAGING_PATH_HINT):
+    """Aggregate missing staged-input errors before attempting reads.
+
+    `hint` closes the message: the plain staging hint, or at a staged
+    launch STAGED_LAUNCH_PATH_HINT, which starts over in a new directory.
+    """
     problems = [
         problem
         for arg_name, path in arg_pairs
@@ -1829,7 +1860,7 @@ def _usage_exit_if_file_arg_problems(*arg_pairs):
         _usage_exit(
             "codex-council input staging error:\n"
             + "\n".join(f"- {p}" for p in problems)
-            + f"\n{STAGING_PATH_HINT}"
+            + f"\n{hint}"
         )
 
 
@@ -1861,7 +1892,8 @@ def _usage_exit_if_codex_missing(
     )
 
 
-def _usage_exit_if_staging_dirs_differ(roles_file, context_file):
+def _usage_exit_if_staging_dirs_differ(roles_file, context_file,
+                                      hint=STAGING_PATH_HINT):
     """Require staged launch inputs to live in the same per-run directory."""
     if roles_file is None or context_file is None:
         return
@@ -1873,29 +1905,31 @@ def _usage_exit_if_staging_dirs_differ(roles_file, context_file):
             f"- --roles-file and --context-file must be in the same mktemp "
             f"directory; got roles dir {roles_dir!r} and context dir "
             f"{context_dir!r}.\n"
-            f"{STAGING_PATH_HINT}"
+            f"{hint}"
         )
 
 
-def _read_roles_file(path):
+def _read_roles_file(path, hint=STAGING_PATH_HINT):
     """Read the raw roles JSON from a file.
 
     Passing the unrestricted-size panel as a path lets the caller write the
     JSON with a real editor/tool instead of escaping a large blob through the
     shell, where a stray quote or unbalanced brace would break the call.
     Read and decode errors exit 2 like other usage errors; JSON validity is left to
-    _parse_roles_json.
+    _parse_roles_json. A path or read problem ends with `hint` (see
+    _usage_exit_if_file_arg_problems); non-UTF-8 content is a roles defect
+    and carries the scoped whole-file rewrite recovery.
     """
     problem = _file_arg_problem("--roles-file", path)
     if problem:
-        _usage_exit(f"{problem}. {STAGING_PATH_HINT}")
+        _usage_exit(f"{problem}. {hint}")
     try:
         with open(path, encoding="utf-8") as f:
             return f.read()
     except OSError as e:
-        _usage_exit(f"--roles-file: cannot read {path!r} ({e}). {STAGING_PATH_HINT}")
+        _usage_exit(f"--roles-file: cannot read {path!r} ({e}). {hint}")
     except UnicodeDecodeError as e:
-        _usage_exit(f"--roles-file: {path!r} is not valid UTF-8 ({e}).")
+        _roles_usage_exit(f"--roles-file: {path!r} is not valid UTF-8 ({e}).")
 
 
 def _validate_role_id(rid, ctx):
@@ -2117,16 +2151,19 @@ def _read_context_file(path, staged_launch=False):
     preflight's recovery re-runs it; the launch passes `staged_launch`,
     whose recovery starts over in a new directory, since the launch's own
     redirections already made this one a launched directory the preflight
-    refuses. There is no plugin-imposed context size ceiling.
+    refuses; the same holds for a path or read problem, which ends with
+    STAGED_LAUNCH_PATH_HINT there. There is no plugin-imposed context size
+    ceiling.
     """
+    hint = STAGED_LAUNCH_PATH_HINT if staged_launch else STAGING_PATH_HINT
     problem = _file_arg_problem("--context-file", path)
     if problem:
-        _usage_exit(f"{problem}. {STAGING_PATH_HINT}")
+        _usage_exit(f"{problem}. {hint}")
     try:
         with open(path, "rb") as f:
             body, body_problem = _read_body_or_problem(f)
     except OSError as e:
-        _usage_exit(f"--context-file: cannot read {path!r} ({e}). {STAGING_PATH_HINT}")
+        _usage_exit(f"--context-file: cannot read {path!r} ({e}). {hint}")
     if body_problem is None:
         return body
     kind, detail = body_problem
@@ -2433,6 +2470,57 @@ def _follow(run_dir):
                 os.close(fd)
 
 
+class _TerminationSignal(BaseException):
+    """SIGTERM or SIGHUP, raised where synchronous work held the main
+    thread (see _termination_raises). A BaseException, like
+    KeyboardInterrupt, so discovery's catch-all cannot swallow it."""
+
+    def __init__(self, signum):
+        super().__init__(signum)
+        self.signum = signum
+
+
+@contextlib.contextmanager
+def _termination_raises():
+    """Turn SIGTERM and SIGHUP into _TerminationSignal inside the block.
+
+    Discovery runs synchronously, before the council's event loop installs
+    its own handlers, and it owns process groups: the `codex --version`
+    probe and the app-server with anything it spawned. With the default
+    action a SIGTERM or SIGHUP would kill the runner and orphan them;
+    raising instead unwinds through their `finally` teardown, as
+    KeyboardInterrupt does for SIGINT. Only the first signal raises, so a
+    second cannot cut that teardown short; a signal the process already
+    ignores (SIGHUP under nohup) stays ignored; the previous handlers are
+    restored on exit.
+    """
+    received = []
+
+    def _raise(signum, _frame):
+        if not received:
+            received.append(signum)
+            raise _TerminationSignal(signum)
+
+    previous = {}
+    try:
+        for signum in (signal.SIGTERM, signal.SIGHUP):
+            if signal.getsignal(signum) is not signal.SIG_IGN:
+                previous[signum] = signal.signal(signum, _raise)
+        yield
+    finally:
+        for signum, handler in previous.items():
+            # None: a handler not installed from Python; default is closest.
+            if handler is None:
+                handler = signal.SIG_DFL
+            signal.signal(signum, handler)
+
+
+def _exit_interrupted(signum, line):
+    """Write the one-line interruption notice and exit 128 + signum."""
+    _diag(f"{line} {signal.Signals(signum).name}")
+    sys.exit(128 + int(signum))
+
+
 async def _run_council_with_signals(roles, body, max_parallel, replies_dir=None):
     """Run the council and translate POSIX termination signals into cleanup."""
     loop = asyncio.get_running_loop()
@@ -2500,12 +2588,17 @@ def main():
 
     if args.discover is not None:
         try:
-            _discover_command(args.discover)
+            with _termination_raises():
+                _discover_command(args.discover)
         except KeyboardInterrupt:
             # The app-server group was already torn down by its session's
             # finally; no new snapshot was written.
             _diag("[codex-council] --discover interrupted by user")
             sys.exit(130)
+        except _TerminationSignal as stop:
+            # Unwound the same way: every discovery process group is gone.
+            _exit_interrupted(stop.signum,
+                              "[codex-council] --discover interrupted by")
         return
 
     if args.follow is not None:
@@ -2520,29 +2613,30 @@ def main():
     # must produce "abandon this exposed directory", never "rewrite roles".
     # In stdin mode only roles.json is on disk; piped context has no directory
     # and is validated below as UTF-8/non-empty only.
+    #
+    # A staged launch's own redirections created out.md and err.log before
+    # it started, so the pre-flight now refuses its directory: every
+    # refusal from here to dispatch, the input and path checks included,
+    # starts over in a new directory instead of asking for a pre-flight
+    # re-run in this one. Stdin mode keeps its own wording.
+    staged = args.context_file is not None
+    path_hint = STAGED_LAUNCH_PATH_HINT if staged else STAGING_PATH_HINT
+    roles_recovery = (
+        STAGED_LAUNCH_ROLES_RECOVERY if staged else ROLES_REWRITE_RECOVERY
+    )
     if args.roles_file is not None:
-        recovery = (
-            STAGING_DIR_RECOVERY if args.context_file is not None
-            else STDIN_DIR_RECOVERY
-        )
+        recovery = STAGING_DIR_RECOVERY if staged else STDIN_DIR_RECOVERY
         _usage_exit_unless_parent_private("--roles-file", args.roles_file, recovery)
-    if args.context_file is not None:
+    if staged:
         _usage_exit_unless_parent_private(
             "--context-file", args.context_file, STAGING_DIR_RECOVERY
         )
-    _usage_exit_if_staging_dirs_differ(args.roles_file, args.context_file)
+    _usage_exit_if_staging_dirs_differ(args.roles_file, args.context_file,
+                                      path_hint)
     _usage_exit_if_file_arg_problems(
         ("--roles-file", args.roles_file),
         ("--context-file", args.context_file),
-    )
-
-    # A staged launch's own redirections created out.md and err.log before
-    # it started, so the pre-flight now refuses its directory: every
-    # refusal from here to dispatch starts over in a new directory instead
-    # of asking for a pre-flight re-run in this one.
-    staged = args.context_file is not None
-    roles_recovery = (
-        STAGED_LAUNCH_ROLES_RECOVERY if staged else ROLES_REWRITE_RECOVERY
+        hint=path_hint,
     )
 
     # Parse and validate staged inputs before requiring Codex. This catches
@@ -2550,7 +2644,8 @@ def main():
     if args.roles_file is not None:
         with _roles_recovery(roles_recovery):
             custom_roles = _parse_roles_json(
-                _read_roles_file(args.roles_file), require_selection
+                _read_roles_file(args.roles_file, path_hint),
+                require_selection,
             )
     else:
         custom_roles = []
@@ -2584,15 +2679,18 @@ def main():
     ))
     # Authoring defects exit 2 here, before any worker; automatic
     # selections are then revalidated by one fresh discovery, and every
-    # role gets the decision its commands are built from.
+    # role gets the decision its commands are built from. A termination
+    # signal during that discovery unwinds through its teardown.
     try:
-        with _roles_recovery(roles_recovery):
+        with _roles_recovery(roles_recovery), _termination_raises():
             roles, launch = _resolve_run_selections(
                 roles, run_dir, routing_mode, at_launch=True
             )
     except KeyboardInterrupt:
         _diag("\n[codex-council] interrupted by user")
         sys.exit(130)
+    except _TerminationSignal as stop:
+        _exit_interrupted(stop.signum, "\n[codex-council] interrupted by")
     state, reason = _launch_discovery_state(
         routing_mode, any(_is_automatic(r) for r in roles), launch
     )
@@ -2626,9 +2724,7 @@ def main():
         )
         raise
     if signum is not None:
-        signame = signal.Signals(signum).name
-        _diag(f"\n[codex-council] interrupted by {signame}")
-        sys.exit(128 + int(signum))
+        _exit_interrupted(signum, "\n[codex-council] interrupted by")
 
     elapsed = time.monotonic() - started
     try:

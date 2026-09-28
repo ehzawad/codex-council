@@ -48,10 +48,11 @@ from council_common import (
 # Routing is on unless this is "off"; any value other than auto/off is a
 # usage error.
 MODEL_ROUTING_ENV = "CODEX_COUNCIL_MODEL_ROUTING"
-# ONE monotonic budget covers the `codex --version` probe (itself capped),
-# the app-server spawn, the handshake, and every request; interleaved
-# notifications never extend it. Teardown then adds at most three
-# DISCOVERY_CLOSE_GRACE_SECS waits (stdin EOF, SIGTERM, SIGKILL).
+# ONE monotonic budget covers the project-root lookup (git, itself capped
+# at PROJECT_ROOT_TIMEOUT_SECS), the `codex --version` probe (itself
+# capped), the app-server spawn, the handshake, and every request;
+# interleaved notifications never extend it. Teardown then adds at most
+# three DISCOVERY_CLOSE_GRACE_SECS waits (stdin EOF, SIGTERM, SIGKILL).
 DISCOVERY_TIMEOUT_SECS = 20
 DISCOVERY_VERSION_TIMEOUT_SECS = 5
 DISCOVERY_CLOSE_GRACE_SECS = 0.5
@@ -63,8 +64,11 @@ DISCOVERY_MAX_UNSOLICITED = 10000
 DISCOVERY_PAGE_LIMIT = 100
 DISCOVERY_MAX_PAGES = 10
 DISCOVERY_MAX_MODELS = 1000
+# The app-server's stderr is drained so it can never block on a full pipe,
+# and only this much of its tail is kept, to pick a _stderr_category. None
+# of its text ever leaves this module: it can carry account ids, plans, or
+# tokens.
 DISCOVERY_STDERR_TAIL_BYTES = 4096
-DISCOVERY_STDERR_EXCERPT_CHARS = 200
 SNAPSHOT_FILENAME = "model-snapshot.json"
 SNAPSHOT_SCHEMA = "codex-council/model-snapshot@1"
 SNAPSHOT_MAX_BYTES = 64 * 1024 * 1024
@@ -87,7 +91,7 @@ class _DiscoveryFailure(Exception):
     def __init__(self, problem, detail=None):
         super().__init__(problem)
         self.problem = problem
-        # Sanitized last stderr line of a server that went away, or None.
+        # The _stderr_category of a server that went away, or None.
         self.detail = detail
 
 
@@ -115,7 +119,7 @@ def _model_routing_mode():
     _usage_exit(f"{MODEL_ROUTING_ENV} must be 'auto' or 'off'; got {raw!r}.")
 
 
-def _execution_context():
+def _execution_context(deadline=None):
     """The process context discovery shares with every worker.
 
     Workers run the PATH-resolved `codex` with this process's cwd and
@@ -125,10 +129,12 @@ def _execution_context():
     The runner forwards no profile, so `profile` is always null.
     CODEX_API_KEY is recorded as presence only: `codex exec` honors it but
     the app-server does not, so the catalog may not match exec's auth.
+    The project root's git lookup is charged to `deadline` (see
+    _project_root); a root that lookup could not establish in time is None.
     """
     executable = shutil.which("codex")
     return {
-        "project_root": _project_root(),
+        "project_root": _project_root(deadline),
         "launch_cwd": os.getcwd(),
         "codex_executable": os.path.abspath(executable) if executable else None,
         "codex_cli_version": None,
@@ -197,17 +203,24 @@ def _stop_process_group(proc):
     start_new_session=True made proc a group leader (pgid == pid). Each step
     waits DISCOVERY_CLOSE_GRACE_SECS for the WHOLE group, so neither a
     grandchild holding a pipe nor a server ignoring SIGTERM outlives
-    discovery. Best effort; never raises.
+    discovery. An interruption during those waits (Ctrl+C, or the runner's
+    termination signal) SIGKILLs the group before it propagates, so even
+    a cut-short teardown leaves nothing behind. Never raises otherwise.
     """
     if proc.stdin is not None:
         with contextlib.suppress(OSError, ValueError):
             proc.stdin.close()
-    for sig in (None, signal.SIGTERM, signal.SIGKILL):
-        if sig is not None:
-            with contextlib.suppress(OSError):
-                os.killpg(proc.pid, sig)
-        if _process_group_gone(proc, DISCOVERY_CLOSE_GRACE_SECS):
-            return
+    try:
+        for sig in (None, signal.SIGTERM, signal.SIGKILL):
+            if sig is not None:
+                with contextlib.suppress(OSError):
+                    os.killpg(proc.pid, sig)
+            if _process_group_gone(proc, DISCOVERY_CLOSE_GRACE_SECS):
+                return
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        raise
 
 
 _CODEX_VERSION_RE = re.compile(r"codex-cli ([0-9][0-9A-Za-z.+-]{0,63})")
@@ -246,23 +259,31 @@ def _probe_codex_version(executable, deadline):
     return _parse_codex_version(output)
 
 
-_EMAIL_LIKE_RE = re.compile(r"[^\s@]+@[^\s@]+")
+# (category, lowercase markers) for a departing app-server's stderr, first
+# match wins: the command line was refused (a Codex without `app-server
+# --listen`), or the server panicked.
+_STDERR_CATEGORIES = (
+    ("usage_error", ("unrecognized subcommand", "unexpected argument")),
+    ("panic", ("panicked at",)),
+)
 
 
-def _stderr_excerpt(tail):
-    """Sanitized last non-empty line of a stderr tail, or None.
+def _stderr_category(tail):
+    """A fixed category for a stderr tail: "usage_error", "panic", "other"
+    (any other output), or None when the server wrote nothing.
 
-    Single-line (non-printable characters become spaces), bounded, and with
-    email-like tokens redacted: it reaches the snapshot and --discover's
-    stdout, which must never carry account identity.
+    Only the category ever leaves discovery (as `server_stderr:<category>`),
+    never the text: stderr is free-form and can carry account ids, plan
+    names, or tokens, which must not reach the snapshot, --discover's
+    output, err.log, the report, or a reply file.
     """
-    text = bytes(tail).decode("utf-8", errors="replace")
-    lines = [line for line in text.split("\n") if line.strip()]
-    if not lines:
+    text = bytes(tail).decode("utf-8", errors="replace").lower()
+    if not text.strip():
         return None
-    line = "".join(ch if ch.isprintable() else " " for ch in lines[-1])
-    line = _EMAIL_LIKE_RE.sub("<redacted>", line).strip()
-    return line[:DISCOVERY_STDERR_EXCERPT_CHARS] or None
+    for category, markers in _STDERR_CATEGORIES:
+        if any(marker in text for marker in markers):
+            return category
+    return "other"
 
 
 _PROBLEM_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,63}")
@@ -478,7 +499,8 @@ class _AppServerTransport:
         del self.stderr_tail[:-DISCOVERY_STDERR_TAIL_BYTES]
 
     def _drain_stderr(self):
-        """Briefly collect a departing server's stderr; return the excerpt."""
+        """Briefly collect a departing server's stderr; return its
+        _stderr_category (never its text)."""
         until = min(
             self._deadline, time.monotonic() + DISCOVERY_CLOSE_GRACE_SECS
         )
@@ -490,7 +512,7 @@ class _AppServerTransport:
                 if remaining <= 0 or not selector.select(remaining):
                     break
                 self._read_stderr()
-        return _stderr_excerpt(self.stderr_tail)
+        return _stderr_category(self.stderr_tail)
 
 
 @contextlib.contextmanager
@@ -906,13 +928,19 @@ def _observe_codex(deadline):
     configRequirements/read, and model/list — never thread/start,
     thread/resume, turn/start, or any login or account-changing method. A
     session failure keeps what was already observed and ends the session.
+    A project root the git lookup could not establish within `deadline`
+    ends discovery before Codex starts (`timeout:project_root`): config/read
+    would otherwise describe a root workers may not get.
     """
-    context = _execution_context()
+    context = _execution_context(deadline)
     observed = {
         "context": context, "problems": [], "conclusive": False,
         "account": None, "configured": None, "managed": None, "catalog": None,
     }
     problems = observed["problems"]
+    if context["project_root"] is None:
+        problems.append("timeout:project_root")
+        return observed
     executable = context["codex_executable"]
     if executable is None:
         problems.append("codex_missing")
@@ -954,7 +982,7 @@ def _observe_codex(deadline):
         problems.append(failure.problem)
         detail = getattr(failure, "detail", None)
         if detail:
-            problems.append(f"stderr: {detail}")
+            problems.append(f"server_stderr:{detail}")
     server_requests = session.server_requests if session is not None else []
     problems.extend(f"server_request:{method}" for method in server_requests)
     observed["conclusive"] = not server_requests and all(
@@ -967,6 +995,30 @@ def _observe_codex(deadline):
 _EXEC_API_KEY_REASON = (
     "CODEX_API_KEY is set for codex exec but not visible to discovery"
 )
+_SIGNED_OUT_REASON = "not signed in: catalog is not account-grounded"
+# config/read origin kinds (ConfigLayerSource "type") whose values take
+# precedence even over the CLI `-m` / `-c` overrides a worker is sent: macOS
+# managed preferences delivered by MDM, and the legacy managed_config.toml
+# read from a file or from MDM. A model or effort one of them supplies
+# would silently replace an automatic choice.
+_CLI_OVERRIDING_ORIGINS = (
+    "mdm",
+    "legacyManagedConfigTomlFromFile",
+    "legacyManagedConfigTomlFromMdm",
+)
+
+
+def _overriding_layer(configured):
+    """Why a managed layer that outranks CLI overrides set the configured
+    model or effort, or None."""
+    found = [
+        f"{key} origin {configured[f'{key}_origin']}"
+        for key in ("model", "effort")
+        if configured[f"{key}_origin"] in _CLI_OVERRIDING_ORIGINS
+    ]
+    if not found:
+        return None
+    return f"managed layer overrides CLI flags ({', '.join(found)})"
 
 
 def _provider_mismatch(configured, provider_keys):
@@ -997,7 +1049,7 @@ def _provider_mismatch(configured, provider_keys):
 
 
 def _routing_reasons(routing_mode, status_ok, problems, account, mismatch,
-                     api_key_env, managed_status, catalog):
+                     api_key_env, managed_status, overriding, catalog):
     """Every reason automatic routing is unavailable (empty = eligible)."""
     reasons = []
     if routing_mode == "off":
@@ -1011,30 +1063,39 @@ def _routing_reasons(routing_mode, status_ok, problems, account, mismatch,
             + "; ".join(_dedupe_preserve_order(catalog["gaps"]))
         )
     if account["type"] is None:
-        reasons.append("not signed in: catalog is not account-grounded")
+        reasons.append(_SIGNED_OUT_REASON)
     if mismatch:
         reasons.append(mismatch)
     if api_key_env:
         reasons.append(_EXEC_API_KEY_REASON)
     if managed_status != "absent":
         reasons.append(f"managed new-thread defaults {managed_status}")
+    if overriding:
+        reasons.append(overriding)
     return reasons
 
 
-def _native_resolution(status_ok, configured, managed_status, mismatch,
-                       api_key_env, catalog):
+def _native_resolution(status_ok, account, configured, managed_status,
+                       overriding, mismatch, api_key_env, catalog):
     """Whether the model an override-free worker runs is proven, and which.
 
-    Proven only when nothing can divert Codex from the configured model
-    (no managed new-thread defaults, a corresponding provider, no exec-only
-    API key) AND a well-formed catalog entry for that exact model exists
-    (hidden allowed), so its advertised efforts are known.
+    Proven only when the catalog is the signed-in account's (an
+    unauthenticated app-server still lists models), nothing can divert
+    Codex from the configured model or override what the council sends
+    with it (no managed new-thread defaults, no managed layer that outranks
+    CLI flags, a corresponding provider, no exec-only API key) AND a
+    well-formed catalog entry for that exact model exists (hidden allowed),
+    so its advertised efforts are known.
     """
     model = configured["model"]
     if not status_ok:
         reason = "discovery unavailable"
+    elif account["type"] is None:
+        reason = _SIGNED_OUT_REASON
     elif managed_status != "absent":
         reason = f"managed new-thread defaults {managed_status}"
+    elif overriding:
+        reason = overriding
     elif mismatch:
         reason = mismatch
     elif api_key_env:
@@ -1075,10 +1136,11 @@ def _build_snapshot(*, snapshot_id, created_at, plugin_version, routing_mode,
     complete = catalog is not None and not catalog["gaps"]
     catalog = catalog or _new_catalog()
     mismatch = _provider_mismatch(configured, managed["provider_keys"])
+    overriding = _overriding_layer(configured)
     api_key_env = bool(context["exec_api_key_env"])
     reasons = _routing_reasons(
         routing_mode, conclusive, problems, account, mismatch, api_key_env,
-        managed["status"], catalog,
+        managed["status"], overriding, catalog,
     )
     return {
         "schema": SNAPSHOT_SCHEMA,
@@ -1094,8 +1156,8 @@ def _build_snapshot(*, snapshot_id, created_at, plugin_version, routing_mode,
             key: managed[key] for key in ("status", "model", "effort")
         },
         "native": _native_resolution(
-            conclusive, configured, managed["status"], mismatch, api_key_env,
-            catalog,
+            conclusive, account, configured, managed["status"], overriding,
+            mismatch, api_key_env, catalog,
         ),
         "routing": {
             "mode": routing_mode, "eligible": not reasons, "reasons": reasons,
@@ -1109,7 +1171,9 @@ def _build_snapshot(*, snapshot_id, created_at, plugin_version, routing_mode,
 def _discover(routing_mode):
     """Run bounded, metadata-only model discovery; return the snapshot dict.
 
-    Never raises (Ctrl+C aside): codex missing, spawn errors, timeouts,
+    Never raises (KeyboardInterrupt, and the termination signal the entry
+    point raises for SIGTERM or SIGHUP, aside: both unwind through the
+    process-group teardown): codex missing, spawn errors, timeouts,
     protocol violations, RPC errors, and server requests all yield status
     "unavailable" with machine-safe problems, which every caller treats as
     "no automatic selection" (explicit user pins still apply). A
@@ -1482,7 +1546,8 @@ def _discover_command(run_dir):
     older one is removed and the only line printed says to write no
     automatic selections (explicit user pins still apply). Every first
     line carries the plugin version. A dead stdout exits 1 quietly (the
-    snapshot is already written); Ctrl+C is left to the caller.
+    snapshot is already written); Ctrl+C, SIGTERM, and SIGHUP are left to
+    the caller, which reports them after discovery's teardown.
     """
     run_dir = _check_private_dir(
         run_dir, prefix="--discover: ", recovery=STAGING_DIR_RECOVERY

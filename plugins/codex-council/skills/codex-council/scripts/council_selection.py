@@ -106,7 +106,10 @@ class SelectionDecision:
     to native inheritance). Dispatch uses ONLY dispatch_model and
     dispatch_effort (None = that override is not sent); the requested
     values are kept for reporting. `note` is a fallback reason or a user-pin
-    advisory.
+    advisory. `native_model` is the native model the resolving evidence
+    proves (None when unproven or absent): it is never sent, and only tells
+    a refusal of a sent model that equals it (a routed or pinned model that
+    is the native one) that an inheriting re-run would send it again.
     """
     mode: str
     provenance: str
@@ -116,6 +119,7 @@ class SelectionDecision:
     dispatch_effort: Optional[str] = None
     reason: Optional[str] = None
     note: Optional[str] = None
+    native_model: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -454,11 +458,21 @@ def _user_pin_advisory(role, evidence, now):
     return "; ".join(notes) or None
 
 
-def _decision(role, mode, provenance, model=None, effort=None, note=None):
+def _proven_native_model(evidence):
+    """The native model `evidence` proves, or None (no evidence, or the
+    native model is not proven there)."""
+    if evidence is None or evidence["native"]["resolution"] != "proven":
+        return None
+    return evidence["native"]["model"]
+
+
+def _decision(role, mode, provenance, model=None, effort=None, note=None,
+              native_model=None):
     """A SelectionDecision that keeps the role's request for reporting."""
     reason = role.selection.reason if role.selection else None
     return SelectionDecision(
-        mode, provenance, role.model, role.effort, model, effort, reason, note
+        mode, provenance, role.model, role.effort, model, effort, reason, note,
+        native_model,
     )
 
 
@@ -475,7 +489,9 @@ def _resolve_selection(role, planning, launch, routing_mode, now):
     retirements. Authoring defects never reach here (see
     _validate_selection_authoring): an automatic choice that the evidence
     does not support resolves to native inheritance, with the reason, and
-    an explicit pin is forwarded unchanged with advisories at most.
+    an explicit pin is forwarded unchanged with advisories at most. A
+    decision that sends a model also records the native model the evidence
+    proves, so a refusal can tell whether that model was the native one.
     """
     selection = role.selection
     if selection is None and role.model is None and role.effort is None:
@@ -484,7 +500,8 @@ def _resolve_selection(role, planning, launch, routing_mode, now):
     if selection is None or selection.mode == "user":
         # An untagged pin gets here only from direct CLI use.
         return _decision(role, "user", "user", role.model, role.effort,
-                         _user_pin_advisory(role, evidence, now))
+                         _user_pin_advisory(role, evidence, now),
+                         _proven_native_model(evidence))
     mode = selection.mode
     if routing_mode == "off":
         return _decision(role, mode, "fallback", note=ROUTING_OFF_NOTE)
@@ -519,7 +536,8 @@ def _resolve_selection(role, planning, launch, routing_mode, now):
         if launch is not None:
             gap = f"selection evidence changed since discovery: {gap}"
         return _decision(role, mode, "fallback", note=gap)
-    return _decision(role, mode, mode, model, role.effort)
+    return _decision(role, mode, mode, model, role.effort,
+                     native_model=_proven_native_model(evidence))
 
 
 def _authoring_problem(role, planning, planning_problem, now):
@@ -599,7 +617,7 @@ def _launch_discovery_state(routing_mode, automatic, launch):
 def _discovery_sentence(state, reason, launch):
     """The discovery half of the report's Model selection paragraph."""
     if state == "not-run":
-        return f"discovery not run ({reason})"
+        return f"launch discovery not run ({reason})"
     if state == "unavailable":
         return f"launch discovery unavailable: {reason}"
     version = launch["context"]["codex_cli_version"] or "version unknown"
@@ -639,17 +657,19 @@ def _resolve_run_selections(roles, run_dir, routing_mode, at_launch):
     the planning snapshot. The preflight passes the resolver no launch
     snapshot, so its decisions are the plan.
 
-    The preflight judges authoring at the current time. The launch judges
-    it as of the planning snapshot's creation, so a choice already retired
-    at discovery stays an exit-2 defect, while a retirement that passes
-    after discovery is changed evidence: the resolver, given the real
-    `now`, falls back to inheritance.
+    The preflight judges authoring, and resolves, at the current time. The
+    launch judges authoring as of the planning snapshot's creation, so a
+    choice already retired at discovery stays an exit-2 defect, while a
+    retirement that passes after discovery is changed evidence: the
+    resolver falls back to inheritance. Its clock is read only after launch
+    discovery has finished, so a retirement that passes while discovery
+    runs is already in effect when the evidence is judged.
     """
-    now = _utc_iso(time.time())
     planning, planning_problem = _read_snapshot(run_dir)
-    authoring_now = now
     if at_launch:
         authoring_now = planning["created_at"] if planning is not None else None
+    else:
+        authoring_now = _utc_iso(time.time())
     _validate_selection_authoring(
         roles, planning, planning_problem, routing_mode, authoring_now
     )
@@ -657,6 +677,7 @@ def _resolve_run_selections(roles, run_dir, routing_mode, at_launch):
     if (at_launch and routing_mode == "auto"
             and any(_is_automatic(r) for r in roles)):
         launch = _discover(routing_mode)
+    now = _utc_iso(time.time()) if at_launch else authoring_now
     resolved = [
         replace(role, decision=_resolve_selection(
             role, planning, launch, routing_mode, now

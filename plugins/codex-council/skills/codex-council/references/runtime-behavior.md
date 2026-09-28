@@ -36,7 +36,10 @@ another local user, who could then read the report or plant a fake
 (`--check-staging-dir`), and the launch all check that the directory is
 private, and the pre-flight and the launch check that `roles.json` and
 `context.md` are regular, non-symlink files, before reading any content. A
-rejected directory is abandoned, never repaired with chmod or mkdir.
+rejected directory is abandoned, never repaired with chmod or mkdir: run
+`mktemp -d` again, run `--discover` in the new directory, Write both
+`roles.json` (every routed or native_effort selection naming the new
+`snapshot_id`) and `context.md` there, and run the pre-flight on it.
 
 A directory holds one launch. A `[model-rejected]` re-run, a follow-up
 round, a recovery re-invocation, and a council started while another runs
@@ -48,11 +51,20 @@ apart; relaunching after it finished replaces its report and mixes two runs
 in `replies/`. The runner cannot object in time, so `--discover` and the
 pre-flight both exit 2 when `out.md`, `err.log`, or `replies/` already
 exists (`already holds a council launch`), and the recovery is a new
-directory, never cleaning up the old one. A staged launch refused before
-dispatch (exit 2, no sentinel) has already claimed its directory the same
-way, so every recovery it writes to `err.log` (a roles defect, an empty or
-non-UTF-8 `context.md`, a missing `codex`) starts over in a new directory
-with its own `--discover` instead of re-running the pre-flight there.
+directory, never cleaning up the old one. The launch itself does not check
+for an earlier launch, so this holds only when the pre-flight is its own
+Bash call and the launch follows in a separate call, only after the
+pre-flight exits 0: in one
+combined call a refused pre-flight does not stop the launch, whose
+redirections still truncate the directory's files. One launch per directory
+therefore rests on that order, not on an atomic guard at launch. A staged
+launch refused before dispatch (exit 2, no sentinel) has already claimed its
+directory the same way, so every recovery it writes to `err.log` (a missing,
+unreadable, or misplaced `roles.json` or `context.md`, a roles defect, an
+empty or non-UTF-8 `context.md`, a missing `codex`) starts over in a new
+directory with its own `--discover` instead of re-running the pre-flight
+there. The direct stdin mode, which stages no `context.md`, keeps its own
+recovery wording.
 
 The private directory keeps out other local users, not the roles. Roles run
 unsandboxed as the same user, so they can write to `err.log`, `out.md`, and
@@ -98,7 +110,9 @@ included). It never starts a thread or a turn and never calls a login or
 account-changing method; a request from the server is refused and makes the
 result inconclusive.
 
-One 20-second monotonic deadline covers the version probe, the spawn, the
+One 20-second monotonic deadline covers the project-root lookup (`git
+rev-parse`, itself capped at 5s; a timeout falls back to the launch
+directory, as any Git failure does), the version probe, the spawn, the
 handshake, and every request, and interleaved notifications never extend
 it. Teardown then closes stdin and escalates SIGTERM and SIGKILL over the
 whole process group, waiting at most 0.5s at each step, so no child outlives
@@ -140,7 +154,11 @@ unchanged` note.
 The status is `ok` when the handshake and all four requests answered in the
 expected shape and the server made no request of its own. Anything else is
 `unavailable`: codex missing (`codex_missing`), a spawn failure, a
-`timeout:<method>`, a server exit (with its redacted last stderr line), a
+`timeout:<method>` (`timeout:project_root` when the Git root lookup used up
+the budget, before Codex starts), a server exit (`server_exited:<method>`,
+followed by `server_stderr:usage_error`, `server_stderr:panic`, or
+`server_stderr:other` when the server wrote to stderr; its stderr text is
+never recorded or printed, since it can carry account identity or tokens), a
 protocol violation (`protocol_error:<kind>`), an RPC error
 (`rpc_error:<method>:<code>`), a server request
 (`server_request:<method>`), or an unexpected shape of a response or of a
@@ -169,14 +187,17 @@ holds a launch, an invalid
 epoch mismatch); it cannot be combined with `--roles-file`,
 `--context-file`, `--check-staging-dir`, or `--follow`. Ctrl+C exits 130
 with one `[codex-council] --discover interrupted by user` line once the
-app-server is torn down; that run writes no snapshot, and one from an
-earlier `--discover` in the directory stays as it was. A closed stdout ends
-it quietly with exit 1 after the snapshot is written.
-A rejected directory's recovery text is the staging one (re-Write both
-files, re-run the pre-flight); before staging, the action is simply a new
-`mktemp -d` and `--discover` there. If the snapshot cannot be written, an
-older one is removed and the only line printed is `[codex-council] discovery
-snapshot not written (<error>); version=<plugin version>; write no routed or
+version probe and the app-server are torn down, and SIGTERM or SIGHUP the
+same way with exit 128 + the signal number and `[codex-council] --discover
+interrupted by SIGTERM` (or `SIGHUP`); that run writes no snapshot, and one
+from an earlier `--discover` in the directory stays as it was. A closed
+stdout ends it quietly with exit 1 after the snapshot is written.
+A rejected directory's recovery text is the staging one: a new `mktemp -d`
+directory, `--discover` there, both files re-Written there (every routed or
+native_effort selection naming the new `snapshot_id`), then the pre-flight;
+before staging, only the first two steps apply. If the snapshot cannot be
+written, an older one is removed and the only line printed is
+`[codex-council] discovery snapshot not written (<error>); version=<plugin version>; write no routed or
 native_effort selections; explicit user pins (mode user) still apply,
 otherwise omit model, effort, and selection to inherit native
 configuration.` Explicit pins never depend on
@@ -209,14 +230,22 @@ to the `routing: unavailable — ...` line:
   does not — else `CODEX_API_KEY is set for codex exec but not visible to
   discovery`;
 - no managed new-thread defaults — else `managed new-thread defaults
-  present` (or `unknown`).
+  present` (or `unknown`);
+- no configured model or effort from a managed layer that outranks CLI
+  flags: macOS managed preferences (origin `mdm`) or a legacy
+  `managed_config.toml` (origin `legacyManagedConfigTomlFromFile` or
+  `legacyManagedConfigTomlFromMdm`) — else, for example, `managed layer
+  overrides CLI flags (model origin mdm)`, since such a layer would replace
+  the model or effort the council sends.
 
 Native-model effort adjustment is available when the native model is
-proven: the requests succeeded, managed new-thread defaults are absent, the
-provider corresponds (no endpoint or catalog override either),
-`CODEX_API_KEY` is unset, a model is configured, and a well-formed catalog
-entry exists for exactly that model (hidden allowed), so its efforts are
-known. Otherwise its line
+proven: the requests succeeded, the account is signed in (a signed-out
+catalog is no evidence of what the account can run), managed new-thread
+defaults are absent, no managed layer that outranks CLI flags set the
+model or effort, the provider corresponds (no endpoint or catalog override
+either), `CODEX_API_KEY` is unset, a model is configured, and a
+well-formed catalog entry exists for exactly that model (hidden allowed),
+so its efforts are known. Otherwise its line
 gives the reason, for example
 `unavailable — no model is configured; Codex's built-in default is not
 observable`. With routing off, discovery still runs and records the
@@ -243,11 +272,16 @@ the whole council and never written over the planning snapshot; councils of
 inherited and explicit roles pay no discovery latency. Each role then
 resolves to what it sends, and a choice the fresh evidence no longer
 supports resolves to native inheritance. That includes an advertised
-retirement that passed after discovery (the launch judges authoring as of
-the snapshot's creation, so only a model already retired then exits 2) and,
-for a native-effort role, a native model that is no longer the one
-discovery planned with, since its effort was chosen from that model's
-descriptions.
+retirement that passed after discovery, even while launch discovery ran
+(the launch judges authoring as of the snapshot's creation, so only a model
+already retired then exits 2, and judges the fresh evidence at the time its
+discovery finished) and, for a native-effort role, a native model that is
+no longer the one discovery planned with, since its effort was chosen from
+that model's descriptions. Ctrl+C, SIGTERM, or SIGHUP during that discovery tears the
+version probe and the app-server down before any worker starts, and the
+launch ends with the follower's interruption line (`[codex-council]
+interrupted by user`, exit 130, or `[codex-council] interrupted by SIGTERM`
+or `SIGHUP`, exit 128 + the signal number).
 
 Right after the dispatch line, `err.log` gets one summary line and one line
 per fallback:
@@ -273,7 +307,7 @@ The report shows each decision in three places:
   effort Y)`, ` (routed effort: Y on native model X)`, ` (native
   inheritance; routing fell back)`, or nothing for native inheritance;
 - a `Model selection:` paragraph after the Summary, which starts with
-  `discovery not run (...)`, `launch discovery ok (codex-cli <version>)`, or
+  `launch discovery not run (...)`, `launch discovery ok (codex-cli <version>)`, or
   `launch discovery unavailable: <problems>` and then states that codex exec
   does not report the model or effort that served a turn;
 - a `_Model selection: ..._` line at the top of each role section, for
@@ -474,11 +508,17 @@ Failed-role messages for recognized classes start with a bracketed tag:
 carry the raw stderr untagged.
 
 A non-zero exit is classified in one order on both the fresh and the resume
-path, after the structured stall verdict: auth, then quota, then an anchored
-HTTP 429 or 5xx status, then model rejection, then a stale thread (resume
-only: clear it and restart fresh), then the substring retriable fallback,
-and finally untagged. Only the codex `error` and `turn.failed` events and
-stderr are read; agent messages, reasoning, and tool output never are.
+path, after the structured stall verdict: auth (HTTP 401, an
+`authentication_error` or `invalid_api_key` error type or code, or Codex's
+sign-in wording; never clears state, even when the text also looks stale),
+then quota, then an anchored HTTP 429 or 5xx status, then model rejection,
+then a stale thread (resume only: clear it and restart fresh), then the
+substring retriable fallback, and finally untagged. Only the codex `error`
+and `turn.failed` events and stderr are read; agent messages, reasoning,
+and tool output never are. Whether a failure is retried comes from that
+classification, never from the message text: an untagged failure keeps
+Codex's own text, which is not retried even if it begins with
+`[retriable:`.
 
 `[quota]` is a structured quota or billing code (such as
 `insufficient_quota`, `usage_limit_reached`, `credit_balance_exhausted`, or
@@ -488,8 +528,8 @@ retried and never clears saved state. When Codex says the limit is for one
 model ("You've hit your usage limit for <label>. Switch to another model
 now, or try again at <time>."), the message ends with the same closing
 action a `[model-rejected]` gives for the model that invocation sent (see
-the list below), so a routed role can re-run on the native configuration
-instead of waiting for the reset. The label is the server's name for the
+the list below), so a routed role whose model is not the native one can
+re-run on the native configuration instead of waiting for the reset. The label is the server's name for the
 limit, so it is never compared with the model sent; an inheriting re-run
 that hits the same limit fails `[quota]` again. For example:
 
@@ -506,35 +546,49 @@ the sentence bare or after Codex's `unexpected status` prefix. The first
 sentence was observed live with ChatGPT sign-in; the second is the API's
 wording, which Codex passes through and which has not been observed live.
 Bare "not found" or "not supported" text, the "Model metadata for ... not
-found" advisory, "Selected model is at capacity" (retried as a transient
-5xx), and failures naming reasoning effort or service tier do not count. It
-is terminal: never retried, no substitute model, and the saved thread is
-kept even when the text also looks stale. For example:
+found" advisory, and "Selected model is at capacity" (retried as a transient
+5xx) do not count. Neither does a failure about reasoning effort or service
+tier: a structured error whose `param` is `reasoning.effort`,
+`model_reasoning_effort`, or `service_tier`, or unstructured text naming one
+of those outside the quoted model id. Each error is judged on its own, so
+such an error never hides a separate `model_not_found` for the model, and a
+model id may itself contain those words. It is terminal: never retried, no
+substitute model, and the saved thread is kept even when the text also
+looks stale. For example:
 
 ```
 [model-rejected] Codex rejected the requested model 'future-vega-2033' for this invocation: The model 'future-vega-2033' does not exist or you do not have access to it. No substitute model was tried and the saved thread was kept. Re-run this role with model, effort, and selection omitted to inherit native configuration.
 ```
 
 The subject is `the requested model '<model>'` when an override was sent and
-`the natively configured model` otherwise. "and the saved thread was kept"
-appears only on a resume, since a fresh attempt has no thread to keep. The
-closing action depends on which model was refused, and the runner never
-falls back or replays after a rejection:
+`the natively configured model` otherwise; when the model sent is one the
+resolving discovery proved is the native model, the subject reads `the
+requested model '<model>', which is also the natively configured model,`.
+"and the saved thread was kept" appears only on a resume, since a fresh
+attempt has no thread to keep. The closing action depends on which model
+was refused, and the runner never falls back or replays after a rejection:
 
-- a routed model → "Re-run this role with model, effort, and selection
-  omitted to inherit native configuration." Re-run only that role, in a new
-  run directory.
-- an explicit model pin → "Change or remove the explicit pin." Ask the user
-  which.
+- a routed model not proven to be the native one → "Re-run this role with
+  model, effort, and selection omitted to inherit native configuration."
+  Re-run only that role, in a new run directory.
+- an explicit model pin not proven to be the native model → "Change or
+  remove the explicit pin." Ask the user which.
 - the natively configured model, whether a native-effort role sent it, an
-  effort-only pin ran on it, or the role inherited or fell back → "Ask the
-  user to update the Codex configuration (model) or to name a model to
+  effort-only pin ran on it, the role inherited or fell back, or a routed
+  or pinned model that discovery proved is that same native model → "Ask
+  the user to update the Codex configuration (model) or to name a model to
   pin." An inheriting re-run would send the same model again, so nothing
   changes until the user acts. Report the rejection and ask; never edit
   Codex configuration or choose a model for the user. A model the user
   names becomes a `"mode": "user"` pin. A routed pair for the re-run is an
   option only when a new discovery reports routing eligible and the
   catalog supports one; it is never a substitute the runner picks.
+
+"Proven" means the discovery the decision was resolved against (launch
+discovery when it ran, else this run's snapshot) proved the native model.
+Without that proof a routed or pinned model keeps its own action; if an
+inheriting re-run then meets the same refusal, its message gives the native
+model's action.
 
 ## Session continuity and resume
 
@@ -555,8 +609,11 @@ a deterministic SHA-256 role key to avoid filesystem component limits.
 `CODEX_COUNCIL_DISABLE_AUTO_SESSION_KEY=1` only to request the older
 project-wide `{project-hash}__{role-key}.json` state shape.
 
-Model and effort overrides apply per invocation and are never stored in
-state files or threads. On codex-cli 0.157.1, overrides the runner places
+Model and effort overrides apply per invocation, and the council never
+persists them: its state files record the thread id, never a model or
+effort. Codex keeps its own record of the model a thread ran with in the
+thread's metadata, but that record is not reapplied as an override. On
+codex-cli 0.157.1, overrides the runner places
 before `resume` apply to the resumed turn. A resumed role that sends none
 runs on the current native configuration, not on the model its thread was
 recorded with. When the two differ, Codex prints an advisory ("This session

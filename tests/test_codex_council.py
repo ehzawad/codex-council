@@ -19,11 +19,13 @@ import asyncio
 import contextlib
 import dataclasses
 import hashlib
+import inspect
 import io
 import json
 import os
 import re
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
@@ -1436,7 +1438,7 @@ class RunRoleAttemptsTests(unittest.IsolatedAsyncioTestCase):
             if attempt == 1:
                 return codex_council.RoleResult(
                     role=r, ok=False, error="[retriable:5xx] 503 unavailable",
-                    elapsed_seconds=0.1, attempts=attempt,
+                    elapsed_seconds=0.1, attempts=attempt, retriable=True,
                 )
             return codex_council.RoleResult(
                 role=r, ok=True, text="finally", thread_id="sid",
@@ -1453,7 +1455,7 @@ class RunRoleAttemptsTests(unittest.IsolatedAsyncioTestCase):
         async def fake_once(r, prompt, attempt):
             return codex_council.RoleResult(
                 role=r, ok=False, error="[retriable:rate-limit] 429",
-                elapsed_seconds=0.1, attempts=attempt,
+                elapsed_seconds=0.1, attempts=attempt, retriable=True,
             )
         with patch.object(codex_council, "_run_role_once", side_effect=fake_once):
             result = await codex_council._run_role_attempts(role, "prompt")
@@ -2314,10 +2316,10 @@ class ResolveRolesJsonIntegrationTests(unittest.TestCase):
 
 class ProjectRootCacheTests(unittest.TestCase):
     def setUp(self):
-        council_common._project_root.cache_clear()
+        council_common._project_root_cache.clear()
 
     def tearDown(self):
-        council_common._project_root.cache_clear()
+        council_common._project_root_cache.clear()
 
     def test_only_one_git_call_across_many_lookups(self):
         calls = {"count": 0}
@@ -3047,7 +3049,10 @@ class NoRunLevelDeadlineTests(unittest.TestCase):
         The output-inactivity watchdog must stay hand-rolled (an
         asyncio.sleep loop over time.monotonic): the named APIs below would
         impose a deadline on the subprocess await itself, which is exactly
-        what the design forbids."""
+        what the design forbids. The one allowed exception is not a role's
+        deadline: the project root's `git rev-parse` in
+        council_common._project_root is capped, so a hung git can stall
+        neither discovery nor dispatch."""
         import io as _io
         import re as _re
         import tokenize as _tokenize
@@ -3061,6 +3066,7 @@ class NoRunLevelDeadlineTests(unittest.TestCase):
             (".settimeout(", r"\.\s*settimeout\s*\("),
             ("timeout=", r"\btimeout\s*="),
         )
+        allowed = {("council_common.py", "timeout="): 1}
         modules = sorted(name for name in os.listdir(SCRIPTS_DIR)
                          if name.endswith(".py"))
         self.assertIn("codex_council.py", modules)
@@ -3083,10 +3089,15 @@ class NoRunLevelDeadlineTests(unittest.TestCase):
                         if masked[i] != "\n":
                             masked[i] = " "
             code = "".join(masked)
-            found = [name for name, pat in forbidden if _re.search(pat, code)]
+            found = [
+                name for name, pat in forbidden
+                if len(_re.findall(pat, code)) > allowed.get((module, name), 0)
+            ]
             with self.subTest(module=module):
                 self.assertEqual(
                     found, [], f"unexpected timeout primitive(s): {found}")
+        self.assertIn("timeout=timeout",
+                      inspect.getsource(council_common._project_root))
 
 
 # ---------- output-inactivity watchdog (env, flags, policy) ----------
@@ -3398,6 +3409,8 @@ class StallWatchdogIntegrationTests(unittest.IsolatedAsyncioTestCase):
             started=0.0)
         self.assertTrue(result.error.startswith("[retriable:stall]"),
                         result.error)
+        # The retry decision is carried as data, not read from the tag.
+        self.assertTrue(result.retriable)
 
     async def test_tool_start_then_hang_is_unsafe_to_replay(self):
         cmd = self._script("tool.py", self._PREAMBLE + (
@@ -3579,7 +3592,7 @@ class DiagnosticsHelperTests(unittest.TestCase):
                 if attempt == 1:
                     return codex_council.RoleResult(
                         role=r, ok=False, error="[retriable:5xx] 503",
-                        elapsed_seconds=0.1, attempts=attempt,
+                        elapsed_seconds=0.1, attempts=attempt, retriable=True,
                     )
                 return codex_council.RoleResult(
                     role=r, ok=True, text="recovered", elapsed_seconds=0.1,
@@ -4619,10 +4632,31 @@ class DocsContractTests(unittest.TestCase):
             "rejects any other key and any duplicated key",
             "rewrite the whole file",
             "JSON array of short strings, one sentence per item",
-            '"nothing material"',
-            'exactly "Thoroughness beats speed."',
+            # The checks read the joined paragraph, not individual items.
+            "joins the items into one whitespace-normalized paragraph",
+            'must contain "nothing material"',
+            'end with "Thoroughness beats speed."',
         ):
             self.assertIn(required, flat)
+        self.assertNotIn('exactly "Thoroughness beats speed."', flat)
+        # What the runner does is what the sentence says: the scope phrase
+        # may span items and the cadence sentence may close a longer final
+        # item, while a paragraph that does not end with it is refused.
+        for items in (
+            ["Check the parser. If nothing", "material, say so clearly.",
+             "Thoroughness beats speed."],
+            ["If nothing material, say so clearly.",
+             "Check the parser. Thoroughness beats speed."],
+        ):
+            with self.subTest(items=items):
+                self._parse_skill_role(
+                    {"id": "lens", "label": "Lens", "instruction": items})
+        _assert_usage_exit(
+            self, lambda: self._parse_skill_role({
+                "id": "lens", "label": "Lens", "instruction": [
+                    "Thoroughness beats speed.",
+                    "If nothing material, say so clearly."]}),
+            expect_in_stderr="must end with 'Thoroughness beats speed.'")
         id_pattern = codex_council.ROLE_ID_PATTERN.pattern.replace("\\Z", "$")
         self.assertIn(f"`{id_pattern}`", flat)
         # The launch template's example panel is valid on the skill path.
@@ -4859,6 +4893,50 @@ class DocsContractTests(unittest.TestCase):
             self.assertLessEqual(expected.get(name, set()), modes, name)
             self.assertNotIn("other", modes, name)
 
+    def test_preflight_and_launch_are_separate_calls_that_fail_closed(self):
+        """A pre-flight that refuses a directory cannot stop a launch that
+        runs in the same Bash call: executed literally, the old one-block
+        template printed the refusal and launched anyway, truncating the
+        directory's out.md and err.log. So every SKILL code block holds at
+        most one runner command, the launch block holds nothing but that
+        command, and the prose makes the launch a separate call that runs
+        only after the pre-flight exits 0."""
+        skill = self._skill()
+        blocks = re.findall(r"```[\w-]*\n(.*?)```", skill, re.S)
+        modes = []
+        for block in blocks:
+            commands = self._runner_commands("```\n" + block + "```")
+            with self.subTest(block=block[:60]):
+                self.assertLessEqual(len(commands), 1)
+            modes += [(self._command_mode(codex_council._parse_args(argv)),
+                       block) for argv in commands]
+        order = [mode for mode, _ in modes]
+        self.assertLess(order.index("check-staging-dir"),
+                        order.index("launch"))
+        launch_block = dict(modes)["launch"]
+        code = [line for line in launch_block.replace("\\\n", " ").splitlines()
+                if line.strip() and not line.lstrip().startswith("#")]
+        self.assertEqual(len(code), 1, code)
+        self.assertTrue(code[0].strip().startswith(self.RUNNER_COMMAND))
+        for token in ("&&", "||", ";", "&", "|"):
+            self.assertNotIn(token, shlex.split(code[0], posix=True)[3:])
+        comment = self._flat(" ".join(
+            line.lstrip("# ") for line in launch_block.splitlines()
+            if line.lstrip().startswith("#")))
+        self.assertIn("Only after the pre-flight exits 0, a separate call",
+                      comment)
+        self.assertIn("nothing else in it", comment)
+        flat = self._section("## Step 4", "## Step 5")
+        for required in (
+            "**Two Bash calls.**",
+            "Run the pre-flight in the foreground; launch only after it "
+            "exits 0, in a separate call",
+            "Never combine them: a refused pre-flight would not stop the "
+            "launch",
+        ):
+            self.assertIn(required, flat)
+        self.assertNotIn("nothing appended", flat)
+
     # ---------- following a run ----------
 
     def test_skill_consumes_replies_as_they_land_with_explicit_limits(self):
@@ -5012,10 +5090,28 @@ class DocsContractTests(unittest.TestCase):
             # Launch revalidation and the resume facts.
             "one fresh discovery",
             "frozen for the whole council",
-            "never stored in state files",
+            # The council persists no override; Codex's own thread record
+            # of the model is a separate thing and is not reapplied.
+            "the council never persists them",
+            "its state files record the thread id, never a model or effort",
+            "Codex keeps its own record of the model a thread ran with",
             "runs on the current native configuration",
         ):
             self.assertIn(required, ref)
+        self.assertNotIn("never stored in state files or threads", ref)
+        panel = self._flat(self._ref("panel-design.md"))
+        for required in (
+            "its state file records the thread id, never a model or effort",
+            "Codex itself records the model a thread ran with in its own "
+            "thread metadata",
+            # The runner reads no configuration file for model or effort,
+            # but does read agents.max_threads for concurrency.
+            "For model and effort, the runner reads none of those files "
+            "itself",
+            "`agents.max_threads`",
+        ):
+            self.assertIn(required, panel)
+        self.assertNotIn("They are not stored with the thread", panel)
         for stale in ("hours or days", "TaskOutput"):
             self.assertNotIn(stale, ref)
         # Classifier order, identical on the fresh and resume paths.
@@ -5091,15 +5187,17 @@ class DocsContractTests(unittest.TestCase):
         ref = self._flat(self._ref("runtime-behavior.md"))
         default = {"provider": None, "endpoint_overrides": [],
                    "catalog_override": False}
+        overriding = council_discovery._overriding_layer(
+            {"model_origin": "mdm", "effort_origin": "user"})
         reasons = council_discovery._routing_reasons(
             "off", True, [], {"type": None},
             council_discovery._provider_mismatch(
                 dict(default, provider="<p>"), []),
-            True, "present", {"gaps": ["<why>"]},
+            True, "present", overriding, {"gaps": ["<why>"]},
         )
         reasons += council_discovery._routing_reasons(
             "auto", False, ["<problems>"], {"type": None}, None, False,
-            "absent", {"gaps": []},
+            "absent", None, {"gaps": []},
         )
         reasons.append(council_discovery._provider_mismatch(
             dict(default, endpoint_overrides=["<keys>"]), []))
@@ -5107,13 +5205,13 @@ class DocsContractTests(unittest.TestCase):
             dict(default, catalog_override=True), []))
         reasons.append(council_discovery._provider_mismatch(
             default, ["<keys>"]))
-        self.assertEqual(len(reasons), 10)
+        self.assertEqual(len(reasons), 11)
         for reason in reasons:
             with self.subTest(reason=reason):
                 self.assertIn(f"`{reason}`", ref)
         native = council_discovery._native_resolution(
-            True, {"model": None}, "absent", None, False,
-            {"models": {}, "unusable": {}, "gaps": []},
+            True, {"type": "chatgpt"}, {"model": None}, "absent", None, None,
+            False, {"models": {}, "unusable": {}, "gaps": []},
         )
         self.assertIn(f"`unavailable — {native['reason']}`", ref)
 
@@ -5435,12 +5533,26 @@ class DocsContractTests(unittest.TestCase):
                     self.assertIn(marker, self._flat(text))
         step6 = self._flat(self._skill().split("## Step 6", 1)[1])
         for required in ("`[quota]`", "`[model-rejected]`",
-                         "For a routed role, re-run only that role with "
-                         "model, effort, and selection omitted",
-                         "a refused native model that inheriting would "
-                         "send again, ask the user",
+                         "Follow the one action its message ends with",
+                         "re-run only that role with model, effort, and "
+                         "selection omitted (a routed model other than the "
+                         "native one)",
+                         "ask the user to change the pin, update their Codex "
+                         "configuration, or name a model to pin (a refused "
+                         "pin, or a native model that inheriting would send "
+                         "again)",
                          "never edit Codex configuration yourself"):
             self.assertIn(required, step6)
+        # A routed model that discovery proved is the native one gets the
+        # native model's action, never the inherit re-run that would send
+        # it again.
+        native_routed = council_selection.SelectionDecision(
+            "routed", "routed", "X", "Y", "X", "Y", "why",
+            native_model="X")
+        self.assertEqual(
+            council_failures._refused_model_action(native_routed),
+            council_failures._refused_model_action(
+                self._sent("native_effort", "X", "Y")))
         # The runner's action for a refused native model addresses the user,
         # and the reference quotes it without telling Claude to re-run.
         runtime = self._flat(runtime)
@@ -5451,6 +5563,155 @@ class DocsContractTests(unittest.TestCase):
         self.assertIn("never edit Codex configuration or choose a model for "
                       "the user", runtime)
         self.assertNotIn("you re-run the role", runtime)
+
+    def test_exact_off_catalog_pins_are_forwarded_without_asking(self):
+        """An exact, syntactically valid id the summary does not list (a
+        custom provider's model) is forwarded unchanged with the runner's
+        advisory; the user is asked only about an ambiguous alias or display
+        name or a value that fails the grammar. No surface tells Claude to
+        ask merely because a pin is absent from the summary."""
+        panel = self._flat(self._ref("panel-design.md"))
+        for required in (
+            "An exact, syntactically valid id that the summary does not "
+            "list (a custom provider's model, for example) is forwarded "
+            "unchanged",
+            "do not ask about it",
+            f"`{council_selection.UNVERIFIED_MODEL_ADVISORY}`",
+            "Ask the user for the exact value only when what they named is "
+            "ambiguous",
+            "fails the value grammar",
+            "never drop the pin to inherit",
+        ):
+            self.assertIn(required, panel)
+        for name, text in self._doc_surfaces().items():
+            with self.subTest(surface=name):
+                self.assertNotIn("matches nothing in the summary",
+                                 self._flat(text))
+        # The runner forwards such a pin with exactly that advisory.
+        role = codex_council.Role(
+            "custom", "Custom", _valid_instruction(),
+            model="acme/future-review-2034:rev2",
+            selection=council_selection.Selection("user"))
+        decision = council_selection._resolve_selection(
+            role, self._synthetic_snapshot("0ddc08d1899d8bb5"), None, "auto",
+            None)
+        self.assertEqual((decision.provenance, decision.dispatch_model,
+                          decision.note),
+                         ("user", "acme/future-review-2034:rev2",
+                          council_selection.UNVERIFIED_MODEL_ADVISORY))
+
+    def test_new_directory_recoveries_are_documented_as_the_runner_gives_them(self):
+        """Every new-directory recovery the runner prints names discovery in
+        the new directory and the new snapshot_id before the pre-flight,
+        and the runtime reference gives the same sequence, including for a
+        staged launch's early input and path refusals."""
+        clause = council_common.NEW_DIR_SNAPSHOT_CLAUSE
+        for name in ("STAGING_DIR_RECOVERY", "LAUNCHED_DIR_RECOVERY",
+                     "STAGED_LAUNCH_RESTART"):
+            text = getattr(council_common, name)
+            with self.subTest(recovery=name):
+                steps = [text.index(step) for step in (
+                    "`mktemp -d` again", "--discover", clause,
+                    "--check-staging-dir on it")]
+                self.assertEqual(steps, sorted(steps))
+        self.assertIn(council_common.STAGED_LAUNCH_RESTART,
+                      codex_council.STAGED_LAUNCH_PATH_HINT)
+        runtime = self._flat(self._ref("runtime-behavior.md"))
+        for required in (
+            "run `--discover` in the new directory, Write both `roles.json` "
+            "(every routed or native_effort selection naming the new "
+            "`snapshot_id`) and `context.md` there, and run the pre-flight",
+            "a new `mktemp -d` directory, `--discover` there, both files "
+            "re-Written there (every routed or native_effort selection "
+            "naming the new `snapshot_id`), then the pre-flight",
+            "a missing, unreadable, or misplaced `roles.json` or "
+            "`context.md`",
+            "The direct stdin mode, which stages no `context.md`, keeps its "
+            "own recovery wording",
+        ):
+            self.assertIn(required, runtime)
+        self.assertNotIn("re-Write both files, re-run the pre-flight",
+                         runtime)
+
+    def test_a_refused_native_routed_model_is_documented_with_its_action(self):
+        """The runner's message for a routed model that is the proven
+        native one names it as such and gives the native model's action;
+        the reference quotes that subject and scopes the inherit re-run to
+        a routed model not proven to be the native one."""
+        decision = council_selection.SelectionDecision(
+            "routed", "routed", "future-orion-2032", "brisk",
+            "future-orion-2032", "brisk", "why",
+            native_model="future-orion-2032")
+        message = council_failures._model_rejected_error(
+            decision, "The model 'future-orion-2032' does not exist", "exec")
+        subject = ("the requested model 'future-orion-2032', which is also "
+                   "the natively configured model,")
+        self.assertIn(subject, message)
+        self.assertTrue(message.endswith(
+            council_failures._NATIVE_MODEL_ACTION), message)
+        runtime = self._flat(self._ref("runtime-behavior.md"))
+        for required in (
+            "`the requested model '<model>', which is also the natively "
+            "configured model,`",
+            "a routed model not proven to be the native one → \"Re-run this "
+            "role",
+            "or a routed or pinned model that discovery proved is that same "
+            "native model → \"Ask the user",
+            "so a routed role whose model is not the native one can re-run",
+        ):
+            self.assertIn(required, runtime)
+        for name, phrase in (
+                ("README.md", "A routed or pinned model that discovery "
+                              "proved is the native model gets that last "
+                              "step too"),
+                ("DESIGN.md", "a routed or pinned model equal to the "
+                              "`native_model` its decision recorded")):
+            with self.subTest(surface=name):
+                self.assertIn(phrase, self._flat(self._read_repo_file(name)))
+
+    def test_report_names_launch_discovery_when_it_did_not_run(self):
+        """Planning discovery may have run and succeeded; what the report's
+        Model selection paragraph says did not run is launch discovery."""
+        sentence = council_selection._discovery_sentence(
+            "not-run", council_selection.NO_AUTOMATIC_SELECTIONS, None)
+        self.assertTrue(sentence.startswith("launch discovery not run ("),
+                        sentence)
+        report = codex_council._format_report([], 0.0)
+        self.assertIn("Model selection: launch discovery not run (", report)
+        for name, text in self._doc_surfaces().items():
+            flat = self._flat(text)
+            with self.subTest(surface=name):
+                self.assertNotRegex(flat, r"(?<!launch )discovery not run")
+        self.assertIn("`launch discovery not run (...)`",
+                      self._flat(self._ref("runtime-behavior.md")))
+        self.assertIn("`launch discovery not run (<why>)`",
+                      self._flat(self._read_repo_file("DESIGN.md")))
+
+    def test_design_is_honest_about_what_the_runner_does_not_enforce(self):
+        """User-pin provenance and a reason's meaning are trusted to the
+        orchestrator, and one launch per directory is enforced by
+        discovery and the pre-flight, not atomically at launch."""
+        design = self._read_repo_file("DESIGN.md")
+        limits = self._flat(design.split("\n### Known limits\n", 1)[1]
+                            .split("\n### ", 1)[0])
+        for required in (
+            "**User-pin provenance and semantic grounding rest on the "
+            "orchestrator.**",
+            "`selection.mode: \"user\"` is a label the orchestrator writes",
+            "`reason` is checked only as a non-empty single line, never for "
+            "meaning",
+            "not on runner enforcement",
+            "**One launch per directory is not enforced atomically.**",
+            "the launch itself does not check",
+        ):
+            self.assertIn(required, limits)
+        # The runner really does accept any non-empty single-line reason.
+        role = self._parse_skill_role({
+            **_role_json("probe", "Probe"), "model": "future-vega-2033",
+            "effort": "brisk", "selection": {
+                "mode": "routed", "snapshot_id": "0123456789abcdef",
+                "reason": "picked the newest-looking id"}})
+        self.assertEqual(role.selection.reason, "picked the newest-looking id")
 
     # ---------- reconciliation ----------
 
@@ -5767,8 +6028,14 @@ class ContextRecipeBehaviorTests(unittest.TestCase):
         with open(out_path, encoding="utf-8") as f:
             self.assertEqual(f.read(), "fresh context\n")
 
-    def _run_brief_recipe(self, *, changed, brief="Objective: verify X.\n"):
-        """Run the verification-brief recipe in a fresh one-commit repo."""
+    def _run_brief_recipe(self, *, changed, brief="Objective: verify X.\n",
+                          quiet_check_exit=None, pre_existing_final=None):
+        """Run the verification-brief recipe in a fresh one-commit repo.
+
+        `quiet_check_exit` puts a git shim first on PATH that fails the
+        recipe's `--quiet` change check with that status (Git's own
+        failure, such as 128) after the extraction itself succeeded.
+        """
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         repo = os.path.join(tmp.name, "repo")
@@ -5777,6 +6044,28 @@ class ContextRecipeBehaviorTests(unittest.TestCase):
         # Isolated from the user's git configuration (signing, hooks).
         env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull,
                "GIT_CONFIG_NOSYSTEM": "1"}
+        if quiet_check_exit is not None:
+            real_git = shutil.which("git")
+            self.assertIsNotNone(real_git)
+            shim_dir = os.path.join(tmp.name, "shim")
+            os.mkdir(shim_dir)
+            shim = os.path.join(shim_dir, "git")
+            with open(shim, "w", encoding="utf-8") as f:
+                f.write(
+                    "#!/bin/sh\n"
+                    'for arg in "$@"; do\n'
+                    '  if [ "$arg" = "--quiet" ]; then\n'
+                    "    echo 'fatal: injected Git read failure' >&2\n"
+                    f"    exit {int(quiet_check_exit)}\n"
+                    "  fi\n"
+                    "done\n"
+                    f'exec {shlex.quote(real_git)} "$@"\n')
+            os.chmod(shim, 0o755)
+            env["PATH"] = shim_dir + os.pathsep + env.get("PATH", "")
+        if pre_existing_final is not None:
+            with open(os.path.join(rundir, "context.md"), "w",
+                      encoding="utf-8") as f:
+                f.write(pre_existing_final)
         git = ["git", "-C", repo, "-c", "user.name=council",
                "-c", "user.email=council@example.invalid"]
         subprocess.run(["git", "init", "-q", repo], env=env, check=True,
@@ -5817,6 +6106,22 @@ class ContextRecipeBehaviorTests(unittest.TestCase):
         self.assertIn("+HEADER = 'v2'", context)
         self.assertLess(context.index("Objective"),
                         context.index("diff --git"))
+
+    def test_brief_recipe_fails_closed_when_the_change_check_errors(self):
+        """The extraction succeeded, but the change check itself failed
+        (Git's exit 128, or any status other than 0 or 1): the recipe
+        fails with that status and publishes nothing, removing an older
+        accepted context.md too. `git diff HEAD --quiet && exit 1` let such
+        a failure fall through to the publish step."""
+        for status in (128, 2):
+            with self.subTest(status=status):
+                proc, out_path, tmp_path = self._run_brief_recipe(
+                    changed=True, quiet_check_exit=status,
+                    pre_existing_final="OLD ACCEPTED CONTEXT")
+                self.assertEqual(proc.returncode, status, proc.stderr)
+                self.assertIn("injected Git read failure", proc.stderr)
+                self.assertFalse(os.path.exists(out_path))
+                self.assertFalse(os.path.exists(tmp_path))
 
     def test_brief_recipe_without_the_brief_publishes_nothing(self):
         proc, out_path, tmp_path = self._run_brief_recipe(changed=True,

@@ -180,8 +180,13 @@ trap - EXIT
 Write the brief first with the Write tool: the objective, acceptance
 criteria, verification question, reviewed state, and your claims with the
 evidence for and against them. Then combine it with the diff. The diff guard
-fails the recipe when there are no tracked changes to review, instead of
-publishing a brief that points at an empty diff:
+reads `git diff HEAD --quiet`'s status explicitly: 1 (tracked changes exist)
+publishes; 0 (no tracked changes to review) fails the recipe instead of
+publishing a brief that points at an empty diff; anything else is a Git
+failure and fails the recipe with that status. Every failure removes both
+files. Never write the guard as `git diff HEAD --quiet && exit 1`: `set -e`
+ignores a command that fails before `&&`, so a Git error would publish the
+context:
 
 ```bash
 set -euo pipefail
@@ -195,7 +200,13 @@ trap 'rc=$?; if [ "$rc" -ne 0 ]; then rm -f "$out" "$tmp"; fi; exit "$rc"' EXIT
   git diff HEAD
 } >"$tmp"
 [ -s "$tmp" ]
-git diff HEAD --quiet && exit 1
+diff_rc=0
+git diff HEAD --quiet || diff_rc=$?
+case "$diff_rc" in
+  1) ;;
+  0) exit 1 ;;
+  *) exit "$diff_rc" ;;
+esac
 mv -f "$tmp" "$out"
 trap - EXIT
 ```

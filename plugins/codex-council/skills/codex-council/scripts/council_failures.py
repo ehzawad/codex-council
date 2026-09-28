@@ -4,10 +4,12 @@ Reads stderr plus the structured `error` / `turn.failed` events of codex's
 JSONL stdout (never agent messages, reasoning, or tool output), decides one
 verdict in a fixed order (auth, quota, anchored 429/5xx, model rejected,
 stale on resume only, substring retriable fallback, untagged), and formats
-the tagged error text a role reports. A model rejection, and a usage limit
-Codex names for one model, end with one action for the model that was sent.
-The stall verdict is structured and decided by the runner before any of
-this runs.
+the tagged error text a role reports. The verdict, not that text, carries
+whether the attempt may be retried (FailureVerdict.retriable): provider text
+that happens to begin with a tag never decides a retry. A model rejection,
+and a usage limit Codex names for one model, end with one action for the
+model that was sent. The stall verdict is structured and decided by the
+runner before any of this runs.
 """
 
 import json
@@ -23,7 +25,8 @@ from council_selection import _INHERIT_DECISION
 # parsed out of the JSONL error body (see _extract_statuses) and, for quota
 # and model rejection, the structured failure records (_failure_records).
 # Order of check, identical on the fresh and resume paths (see
-# _failure_verdict): auth first (never clear state), then quota (terminal,
+# _failure_verdict): auth first (never clear state; a structured 401 or
+# authentication code, or the prose below), then quota (terminal,
 # even when it carries HTTP 429), then ANCHORED-status retriable (a real API
 # 429/5xx — by JSON status, `HTTP NNN`, or a reason phrase — beats a
 # stale-looking message), then model rejection (terminal; never clears
@@ -42,6 +45,14 @@ AUTH_ERROR_MARKERS = (
     # token could not be refreshed because your refresh token ...").
     "access token could not be refreshed",
 )
+# Structured authentication failures, matched against a failure record's
+# error code or type (alongside HTTP 401 on a record or as an anchored
+# status). Checked first, ahead of the stale-resume text, so an
+# authentication failure whose message also looks stale never clears state.
+AUTH_ERROR_CODES = frozenset({
+    "authentication_error",
+    "invalid_api_key",
+})
 RATE_LIMIT_MARKERS = (
     # NB: bare "429" is intentionally NOT here — codex normalizes ordinary
     # HTTP errors to text carrying the real transport status, which the
@@ -132,13 +143,26 @@ _MODEL_USAGE_LIMIT_RE = re.compile(
     r"hit your usage limit for \S.*?\. Switch to another model",
     re.IGNORECASE,
 )
-# A failure naming one of these parameters is about the effort or service
-# tier, not the model, so it is never read as a model rejection.
+# A failure record whose structured `param` is one of these is about the
+# effort or service tier, not the model, so none of its text is read as a
+# model rejection. Only that record is set aside: another record in the
+# same failure can still be the rejection.
 MODEL_REJECTION_EXCLUDED_PARAMS = (
     "reasoning.effort",
     "model_reasoning_effort",
     "service_tier",
 )
+# The same names as whole tokens in text that carries no structured param
+# (a stderr line, a plain message). A model id is free to contain these
+# words, so the quoted model id a rejection sentence names is removed
+# before this is searched (see _sentence_rejection).
+_EXCLUDED_PARAM_RE = re.compile(
+    r"(?<![A-Za-z0-9_.-])(?:reasoning\.effort|model_reasoning_effort"
+    r"|service_tier)(?![A-Za-z0-9_-])",
+    re.IGNORECASE,
+)
+# The verdict kinds the runner retries (see FailureVerdict.retriable).
+RETRIABLE_KINDS = ("rate-limit", "5xx")
 
 
 # ---------- failure text and structured failure records ----------
@@ -300,8 +324,17 @@ def _stderr_contains(stderr_text, markers):
     return any(m in lowered for m in markers)
 
 
-def _is_auth_error(stderr_text):
-    return _stderr_contains(stderr_text, AUTH_ERROR_MARKERS)
+def _is_auth_error(failure_text, records=()):
+    """True for an authentication failure: a structured one (HTTP 401 on a
+    failure record or as an anchored status in the text, or an
+    AUTH_ERROR_CODES code or type) or Codex's authentication prose."""
+    for record in records:
+        if (record.status == 401 or record.code in AUTH_ERROR_CODES
+                or record.type in AUTH_ERROR_CODES):
+            return True
+    if 401 in _extract_statuses(failure_text):
+        return True
+    return _stderr_contains(failure_text, AUTH_ERROR_MARKERS)
 
 
 def _is_rate_limit_error(stderr_text):
@@ -421,9 +454,16 @@ def _is_quota_error(failure_text, records):
 
 
 def _names_excluded_param(text):
-    """True when text names reasoning effort or service tier."""
-    lowered = text.lower()
-    return any(name in lowered for name in MODEL_REJECTION_EXCLUDED_PARAMS)
+    """True when text names reasoning effort or service tier as a whole
+    token (see _EXCLUDED_PARAM_RE)."""
+    return _EXCLUDED_PARAM_RE.search(text) is not None
+
+
+def _about_a_setting(record):
+    """True when a record's structured param is reasoning effort or service
+    tier: that record is about the setting, not the model."""
+    param = (record.param or "").strip().lower()
+    return param in MODEL_REJECTION_EXCLUDED_PARAMS
 
 
 # Codex passes the provider's rejection sentence through as text. The model
@@ -436,9 +476,11 @@ _MODEL_QUOTE = "['`]"
 def _model_rejection_patterns(requested_model):
     """Codex's complete rejection sentences for the model this invocation
     sent (regex-escaped), or for any model when none was sent. The model
-    may be quoted with single quotes or backticks."""
+    may be quoted with single quotes or backticks; its span is the "model"
+    group."""
     q = _MODEL_QUOTE
     model = re.escape(requested_model) if requested_model else r"[^'`]+"
+    model = f"(?P<model>{model})"
     return (
         # ChatGPT sign-in; the trailing account wording varies.
         re.compile(
@@ -454,35 +496,63 @@ def _model_rejection_patterns(requested_model):
     )
 
 
+def _sentence_rejection(text, patterns):
+    """True when text carries one of the rejection `patterns` and, outside
+    the quoted model id that sentence names, names neither reasoning effort
+    nor service tier. The id is left out because a model id may contain
+    those words; elsewhere in unstructured text they are the only
+    unambiguous sign that the failure is about that setting."""
+    for pattern in patterns:
+        match = pattern.search(text)
+        if match is None:
+            continue
+        rest = text[:match.start("model")] + text[match.end("model"):]
+        if not _names_excluded_param(rest):
+            return True
+    return False
+
+
 def _model_rejection(failure_text, records, requested_model):
     """Codex's own message when it rejected this invocation's model, or None.
 
-    Positive evidence only: a structured `model_not_found` code (status
-    400, 404, or absent), or one of Codex's complete rejection sentences.
-    Bare "not found" / "not supported", the "Model metadata for ... not
-    found" advisory, and "Selected model is at capacity" (transient) never
-    qualify. A structured failure naming reasoning effort or service tier
-    is about that setting, so none of its text counts; neither does a
-    text line naming one.
+    Positive evidence only: a structured `model_not_found` code whose param
+    is `model` or absent (status 400, 404, or absent), or one of Codex's
+    complete rejection sentences for the model this invocation sent. Bare
+    "not found" / "not supported", the "Model metadata for ... not found"
+    advisory, and "Selected model is at capacity" (transient) never
+    qualify. Each record is judged on its own, so a definitive rejection
+    wins whatever order the records came in: a record whose structured
+    param is reasoning effort or service tier is about that setting, and
+    none of its text counts (nor does a failure-text line repeating its
+    message), but it never hides another record. A record with any other
+    structured param is judged by that param alone; text with no structured
+    param is excluded only when it names one of those settings outside the
+    quoted model id (see _sentence_rejection).
     """
-    if any(
-        _names_excluded_param(f"{record.param or ''} {record.message or ''}")
-        for record in records
-    ):
-        return None
-    for record in records:
-        if record.code == "model_not_found" and record.status in (
-            None, 400, 404,
-        ):
+    kept = [record for record in records if not _about_a_setting(record)]
+    for record in kept:
+        if (record.code == "model_not_found"
+                and (record.param or "model").strip().lower() == "model"
+                and record.status in (None, 400, 404)):
             return record.message or "model_not_found"
-    candidates = [record.message for record in records if record.message]
-    candidates += failure_text.splitlines()
     patterns = _model_rejection_patterns(requested_model)
-    for text in candidates:
-        if _names_excluded_param(text):
+    for record in kept:
+        if not record.message:
             continue
-        if any(pattern.search(text) for pattern in patterns):
-            return text.strip()
+        if record.param is not None:
+            # A structured param already says what the record is about.
+            if any(pattern.search(record.message) for pattern in patterns):
+                return record.message
+        elif _sentence_rejection(record.message, patterns):
+            return record.message
+    set_aside = [record.message for record in records
+                 if record.message and _about_a_setting(record)]
+    for line in failure_text.splitlines():
+        line = line.strip()
+        if not line or any(line in message for message in set_aside):
+            continue
+        if _sentence_rejection(line, patterns):
+            return line
     return None
 
 
@@ -497,16 +567,25 @@ class FailureVerdict:
     kind: Optional[str]
     rejection: Optional[str] = None
 
+    @property
+    def retriable(self):
+        """Whether the runner may retry this attempt: the one retry
+        decision, carried as data and never read back from the formatted
+        tag (an untagged failure's text is Codex's and may look like one)."""
+        return self.kind in RETRIABLE_KINDS
+
 
 def _failure_verdict(failure_text, records, requested_model, resume=False):
     """Classify a non-zero codex exit; the stall verdict is decided earlier.
 
-    Precedence, identical on the fresh and resume paths: auth -> quota ->
-    anchored 429/5xx -> model rejected -> stale (resume only) -> substring
-    retriable fallback -> None (untagged). Returns a FailureVerdict, whose
-    rejection message is parsed here, once per attempt.
+    Precedence, identical on the fresh and resume paths: auth (structured
+    401 or authentication code, or auth prose) -> quota -> anchored
+    429/5xx -> model rejected -> stale (resume only) -> substring retriable
+    fallback -> None (untagged). Returns a FailureVerdict, whose rejection
+    message is parsed here, once per attempt, and whose `retriable` is the
+    runner's retry decision.
     """
-    if _is_auth_error(failure_text):
+    if _is_auth_error(failure_text, records):
         return FailureVerdict("auth")
     if _is_quota_error(failure_text, records):
         return FailureVerdict("quota")
@@ -531,8 +610,10 @@ def _failure_verdict(failure_text, records, requested_model, resume=False):
 # would send again, so only a configuration change or an explicit pin
 # avoids it, and both are the user's decision: the action addresses the
 # user, never the orchestrator, which must not edit Codex configuration or
-# pick a model on the user's behalf. The runner never substitutes or
-# replays: the host re-runs the role.
+# pick a model on the user's behalf. A routed or pinned model that the
+# resolving discovery proved IS the native model counts as the native one:
+# dropping it would send the same refused model again. The runner never
+# substitutes or replays: the host re-runs the role.
 _INHERIT_ACTION = (
     "Re-run this role with model, effort, and selection omitted to inherit "
     "native configuration."
@@ -544,10 +625,19 @@ _NATIVE_MODEL_ACTION = (
 )
 
 
+def _sent_the_native_model(decision):
+    """Whether the model `decision` sent is known to be the native one: an
+    override was sent and discovery proved it equals the native model."""
+    return (decision.dispatch_model is not None
+            and decision.dispatch_model == decision.native_model)
+
+
 def _refused_model_action(decision):
     """The one recovery action when Codex refused the model `decision` sent
     (a rejection, or that model's usage limit)."""
-    if decision.dispatch_model is None or decision.provenance == "native_effort":
+    if (decision.dispatch_model is None
+            or decision.provenance == "native_effort"
+            or _sent_the_native_model(decision)):
         return _NATIVE_MODEL_ACTION
     if decision.provenance == "routed":
         return _INHERIT_ACTION
@@ -559,6 +649,9 @@ def _model_rejected_error(decision, provider_message, phase):
     message, and one action for the model that was refused."""
     if decision.dispatch_model:
         subject = f"requested model '{decision.dispatch_model}'"
+        if _sent_the_native_model(decision):
+            # Why the action is the native model's, not a plain re-run.
+            subject += ", which is also the natively configured model,"
     else:
         subject = "natively configured model"
     # Only a resume has a saved thread this failure could have touched.

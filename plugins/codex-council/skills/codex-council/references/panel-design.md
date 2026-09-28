@@ -75,11 +75,14 @@ A useful instruction reads like the checklist a domain expert would run for
 this exact work; a weak one reads like "review for quality." Name the files,
 behaviors, or claims in scope, what the deliverable is, and where to stop.
 
-Two phrases are required by the script:
+The script joins the items into one whitespace-normalized paragraph and
+checks two things on that paragraph, not on any single item:
 
-- An item containing "nothing material", so a role can say plainly that its
-  lens found nothing instead of inventing findings.
-- A final item that is exactly "Thoroughness beats speed."
+- It contains "nothing material" (in any case), so a role can say plainly
+  that its lens found nothing instead of inventing findings. Keep the phrase
+  inside one item so it reads as the sentence you meant.
+- It ends with "Thoroughness beats speed." Give that sentence its own final
+  item.
 
 Frame each role as a collaborator: it consumes the shared context, separates
 verified evidence from inference, and returns its result, evidence,
@@ -149,8 +152,11 @@ command-line overrides (none are sent), trusted project
 root (closest wins; one in a subdirectory below the `-C` root is not part
 of the council's baseline, even when you launch from that subdirectory),
 the user's `$CODEX_HOME/config.toml`, cloud-managed and system defaults,
-built-in defaults, and any managed new-thread defaults. The runner reads
-none of those files itself; discovery asks Codex what it resolved.
+built-in defaults, and any managed new-thread defaults. For model and
+effort, the runner reads none of those files itself; discovery asks Codex
+what it resolved. (The one configuration value the runner reads is a
+positive `agents.max_threads` in the user's `$CODEX_HOME/config.toml`, as a
+concurrency signal.)
 
 Inheritance is always valid. It is the right choice when the user has not
 asked for anything different and the evidence does not support a better
@@ -234,11 +240,15 @@ Decide each role's selection while writing `roles.json`:
 1. **Explicit user request.** Set exactly the fields and values the user
    named, with `"selection": {"mode": "user"}` and an optional one-line
    `reason`. When the user named a model by the display name the summary
-   shows, write that line's execution id, still as mode `user`. If a pinned
-   value is refused (a display name with a space fails the value grammar,
-   for example) or matches nothing in the summary, ask the user for the exact
-   value; never drop the pin to inherit. A request to keep native settings
-   means step 4.
+   shows, write that line's execution id, still as mode `user`. An exact,
+   syntactically valid id that the summary does not list (a custom
+   provider's model, for example) is forwarded unchanged: write it as given,
+   do not ask about it, and expect the runner's `unverified: not in the
+   discovered catalog; forwarded unchanged` note. Ask the user for the exact
+   value only when what they named is ambiguous (an alias or a display name
+   that does not identify one execution id) or fails the value grammar (a
+   display name with a space, for example); never drop the pin to inherit.
+   A request to keep native settings means step 4.
 2. **Routed pair.** When the summary says `routing: eligible` and the
    descriptions support a model and effort for this role, set both with
    `{"mode": "routed", "snapshot_id": "<id>", "reason": "<one line>"}`. The
@@ -336,14 +346,26 @@ goes through, with the partial-pin note when discovery reports the defaults
 present or unknown (a run with no snapshot carries no advisories at all);
 pin both values if the user's intent depends on the pair.
 
+macOS managed preferences and a legacy `managed_config.toml` go further:
+they outrank even command-line overrides. Discovery names the kind of layer
+the configured model and effort came from, and when one of those layers
+(origin `mdm`, `legacyManagedConfigTomlFromFile`, or
+`legacyManagedConfigTomlFromMdm`) supplied either value, routing and
+native-model effort adjustment are unavailable, because such a layer would
+replace what the council sends. An explicit user pin is still forwarded,
+but on such a machine the layer may override it; say so when you report.
+
 ### Per-invocation overrides, including resume
 
 The runner passes the values it sends as `codex exec -m <model>` and
 `-c model_reasoning_effort="<effort>"`, before `resume`, on every invocation
-of that role. They are not stored with the thread. A follow-up that reuses a
-role id and sends no override runs on the current native configuration, not
-on the model the thread was recorded with (verified on codex-cli 0.157.1).
-Automatic choices are made again from a new discovery for each council;
+of that role. The council persists none of them: its state file records the
+thread id, never a model or effort, so no override carries over to a later
+invocation. Codex itself records the model a thread ran with in its own
+thread metadata, but that record is not an override either: a follow-up
+that reuses a role id and sends no override runs on the current native
+configuration, not on the model the thread was recorded with (verified on
+codex-cli 0.157.1). Automatic choices are made again from a new discovery for each council;
 repeat an explicit pin when continuity matters. When a resumed thread runs
 on a different model than it was recorded with, Codex prints an advisory,
 and the role's report shows it verbatim as a warning.

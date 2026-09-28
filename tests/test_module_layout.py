@@ -254,6 +254,7 @@ class ModuleStateTests(unittest.TestCase):
         for state, owner in (
             ("_diagnostics", "council_common"),
             ("_roles_recovery_text", "council_common"),
+            ("_project_root_cache", "council_common"),
             ("_ROLE_LIVENESS", "codex_council"),
             ("STATE_DIR", "codex_council"),
         ):

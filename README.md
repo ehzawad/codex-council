@@ -220,9 +220,9 @@ sequenceDiagram
     C->>C: Per role choose a routed pair, a native-model effort, the user's pin, or inheritance
     C->>U: Announce panel
     C->>F: Write roles.json and context.md
-    C->>S: --check-staging-dir F --skill-contract 3
-    S-->>C: staging OK, then one selection plan line per role
-    C->>S: run_in_background: --roles-file F/roles.json --context-file F/context.md --skill-contract 3
+    C->>S: --check-staging-dir F --skill-contract 3 (its own foreground call)
+    S-->>C: exit 0: staging OK, then one selection plan line per role
+    C->>S: only after exit 0, a separate call with run_in_background: --roles-file F/roles.json --context-file F/context.md --skill-contract 3
     C->>S: Monitor: --follow F --skill-contract 3 (separate read-only process)
     S->>S: privacy gate, parse roles, authoring check against the snapshot
     opt a role is routed or native_effort and routing is on
@@ -365,8 +365,11 @@ an explicit override of **either** the model **or** the reasoning effort
 makes Codex ignore **both** of those managed defaults, so pinning only an
 effort can change the model too. Legacy managed defaults
 (`managed_config.toml` or macOS managed preferences) take precedence even over
-CLI `--config` overrides, so on a machine that uses them a value the council
-sends may not be the one that runs.
+CLI `--config` overrides. When discovery sees that one of them supplied the
+configured model or effort, automatic routing and native-model effort
+adjustment stand down, so the council sends no automatic value such a layer
+would replace. An explicit pin is still sent, and on such a machine it may
+not be the value that runs.
 
 **Where workers run.** Every worker runs as `codex exec -C <root>`, where
 `<root>` is the Git top level of the directory the council was launched from,
@@ -412,7 +415,8 @@ and asks for five things only: the handshake, the account type, the
 configuration Codex resolves for the project root, managed requirements, and
 the model catalog (`initialize`, `account/read`, `config/read`,
 `configRequirements/read`, `model/list`). It never starts a thread or a turn,
-never logs in, and is bounded to 20 seconds. It writes
+never logs in, and is bounded to 20 seconds, including the Git lookup that
+finds the project root. It writes
 `ABS_RUNDIR/model-snapshot.json` (mode 0600) and prints a compact summary:
 the native model and effort and the kind of layer each came from, managed
 new-thread defaults, whether routing is eligible, whether effort can be
@@ -425,8 +429,12 @@ and configuration text is printed as data, with control characters escaped.
 There is no cross-run cache: every run directory gets its own snapshot.
 `--discover` exits 0 even when discovery is unavailable or `codex` is missing;
 the summary then says to write no automatic selections: explicit pins still
-apply, and every other role inherits. Its first line always carries the
-plugin `version=`. It exits 2 for a directory that already holds a launch
+apply, and every other role inherits. A problem is reported by fixed codes
+only (for example `server_exited:initialize, server_stderr:other`); the
+app-server's stderr text never reaches the snapshot or any output, because it
+can carry account identity or tokens. Ctrl+C, SIGTERM, or SIGHUP tears the
+discovery processes down before the command exits. Its first line always
+carries the plugin `version=`. It exits 2 for a directory that already holds a launch
 (see Preflight). The skill runs it even with routing off, because explicit
 pins get their advisory notes from the snapshot.
 
@@ -434,17 +442,21 @@ Routing is eligible only when routing is on, discovery completed, the catalog
 is complete and well-formed, you are signed in, the configured provider is the
 default OpenAI one with no endpoint override (`openai_base_url` or
 `chatgpt_base_url`), no `model_catalog_json` catalog file, and no managed
-provider, model-catalog, or endpoint setting, `CODEX_API_KEY` is not set, and
-no managed new-thread defaults are present. An overridden endpoint counts as a
-different provider because the catalog discovery reads is not evidence of what
-that endpoint serves. A `model_catalog_json` file replaces the catalog with
+provider, model-catalog, or endpoint setting, `CODEX_API_KEY` is not set,
+no managed new-thread defaults are present, and neither the configured model
+nor the effort comes from a managed layer that outranks CLI flags (macOS
+managed preferences or a legacy `managed_config.toml`). An overridden
+endpoint counts as a different provider because the catalog discovery reads
+is not evidence of what that endpoint serves. A `model_catalog_json` file replaces the catalog with
 entries someone wrote, and any config layer can set it, including a trusted
 project's `.codex/config.toml`, so the repository under review could describe
 the models that review it. The summary lists every reason that fails.
 Adjusting only the effort on the native model has its own proof: discovery
-completed, no managed new-thread defaults, a matching provider, endpoint, and
-catalog, no `CODEX_API_KEY`, a configured model, and a well-formed catalog
-entry for exactly that model (a hidden one counts), so its efforts are known. Available models, efforts, and defaults depend on the
+completed, you are signed in, no managed new-thread defaults and no managed
+layer that outranks CLI flags set the model or effort, a matching provider,
+endpoint, and catalog, no `CODEX_API_KEY`, a configured model, and a
+well-formed catalog entry for exactly that model (a hidden one counts), so
+its efforts are known. Available models, efforts, and defaults depend on the
 client and the account, so the catalog is evidence of what is advertised to
 you, not a guarantee of access. Its recommended marker is never treated as
 your configured model.
@@ -503,10 +515,14 @@ holds a launch (`out.md`, `err.log`, or `replies/` exists): every launch,
 including a re-run of one role or a follow-up round, gets its own
 `mktemp -d` directory, because the launch command's own redirections would
 truncate a running council's `out.md` and `err.log` before the runner could
-object. Those redirections also mean a staged launch refused before
-dispatch has used up its directory, so its `err.log` recovery starts over in
-a new one with its own `--discover` rather than re-running the preflight
-there. It checks each automatic selection against
+object. The launch itself does not check for an earlier launch, so the
+skill runs the preflight as its own Bash call and launches, in a separate
+call, only after it exits 0: in one combined call a refused preflight would
+not stop the launch. Those redirections also mean a staged launch refused
+before dispatch, including one whose `roles.json` or `context.md` is
+missing or misplaced, has used up its directory, so its `err.log` recovery
+starts over in a new one with its own `--discover` rather than re-running
+the preflight there. It checks each automatic selection against
 `ABS_RUNDIR/model-snapshot.json` and prints the plan, one line per role:
 
 ```
@@ -534,12 +550,12 @@ snapshot is never overwritten. A choice the fresh evidence no longer supports
 falls back to native inheritance with the reason logged, instead of failing
 the run. That covers discovery now unavailable, routing now ineligible for a
 routed pair, a model that is gone, hidden, or retired (including a
-retirement that passed after discovery), an effort no longer advertised, or a
-native model no longer proven. `native_effort` sends the native model that
-launch discovery proves only when it is the one discovery planned with: the
-effort was chosen from that model's descriptions, so a changed native model
-(a config edit, or a launch from another project root) falls back instead of
-carrying the effort over. A council of only inherited and explicit roles runs
+retirement that passed after discovery, even while launch discovery ran), an
+effort no longer advertised, or a native model no longer proven.
+`native_effort` sends the native model that launch discovery proves only
+when it is the one discovery planned with: the effort was chosen from that
+model's descriptions, so a changed native model (a config edit, or a launch
+from another project root) falls back instead of carrying the effort over. A council of only inherited and explicit roles runs
 no launch discovery at all.
 
 **`CODEX_COUNCIL_MODEL_ROUTING`.** Unset, empty, or `auto` keeps routing on.
@@ -586,7 +602,9 @@ the `requested_model=` and `requested_effort=`.
 
 **Model and quota failures.** When Codex rejects the model for an
 invocation—a structured `model_not_found`, or Codex's own complete rejection
-sentence—the role fails as `[model-rejected]`. That failure is terminal. It
+sentence—the role fails as `[model-rejected]`, even when another error in the
+same failure is about reasoning effort or service tier, and even when the
+model id contains those words. That failure is terminal. It
 is not retried, no substitute model is tried, it never clears a saved thread,
 and the message quotes Codex and names one next step for the model that was
 refused: re-run the role with `model`, `effort`, and `selection` omitted (a
@@ -594,12 +612,20 @@ routed model), change or remove the pin (a user model pin), or ask the user
 to update the Codex configuration or name a model to pin (the natively
 configured model, which a native-effort role, an effort-only pin, or native
 inheritance runs, and which an inheriting re-run would send again; Claude
-never edits Codex configuration itself). A
-usage, quota, or credit limit fails as `[quota]`, which is terminal and
-never retried, even when the provider reports it as HTTP 429. When Codex
-says the usage limit is for one model, the `[quota]` message ends with the
-same next step as a rejection of the model that was sent, so a routed role
-can re-run on native configuration instead of waiting for the reset.
+never edits Codex configuration itself). A routed or pinned model that
+discovery proved is the native model gets that last step too, and the
+message says it is also the natively configured model, since dropping it
+would send the same model again. A usage, quota, or credit limit fails as
+`[quota]`, which is terminal and never retried, even when the provider
+reports it as HTTP 429. When Codex says the usage limit is for one model,
+the `[quota]` message ends with the same next step as a rejection of the
+model that was sent, so a routed role whose model is not the native one can
+re-run on native configuration instead of waiting for the reset. An
+authentication failure (HTTP 401, an `authentication_error` or
+`invalid_api_key` error, or Codex's sign-in wording) fails as `[auth]`: never
+retried, and it never clears a saved thread even when its text looks like a
+stale one. Only failures classified as a rate limit, a 5xx, or a replay-safe
+stall are retried; the decision is never read back from Codex's message text.
 
 ### Other settings
 
@@ -637,7 +663,8 @@ stretches — the heartbeat's `quiet=Ns` measures bytes, not progress. Codex's
 own per-provider stream-idle guard
 (`model_providers.<id>.stream_idle_timeout_ms`) remains a separate,
 provider-scoped control in your own Codex configuration. Ctrl+C tears down
-every codex process group. While work remains, the runner writes a status
+every codex process group, and so do SIGTERM and SIGHUP, including during
+launch discovery. While work remains, the runner writes a status
 heartbeat to the staged `err.log` — cadence adapts to the watchdog
 (`stall_secs / 3`, bounded 300–1800s; every 600s at the default watchdog,
 every 1800s when disabled) and each line carries per-role `quiet=Ns` (or
@@ -671,6 +698,8 @@ each timeout; either way progress surfaces without a shell polling loop.
 - **One launch per run directory.** Every launch, including a re-run of one
   rejected role or a follow-up round, gets its own `mktemp -d` directory;
   `--discover` and the preflight refuse a directory that already launched.
+  The launch itself does not check for an earlier launch, so the skill runs
+  the preflight as its own call and launches only after it exits 0.
 - **Verifier framing.** The collaboration brief tells each role it is an
   independent cross-model check: the user's requirements are authoritative,
   Claude's account of the work is a set of claims to verify, and verified

@@ -3,17 +3,21 @@
 Not a test module itself (the name does not match test*.py); test files
 import it (unittest discover puts tests/ on sys.path). It holds what more
 than one test module needs: the usage-exit assertion, one clean
-environment, the synthetic discovery observations and snapshot builder,
-the per-module fake `codex` install, and the discovery-methods check with
-its independent FORBIDDEN_METHODS and login guards. The fake itself, and
+environment, the process checks that prove teardown left nothing behind,
+the synthetic discovery observations and snapshot builder, the per-module
+fake `codex` install, and the discovery-methods check with its independent
+FORBIDDEN_METHODS and login guards. The fake itself, and
 its DISCOVERY_METHODS allowlist, live in fake_codex.py.
 """
 
 import contextlib
 import io
 import os
+import signal
+import subprocess
 import sys
 import tempfile
+import time
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS_DIR = os.path.abspath(os.path.join(
@@ -63,6 +67,54 @@ def clean_env(**extra):
     }
     env.update(extra)
     return env
+
+
+# ---------- processes the fake codex leaves behind ----------
+
+def pid_running(pid):
+    """False once pid has exited; a zombie awaiting its reaper is dead."""
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
+            return f.read().rpartition(")")[2].split()[0] != "Z"
+    except OSError:
+        pass
+    state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)],
+                           capture_output=True, text=True).stdout.strip()
+    return bool(state) and not state.startswith("Z")
+
+
+def pid_gone(pid, timeout=5.0):
+    """True once pid is no longer running (polls up to `timeout`)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not pid_running(pid):
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def kill_quietly(pid):
+    """SIGKILL pid if it is still a fake codex process (a test cleanup).
+
+    The command-line check keeps a recycled pid from ever being signalled.
+    """
+    command = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                             capture_output=True, text=True).stdout
+    if "fake_codex_impl.py" in command:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
+
+
+def default_signal_dispositions():
+    """preexec_fn: SIGINT, SIGTERM, and SIGHUP back to their defaults in
+    the child, so a signal test also works when the suite itself runs with
+    one ignored (a background job, nohup)."""
+    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(signum, signal.SIG_DFL)
 
 
 # ---------- synthetic snapshots (built by the real snapshot builder) ----------
