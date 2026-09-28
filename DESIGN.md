@@ -668,7 +668,8 @@ old one; the skill mints a new id instead.
 ## One attempt and its watchdog
 
 **Purpose.** Run one `codex exec`, notice a silent process without imposing
-a run-level deadline, and make sure nothing the attempt started outlives it.
+a run-level deadline, and make sure codex's process group does not outlive
+the attempt.
 
 ![d26-attempt: the prompt and argv, codex exec in its own process group, the output pumps, the per-attempt activity clock, the watchdog, the post-exit drain, the termination owner, the sweep, and the CodexRun result](docs/diagrams/d26-attempt.png)
 
@@ -677,16 +678,20 @@ has its own copy of all of this. Source:
 [d26-attempt.mmd](docs/diagrams/d26-attempt.mmd).*
 
 **How it works.** The runner starts `codex exec` with
-`start_new_session=True`, so codex and anything it spawns share a process
-group that belongs to this attempt alone. Both pumps start before the prompt
-is written to stdin. They read stdout and stderr in fixed-size chunks (never
+`start_new_session=True`, so codex leads a process group that belongs to
+this attempt alone. The group signals and the sweep below reach codex and
+any child that stays in that group. Current codex starts each tool command
+in its own session and each MCP server in its own process group, so those
+are outside it (see Limits). Both pumps start before the prompt is written
+to stdin. They read stdout and stderr in fixed-size chunks (never
 line-buffered reads, which would cap JSONL line sizes), buffer the raw bytes,
 and decode once at the end, so a UTF-8 sequence split across chunks
 survives. Every byte on either stream resets this attempt's activity clock;
 another role's output never keeps this one alive. The stdout pump also
-scans JSONL events for the stall policy's flags; a line that does not decode
-(too deeply nested, or holding an out-of-range number) is skipped and can
-never stop a pump.
+scans JSONL events for the stall policy's flags. A non-blank line that is
+not a JSON object (it does not decode, is too deeply nested, holds an
+out-of-range number, or is another JSON value) could hide an item, so it
+counts as unknown work; it never stops a pump.
 
 The council has no total elapsed-time or run-level deadline. The
 output-inactivity watchdog fires after `CODEX_COUNCIL_STALL_SECS` seconds of
@@ -699,13 +704,14 @@ The runner watches codex's own exit rather than its pipes, because on some
 Python versions `Process.wait()` also waits for the pipes, which a
 descendant can hold open forever. After the exit, the pipes get
 `POST_EXIT_DRAIN_SECS` (10 s) to reach EOF, counted from the observed exit
-and never extended by more output. A descendant still holding them gets the
-group terminated and the pumps stopped; the output already read is kept with
-the warning `codex exited but its process group kept its output open; the
-group was terminated`. When the attempt ends, whatever is left in the group
-is swept. A cancellation at any point, the drain and the sweep included,
-still tears the group down; SIGINT, SIGTERM, and SIGHUP cancel the whole
-fan-out and end the run without the `CODEX_COUNCIL_DONE` line.
+and never extended by more output. If they are still open at the bound, the
+runner terminates the group and stops the pumps, whoever holds the pipes;
+the output already read is kept with the warning `codex exited but its
+process group kept its output open; the group was terminated`. When the
+attempt ends, whatever is left in the group is swept. A cancellation at any
+point, the drain and the sweep included, still tears the group down;
+SIGINT, SIGTERM, and SIGHUP cancel the whole fan-out and end the run without
+the `CODEX_COUNCIL_DONE` line.
 
 ![d27-stall: a stalled attempt becomes ok with a warning, a terminal stall, or a retriable stall](docs/diagrams/d27-stall.png)
 
@@ -719,10 +725,11 @@ was buffered, the kill hit a wedged shutdown: the reply is kept as success
 with the warning "codex wedged after completing its turn; process
 terminated" and state is saved best-effort. Otherwise, if every item started
 or completed was an agent message, reasoning, or a Codex `error` notice (the
-resume advisory, for example), replay is safe and the attempt is
-`[retriable:stall]`. Any other item type, known or not, makes it a terminal
-`[stall]`, and a buffered message without turn completion is quoted but
-never promoted to success.
+resume advisory, for example), and every non-blank stdout line was a JSON
+object, replay is safe and the attempt is `[retriable:stall]`. Any other
+item type, known or not, or a line that is not a JSON object, makes it a
+terminal `[stall]`, and a buffered message without turn completion is
+quoted but never promoted to success.
 
 **Key decisions and why.**
 
@@ -734,11 +741,16 @@ never promoted to success.
   the user's Codex configuration.
 - *No run-level deadline.* A long, productive role must not be killed for
   taking long; the host bounds a run's lifetime.
-- *Conservative replay.* An unknown item type counts as work, because
-  replaying a turn that did work could repeat its side effects.
+- *Conservative replay.* An unknown item type, or a line that is not a
+  JSON object, counts as work, because replaying a turn that did work could
+  repeat its side effects.
 
-**Limits.** A descendant that moves into its own session or process group
-escapes the group signals and the sweep. A process that keeps writing
+**Limits.** The group signals and the sweep reach codex and the children
+that stay in its process group, nothing else. Current codex runs each tool
+command in its own session, so a tool command that is running when codex is
+terminated (by the watchdog, a cancellation, or `--reap`) keeps running
+until it ends; the same holds for any process outside the group that still
+holds codex's pipes when the drain bound ends. A process that keeps writing
 keepalive bytes resets the clock without making progress. Setting the
 watchdog to 0 permits an indefinitely silent role.
 
@@ -959,6 +971,9 @@ state (`running`, `not responding`, `gone`, `done`, `interrupted`,
 `aborted`, or `unknown`) with its pid and tick age, the settled count, one
 line per unfinished role with its state, attempt, quiet seconds, and codex
 pid, the live codex groups when the runner is gone, and one `next:` action.
+Quiet seconds count from the last output recorded at the latest status
+tick, so they can read up to 15 s high; the heartbeat in `err.log` uses the
+live value.
 `--reap RUNDIR` acts only when the runner is gone: it sends SIGTERM, then
 SIGKILL, to each recorded group whose leader still has the recorded start
 identity, reports and leaves alone every other group (and never its own),
@@ -969,8 +984,9 @@ directory.
 **Key decisions and why.**
 
 - *Facts, not health.* A fresh tick shows the runner's event loop is
-  turning; `quiet=Ns` shows time since the last output byte. Neither shows
-  that a role is making progress, so no command claims health.
+  turning; `quiet=Ns` shows time since the last output byte (in `--status`,
+  as of the latest tick). Neither shows that a role is making progress, so
+  no command claims health.
 - *Identity, never command-line matching.* A pid alone can be reused, and a
   command line can be imitated; a pid plus its start time cannot.
 - *Recovery stays with Claude.* A supervisor process would need its own
@@ -983,8 +999,10 @@ directory.
   running until `--reap` ends them.
 - A runner killed within milliseconds of starting a codex process can leave
   a group it never recorded.
-- A descendant that moved into its own session is outside its role's group,
-  so neither the sweep nor `--reap` reaches it.
+- `--status` and `--reap` see only the recorded codex process groups.
+  Current codex runs each tool command in its own session, so a tool
+  command still running when its codex is reaped keeps running until it
+  ends, and neither command lists it.
 - `--reap` leaves alone a group whose leader has exited, even if other
   members remain, because it cannot verify them.
 - Liveness checks need a `ps` that supports `-A` and `-o pid,pgid,stat,lstart`;
@@ -1003,8 +1021,9 @@ reply files and overrides (`test_replies_and_overrides.py`), liveness
 `tests/liveness_scenarios.py` runs the liveness scenarios end to end against
 the real CLI and prints a verdict and the follower's line count for each: the
 happy path, a descendant holding codex's output open, a SIGKILLed runner, a
-stopped runner, a follower whose parent dies, and a role that is silent for a
-while and then succeeds.
+stopped runner, a follower whose parent dies, a role that is silent for a
+while and then succeeds, and a role whose stdout carries lines no JSON
+parser accepts while its stderr keeps printing.
 
 The documentation tests check behavior, not prose: every runner command a
 document shows parses with the runner's own parser; every example of

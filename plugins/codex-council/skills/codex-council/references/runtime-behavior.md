@@ -431,8 +431,10 @@ It prints about ten lines at most and exits 0: the runner's state
 (`running`, `not responding`, `gone`, `done`, `interrupted`, `aborted`, or
 `unknown`) with its pid and tick age, how many roles settled, one line per
 unfinished role (state, attempt, quiet seconds, codex pid), the live codex
-process groups when the runner is gone, and one `next:` action. It states
-facts (present, gone, tick age, quiet seconds), never health.
+process groups when the runner is gone, and one `next:` action. Quiet
+seconds count from the last output recorded at the latest status tick, so
+they can read up to 15 seconds high. It states facts (present, gone, tick
+age, quiet seconds), never health.
 
 When the runner is gone and `--status` lists live codex groups, first
 confirm that the council's background task has ended, then run:
@@ -447,7 +449,10 @@ started at another time) and refuses with exit 1 otherwise. It sends
 SIGTERM, then SIGKILL, to each recorded codex process group whose leader is
 still this run's codex (same pid and start time), leaves any other group
 alone, prints what it did, and never touches saved threads, replies, or
-other files. Then re-run the unfinished roles in a new directory.
+other files. Then re-run the unfinished roles in a new directory. Current
+codex runs each tool command in its own session, outside codex's group, so
+a tool command still running at that point keeps running until it ends;
+neither `--status` nor `--reap` sees it.
 
 Without the Monitor tool, what works depends on whether the end of your
 turn ends the host. Never poll with a shell `sleep` loop in either case.
@@ -696,8 +701,8 @@ conclusion from it.
 - `[retriable:stall]` — a watchdog-terminated attempt with no
   side-effect-capable tool work — retries through the same shared budget as
   rate-limit/5xx; there is no separate stall budget. `[stall]` is terminal:
-  tool work had begun, so an automatic replay could duplicate side effects —
-  re-invoke the role manually if needed.
+  tool work may have begun, so an automatic replay could duplicate side
+  effects — re-invoke the role manually if needed.
 - **Usage/quota-limit** and authentication failures do not retry: a
   recognized quota failure is tagged `[quota]` even when it carries HTTP 429.
   Fix the plan cap, credits, or authentication and invoke the council again.
@@ -735,9 +740,11 @@ and applies the stall policy:
   is saved best-effort; no retry.
 - No side-effect-capable tool work had begun (only pure-text
   agent_message/reasoning items, Codex's own `error` notices such as the
-  resume advisory, or nothing): replay is safe — **`[retriable:stall]`**,
-  retried through the shared retry budget.
-- Otherwise: **terminal `[stall]`** — tool work had begun and replaying could
+  resume advisory, or nothing, and every non-blank stdout line was a JSON
+  object): replay is safe — **`[retriable:stall]`**, retried through the
+  shared retry budget.
+- Otherwise: **terminal `[stall]`** — tool work had begun, or a stdout line
+  that is not a JSON object may have hidden it, and replaying could
   duplicate side effects. A buffered agent_message without turn completion is
   quoted in the error but never auto-promoted to success.
 
@@ -749,14 +756,17 @@ structured and handled before any text classification, so stale- or
 auth-looking fragments in a killed run's stderr neither classify the failure
 nor clear resume state.
 
-Each codex process group belongs to one attempt. Once codex exits, its
-pipes get 10 seconds to reach EOF. A descendant that still holds them open
-(for example a background process a tool call started) makes the runner
-terminate the attempt's process group; the reply already read is kept, with
-the warning `codex exited but its process group kept its output open; the
-group was terminated`. The group is swept when every attempt ends, so
-tool-started descendants never outlive their role; a descendant that moved
-into its own session is outside that sweep.
+Each codex process group belongs to one attempt. Its signals and sweep
+reach codex and any child that stays in the group. Current codex starts
+each tool command in its own session and each MCP server in its own process
+group, so a tool command that is running when codex is terminated (by the
+watchdog, a cancellation, or `--reap`) keeps running until it ends. Once
+codex exits, its pipes get 10 seconds to reach EOF. If they are still open
+then (a process that inherited codex's output still holds them), the runner
+terminates the attempt's process group and stops reading; the reply already
+read is kept, with the warning `codex exited but its process group kept its
+output open; the group was terminated`. The group is swept when every
+attempt ends.
 
 The watchdog's claim is **output-inactivity recovery only**; semantic wedge
 detection is out of scope. Current codex `exec --json` suppresses

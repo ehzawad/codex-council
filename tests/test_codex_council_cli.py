@@ -37,7 +37,8 @@ from fake_codex import EXEC_SENTINELS  # noqa: E402
 # status-400 body whose text holds "429", which must NOT be tagged
 # retriable), replies with a body embedding a forged CODEX_COUNCIL_DONE
 # line, fails with a 503 on its first invocation only, makes the council
-# state directory read-only before replying, or hangs byte-silent.
+# state directory read-only before replying, hangs byte-silent, or writes
+# stdout lines no JSON parser accepts (then, with a sleep, goes silent).
 FAIL_SENTINEL = EXEC_SENTINELS["fail"]
 STDOUT_ERROR_SENTINEL = EXEC_SENTINELS["stdout_error"]
 STATUS400_429_SENTINEL = EXEC_SENTINELS["status400_429"]
@@ -45,6 +46,8 @@ FORGE_SENTINEL = EXEC_SENTINELS["forge"]
 RETRY_ONCE_SENTINEL = EXEC_SENTINELS["retry_once"]
 CHMOD_STATE_SENTINEL = EXEC_SENTINELS["chmod_state"]
 HANG_SENTINEL = EXEC_SENTINELS["hang"]
+MALFORMED_LINES_SENTINEL = EXEC_SENTINELS["malformed_lines"]
+SLEEP_SENTINEL = EXEC_SENTINELS["sleep_secs"]
 
 setUpModule = council_testlib.install_fake_codex
 tearDownModule = council_testlib.remove_fake_codex
@@ -827,6 +830,29 @@ class StallWatchdogCliTests(CouncilCLITestCase):
             r"CODEX_COUNCIL_DONE ok=0 total=1 elapsed=[\d.]+s exit=1 "
             r"version=\S+$",
         )
+
+    def test_unreadable_lines_then_silence_is_a_terminal_stall(self):
+        """A stdout line that does not decode could have been tool work,
+        so a stall after it is terminal: one attempt, never a replay."""
+        roles_path = self._write_role(
+            f"Review {MALFORMED_LINES_SENTINEL} {SLEEP_SENTINEL}300")
+        pid_dir = os.path.join(self.workdir.name, "pids")
+        os.mkdir(pid_dir)
+        env = dict(self.env, CODEX_COUNCIL_STALL_SECS="1",
+                   FAKE_CODEX_PID_DIR=pid_dir)
+        proc = subprocess.run(
+            [sys.executable, SCRIPT, "--roles-file", roles_path],
+            input="please review\n", capture_output=True, text=True,
+            env=env, cwd=self.workdir.name, timeout=60,
+        )
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertEqual(proc.stderr.count("stall threshold reached"), 1,
+                         proc.stderr)
+        self.assertNotIn("retriable error on attempt", proc.stderr)
+        self.assertIn("[stall]", proc.stdout)
+        self.assertNotIn("[retriable:stall]", proc.stdout)
+        execs = [n for n in os.listdir(pid_dir) if n.startswith("exec-")]
+        self.assertEqual(len(execs), 1, execs)
 
 
 class ReadOnlyStateDirTests(CouncilCLITestCase):

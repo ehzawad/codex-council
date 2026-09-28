@@ -98,8 +98,11 @@ side-effect-capable work had begun, success-with-warning when the turn had
 already completed, terminal otherwise. Setting 0 permits an indefinitely
 silent role. Ctrl+C tears down every in-flight codex process group. Each
 codex process group belongs to one attempt: after codex exits its pipes get
-a bounded drain, and whatever is left in the group is then terminated, so
-tool-started descendants never outlive their role.
+a bounded drain, and whatever is left in the group is then terminated. The
+group signals reach codex and any child that stays in its group; current
+codex starts each tool command in its own session and each MCP server in
+its own process group, so a tool command still running when codex is
+terminated keeps running until it ends.
 
 The optional `--skill-contract <int>` flag pins the SKILL/script contract
 epoch: absent it is ignored; present it must equal this script's epoch or
@@ -498,7 +501,7 @@ def load_session(role_id):
     try:
         with open(_state_path(role_id)) as f:
             meta = json.load(f)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError, RecursionError):
         return None, None
     # Corrupt state that is valid JSON but not an object (e.g. "[]") must
     # degrade to a fresh start like any other corruption, not crash the role.
@@ -671,9 +674,10 @@ class _EventFlagScanner:
     (command executions, MCP tool calls, file changes, web searches, to-do
     lists, collab tool calls, and any unknown/future type) marks the attempt
     unsafe to replay — conservative by default, since replaying such a turn
-    could duplicate side effects. A line that does not decode (including one
-    nested too deeply or holding an out-of-range number) is skipped, never
-    allowed to stop the stdout pump.
+    could duplicate side effects. A non-blank line that is not a JSON object
+    (it does not decode, is nested too deeply, holds an out-of-range number,
+    or is another JSON value) could hide such an item, so it marks the
+    attempt unsafe to replay too; it never stops the stdout pump.
     """
 
     _SAFE_ITEM_TYPES = frozenset({"agent_message", "reasoning", "error"})
@@ -702,8 +706,9 @@ class _EventFlagScanner:
         try:
             event = json.loads(line)
         except (ValueError, RecursionError):
-            return
+            event = None
         if not isinstance(event, dict):
+            self.unsafe_to_replay = True
             return
         event_type = event.get("type")
         if event_type == "turn.completed":
@@ -719,12 +724,13 @@ async def _run_codex_subprocess(cmd, prompt, role_id=""):
     """Run codex exec async with incremental readers and a stall watchdog.
 
     start_new_session=True puts codex in its own process group, which
-    belongs to this attempt alone: a SIGTERM to the group also reaches any
-    shell commands codex spawned for tool calls. Once codex exits, its pipes
-    get POST_EXIT_DRAIN_SECS to reach EOF; a descendant still holding them
-    then gets the group terminated, and the output already read is kept with
-    POST_EXIT_DRAIN_WARNING. Either way the group is swept when the attempt
-    ends, so tool-started descendants never outlive their role.
+    belongs to this attempt alone. The group signals reach codex and any
+    child that stays in that group, not a tool command or MCP server that
+    codex starts in its own session or group. Once codex exits, its pipes
+    get POST_EXIT_DRAIN_SECS to reach EOF; if they are still open, the group
+    is terminated and the pumps stop, and the output already read is kept
+    with POST_EXIT_DRAIN_WARNING. Either way the group is swept when the
+    attempt ends.
 
     Returns a CodexRun. All termination paths — the watchdog, the drain
     bound, outer cancellation, and any post-spawn failure — converge on one
@@ -1004,8 +1010,8 @@ def _stalled_role_result(role, run, stored_id, attempt, started, warning=None):
         )
     error = (
         f"[stall] no output for {stall}s (watchdog {stall}s); not "
-        "automatically retried because tool work had begun — re-invoke the "
-        "role manually if needed"
+        "automatically retried because tool work may have begun — re-invoke "
+        "the role manually if needed"
     )
     if msg:
         error += f"\nlast (possibly incomplete) agent_message: {msg}"

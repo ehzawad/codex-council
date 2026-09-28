@@ -12,6 +12,8 @@ and prints one verdict line with the number of lines the follower emitted:
   S3  the runner is alive but its event loop is blocked (SIGSTOP).
   S4  the follower's parent process dies.
   S5  a role is byte-silent for a while, then succeeds.
+  S6  a role writes stdout lines no JSON parser accepts while its stderr
+      keeps printing, then succeeds.
 
 S3 compresses time: while the runner is stopped nothing rewrites
 status.json, so the scenario backdates its tick to stand for the minutes a
@@ -506,6 +508,24 @@ def s5_silent_role(runner, fake_bin):
                        len(follower.lines))
 
 
+def s6_malformed_lines(runner, fake_bin):
+    roles = [_role("garbled", f"{SENTINELS['malformed_lines']}.")]
+    with Council(runner, fake_bin, roles) as c:
+        c.launch()
+        follower = c.follow()
+        code = follower.wait_exit(60)
+        runner_code = c.wait_runner(30)
+        reply = c.read("replies", "garbled.md")
+        err = c.read("err.log")
+        ok = "status=ok" in reply and "fake reply from codex" in reply
+        crashed = "Traceback" in err or "crashed" in err
+        passed = code == 0 and runner_code == 0 and ok and not crashed
+        detail = (f"follower exit={code}; runner exit={runner_code}; "
+                  f"reply ok={ok}; traceback or crash in err.log={crashed}")
+        return Outcome("S6", "malformed stdout lines, chatty stderr", passed,
+                       detail, len(follower.lines))
+
+
 SCENARIOS = {
     "S0": s0_happy_path,
     "S1": s1_held_pipe,
@@ -513,6 +533,7 @@ SCENARIOS = {
     "S3": s3_runner_stopped,
     "S4": s4_follower_orphaned,
     "S5": s5_silent_role,
+    "S6": s6_malformed_lines,
 }
 
 

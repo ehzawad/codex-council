@@ -45,13 +45,16 @@ Subcommands:
   (``stdout_error``) or a status-400 body whose text holds "429"
   (``status400_429``). ``chmod_state`` makes the council state directory
   read-only before a successful reply, and ``forge`` replies with a body
-  that embeds a forged CODEX_COUNCIL_DONE line. Two sentinels drive the
+  that embeds a forged CODEX_COUNCIL_DONE line. Three sentinels drive the
   liveness scenarios: a
   ``PLEASE_SLEEP_SECS=<n>`` prompt stays byte-silent for n seconds after
-  thread.started before replying, and ``PLEASE_LEAK_OUTPUT_HOLDER`` leaves
+  thread.started before replying, ``PLEASE_LEAK_OUTPUT_HOLDER`` leaves
   a sleeper in its process group that holds stdout/stderr open after the
-  fake exits. Each exec writes ``exec-<pid>.pid`` (and a holder
-  ``holder-<pid>.pid``) into FAKE_CODEX_PID_DIR.
+  fake exits, and ``PLEASE_EMIT_MALFORMED_LINES`` writes MALFORMED_LINES
+  to stdout after thread.started, one stderr line after each (combined
+  with a sleep, the malformed lines come first). Each exec writes
+  ``exec-<pid>.pid`` (and a holder ``holder-<pid>.pid``) into
+  FAKE_CODEX_PID_DIR.
 
 Scenario format (every key optional)::
 
@@ -108,6 +111,16 @@ import uuid
 # Filled in by install(): the EXEC_SENTINELS map and NATIVE_MODEL.
 SENTINELS = __SENTINELS__
 NATIVE_MODEL = __NATIVE_MODEL__
+# Stdout lines no JSON parser accepts: nested too deeply (RecursionError), a
+# command_execution item holding an integer past Python's digit limit
+# (ValueError), invalid UTF-8, and a truncated object (JSONDecodeError).
+MALFORMED_LINES = (
+    b"[" * 100000 + b"]" * 100000,
+    b'{"type":"item.started","item":{"type":"command_execution",'
+    b'"exit_code":1' + b"0" * 5000 + b"}}",
+    b"\xff\xfe not utf-8",
+    b'{"type":"item.completed","item":',
+)
 
 
 def _scenario():
@@ -395,6 +408,14 @@ def run_exec(argv, scenario):
     if failure is not None:
         _emit(events + failure)
         return 1
+    if SENTINELS["malformed_lines"] in prompt:
+        _emit(events)
+        events = []
+        for line in MALFORMED_LINES:
+            _write_line(line)
+            sys.stderr.write("fake codex: still working\n")
+            sys.stderr.flush()
+            time.sleep(0.2)
     silent = re.search(re.escape(SENTINELS["sleep_secs"]) + r"(\d+)", prompt)
     if silent:
         _emit(events)
@@ -476,6 +497,7 @@ EXEC_SENTINELS = {
     "quota_429": "PLEASE_QUOTA_429",
     "sleep_secs": "PLEASE_SLEEP_SECS=",
     "leak_output_holder": "PLEASE_LEAK_OUTPUT_HOLDER",
+    "malformed_lines": "PLEASE_EMIT_MALFORMED_LINES",
     "fail": "PLEASE_FAIL",
     "hang": "PLEASE_HANG_SILENTLY",
     "retry_once": "PLEASE_RETRY_ONCE",

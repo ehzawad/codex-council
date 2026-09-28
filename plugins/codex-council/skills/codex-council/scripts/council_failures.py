@@ -187,12 +187,16 @@ def extract_error_messages(jsonl_output):
 
 
 def _expand_error_message(message):
-    """Return the message plus any nested JSON error.message it contains."""
+    """Return the message plus any nested JSON error.message it contains.
+
+    A message that does not decode (including one nested too deeply or
+    holding an out-of-range number) is returned as it is.
+    """
     stripped = message.strip()
     messages = [stripped]
     try:
         decoded = json.loads(stripped)
-    except json.JSONDecodeError:
+    except (ValueError, RecursionError):
         return messages
     if isinstance(decoded, dict):
         error = decoded.get("error")

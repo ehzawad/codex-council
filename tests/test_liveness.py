@@ -767,6 +767,8 @@ class CodexLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(codex_council.extract_final_message(run.stdout),
                          "done")
         self.assertTrue(run.turn_completed)
+        # An unreadable line could have been tool work.
+        self.assertTrue(run.unsafe_to_replay)
 
     async def test_the_run_status_follows_the_codex_process(self):
         seen = []
@@ -876,6 +878,9 @@ class LivenessScenarioTests(unittest.TestCase):
 
     def test_s5_silent_role(self):
         self._assert_passed("S5")
+
+    def test_s6_malformed_lines(self):
+        self._assert_passed("S6")
 
 
 if __name__ == "__main__":

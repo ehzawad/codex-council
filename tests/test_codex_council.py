@@ -359,13 +359,17 @@ class StateIOTests(unittest.TestCase):
         self.assertIsNone(meta)
 
     def test_load_corrupt_returns_none_pair(self):
-        with patch.dict(os.environ, _env_without_session_key(), clear=True):
-            os.makedirs(self.tmp.name, exist_ok=True)
-            with open(codex_council._state_path("architect"), "w") as f:
-                f.write("{not json")
-            sid, meta = codex_council.load_session("architect")
-        self.assertIsNone(sid)
-        self.assertIsNone(meta)
+        for corrupt in (b"{not json", b"\xff\xfe{", b"1" + b"0" * 5000):
+            with self.subTest(corrupt=corrupt[:8]):
+                with patch.dict(os.environ, _env_without_session_key(),
+                                clear=True):
+                    os.makedirs(self.tmp.name, exist_ok=True)
+                    with open(codex_council._state_path("architect"),
+                              "wb") as f:
+                        f.write(corrupt)
+                    sid, meta = codex_council.load_session("architect")
+                self.assertIsNone(sid)
+                self.assertIsNone(meta)
 
     def test_load_valid_json_non_dict_returns_none_pair(self):
         """Valid JSON that is not an object (a list, a bare string) must
@@ -525,6 +529,15 @@ class ExtractErrorMessagesTests(unittest.TestCase):
             council_failures.extract_error_messages(jsonl),
             [inner, "The model is unsupported."],
         )
+
+    def test_a_message_that_does_not_decode_is_kept_as_text(self):
+        """A message too deeply nested or holding an out-of-range number
+        is failure text, never an exception out of classification."""
+        for message in ("[" * 100000 + "]" * 100000, "1" + "0" * 5000):
+            with self.subTest(size=len(message)):
+                jsonl = json.dumps({"type": "error", "message": message})
+                self.assertEqual(
+                    council_failures.extract_error_messages(jsonl), [message])
 
 
 # ---------- error classifiers ----------
@@ -3179,11 +3192,30 @@ class EventFlagScannerTests(unittest.TestCase):
         s.finish()
         self.assertTrue(s.turn_completed)
 
-    def test_garbage_lines_are_ignored(self):
+    def test_blank_lines_are_ignored(self):
         s = codex_council._EventFlagScanner()
-        self._feed(s, "not json\n[]\nnull\n\xff\n")
+        self._feed(s, "\n  \n\r\n")
+        s.finish()
         self.assertFalse(s.turn_completed)
         self.assertFalse(s.unsafe_to_replay)
+
+    def test_a_line_that_is_not_a_json_object_is_unknown_work(self):
+        """Such a line could hide a tool item, so it is never replay-safe;
+        each kind is checked alone, the unterminated last line included."""
+        undecodable_tool_item = (
+            b'{"type":"item.started","item":{"type":"command_execution",'
+            b'"exit_code":1' + b"0" * 5000 + b"}}")
+        for line in (b"not json", b"[]", b"null", b"\xff",
+                     b"[" * 100000 + b"]" * 100000, undecodable_tool_item):
+            with self.subTest(line=line[:16]):
+                s = codex_council._EventFlagScanner()
+                s.feed(line + b"\n")
+                self.assertTrue(s.unsafe_to_replay)
+                self.assertFalse(s.turn_completed)
+                s = codex_council._EventFlagScanner()
+                s.feed(line)
+                s.finish()
+                self.assertTrue(s.unsafe_to_replay)
 
 
 def _stalled_run(stdout="", stderr="", turn_completed=False,
@@ -3260,7 +3292,7 @@ class StallPolicyTests(unittest.IsolatedAsyncioTestCase):
             result = await codex_council._run_role_attempts(role, "prompt")
         self.assertFalse(result.ok)
         self.assertTrue(result.error.startswith("[stall]"))
-        self.assertIn("tool work had begun", result.error)
+        self.assertIn("tool work may have begun", result.error)
         self.assertIn("re-invoke the role manually", result.error)
         self.assertEqual(calls["count"], 1)
 
@@ -3351,7 +3383,7 @@ class StallWatchdogIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_resume_advisory_then_hang_stays_replay_safe(self):
         """A resume onto another model makes Codex print an `error` item
         advisory first; a stall after it is still retriable, never a
-        terminal "tool work had begun"."""
+        terminal "tool work may have begun"."""
         cmd = self._script("advisory.py", self._PREAMBLE + (
             "emit({'type': 'thread.started', 'thread_id': 'sid-a'})\n"
             "emit({'type': 'turn.started'})\n"
