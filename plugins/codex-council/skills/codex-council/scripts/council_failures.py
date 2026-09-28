@@ -128,7 +128,7 @@ QUOTA_ERROR_CODES = frozenset({
 QUOTA_MARKERS = (
     "hit your usage limit",
 )
-# codex-cli 0.157.1's wording when the cap applies to one model rather than
+# codex-cli's wording when the cap applies to one model rather than
 # the plan: "You've hit your usage limit for <label>. Switch to another model
 # now, or try again at <time>." (with a typographic apostrophe). The label is
 # the server's name for the limit, not an echo of the -m value, so it is

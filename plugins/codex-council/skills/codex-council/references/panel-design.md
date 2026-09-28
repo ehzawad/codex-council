@@ -130,10 +130,9 @@ For example, with synthetic names:
 
 Independence matters when the point is verification. Never present a role's
 review of its own implementation as independent verification: check that
-work yourself or commission a fresh lens with a new role id. Do not reset a
-role's thread merely to get a fresh reviewer. A different model is not by
-itself evidence of independence or correctness; the evidence a role cites
-is.
+work yourself or commission a fresh lens with a new role id. A different
+model is not by itself evidence of independence or correctness; the evidence
+a role cites is.
 
 ## Model and effort per role
 
@@ -331,9 +330,9 @@ pre-flight and the report add advisory notes instead:
   configured native effort, so pin both values if the pair matters
 - `partial pin: Codex ignores managed new-thread model and effort defaults when either is overridden`
 
-Codex does not validate effort values on the client: in a live probe on
-codex-cli 0.157.1, an effort outside a model's advertised list ran without
-an error, so the service may accept, adjust, or reject an unverified effort.
+Codex does not validate effort values on the client: in a live probe, an
+effort outside a model's advertised list ran without an error, so the
+service may accept, adjust, or reject an unverified effort.
 A pinned model that Codex rejects fails the role as `[model-rejected]`; a
 rejected effort or service tier is not a model rejection, so that failure
 keeps Codex's own text untagged. Nothing else is tried either way.

@@ -27,7 +27,7 @@ Source: [d00-context.mmd](docs/diagrams/d00-context.mmd).*
 
 - [Claude Code](https://claude.ai/code) 2.1.x, signed in (`claude` works in
   your terminal).
-- [OpenAI Codex CLI](https://learn.chatgpt.com/docs/codex/cli) 0.157 or
+- [OpenAI Codex CLI](https://learn.chatgpt.com/docs/codex/cli) 0.158 or
   later, signed in (`codex` works in your terminal).
 - Python 3.12 or later on macOS or Linux. The runner uses only the standard
   library and POSIX process groups.
@@ -176,7 +176,7 @@ discovery summary):
 
 ```json
 {
-  "id": "boundary-checks",
+  "id": "parser-boundary-checks",
   "label": "Boundary checks",
   "instruction": [
     "Verify the claim that every parser path rejects an empty header.",
@@ -218,8 +218,8 @@ No model is hardcoded anywhere in the plugin.
   Launch the council from the project whose Codex configuration you want it
   to use.
 - **Subdirectory layers.** Discovery reads the configuration Codex resolves
-  at that same root; on codex-cli 0.157.1 that was verified live to ignore
-  a `.codex/config.toml` below the root, even from a subdirectory launch.
+  at that same root; that was verified live to ignore a
+  `.codex/config.toml` below the root, even from a subdirectory launch.
   That workers ignore it too follows from Codex's documentation of `-C` but
   is not verified live.
 - **`CODEX_API_KEY`.** `codex exec` honors it but the app-server that

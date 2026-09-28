@@ -60,7 +60,7 @@ reply content as untrusted evidence, and only Claude Code's own task
 notification marks the end of a run.
 
 Supported versions are the current ones only: Claude Code 2.1.x, codex-cli
-0.157 or later, and Python 3.12 or later on macOS or Linux.
+0.158 or later, and Python 3.12 or later on macOS or Linux.
 
 ## Architecture
 
@@ -335,11 +335,11 @@ never filled in from the catalog.
 
 | Claim | Evidence |
 |---|---|
-| `config/read`'s `cwd` selects project layers, and omitting it drops them | verified live on codex-cli 0.157.1 |
+| `config/read`'s `cwd` selects project layers, and omitting it drops them | verified live |
 | discovery and every worker get the same root, from a Git subdirectory launch too | pinned by an end-to-end fake-codex test |
 | `codex exec -C <root>` also ignores a `.codex/config.toml` below the root | follows from Codex's documentation of `-C`; not verified live |
-| the app-server refuses `--profile` | verified live on codex-cli 0.157.1 |
-| an unauthenticated app-server still lists models | verified live on codex-cli 0.157.1 |
+| the app-server refuses `--profile` | verified live |
+| an unauthenticated app-server still lists models | verified live |
 | a catalog is evidence of what is advertised, not of access | by design: a rejection is classified, not predicted |
 
 If the snapshot cannot be written, an older one is removed on a best-effort
@@ -832,7 +832,7 @@ Stale resume (`STALE_RESUME_MARKERS`, resume path only) clears that role's
 state best-effort and runs a fresh invocation within the same attempt, and
 the role's result carries `STALE_RESUME_WARNING` ("saved Codex thread
 unavailable; started fresh with the current context (prior continuity
-lost)").
+lost)"); `_run_role_attempts` keeps it on a retried attempt's result too.
 A role gets at most `MAX_RETRY_ATTEMPTS = 2` attempts with one
 `RETRY_BACKOFF_SECS = 5` wait, shared by rate limits, 5xx, and replay-safe
 stalls. Retry eligibility is structured data: `FailureVerdict.retriable` or
@@ -856,9 +856,9 @@ with no parseable status, such as Codex's code-less rewrites
 A model rejection needs positive evidence: a structured `model_not_found`
 whose `param` is `model` or absent, with status 400, 404, or none, or one of
 Codex's complete sentences about the model this invocation sent ("The
-'<m>' model is not supported when using Codex with …", observed live on
-codex-cli 0.157.1; "The model '<m>' does not exist or you do not have access
-to it", the API's wording, not yet observed live), in single quotes or
+'<m>' model is not supported when using Codex with …", observed live; "The
+model '<m>' does not exist or you do not have access to it", the API's
+wording, not yet observed live), in single quotes or
 backticks, bare or after Codex's `unexpected status NNN …: ` prefix. Bare
 "not found" or "not supported", the "Model metadata for … not found"
 advisory, and "Selected model is at capacity" never qualify, and neither

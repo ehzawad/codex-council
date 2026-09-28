@@ -205,7 +205,7 @@ it.
 ```bash
 # 1. With the Write tool, write ABS_RUNDIR/roles.json and ABS_RUNDIR/context.md.
 #    [
-#      {"id": "<lens>", "label": "<Title>", "instruction": [
+#      {"id": "<task-lens>", "label": "<Title>", "instruction": [
 #        "<one sentence naming the claim to check or the deliverable>",
 #        "If nothing material falls in your lens, say so clearly.",
 #        "Thoroughness beats speed."]}

@@ -1176,6 +1176,29 @@ class RunRoleAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.warning, codex_council.STALE_RESUME_WARNING)
 
+    async def test_stale_resume_warning_survives_a_retried_fresh_run(self):
+        """Stale resume, then a retriable 503 on the fresh run, then a fresh
+        success on attempt 2: attempt 2 loads no thread, yet the final
+        result still says the role's earlier turns are gone."""
+        role = _make_role("architect", "Architect")
+        codex_council.save_session("architect", "stale-sid")
+        calls = []
+        async def fake_subproc(cmd, prompt, role_id=""):
+            calls.append("resume" if "resume" in cmd else "fresh")
+            if calls[-1] == "resume":
+                return _codex_run(1, "", "no rollout found for thread id stale-sid")
+            if len(calls) == 2:
+                return _codex_run(1, "", "503 Service Unavailable")
+            return _codex_run(0, _fresh_jsonl("brand-new-sid", "fresh ok"), "")
+        with patch.object(codex_council.asyncio, "sleep", AsyncMock(return_value=None)), \
+                patch.object(codex_council, "_run_codex_subprocess", side_effect=fake_subproc):
+            result = await codex_council._run_role_attempts(role, "p")
+        self.assertEqual(calls, ["resume", "fresh", "fresh"])
+        self.assertTrue(result.ok)
+        self.assertEqual(result.attempts, 2)
+        self.assertEqual(result.warning, codex_council.STALE_RESUME_WARNING)
+        self.assertEqual(codex_council.load_session("architect")[0], "brand-new-sid")
+
     async def test_stale_resume_with_429_in_thread_id_still_restarts_fresh(self):
         role = _make_role("architect", "Architect")
         codex_council.save_session("architect", "stale-429-sid")
@@ -4696,7 +4719,7 @@ class DocsContractTests(unittest.TestCase):
         panel = "[" + "\n".join(
             line[1:] for line in commented.strip("\n").splitlines()) + "]"
         roles = codex_council._parse_roles_json(
-            panel.replace('"<lens>"', '"lens"'))
+            panel.replace('"<task-lens>"', '"task-lens"'))
         self.assertEqual(len(roles), 1)
         self.assertIsNone(roles[0].selection)
         self.assertIn(codex_council.REQUIRED_SCOPE_PHRASE, template)

@@ -1318,12 +1318,21 @@ async def _run_role_attempts(role, prompt):
     A failed attempt is retried only when its RoleResult says so
     (`retriable`, from the structured verdict or the stall policy); the
     error text is never consulted, so Codex text that merely starts with
-    "[retriable:" cannot forge a retry.
+    "[retriable:" cannot forge a retry. A stale thread recovered on an
+    earlier attempt stays lost, so every later result keeps
+    STALE_RESUME_WARNING.
     """
     attempt = 1
+    lost = False
     while True:
         _RUN.update(role.id, state="active", attempt=attempt)
         result = await _run_role_once(role, prompt, attempt)
+        if STALE_RESUME_WARNING in (result.warning or ""):
+            lost = True
+        elif lost:
+            result.warning = _append_warning(
+                STALE_RESUME_WARNING, result.warning,
+            )
         if result.ok or not result.retriable or attempt >= MAX_RETRY_ATTEMPTS:
             return result
         _diag(
