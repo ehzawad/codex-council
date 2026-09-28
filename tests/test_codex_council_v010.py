@@ -3,6 +3,9 @@
 Unit tests import codex_council directly; end-to-end tests drive the REAL
 script as a subprocess with a FAKE `codex` on PATH (no network, no real
 Codex) and an isolated XDG_STATE_HOME, like tests/test_codex_council_cli.py.
+Model ids are synthetic; the v1.0.0 selection contract (the `selection`
+object, discovery, routing, [model-rejected]/[quota]) is covered in
+tests/test_model_selection.py.
 
 Lives outside the plugin subtree so end-user installs don't bundle it.
 Run from repo root:
@@ -33,10 +36,14 @@ SCRIPTS_DIR = os.path.abspath(os.path.join(
     "plugins", "codex-council", "skills", "codex-council", "scripts",
 ))
 sys.path.insert(0, SCRIPTS_DIR)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import codex_council  # noqa: E402
+import council_common  # noqa: E402
+from council_testlib import assert_usage_exit as _assert_usage_exit  # noqa: E402
 
 SCRIPT = os.path.join(SCRIPTS_DIR, "codex_council.py")
+EPOCH = str(codex_council.SKILL_CONTRACT_EPOCH)
 FIXED_PROJECT_ROOT = "/fixed/project/root"
 
 HANG_SENTINEL = "PLEASE_HANG_SILENTLY"
@@ -84,16 +91,6 @@ def _make_role(rid="architect", label="Architect", model=None, effort=None):
     return codex_council.Role(rid, label, _instruction(), model, effort)
 
 
-def _assert_usage_exit(test, callable_, *, expect_in_stderr):
-    buf = io.StringIO()
-    with contextlib.redirect_stderr(buf):
-        with test.assertRaises(SystemExit) as ctx:
-            callable_()
-    test.assertEqual(ctx.exception.code, 2)
-    test.assertIn(expect_in_stderr, buf.getvalue())
-    return buf.getvalue()
-
-
 def _private_tmpdir(test):
     d = tempfile.TemporaryDirectory()
     test.addCleanup(d.cleanup)
@@ -104,17 +101,17 @@ def _private_tmpdir(test):
 # ---------- contract epoch / brief ----------
 
 class ContractEpochTests(unittest.TestCase):
-    def test_epoch_is_2(self):
-        self.assertEqual(codex_council.SKILL_CONTRACT_EPOCH, 2)
+    def test_epoch_is_3(self):
+        self.assertEqual(codex_council.SKILL_CONTRACT_EPOCH, 3)
 
-    def test_help_mentions_follow_and_v010(self):
+    def test_help_mentions_follow_replies_and_v100(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             with self.assertRaises(SystemExit):
                 codex_council._parse_args(["--help"])
         text = out.getvalue()
         self.assertIn("--follow", text)
-        self.assertIn("v0.10.0", text)
+        self.assertIn("v1.0.0", text)
         self.assertIn("replies/", text)
 
 
@@ -137,30 +134,39 @@ class RoleOverrideParsingTests(unittest.TestCase):
         self.assertIsNone(role.effort)
 
     def test_valid_model_and_effort_are_kept(self):
-        for model in ("gpt-6-luna", "gpt-5.6-codex", "org/model:tag_1"):
+        for model in ("future-orion-2032", "acme/future-review-2034:rev2",
+                      "org/model:tag_1", "Future.Model@v2+exp"):
             with self.subTest(model=model):
-                role = self._parse(model=model, effort="low")[0]
+                role = self._parse(model=model, effort="brisk")[0]
                 self.assertEqual(role.model, model)
-                self.assertEqual(role.effort, "low")
+                self.assertEqual(role.effort, "brisk")
+                # Direct CLI use: an untagged pin is an explicit user pin.
+                self.assertEqual(role.selection.mode, "user")
 
     def test_unlisted_but_well_shaped_effort_is_accepted(self):
-        # No hardcoded value list: codex validates the value itself.
-        self.assertEqual(self._parse(effort="ultra")[0].effort, "ultra")
-        self.assertEqual(self._parse(effort="futurelevel")[0].effort, "futurelevel")
+        # No hardcoded value list: discovery evidence or Codex decides.
+        for effort in ("adaptive-v2", "futurelevel", "High", "x-high"):
+            with self.subTest(effort=effort):
+                self.assertEqual(self._parse(effort=effort)[0].effort, effort)
 
     def test_malformed_model_rejected_with_rewrite_recovery(self):
-        for bad in ("", "-m", " gpt", "gpt 6", "gpt-6\n", "gpt x", None, 6,
-                    ["gpt-6"], ".hidden"):
+        for bad in ("", "-m", " future", "future 6", "future-6\n",
+                    "future\u2028x", None, 6, ["future-6"], ".hidden",
+                    'fu"ture', "fu'ture", "fu\\ture", "fu<ture>"):
             with self.subTest(model=bad):
                 err = _assert_usage_exit(
                     self, lambda bad=bad: self._parse(model=bad),
                     expect_in_stderr="optional field 'model'",
                 )
                 self.assertIn("rewrite the entire file", err)
-                self.assertIn("omit the key to inherit", err)
+                # Untagged in direct CLI use is an explicit user pin: the
+                # hint repairs the pin instead of dropping it to inherit.
+                self.assertIn("never drop it to inherit", err)
+                self.assertNotIn("omit model, effort, and selection", err)
 
     def test_malformed_effort_rejected(self):
-        for bad in ("", "High", "x-high", "low\n", "low ", 'low"', None, 3):
+        for bad in ("", "low\n", "low ", 'low"', "lo w", "-low", "low\\",
+                    "<low>", None, 3):
             with self.subTest(effort=bad):
                 _assert_usage_exit(
                     self, lambda bad=bad: self._parse(effort=bad),
@@ -172,7 +178,7 @@ class RoleOverrideParsingTests(unittest.TestCase):
             self, lambda: self._parse(reasoning="high"),
             expect_in_stderr="unknown field(s) 'reasoning'",
         )
-        self.assertIn("optionally 'model' and 'effort'", err)
+        self.assertIn("optionally 'model', 'effort', and 'selection'", err)
 
 
 class CommandOverrideTests(unittest.TestCase):
@@ -191,25 +197,28 @@ class CommandOverrideTests(unittest.TestCase):
         )
 
     def test_fresh_places_overrides_on_parent_exec(self):
-        cmd = codex_council._fresh_cmd("/r", "gpt-6-luna", "low")
+        cmd = codex_council._fresh_cmd("/r", "future-vega-2033", "brisk")
         self.assertEqual(
             cmd[:8],
-            ["codex", "exec", "-C", "/r", "-m", "gpt-6-luna",
-             "-c", 'model_reasoning_effort="low"'],
+            ["codex", "exec", "-C", "/r", "-m", "future-vega-2033",
+             "-c", 'model_reasoning_effort="brisk"'],
         )
         self.assertEqual(cmd[-1], "-")
 
     def test_resume_places_overrides_before_resume_keyword(self):
-        cmd = codex_council._resume_cmd("/r", "sid", "gpt-6-astra", "max")
+        cmd = codex_council._resume_cmd(
+            "/r", "sid", "future-orion-2032", "adaptive-v2")
         self.assertLess(cmd.index("-m"), cmd.index("resume"))
         self.assertLess(cmd.index("-c"), cmd.index("resume"))
-        self.assertEqual(cmd[cmd.index("-m") + 1], "gpt-6-astra")
-        self.assertEqual(cmd[cmd.index("-c") + 1], 'model_reasoning_effort="max"')
+        self.assertEqual(cmd[cmd.index("-m") + 1], "future-orion-2032")
+        self.assertEqual(cmd[cmd.index("-c") + 1],
+                         'model_reasoning_effort="adaptive-v2"')
         self.assertEqual(cmd[cmd.index("resume") + 1], "sid")
 
     def test_model_only_or_effort_only(self):
-        self.assertNotIn("-c", codex_council._fresh_cmd("/r", "gpt-6-sol", None))
-        self.assertNotIn("-m", codex_council._fresh_cmd("/r", None, "high"))
+        self.assertNotIn(
+            "-c", codex_council._fresh_cmd("/r", "future-vega-2033", None))
+        self.assertNotIn("-m", codex_council._fresh_cmd("/r", None, "brisk"))
 
 
 class RunRoleOnceOverrideTests(unittest.IsolatedAsyncioTestCase):
@@ -236,7 +245,7 @@ class RunRoleOnceOverrideTests(unittest.IsolatedAsyncioTestCase):
             ])
             return codex_council.CodexRun(returncode=0, stdout=jsonl, stderr="")
 
-        role = _make_role(model="gpt-6-luna", effort="low")
+        role = _make_role(model="future-vega-2033", effort="brisk")
         with patch.object(codex_council, "_run_codex_subprocess",
                           side_effect=fake_subproc), \
              contextlib.redirect_stderr(io.StringIO()):
@@ -246,13 +255,13 @@ class RunRoleOnceOverrideTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("resume", seen[0])
         self.assertIn("resume", seen[1])
         for cmd in seen:
-            self.assertEqual(cmd[cmd.index("-m") + 1], "gpt-6-luna")
-            self.assertIn('model_reasoning_effort="low"', cmd)
+            self.assertEqual(cmd[cmd.index("-m") + 1], "future-vega-2033")
+            self.assertIn('model_reasoning_effort="brisk"', cmd)
 
 
 class ItemErrorWarningTests(unittest.IsolatedAsyncioTestCase):
-    MISMATCH = ("This session was recorded with model `gpt-6-sol` but is "
-                "resuming with `gpt-6-luna`.")
+    MISMATCH = ("This session was recorded with model `future-lyra-2030` "
+                "but is resuming with `future-vega-2033`.")
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -281,6 +290,16 @@ class ItemErrorWarningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(codex_council.extract_item_errors(self._jsonl(False)),
                          [])
 
+    def test_extract_item_errors_docstring_names_the_verified_trigger(self):
+        """The resume advisory follows a recorded-vs-current model
+        difference; the verified case is a bare resume after the native
+        configuration changed, not only a different override."""
+        flat = " ".join(codex_council.extract_item_errors.__doc__.split())
+        self.assertIn("runs on a model other than the one it was recorded "
+                      "with", flat)
+        self.assertIn("no override after the native configuration changed",
+                      flat)
+
     async def test_item_error_on_successful_resume_becomes_warning(self):
         outputs = [self._jsonl(False), self._jsonl(True)]
 
@@ -288,7 +307,7 @@ class ItemErrorWarningTests(unittest.IsolatedAsyncioTestCase):
             return codex_council.CodexRun(
                 returncode=0, stdout=outputs.pop(0), stderr="")
 
-        role = _make_role(model="gpt-6-luna")
+        role = _make_role(model="future-vega-2033")
         with patch.object(codex_council, "_run_codex_subprocess",
                           side_effect=fake_subproc), \
              contextlib.redirect_stderr(io.StringIO()):
@@ -309,14 +328,17 @@ class ReportOverridesTests(unittest.TestCase):
             text=kw.pop("text", "reply" if ok else None), **kw,
         )
 
-    def test_summary_shows_model_and_effort_only_when_set(self):
+    def test_summary_shows_sent_model_and_effort_only_when_set(self):
+        # Roles built without a selection object are explicit pins.
         out = codex_council._format_report([
-            self._r(_make_role("a", "A", "gpt-6-luna", "low")),
-            self._r(_make_role("b", "B", None, "high")),
+            self._r(_make_role("a", "A", "future-vega-2033", "brisk")),
+            self._r(_make_role("b", "B", None, "deliberate")),
             self._r(_make_role("c", "C")),
         ], 2.0)
-        self.assertIn("- **A** [a]: ok (model: gpt-6-luna, effort: low) — 1.5s", out)
-        self.assertIn("- **B** [b]: ok (effort: high) — 1.5s", out)
+        self.assertIn("- **A** [a]: ok (explicit: model future-vega-2033, "
+                      "effort brisk) — 1.5s", out)
+        self.assertIn("- **B** [b]: ok (explicit: effort deliberate) — 1.5s",
+                      out)
         self.assertIn("- **C** [c]: ok — 1.5s", out)
 
     def test_report_is_header_summary_plus_the_shared_sections(self):
@@ -330,14 +352,16 @@ class ReportOverridesTests(unittest.TestCase):
             self.assertIn(section, report)
 
     def test_reply_file_is_header_plus_exact_section(self):
-        r = self._r(_make_role("a", "Lab el", "gpt-6-sol", "max"),
+        r = self._r(_make_role("a", "Lab\u2028el", "future-orion-2032",
+                               "deliberate"),
                     ok=False, error="boom", attempts=2, warning="careful")
         content = codex_council._format_reply_file(r)
         header, _, rest = content.partition("\n\n")
         self.assertEqual(
             header,
             "<!-- codex-council reply id=a status=FAILED elapsed=1.5s "
-            "attempts=2 model=gpt-6-sol effort=max warning=yes -->",
+            "attempts=2 selection=user model=future-orion-2032 "
+            "effort=deliberate warning=yes -->",
         )
         self.assertEqual(
             rest,
@@ -454,7 +478,7 @@ class WriteReplyFileTests(unittest.TestCase):
 
     def test_failed_replace_removes_temp_file(self):
         buf = io.StringIO()
-        with patch.object(codex_council.os, "replace",
+        with patch.object(council_common.os, "replace",
                           side_effect=OSError("boom")), \
              contextlib.redirect_stderr(buf):
             self.assertIsNone(
@@ -576,7 +600,8 @@ class FollowArgTests(unittest.TestCase):
                 )
 
     def test_follow_accepts_skill_contract(self):
-        args = codex_council._parse_args(["--follow", "/x", "--skill-contract", "2"])
+        args = codex_council._parse_args(
+            ["--follow", "/x", "--skill-contract", EPOCH])
         self.assertEqual(args.follow, "/x")
 
     def test_empty_follow_rejected(self):
@@ -820,7 +845,7 @@ class EndToEndTests(unittest.TestCase):
         self.env["CODEX_HOME"] = self.statedir.name
         self.env["FAKE_CODEX_ARGV_DIR"] = self.argv_dir.name
         for name in ("CODEX_COUNCIL_SESSION_KEY", "CODEX_COUNCIL_MAX_PARALLEL",
-                     "CODEX_COUNCIL_STALL_SECS"):
+                     "CODEX_COUNCIL_STALL_SECS", "CODEX_COUNCIL_MODEL_ROUTING"):
             self.env.pop(name, None)
 
     def _stage(self, roles):
@@ -835,7 +860,7 @@ class EndToEndTests(unittest.TestCase):
         return [sys.executable, SCRIPT,
                 "--roles-file", os.path.join(self.run_dir, "roles.json"),
                 "--context-file", os.path.join(self.run_dir, "context.md"),
-                "--skill-contract", "2"]
+                "--skill-contract", EPOCH]
 
     def _launch_redirected(self):
         """Launch like SKILL.md does: stdout > out.md, stderr > err.log."""
@@ -852,13 +877,14 @@ class EndToEndTests(unittest.TestCase):
     def _follow_proc(self):
         return subprocess.Popen(
             [sys.executable, SCRIPT, "--follow", self.run_dir,
-             "--skill-contract", "2"],
+             "--skill-contract", EPOCH],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             env=self.env)
 
     def test_staged_run_writes_reply_files_and_follow_streams_to_done(self):
         self._stage([
-            _role_json("architect", "Architect", model="gpt-6-luna", effort="low"),
+            _role_json("architect", "Architect", model="future-vega-2033",
+                       effort="brisk", selection={"mode": "user"}),
             _role_json("security", "Security",
                        instruction=_instruction(f"Review {FAIL_SENTINEL}")),
         ])
@@ -869,6 +895,12 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(launch.wait(timeout=60), 0)
         lines = stdout.splitlines()
         self.assertTrue(lines[0].startswith("[codex-council] dispatching 2 roles"))
+        # No runtime-grounded selection: the launch ran no discovery.
+        self.assertEqual(
+            lines[1],
+            "[codex-council] model selection: routing=auto; "
+            "discovery=not-run (no runtime-grounded selections); native=1 "
+            "user=1 routed=0 native_effort=0 fallback=0")
         self.assertRegex(lines[-1], codex_council.FOLLOW_DONE_PATTERN)
         replies = os.path.join(self.run_dir, "replies")
         self.assertEqual(stat.S_IMODE(os.lstat(replies).st_mode), 0o700)
@@ -884,11 +916,14 @@ class EndToEndTests(unittest.TestCase):
             reply = f.read()
         self.assertTrue(reply.startswith(
             "<!-- codex-council reply id=architect status=ok "))
-        self.assertIn("model=gpt-6-luna effort=low", reply)
+        self.assertIn("selection=user model=future-vega-2033 effort=brisk",
+                      reply)
         self.assertIn("fake reply from codex", reply)
         with open(os.path.join(self.run_dir, "out.md"), encoding="utf-8") as f:
             report = f.read()
-        self.assertIn("[architect]: ok (model: gpt-6-luna, effort: low)", report)
+        self.assertIn(
+            "[architect]: ok (explicit: model future-vega-2033, effort brisk)",
+            report)
         self.assertIn(reply.partition("\n\n")[2].rstrip(), report)
         # The real command line carried the overrides on the parent exec.
         argvs = []
@@ -899,8 +934,8 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(len(with_model), 1)
         self.assertEqual(
             with_model[0][:7],
-            ["exec", "-C", with_model[0][2], "-m", "gpt-6-luna",
-             "-c", 'model_reasoning_effort="low"'])
+            ["exec", "-C", with_model[0][2], "-m", "future-vega-2033",
+             "-c", 'model_reasoning_effort="brisk"'])
         without = [a for a in argvs if "-m" not in a]
         self.assertTrue(without and all("-c" not in a for a in without))
 

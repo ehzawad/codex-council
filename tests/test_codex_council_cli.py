@@ -153,6 +153,7 @@ class CouncilCLITestCase(unittest.TestCase):
         self.env.pop("CODEX_COUNCIL_SESSION_KEY", None)
         self.env.pop("CODEX_COUNCIL_MAX_PARALLEL", None)
         self.env.pop("CODEX_COUNCIL_STALL_SECS", None)
+        self.env.pop("CODEX_COUNCIL_MODEL_ROUTING", None)
 
     def _write_roles(self, roles):
         path = os.path.join(self.workdir.name, "roles.json")
@@ -422,6 +423,27 @@ class HappyPathTests(CouncilCLITestCase):
         self.assertEqual(proc.returncode, 2, proc.stderr)
         self.assertIn("Codex CLI not found on PATH", proc.stderr)
         self.assertNotIn("[codex-council] dispatching", proc.stderr)
+        # The launch's redirections already claimed this directory, so the
+        # recovery starts over elsewhere instead of re-running the preflight.
+        self.assertIn("then start over in a new directory", proc.stderr)
+        self.assertNotIn("re-run --check-staging-dir", proc.stderr)
+
+    def test_stdin_launch_without_codex_names_the_direct_command(self):
+        """Stdin mode has no preflight to re-run."""
+        roles_path = self._write_roles([
+            _role("architect", "Architect",
+                  _instruction("Review architecture")),
+        ])
+        self._strip_codex_from_path()
+        proc = self._run(
+            input="please review this change\n",
+            args=("--roles-file", roles_path),
+        )
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn("Codex CLI not found on PATH", proc.stderr)
+        self.assertIn("then re-run the direct command.", proc.stderr)
+        self.assertNotIn("--check-staging-dir", proc.stderr)
+        self.assertNotIn("[codex-council] dispatching", proc.stderr)
 
     def test_report_precedes_sentinel_in_combined_stream(self):
         # Recovery contract (R2): CODEX_COUNCIL_DONE must appear only AFTER the
@@ -655,7 +677,7 @@ class SkillContractTests(CouncilCLITestCase):
         ])
         proc = self._run(
             input="please review\n",
-            args=("--roles-file", roles_path, "--skill-contract", "2"),
+            args=("--roles-file", roles_path, "--skill-contract", "3"),
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("# Codex Council", proc.stdout)
@@ -665,23 +687,24 @@ class SkillContractTests(CouncilCLITestCase):
         proc = self._run(
             input="",
             args=("--check-staging-dir", self.workdir.name,
-                  "--skill-contract", "2"),
+                  "--skill-contract", "3"),
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("staging OK", proc.stdout)
 
-    def test_previous_epoch_1_is_now_a_stale_pair(self):
-        """v0.10.0 bumped the epoch to 2 (SKILL templates rely on --follow
-        and reply files); an epoch-1 SKILL must be refused, not run."""
+    def test_previous_epoch_2_is_now_a_stale_pair(self):
+        """v1.0.0 bumped the epoch to 3 (SKILL templates rely on --discover
+        and the selection object); an epoch-2 SKILL must be refused, not
+        run."""
         roles_path = self._write_roles([
             _role("architect", "Architect", _instruction("Review")),
         ])
         proc = self._run(
             input="please review\n",
-            args=("--roles-file", roles_path, "--skill-contract", "1"),
+            args=("--roles-file", roles_path, "--skill-contract", "2"),
         )
         self.assertEqual(proc.returncode, 2, proc.stderr)
-        self.assertIn("contract epoch 2", proc.stderr)
+        self.assertIn("contract epoch 3", proc.stderr)
         self.assertIn("stale SKILL/script pair", proc.stderr)
         self.assertEqual(proc.stdout, "")
 
@@ -695,7 +718,16 @@ class SkillContractTests(CouncilCLITestCase):
         )
         self.assertEqual(proc.returncode, 2, proc.stderr)
         self.assertIn("stale SKILL/script pair", proc.stderr)
-        self.assertIn("dev-link.sh", proc.stderr)
+        # Installed-plugin recovery first, then the development checkout,
+        # the same order SKILL.md gives.
+        flat = " ".join(proc.stderr.split())
+        installed = "Installed plugin: update it from its marketplace"
+        self.assertIn(installed, flat)
+        self.assertIn("scripts/dev-link.sh", flat)
+        self.assertLess(flat.index(installed),
+                        flat.index("scripts/dev-link.sh"))
+        self.assertIn("reload plugins or start a fresh session", flat)
+        self.assertIn("Never change the epoch", flat)
         self.assertNotIn("[codex-council] dispatching", proc.stderr)
         self.assertEqual(proc.stdout, "")
 
@@ -845,6 +877,20 @@ class StallWatchdogCliTests(CouncilCLITestCase):
         self.assertIn("CODEX_COUNCIL_STALL_SECS", proc.stderr)
         self.assertNotIn("[codex-council] dispatching", proc.stderr)
 
+    def test_invalid_stall_env_fails_the_preflight_too(self):
+        """A value the background launch would refuse (exit 2, error only
+        in err.log) must not pass the pre-flight as "staging OK"."""
+        self._write_role("Review")
+        self._write_context("please review\n")
+        self.env["CODEX_COUNCIL_STALL_SECS"] = "30m"
+        proc = self._run(input="", args=(
+            "--check-staging-dir", self.workdir.name, "--skill-contract", "3"))
+        self.assertEqual(proc.returncode, 2, proc.stdout)
+        self.assertIn("CODEX_COUNCIL_STALL_SECS must be a positive integer "
+                      "(or 0 to disable the watchdog); got '30m'",
+                      proc.stderr)
+        self.assertEqual(proc.stdout, "")
+
     def test_silent_hang_is_stall_killed_retried_then_terminal(self):
         """End-to-end reproduction of the silent-wedge incident: a codex that
         emits no bytes is terminated at the threshold, retried once (replay
@@ -861,6 +907,9 @@ class StallWatchdogCliTests(CouncilCLITestCase):
         self.assertIn("stall threshold reached", proc.stderr)
         self.assertIn("retriable error on attempt 1/2", proc.stderr)
         self.assertIn("[retriable:stall]", proc.stdout)
+        self.assertIn("no tool work had begun, so replay is safe",
+                      proc.stdout)
+        self.assertNotIn("retrying", proc.stdout)
         self.assertRegex(
             self._last_nonempty_stderr_line(proc.stderr),
             r"CODEX_COUNCIL_DONE ok=0 total=1 elapsed=[\d.]+s exit=1 "
