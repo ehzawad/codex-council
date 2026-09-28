@@ -133,7 +133,7 @@ It writes `ABS_RUNDIR/model-snapshot.json` (schema
 a summary. With a synthetic catalog it looks like this:
 
 ```
-[codex-council] discovery ok: snapshot_id=d8997e02609a47c9 codex-cli 9.9.9; auth chatgpt; provider openai (default); version=1.0.0
+[codex-council] discovery ok: snapshot_id=d8997e02609a47c9 codex-cli 9.9.9; auth chatgpt; provider openai (default); version=1.0.1
 native configuration: model future-orion-2032 (origin user), effort deliberate (origin user); managed new-thread defaults: none
 routing: eligible
 native-model effort adjustment: available on future-orion-2032
@@ -166,7 +166,7 @@ whole `model/list` page (`schema_unsupported:<method>:<field>`). The
 summary is then one line plus the snapshot path:
 
 ```
-[codex-council] discovery unavailable: rpc_error:model/list:-32601; snapshot_id=110d7ec3207fb567; version=1.0.0; write no routed or native_effort selections; explicit user pins (mode user) still apply, otherwise omit model, effort, and selection to inherit native configuration
+[codex-council] discovery unavailable: rpc_error:model/list:-32601; snapshot_id=110d7ec3207fb567; version=1.0.1; write no routed or native_effort selections; explicit user pins (mode user) still apply, otherwise omit model, effort, and selection to inherit native configuration
 ```
 
 Problems inside the catalog keep the status `ok` and the rest of the
@@ -703,7 +703,7 @@ seconds with a 300s floor while the watchdog is enabled (600s at the default
 threshold; 1800s when disabled):
 
 ```
-[codex-council] still running after 1240s: completed=1/3; active=2 (architect quiet=41s, prober retry-wait); queued=0; watchdog=1800s; version=1.0.0.
+[codex-council] still running after 1240s: completed=1/3; active=2 (architect quiet=41s, prober retry-wait); queued=0; watchdog=1800s; version=1.0.1.
 ```
 
 `active` is scheduling state, not proof of health. `quiet=Ns` measures time
