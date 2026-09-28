@@ -3,15 +3,16 @@
 The runner publishes RUNDIR/status.json through RunStatus: its own pid and
 OS start identity, its state, a tick that advances on every role transition
 and at least every STATUS_TICK_SECS, and per role the scheduling state, the
-attempt, the live codex process group, and the outcome. Three read-only
-commands use that file:
+attempt, the live codex process group, and the outcome. Two read-only
+commands and one explicit cleanup command use that file:
 
 * --follow RUNDIR relays the actionable lines of RUNDIR/err.log (one stdout
   line per event, for a Claude Code Monitor) and reports a runner that is
   gone or has stopped ticking;
 * --status RUNDIR prints a short snapshot and one next action;
 * --reap RUNDIR, only once the runner is gone, terminates the recorded codex
-  process groups whose leader is still this run's codex.
+  process groups whose leader is still this run's codex, and the process
+  groups and processes that live codex started.
 
 A process identity is its pid plus its start time as `ps -o lstart=` prints
 it (C locale, UTC): the same pid with another start time is another

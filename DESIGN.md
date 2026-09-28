@@ -66,7 +66,7 @@ Supported versions are the current ones only: Claude Code 2.1.x, codex-cli
 
 ### Level 0: the council in context
 
-![d00-context: the user, Claude Code, the council runner, the Codex workers, and the shared workspace](docs/diagrams/d00-context.png)
+![d00-context: the user, Claude Code with the skill, the council runner, the Codex workers, and the shared workspace, top to bottom](docs/diagrams/d00-context.png)
 
 *d00-context — Council in context. Source:
 [d00-context.mmd](docs/diagrams/d00-context.mmd).*
@@ -146,7 +146,7 @@ imports its siblings with bytecode writes off, so a run writes no
 | launch (`--roles-file`, `--context-file`) | the staged inputs, the snapshot, Codex | the report on stdout, progress on stderr, `replies/`, `status.json`, saved threads | 0 some role responded, 1 all failed or aborted, 2 refused before dispatch, 130 or 128 + signal when interrupted |
 | `--follow RUNDIR` | `err.log`, `status.json` | relayed lines on stdout | 0, 1, 2, 3, 4, 5 (see [Progress](#progress-replies-and-reconciliation)) |
 | `--status RUNDIR` | `status.json`, one `ps` | about ten lines on stdout | 0 (2 for a bad directory) |
-| `--reap RUNDIR` | `status.json`, one `ps` | signals to verified groups | 0 done, 1 refused, 2 bad directory |
+| `--reap RUNDIR` | `status.json`, one `ps` | signals to verified groups and a live codex's descendants | 0 done, 1 refused, 2 bad directory |
 
 Every command that SKILL.md shows passes `--skill-contract 3`, the contract
 epoch. The epoch changes only when SKILL.md's command contract changes
@@ -251,7 +251,9 @@ result inconclusive.
 | teardown after the budget | close stdin, then SIGTERM and SIGKILL to the group, waiting at most 0.5 s at each step |
 
 The 20 seconds bound discovery's work; teardown adds its own bounded waits,
-so no child outlives discovery. Discovery never raises: a missing `codex`,
+so no member of the app-server's process group outlives discovery (a
+descendant that started its own session is outside that group and this
+teardown). Discovery never raises: a missing `codex`,
 a spawn error, a timeout, a protocol violation, an RPC error, or an internal
 bug gives status `unavailable` with fixed problem codes (`codex_missing`,
 `spawn_failed:<errno>`, `timeout:<method>`, `server_exited:<method>` with
@@ -308,9 +310,11 @@ never filled in from the catalog.
   `config/read`'s `cwd`, not by the spawn directory, so discovery passes the
   same root workers get as `-C`.
 - *Only key names, never values.* Endpoint overrides and catalog files are
-  recorded by key name only; no URL, path, email, plan, account id, or token
-  is ever read into the snapshot, and the tests plant sentinel values to
-  prove it.
+  recorded by key name only; no endpoint URL, configuration-source or
+  catalog-file path, email, plan, account id, or token is read into the
+  snapshot, and the tests plant sentinel values to prove it. The snapshot
+  does record the execution context it describes: the project root, the
+  launch directory, the resolved `codex` executable, and `CODEX_HOME`.
 - *The app-server's stderr never leaves the adapter.* It is free-form and can
   carry identity or tokens, so only a fixed `server_stderr:<category>`
   (`usage_error`, `panic`, or `other`) is recorded.
@@ -347,7 +351,7 @@ launch from.
 runner guarantees that an automatic choice rests on this run's evidence and
 that a user's pin is never altered.
 
-![d21-choose: user pin, routed pair, native-model effort, or inheritance, all written to roles.json](docs/diagrams/d21-choose.png)
+![d21-choose: what the user asked for decides first (a pin, or native settings kept); otherwise a routed pair, native-model effort, or inheritance, all written to roles.json](docs/diagrams/d21-choose.png)
 
 *d21-choose — Claude chooses one role's model and effort. The runner does
 none of this reasoning. Source: [d21-choose.mmd](docs/diagrams/d21-choose.mmd).*
@@ -376,22 +380,28 @@ lines stay single-line. Case is preserved, and `inherit` and `default`, in
 any case, are refused as model values. A `model` or `effort` without
 `selection` is refused before the grammar is checked.
 
-![d22-resolve: the authoring gate, the launch refresh decision, fresh discovery, the pure resolver, and frozen decisions](docs/diagrams/d22-resolve.png)
+![d22-resolve: only an automatic choice with routing on needs the snapshot; an unsupported one exits 2, rewritten at the preflight or started over at launch; a supported one reaches the pure resolver, through one fresh discovery at launch](docs/diagrams/d22-resolve.png)
 
 *d22-resolve — Validate authoring, then resolve against the newest
-evidence. Source: [d22-resolve.mmd](docs/diagrams/d22-resolve.mmd).*
+evidence. User pins and inheritance need no snapshot. Source:
+[d22-resolve.mmd](docs/diagrams/d22-resolve.mmd).*
 
 Authoring validation runs at the preflight and again at launch, before any
-worker, whenever routing is on. It refuses (exit 2, whole-file rewrite) an
+worker, and checks only automatic choices, and only while routing is on:
+user pins and inheritance pass without a snapshot, and with routing off an
+automatic choice resolves to inheritance instead. It refuses (exit 2) an
 automatic role whose planning snapshot is absent, unreadable, or not the
 private file `--discover` wrote; whose `snapshot_id` does not match; that is
 routed while routing is ineligible; whose model is not an advertised
 execution id (the message names the right id when the value is a picker id
 or display name); whose model is hidden or already retired; whose effort is
 not advertised for that model; or that is `native_effort` without a proven
-native model. The preflight judges retirement against the current time; the
-launch judges authoring as of the snapshot's creation, so a retirement that
-passes after discovery is changed evidence rather than a defect.
+native model. At the preflight the recovery is a whole-file rewrite of
+`roles.json` in the same directory; at launch, whose redirects have already
+claimed the directory, it is a new directory. The preflight judges
+retirement against the current time; the launch judges authoring as of the
+snapshot's creation, so a retirement that passes after discovery is changed
+evidence rather than a defect.
 
 At launch, when routing is on and at least one role is automatic, the runner
 takes one fresh discovery after every input check and freezes it for the
@@ -671,10 +681,11 @@ old one; the skill mints a new id instead.
 a run-level deadline, and make sure codex's process group does not outlive
 the attempt.
 
-![d26-attempt: the prompt and argv, codex exec in its own process group, the output pumps, the per-attempt activity clock, the watchdog, the post-exit drain, the termination owner, the sweep, and the CodexRun result](docs/diagrams/d26-attempt.png)
+![d26-attempt: the prompt and argv, codex exec in its own process group, the output pumps and activity clock, the watchdog, live process-tree discovery, the termination owner, the post-exit drain, the group-only sweep, and the CodexRun result](docs/diagrams/d26-attempt.png)
 
-*d26-attempt — One subprocess attempt and its watchdog. Every invocation
-has its own copy of all of this. Source:
+*d26-attempt — One subprocess attempt and its watchdog. Terminating a live
+codex reaches its descendants; after codex exits, only its group can be
+reached. Every invocation has its own copy of all of this. Source:
 [d26-attempt.mmd](docs/diagrams/d26-attempt.mmd).*
 
 **How it works.** The runner starts `codex exec` with
@@ -703,8 +714,11 @@ The council has no total elapsed-time or run-level deadline. The
 output-inactivity watchdog fires after `CODEX_COUNCIL_STALL_SECS` seconds of
 silence on both streams (default 1800; a positive integer overrides it; 0
 disables it; anything else is a usage error). Every termination path, the
-watchdog, cancellation, and errors alike, goes through one idempotent owner
-that sends SIGTERM to the group, waits briefly, then sends SIGKILL.
+watchdog, cancellation, and errors alike, goes through one idempotent owner.
+While codex is alive, the owner first takes one bounded `ps` snapshot of
+codex's descendants; then it sends SIGTERM to the group and to those
+descendants' groups (and by pid to any other descendant outside codex's
+group), waits briefly, and sends SIGKILL the same way.
 
 The runner watches codex's own exit rather than its pipes, because on some
 Python versions `Process.wait()` also waits for the pipes, which a
@@ -714,10 +728,12 @@ and never extended by more output. If they are still open at the bound, the
 runner terminates the group and stops the pumps, whoever holds the pipes;
 the output already read is kept with the warning `codex exited but its
 process group kept its output open; the group was terminated`. When the
-attempt ends, whatever is left in the group is swept. A cancellation at any
-point, the drain and the sweep included, still tears the group down;
-SIGINT, SIGTERM, and SIGHUP cancel the whole fan-out and end the run without
-the `CODEX_COUNCIL_DONE` line.
+attempt ends, whatever is left in the group is swept. Codex has exited by
+then, so its descendants can no longer be found by walking the tree: the
+drain's termination and the sweep reach codex's own group only. A
+cancellation at any point, the drain and the sweep included, still tears the
+group down; SIGINT, SIGTERM, and SIGHUP cancel the whole fan-out and end the
+run without the `CODEX_COUNCIL_DONE` line.
 
 ![d27-stall: a stalled attempt becomes ok with a warning, a terminal stall, or a retriable stall](docs/diagrams/d27-stall.png)
 
@@ -946,9 +962,10 @@ which. A running role cannot be steered.
 minutes when it stops responding, without adding a supervisor process, and
 give Claude a safe way to clean up.
 
-![d30-liveness: the runner writes status.json; the follower checks the runner every 2 seconds; a gone runner or a stale tick leads to --status, --reap, and a re-run in a new directory](docs/diagrams/d30-liveness.png)
+![d30-liveness: the runner writes status.json; the follower checks the runner every 2 seconds; a gone runner leads to --status, --reap, and a re-run in a new directory; a runner that is not responding is stopped through its tracked task first](docs/diagrams/d30-liveness.png)
 
-*d30-liveness — Runner liveness and recovery. Source:
+*d30-liveness — Runner liveness and recovery. A runner that is still
+present is never reaped: its tracked task is stopped first. Source:
 [d30-liveness.mmd](docs/diagrams/d30-liveness.mmd).*
 
 **How it works.** The launch publishes `RUNDIR/status.json` (mode 0600,
@@ -963,8 +980,12 @@ by one `ps` call bounded to 2 s; the same pid with another start time is
 another process. A `ps` that fails or times out means "cannot tell", never
 "gone". Readers ignore unknown fields and treat a field of the wrong type,
 or a number no float can hold, as unknown. A failed write is reported once
-in `err.log` and removes the file an earlier write left, so a live runner
-never shows an ageing tick; readers then find no usable file.
+in `err.log` (`status.json not written (<error>); ...`) and removes the file
+an earlier write left, so readers find no usable file rather than an ageing
+tick; a later successful write brings it back. The removal is best-effort:
+if it fails too, the old file keeps its last tick, so recovery reads a stale
+tick after that `err.log` line as a publishing failure, not a stuck
+runner.
 
 After dispatch the follower checks every 2 s. A runner whose pid is gone, or
 now belongs to another process, with no terminal line gives one
@@ -973,26 +994,33 @@ line and exit 4. A runner that is present but has published no tick for
 120 s gives one `runner not responding` line (and `runner responding again`
 on recovery), and exit 4 at 300 s. A wall-clock jump far beyond the
 monotonic time between polls is treated as a system suspend and restarts
-the tick age. With no usable `status.json` for 30 s after dispatch, the
-follower prints one
+the tick age. With no usable `status.json` for 30 s after dispatch (or
+after its last usable read), the follower prints one
 `[codex-council-follow] runner liveness unavailable: no usable status.json; following err.log only; run --status`
-line and keeps relaying `err.log`. The follower also exits 5 when its own
-parent disappears.
+line and keeps relaying `err.log`, checking the runner again once a usable
+file appears. The follower also exits 5 when its own parent disappears.
 
 `--status RUNDIR` prints about ten lines of facts and exits 0: the runner's
 state (`running`, `not responding`, `gone`, `done`, `interrupted`,
-`aborted`, or `unknown`) with its pid and tick age, the settled count, one
-line per unfinished role with its state, attempt, quiet seconds, and codex
-pid, the live codex groups when the runner is gone, and one `next:` action.
+`aborted`, or `unknown`) with its pid and tick age, the settled count, up
+to `STATUS_ROLE_LINES` (5) unfinished roles, one line each with its state,
+attempt, quiet seconds, and codex pid, then a count of any others, the live
+codex groups when the runner is gone, and one `next:` action.
 Quiet seconds count from the last output recorded at the latest status
 tick, so they can read up to 15 s high; the heartbeat in `err.log` uses the
 live value.
-`--reap RUNDIR` acts only when the runner is gone: it sends SIGTERM, then
-SIGKILL, to each recorded group whose leader still has the recorded start
-identity, reports and leaves alone every other group (and never its own),
-and never touches saved threads, replies, or other files. Otherwise it
-refuses with exit 1. Claude then re-runs the unfinished roles in a new
-directory.
+`--follow` and `--status` only read. `--reap RUNDIR` is the explicit
+cleanup action, and it acts only when the runner is gone: it sends SIGTERM,
+then SIGKILL, to each recorded group whose leader still has the recorded
+start identity and to the groups and processes descended from that live
+codex (one `ps` snapshot, as in d26), reports and leaves alone every other
+group (and never its own), and never touches saved threads, replies, or
+other files. Otherwise it refuses with exit 1. Claude then re-runs the
+unfinished roles in a new directory. A runner that is present but not
+responding is never reaped: Claude stops the council's tracked background
+task, confirms with `--status` that the runner is gone, and only then runs
+`--reap` if live codex groups remain (the skill's recovery triage, which
+decides the runner's state before any rule about role output).
 
 **Key decisions and why.**
 
@@ -1037,12 +1065,38 @@ stopped runner, a follower whose parent dies, a role that is silent for a
 while and then succeeds, and a role whose stdout carries lines no JSON
 parser accepts while its stderr keeps printing.
 
-The documentation tests check behavior, not prose: every runner command a
-document shows parses with the runner's own parser; every example of
-discovery output, preflight plans, `err.log` lines, report lines, and failure
-messages is regenerated from the runner and compared; every diagram a
-document embeds exists with its Mermaid source; and SKILL.md stays in
-workflow order and inside its compaction budget.
+The documentation tests (`DocsContractTests` in `test_codex_council.py`)
+check three kinds of thing:
+
+- *Against the runner.* Every runner command a document shows parses with
+  the runner's own parser; every example of discovery output, preflight
+  plans, `err.log` selection lines, report and reply lines, and failure
+  messages is regenerated from the runner and compared; the settings table,
+  the run-directory tables, the command table, the timing constants DESIGN
+  states, and the code names it mentions are compared with the code; and
+  `ContextRecipeBehaviorTests` runs the context recipes' fail-closed
+  skeleton in a shell.
+- *Wording pins.* SKILL.md keeps its sections in workflow order and stays
+  inside its compaction budget (17,500 characters and under 500 lines), and
+  named phrases that carry the launch, follow, recovery, and reconciliation
+  rules stay present in SKILL.md, the references, README, and DESIGN, as do
+  the recovery triage's rule order (runner state before role output) and
+  the absence of product model names and effort ladders. A pin catches a
+  deleted or reworded rule, not an inaccurate new sentence, so changed prose
+  is still reviewed against the code.
+- *Diagrams and the PDF.* Every `.mmd` has a PNG with the same id and draws
+  at most nine nodes; every PNG is opaque (no alpha channel) and fits the
+  PDF's page box at 60% scale or more; DESIGN embeds every diagram once,
+  captioned with its id and a link to its source, and README embeds d00 and
+  d10 and indexes all of them; the PDF build's link rules send links to
+  in-document anchors or GitHub; and the committed PDF has only web and
+  in-document links, bookmarks for at least each document, and at least
+  one image per diagram.
+
+Nothing checks that the committed PNGs and PDF were rebuilt after their
+sources changed: run `scripts/build-docs.sh --diagrams` after editing a
+`.mmd` file and `scripts/build-docs.sh` after editing any document it
+includes.
 
 CI runs the suite on Python 3.12, 3.13, 3.14, and 3.15 and a pinned ruff.
 `tests/test_live_codex.py` holds opt-in smoke tests against a real, signed-in

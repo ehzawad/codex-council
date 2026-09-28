@@ -1,4 +1,4 @@
-flowchart LR
+flowchart TD
     User(("User"))
     Claude("Claude Code<br/>with the skill")
     Runner("Council runner")
@@ -6,13 +6,13 @@ flowchart LR
     Workspace[("Shared workspace")]
 
     User -->|"objective"| Claude
-    Claude <-->|"investigate, check"| Workspace
-    Claude -->|"roles, shared context"| Runner
-    Runner -->|"dispatch"| Workers
-    Workers <-->|"authorized work"| Workspace
-    Workers -->|"evidence"| Runner
-    Runner -->|"replies, report"| Claude
     Claude -->|"reconciled result"| User
+    Claude -->|"roles, shared context"| Runner
+    Runner -->|"replies, report"| Claude
+    Runner -->|"dispatch"| Workers
+    Workers -->|"evidence"| Runner
+    Claude <-->|"investigate, check"| Workspace
+    Workers <-->|"authorized work"| Workspace
 
     classDef person fill:#f3f4f6,stroke:#374151,color:#111827
     classDef ours fill:#dbeafe,stroke:#1d4ed8,color:#0f172a

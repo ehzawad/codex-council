@@ -1,35 +1,36 @@
 flowchart TD
-    Roles[("roles.json")]
-    Snapshot[("Planning snapshot")]
-    Gate{"Authoring gate:<br/>snapshot supports<br/>every choice?"}
-    Exit2(["exit 2<br/>rewrite roles.json"])
-    Refresh{"Launch, routing on,<br/>an automatic role?"}
-    Fresh[["Fresh launch<br/>discovery"]]
+    Inputs[("roles.json and the<br/>planning snapshot")]
+    Automatic{"An automatic choice,<br/>with routing on?"}
+    Supported{"Does the snapshot<br/>support it?"}
+    Repair(["Preflight: exit 2,<br/>rewrite roles.json here"])
+    Refuse(["Launch: exit 2, start<br/>over in a new directory"])
+    Launch{"At launch?"}
+    Fresh[["One fresh discovery,<br/>frozen for the council"]]
     Resolver("Pure resolver<br/>one decision per role")
-    Decisions["Frozen decisions<br/>attached to each role"]
     Consumers(["Preflight plan, or<br/>launch argv and report"])
 
-    Roles --> Gate
-    Snapshot --> Gate
-    Gate -->|"no"| Exit2
-    Gate -->|"yes"| Refresh
-    Refresh -->|"yes"| Fresh
-    Fresh -->|"launch evidence"| Resolver
-    Refresh -->|"no: planning evidence"| Resolver
-    Resolver --> Decisions
-    Decisions --> Consumers
+    Inputs --> Automatic
+    Automatic -->|"yes"| Supported
+    Automatic -->|"no: a user pin,<br/>inheritance, or<br/>routing off"| Resolver
+    Supported -->|"no, at preflight"| Repair
+    Supported -->|"no, at launch"| Refuse
+    Supported -->|"yes"| Launch
+    Launch -->|"yes"| Fresh
+    Launch -->|"no"| Resolver
+    Fresh --> Resolver
+    Resolver --> Consumers
 
     classDef data fill:#ede9fe,stroke:#6d28d9,color:#0f172a
     classDef decision fill:#f8fafc,stroke:#475569,color:#0f172a
     classDef stop fill:#fee2e2,stroke:#b91c1c,color:#0f172a
     classDef ext fill:#ffedd5,stroke:#c2410c,color:#0f172a
     classDef ours fill:#dbeafe,stroke:#1d4ed8,color:#0f172a
-    classDef step fill:#ffffff,stroke:#475569,color:#0f172a
+    classDef soft fill:#fef9c3,stroke:#a16207,color:#0f172a
     classDef ok fill:#dcfce7,stroke:#15803d,color:#0f172a
-    class Roles,Snapshot data
-    class Decisions step
-    class Gate,Refresh decision
-    class Exit2 stop
+    class Inputs data
+    class Automatic,Supported,Launch decision
+    class Repair soft
+    class Refuse stop
     class Fresh ext
     class Resolver ours
     class Consumers ok

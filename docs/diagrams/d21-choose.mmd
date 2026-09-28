@@ -1,6 +1,6 @@
 flowchart TD
     Start(["Role demands and<br/>discovery summary"])
-    Named{"User named a<br/>model or effort?"}
+    Asked{"What did the user<br/>ask for this role?"}
     User(["User pin<br/>mode user"])
     Pair{"Routing eligible,<br/>and a pair fits?"}
     Routed(["Routed pair<br/>mode routed"])
@@ -9,9 +9,10 @@ flowchart TD
     Inherit(["Inherit<br/>omit all three keys"])
     Roles[("roles.json")]
 
-    Start --> Named
-    Named -->|"yes"| User
-    Named -->|"no"| Pair
+    Start --> Asked
+    Asked -->|"a model or effort"| User
+    Asked -->|"keep native settings"| Inherit
+    Asked -->|"nothing"| Pair
     Pair -->|"yes"| Routed
     Pair -->|"no"| Effort
     Effort -->|"yes"| Native
@@ -26,6 +27,6 @@ flowchart TD
     classDef ok fill:#dcfce7,stroke:#15803d,color:#0f172a
     classDef data fill:#ede9fe,stroke:#6d28d9,color:#0f172a
     class Start step
-    class Named,Pair,Effort decision
+    class Asked,Pair,Effort decision
     class User,Routed,Native,Inherit ok
     class Roles data

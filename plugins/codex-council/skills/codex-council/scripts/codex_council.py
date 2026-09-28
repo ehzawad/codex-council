@@ -1761,10 +1761,10 @@ def _parse_args(argv):
         help=(
             "Read-only snapshot of a launched run from RUNDIR/"
             f"{STATUS_FILENAME}: the runner's state (running, not "
-            "responding, gone, done, interrupted, aborted), each unfinished "
-            "role's state, attempt, quiet seconds, and codex pid, live codex "
-            "process groups when the runner is gone, and one next action. "
-            "Always exits 0."
+            "responding, gone, done, interrupted, aborted), up to five "
+            "unfinished roles (state, attempt, quiet seconds, and codex pid) "
+            "and a count of the rest, live codex process groups when the "
+            "runner is gone, and one next action. Always exits 0."
         ),
     )
     parser.add_argument(
@@ -1772,9 +1772,10 @@ def _parse_args(argv):
         help=(
             f"Only when RUNDIR/{STATUS_FILENAME} shows the runner is "
             "gone: SIGTERM, then SIGKILL, each recorded codex process group "
-            "whose leader is still this run's codex, and print what was "
-            "done (exit 0). Refused with exit 1 otherwise. Never touches "
-            "saved threads or files."
+            "whose leader is still this run's codex, and the process groups "
+            "and processes that codex started, then print what was done "
+            "(exit 0). Refused with exit 1 otherwise. Never touches saved "
+            "threads or files."
         ),
     )
     parser.add_argument(

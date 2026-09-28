@@ -17,7 +17,7 @@ runs on a model and reasoning effort discovered at runtime for its lens, or
 on your native Codex configuration. Claude itself keeps the host session's
 model and effort; council routing controls only the external Codex workers.
 
-![d00-context: the user, Claude Code, the council runner, the Codex workers, and the shared workspace](docs/diagrams/d00-context.png)
+![d00-context: the user, Claude Code with the skill, the council runner, the Codex workers, and the shared workspace, top to bottom](docs/diagrams/d00-context.png)
 
 *d00-context — Council in context. Claude briefs the runner, the runner
 dispatches one Codex worker per role, and Claude reconciles what comes back.
@@ -114,8 +114,9 @@ directory; only the host's task tracker says the run is over. Source:
 4. **Follow.** A read-only follower (`--follow`) relays the actionable lines
    of `err.log` to Claude, and each role's reply lands in `replies/` as the
    role settles. The runner also keeps `status.json` current, so the
-   follower notices within seconds if the runner itself dies or stops
-   responding.
+   follower reports within seconds a runner that has died; for a runner
+   that is still present but has stopped publishing status ticks, it warns
+   after 120 seconds and stops at 300.
 5. **Reconcile.** When Claude Code reports the background task finished,
    Claude reads `out.md` and reconciles one result for you.
 
@@ -139,7 +140,7 @@ the [diagram index](#diagrams) below lists them all.
 |---|---|---|
 | `CODEX_COUNCIL_MODEL_ROUTING` | `auto` | `off` turns automatic model and effort selection off; explicit pins still apply. Any other value exits 2. |
 | `CODEX_COUNCIL_MAX_PARALLEL` | `6` | How many roles run at once (a positive integer). Larger panels queue; Codex's own configuration does not change this. |
-| `CODEX_COUNCIL_STALL_SECS` | `1800` | The output-inactivity watchdog: seconds of silence on a role's stdout and stderr before that attempt is stopped. A positive integer overrides it; 0 disables it. |
+| `CODEX_COUNCIL_STALL_SECS` | `1800` | The output-inactivity watchdog: seconds of silence on a role's stdout and stderr before that attempt is stopped. A positive integer overrides it; 0 disables it (runner monitoring and the post-exit drain still apply). |
 | `CODEX_COUNCIL_SESSION_KEY` | unset | An explicit scope for saved role threads (see [Saved role threads](#saved-role-threads)). |
 | `XDG_STATE_HOME` | `~/.local/state` | Saved role threads live in `$XDG_STATE_HOME/codex-council/`. |
 
@@ -383,8 +384,11 @@ CODEX_COUNCIL_LIVE_TESTS=1 python3 -m unittest tests.test_live_codex -v   # real
 
 `scripts/build-docs.sh` rebuilds `docs/codex-council.pdf` from this README,
 DESIGN.md, SKILL.md, and its references (it needs `uvx` and Chrome or
-Chromium); `scripts/build-docs.sh --diagrams` first re-renders every
-`docs/diagrams/<id>.png` from its `.mmd` source through mermaid.ink.
+Chromium). In the PDF, links between these documents jump within it, other
+repository links point at GitHub, and the headings are bookmarks.
+`scripts/build-docs.sh --diagrams` first re-renders every
+`docs/diagrams/<id>.png` from its `.mmd` source through mermaid.ink, on an
+opaque white background.
 
 ## License
 

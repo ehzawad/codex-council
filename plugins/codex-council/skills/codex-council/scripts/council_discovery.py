@@ -203,9 +203,10 @@ def _stop_process_group(proc):
     """Close stdin, then escalate SIGTERM -> SIGKILL over the process group.
 
     start_new_session=True made proc a group leader (pgid == pid). Each step
-    waits DISCOVERY_CLOSE_GRACE_SECS for the WHOLE group, so neither a
-    grandchild holding a pipe nor a server ignoring SIGTERM outlives
-    discovery. An interruption during those waits (Ctrl+C, or the runner's
+    waits DISCOVERY_CLOSE_GRACE_SECS for the WHOLE group, so neither a group
+    member holding a pipe nor a server ignoring SIGTERM outlives discovery;
+    a descendant that started its own session is outside the group and
+    outside this teardown. An interruption during those waits (Ctrl+C, or the runner's
     termination signal) SIGKILLs the group before it propagates, so even
     a cut-short teardown leaves nothing behind. Never raises otherwise.
     """

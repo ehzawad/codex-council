@@ -2,7 +2,7 @@ flowchart TD
     Stalled(["Stalled attempt"])
     Completed{"Turn completed, and a<br/>final message buffered?"}
     Warn(["ok, with a warning<br/>state saved best-effort"])
-    Unsafe{"Any item besides<br/>message, reasoning,<br/>or error notice, or a line<br/>that is not a JSON object?"}
+    Unsafe{"Any item besides a<br/>message, reasoning, or<br/>error notice, a line that is<br/>not a JSON object, or a<br/>failed reader or writer?"}
     Terminal(["[stall]<br/>terminal, no replay"])
     Retriable(["[retriable:stall]<br/>replay is safe"])
     Budget(["Shared retry budget<br/>see d28"])

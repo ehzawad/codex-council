@@ -6,18 +6,21 @@
 #   scripts/build-docs.sh --diagrams  first re-render docs/diagrams/<id>.png
 #                                     from <id>.mmd through mermaid.ink
 #
-# Needs uvx (Markdown to HTML with Python-Markdown) and Google Chrome or
-# Chromium (headless --print-to-pdf); --diagrams also needs curl and network
-# access. Set CHROME to the browser binary when it is not found on its own.
+# The PDF works away from this checkout: scripts/docs_html.py turns links
+# between these documents into in-document links and every other repository
+# link into its GitHub URL, and the headings become PDF bookmarks. Needs uv
+# (Markdown to HTML with Python-Markdown) and Google Chrome or Chromium
+# (headless --print-to-pdf); --diagrams also needs curl and network access.
+# Set CHROME to the browser binary when it is not found on its own.
 set -euo pipefail
 
 root=$(cd -- "$(dirname -- "$0")/.." && pwd)
 diagrams="$root/docs/diagrams"
-skill="$root/plugins/codex-council/skills/codex-council"
 pdf="$root/docs/codex-council.pdf"
+skill="plugins/codex-council/skills/codex-council"
 docs=(
-  "$root/README.md"
-  "$root/DESIGN.md"
+  README.md
+  DESIGN.md
   "$skill/SKILL.md"
   "$skill/references/panel-design.md"
   "$skill/references/context-staging.md"
@@ -60,63 +63,35 @@ if [ "$render" -eq 1 ]; then
       echo "build-docs: $id.mmd does not parse" >&2
       exit 1
     fi
-    # Render at twice the diagram's natural width, for print.
+    # Twice the diagram's natural width, for print, on an opaque white
+    # background (mermaid.ink takes the color as hex without '#').
     width=$(grep -o 'viewBox="[^"]*"' "$work/$id.svg" | head -n 1 |
       awk -F'[" ]' '{ printf "%d", $4 + 0.5 }')
-    curl -fsS --max-time 60 -A 'Mozilla/5.0' -o "$diagrams/$id.png" \
-      "https://mermaid.ink/img/$code?type=png&bgColor=white&width=$width&scale=2"
+    curl -fsS --max-time 60 -A 'Mozilla/5.0' -o "$work/$id.png" \
+      "https://mermaid.ink/img/$code?type=png&bgColor=FFFFFF&width=$width&scale=2"
+    # Only an RGB PNG (colour type 2, no alpha channel) is opaque for sure.
+    python3 - "$work/$id.png" <<'PY'
+import sys
+data = open(sys.argv[1], "rb").read()
+if data[:8] != b"\x89PNG\r\n\x1a\n" or data[25] != 2 or b"tRNS" in data:
+    sys.exit(f"build-docs: {sys.argv[1]} is not an opaque RGB PNG")
+PY
+    mv "$work/$id.png" "$diagrams/$id.png"
     echo "rendered docs/diagrams/$id.png"
   done
 fi
 
-# Every diagram README and DESIGN embed must exist.
-for image in $(grep -oh 'docs/diagrams/[a-z0-9-]*\.png' "$root/README.md" \
-    "$root/DESIGN.md" | sort -u); do
-  [ -f "$root/$image" ] || { echo "build-docs: missing $image" >&2; exit 1; }
-done
-
 html="$work/codex-council.html"
-{
-  cat <<HTML
-<!doctype html>
-<html><head><meta charset="utf-8">
-<base href="file://$root/">
-<title>codex-council</title>
-<style>
-@page { size: A4; margin: 16mm 14mm; }
-body { font: 10.5pt/1.45 -apple-system, "Helvetica Neue", Arial, sans-serif;
-       color: #111827; }
-h1 { font-size: 20pt; border-bottom: 1px solid #d1d5db; }
-h2 { font-size: 15pt; margin-top: 1.6em; }
-h3 { font-size: 12pt; }
-h1, h2, h3 { break-after: avoid; }
-pre, code { font: 8.5pt/1.35 Menlo, Consolas, monospace; }
-pre { background: #f3f4f6; padding: 8px; white-space: pre-wrap;
-      overflow-wrap: anywhere; break-inside: avoid; }
-table { border-collapse: collapse; margin: 0.8em 0; font-size: 9.5pt; }
-th, td { border: 1px solid #d1d5db; padding: 3px 6px; vertical-align: top; }
-img { display: block; margin: 0.6em auto; max-width: 100%;
-      max-height: 200mm; break-inside: avoid; }
-.doc { break-before: page; }
-</style></head><body>
-HTML
-  for doc in "${docs[@]}"; do
-    echo '<div class="doc">'
-    # Drop SKILL.md's YAML frontmatter; the rest is plain Markdown.
-    awk 'NR == 1 && $0 == "---" { fm = 1; next }
-         fm && $0 == "---" { fm = 0; next }
-         !fm' "$doc" |
-      uvx --quiet --from markdown markdown_py -x extra -x sane_lists
-    echo '</div>'
-  done
-  echo '</body></html>'
-} >"$html"
+uvx --quiet --from markdown python3 "$root/scripts/docs_html.py" \
+  "$root" "$html" "${docs[@]}"
 
 "$(find_chrome)" --headless=new --disable-gpu --no-pdf-header-footer \
-  --print-to-pdf="$pdf" "file://$html" 2>/dev/null
+  --generate-pdf-document-outline --print-to-pdf="$pdf" "file://$html" \
+  2>/dev/null
 [ -s "$pdf" ] || { echo "build-docs: no PDF was written" >&2; exit 1; }
 
-# Report what the PDF holds, so a build that lost its images shows it.
+# Report what the PDF holds, and refuse one whose links would only work on
+# this machine.
 python3 - "$pdf" <<'PY'
 import re
 import sys
@@ -124,5 +99,17 @@ import sys
 data = open(sys.argv[1], "rb").read()
 pages = len(re.findall(rb"/Type\s*/Page(?![a-z])", data))
 images = len(re.findall(rb"/Subtype\s*/Image", data))
-print(f"wrote {sys.argv[1]}: {pages} pages, {images} images")
+uris = re.findall(rb"/URI\s*\(([^)]*)\)", data)
+local = sorted({u.decode(errors="replace") for u in uris
+                if not u.startswith((b"https://", b"http://"))})
+internal = len(re.findall(rb"/Subtype\s*/Link[^>]*?/Dest\s*/", data))
+bookmarks = len(re.findall(rb"/Title\s*[(<][^\n]*\n/Dest\s*\[", data))
+print(f"wrote {sys.argv[1]}: {pages} pages, {images} images, "
+      f"{internal} in-document links, {len(uris)} web links, "
+      f"{bookmarks} bookmarks")
+if local:
+    sys.exit("build-docs: links that only work on this machine: "
+             + ", ".join(local))
+if not bookmarks:
+    sys.exit("build-docs: the PDF has no bookmarks")
 PY

@@ -1,22 +1,21 @@
 flowchart TD
     Cmd(["Prompt on stdin,<br/>argv with sent values"])
     Group[["codex exec<br/>in its own process group"]]
-    Pumps["stdout and stderr pumps<br/>event flags from stdout"]
-    Clock["Activity clock<br/>this attempt only"]
+    Pumps["stdout and stderr pumps<br/>every byte resets this<br/>attempt's activity clock"]
     Watchdog{"Silent past the<br/>watchdog threshold?"}
-    Drain{"Pipes at EOF within<br/>10 s of the exit?"}
-    Owner["Termination owner<br/>TERM, then KILL the group"]
-    Sweep["Sweep the group<br/>as the attempt ends"]
+    Tree["Live tree: one ps snapshot<br/>finds the groups and pids<br/>of the live codex's descendants"]
+    Owner["Termination owner<br/>TERM, then KILL the group<br/>and those descendants"]
+    Drain["Post-exit drain<br/>up to 10 s for EOF;<br/>still open: warn"]
+    Sweep["Sweep the group only<br/>codex has exited, so its<br/>tree can no longer be traced"]
     Result(["CodexRun<br/>exit, output, flags"])
 
     Cmd --> Group
     Group --> Pumps
-    Pumps -->|"every byte"| Clock
-    Clock --> Watchdog
-    Watchdog -->|"yes: stalled"| Owner
-    Group -->|"codex exits"| Drain
-    Drain -->|"no: warn"| Owner
-    Drain -->|"yes"| Sweep
+    Pumps --> Watchdog
+    Watchdog -->|"yes: stalled<br/>(or a cancellation)"| Tree
+    Tree --> Owner
+    Group -->|"codex exits<br/>on its own"| Drain
+    Drain --> Sweep
     Owner --> Sweep
     Sweep --> Result
 
@@ -25,8 +24,8 @@ flowchart TD
     classDef decision fill:#f8fafc,stroke:#475569,color:#0f172a
     classDef soft fill:#fef9c3,stroke:#a16207,color:#0f172a
     classDef ok fill:#dcfce7,stroke:#15803d,color:#0f172a
-    class Cmd,Pumps,Clock,Sweep step
+    class Cmd,Pumps,Drain,Sweep step
     class Group ext
-    class Watchdog,Drain decision
-    class Owner soft
+    class Watchdog decision
+    class Tree,Owner soft
     class Result ok

@@ -20,6 +20,7 @@ import asyncio
 import contextlib
 import dataclasses
 import hashlib
+import importlib.util
 import inspect
 import io
 import json
@@ -4982,6 +4983,11 @@ class DocsContractTests(unittest.TestCase):
             "A running role cannot be steered",
             "`ok=N total=M exit=X`",
             "Exit `2` with no sentinel means the launch was refused",
+            # Exit 1 is also a runner that could not finish, maybe after
+            # some roles succeeded.
+            "the runner could not finish (`runner aborted`)",
+            "check `replies/` and `--status`",
+            "it settles the runner's state before any role-output rule",
             "then fix it in a new directory",
             "recovery triage",
         ):
@@ -5046,7 +5052,10 @@ class DocsContractTests(unittest.TestCase):
             "Recovery triage",
             "the first match wins",
             "A line starting `[codex-council] CODEX_COUNCIL_DONE` (not the "
-            "word inside other text) → finished",
+            "word inside other text)",
+            # --reap is not read-only, and --status caps its role lines.
+            "`--reap` is an explicit cleanup action",
+            "up to five unfinished roles",
             "`watchdog=disabled`",
             "`[orchestrator-exception]`",
             "exactly one backgrounding layer",
@@ -5064,31 +5073,48 @@ class DocsContractTests(unittest.TestCase):
         self.assertEqual(council_common.LAUNCH_OUTPUTS,
                          ("out.md", "err.log", "replies"))
 
-    def test_recovery_triage_decides_liveness_before_log_patterns(self):
+    def test_recovery_triage_decides_runner_state_before_role_output(self):
         """A runner killed after a stall leaves stall and retry lines in
-        err.log's tail; 'no sentinel and no process' must match before
-        any rule that reads those lines as the runner handling it, and the
-        rule quotes the lines the runner actually writes to err.log."""
+        err.log's tail, and a stopped runner leaves every role's quiet below
+        the watchdog: every runner-state rule (finished, gone, not
+        responding, unknown) must match before a rule that reads role output
+        as the runner handling it or as a reason to keep waiting. An
+        unresponsive runner is stopped through its tracked task, confirmed
+        gone, and only then reaped, unless err.log says status.json could
+        not be written."""
         ref = self._flat(self._ref("runtime-behavior.md"))
         triage = ref.split("the first match wins", 1)[1]
         triage = triage.split("## Exit code", 1)[0]
         rules = re.findall(r"(?:^| )(\d)\. (.*?)(?= \d\. |$)", triage)
         self.assertEqual([number for number, _ in rules],
-                         ["1", "2", "3", "4", "5", "6"])
+                         [str(n) for n in range(1, 9)])
         text = dict(rules)
-        self.assertIn("CODEX_COUNCIL_DONE", text["1"])
-        self.assertIn("No sentinel and no process", text["2"])
+        self.assertIn("role-output rules 5 to 8 apply only to a responsive "
+                      "runner", triage)
+        for number, state in (("1", "CODEX_COUNCIL_DONE"), ("2", "`gone`"),
+                              ("3", "`not responding`"), ("4", "`unknown`")):
+            with self.subTest(rule=number):
+                self.assertIn(state, text[number])
         self.assertIn("even if stall or retry lines precede the end",
                       text["2"])
+        stop = [text["3"].index(step) for step in (
+            "stop the council's tracked background task",
+            "confirm with `--status` that the runner is now `gone`",
+            "run `--reap` if it then lists live codex groups",
+        )]
+        self.assertEqual(stop, sorted(stop))
+        # The runner's write-failure line (pinned in test_liveness).
+        self.assertIn(f"`{council_liveness.STATUS_FILENAME} not written`",
+                      text["3"])
         for fragment in ("stall threshold reached",
                          "retriable error on attempt"):
             with self.subTest(fragment=fragment):
-                self.assertIn(fragment, text["3"])
+                self.assertIn(fragment, text["5"])
                 self.assertIn(fragment, self._runner_source())
         self.assertIn("appears only in reply files and `out.md`, never in "
-                      "`err.log`", text["3"])
-        self.assertIn("rules 3 to 6 apply only while this run's process is "
-                      "alive", triage)
+                      "`err.log`", text["5"])
+        self.assertIn("`watchdog=disabled`", text["6"])
+        self.assertIn("Runner monitoring", text["6"])
         self.assertIn("Every re-invocation below is a new launch in a new "
                       "`mktemp -d` directory", triage)
 
@@ -5798,6 +5824,9 @@ class DocsContractTests(unittest.TestCase):
         "Run liveness and recovery",
     )
     DIAGRAM_NODE_BUDGET = 9
+    # Mermaid draws 16 px labels. A diagram shrunk below this to fit the
+    # PDF's page box prints them under about 7 pt.
+    DIAGRAM_MIN_PRINT_SCALE = 0.6
 
     @staticmethod
     def _top_sections(text):
@@ -5963,6 +5992,9 @@ class DocsContractTests(unittest.TestCase):
             f"checks every {council_liveness.FOLLOW_CHECK_SECS} s",
             f"no tick for {council_liveness.TICK_WARN_SECS} s",
             f"exit 4 at {council_liveness.TICK_GIVE_UP_SECS} s",
+            f"no usable `status.json` for "
+            f"{council_liveness.STATUS_UNUSABLE_WARN_SECS} s after dispatch",
+            f"`STATUS_ROLE_LINES` ({council_liveness.STATUS_ROLE_LINES})",
         ):
             with self.subTest(text=text):
                 self.assertIn(text, liveness)
@@ -6030,9 +6062,95 @@ class DocsContractTests(unittest.TestCase):
             with self.subTest(index=ident):
                 self.assertIn(f"[{ident}](docs/diagrams/{ident}.png)", index)
 
-    def test_docs_pdf_and_its_build_script_ship(self):
-        """The combined PDF ships beside its repeatable build script, which
-        includes every document the PDF promises."""
+    def _docs_html(self):
+        """scripts/docs_html.py, which lays out the PDF; its link rules and
+        page box need no Markdown package."""
+        spec = importlib.util.spec_from_file_location(
+            "docs_html", self._repo_file("scripts", "docs_html.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    @staticmethod
+    def _png_info(path):
+        """(width, height, colour type, chunk types) of a PNG file."""
+        with open(path, "rb") as f:
+            data = f.read()
+        chunks, pos = set(), 8
+        while pos + 8 <= len(data):
+            chunks.add(data[pos + 4:pos + 8])
+            pos += 12 + int.from_bytes(data[pos:pos + 4], "big")
+        return (int.from_bytes(data[16:20], "big"),
+                int.from_bytes(data[20:24], "big"), data[25], chunks)
+
+    def test_diagram_pngs_are_opaque_and_print_legibly(self):
+        """Every diagram PNG is opaque (greyscale or RGB, with no alpha
+        channel and no tRNS chunk), so its dark lines stay visible on a dark
+        page, and it fits the PDF's page box without shrinking below
+        DIAGRAM_MIN_PRINT_SCALE, so an ultra-wide strip or a squeezed tall
+        column fails here."""
+        docs_html = self._docs_html()
+        # The PNGs are rendered at the scale the PDF layout assumes.
+        self.assertIn(f"scale={docs_html.PNG_SCALE}",
+                      self._read_repo_file("scripts", "build-docs.sh"))
+        px_per_mm = 96 / 25.4
+        box = (docs_html.CONTENT_WIDTH_MM * px_per_mm,
+               docs_html.FIGURE_MAX_HEIGHT_MM * px_per_mm)
+        for ident in self._diagram_ids():
+            with self.subTest(diagram=ident):
+                width, height, colour, chunks = self._png_info(
+                    self._repo_file("docs", "diagrams", f"{ident}.png"))
+                self.assertIn(colour, (0, 2))
+                self.assertNotIn(b"tRNS", chunks)
+                natural = (width / docs_html.PNG_SCALE,
+                           height / docs_html.PNG_SCALE)
+                scale = min(1, box[0] / natural[0], box[1] / natural[1])
+                self.assertGreaterEqual(scale, self.DIAGRAM_MIN_PRINT_SCALE)
+
+    def test_pdf_links_stay_in_the_pdf_or_point_at_github(self):
+        """The PDF build turns a link to a document in the PDF, or to one of
+        its headings, into an in-document link, a link to an embedded
+        diagram into a jump to its figure, and any other repository path
+        into its GitHub URL; a link to a missing path stops the build."""
+        docs_html = self._docs_html()
+        skill = "/".join(self.SKILL_PARTS)
+        runtime = "/".join(self.REF_PARTS + ("runtime-behavior.md",))
+        docset = docs_html.DocSet(self._repo_file(),
+                                  ["README.md", "DESIGN.md", skill, runtime])
+        # As convert() records the first embed of each diagram.
+        docset.figures["docs/diagrams/d00-context.png"] = "fig-d00-context"
+        blob = f"{docs_html.REPO_URL}/blob/{docs_html.BRANCH}"
+        for (doc, href), expected in {
+            ("README.md", "DESIGN.md"): "#design",
+            ("DESIGN.md", "#run-liveness-and-recovery"):
+                "#design--run-liveness-and-recovery",
+            ("README.md", "#model-and-effort-per-role"):
+                "#readme--model-and-effort-per-role",
+            (skill, "references/runtime-behavior.md"): "#runtime-behavior",
+            ("README.md", "docs/diagrams/d00-context.png"):
+                "#fig-d00-context",
+            ("README.md", "docs/diagrams/d00-context.mmd"):
+                f"{blob}/docs/diagrams/d00-context.mmd",
+            ("README.md", "docs/diagrams/"):
+                f"{docs_html.REPO_URL}/tree/{docs_html.BRANCH}/docs/diagrams",
+            ("README.md", "https://claude.ai/code"): "https://claude.ai/code",
+        }.items():
+            with self.subTest(doc=doc, href=href):
+                self.assertEqual(docset.link(doc, href), expected)
+        with self.assertRaises(SystemExit):
+            docset.link("README.md", "docs/no-such-file.md")
+        # Heading ids follow GitHub's anchors, so a README anchor that works
+        # on GitHub works in the PDF.
+        self.assertEqual(
+            docs_html.github_slug("Step 3 — Discover, then write the role "
+                                  "<code>JSON</code>"),
+            "step-3--discover-then-write-the-role-json")
+
+    def test_docs_pdf_is_portable_and_navigable(self):
+        """The committed PDF, built by the script from every document it
+        promises, links only to the web or within itself (never to a file
+        on the machine that built it), has in-document links and a bookmark
+        per document at least, and embeds every diagram."""
         script = self._repo_file("scripts", "build-docs.sh")
         self.assertTrue(os.access(script, os.X_OK))
         text = self._read_repo_file("scripts", "build-docs.sh")
@@ -6041,7 +6159,22 @@ class DocsContractTests(unittest.TestCase):
             with self.subTest(doc=doc):
                 self.assertIn(doc, text)
         with open(self._repo_file("docs", "codex-council.pdf"), "rb") as f:
-            self.assertEqual(f.read(5), b"%PDF-")
+            data = f.read()
+        self.assertEqual(data[:5], b"%PDF-")
+        uris = re.findall(rb"/URI\s*\(([^)]*)\)", data)
+        self.assertTrue(any(uri.startswith(b"https://github.com/ehzawad/"
+                                           b"codex-council/")
+                            for uri in uris))
+        for uri in uris:
+            with self.subTest(uri=uri):
+                self.assertRegex(uri, rb"^https?://")
+        self.assertRegex(data, rb"/Subtype\s*/Link[^>]*?/Dest\s*/")
+        # A bookmark per heading: at least one for each document's title.
+        bookmarks = re.findall(rb"/Title\s*[(<][^\n]*\n/Dest\s*\[", data)
+        self.assertGreaterEqual(
+            len(bookmarks), 3 + len(os.listdir(self._repo_file(*self.REF_PARTS))))
+        self.assertGreaterEqual(len(re.findall(rb"/Subtype\s*/Image", data)),
+                                len(self._diagram_ids()))
 
     # ---------- other docs ----------
 
