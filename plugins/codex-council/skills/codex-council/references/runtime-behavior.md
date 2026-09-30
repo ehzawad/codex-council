@@ -13,6 +13,7 @@ exports the variable.
 ## Contents
 
 - Launch mechanics and why they are strict
+- Detached launch, cancel, and the supervisor lock
 - Model discovery
 - Model selection at launch
 - Reply files and the completion line
@@ -33,38 +34,44 @@ sensitive reviewed content, and predictable `/tmp/council_*` names are
 world-readable under a typical umask and can be pre-created or symlinked by
 another local user, who could then read the report or plant a fake
 `CODEX_COUNCIL_DONE` line. Discovery (`--discover`), the pre-flight
-(`--check-staging-dir`), and the launch all check that the directory is
-private, and the pre-flight and the launch check that `roles.json` and
-`context.md` are regular, non-symlink files, before reading any content. A
-rejected directory is abandoned, never repaired with chmod or mkdir: run
-`mktemp -d` again, run `--discover` in the new directory, Write both
-`roles.json` (every routed or native_effort selection naming the new
-`snapshot_id`) and `context.md` there, and run the pre-flight on it.
+(`--check-staging-dir`), `--start`, and the launch all check that the
+directory is private, and the pre-flight, `--start`, and the launch check
+that `roles.json` and `context.md` are regular, non-symlink files, before
+reading any content. A rejected directory is abandoned, never repaired with
+chmod or mkdir: run `mktemp -d` again, run `--discover` in the new
+directory, Write both `roles.json` (every routed or native_effort selection
+naming the new `snapshot_id`) and `context.md` there, and run the pre-flight
+on it.
 
 A directory holds one launch. A `[model-rejected]` re-run, a follow-up
 round, a recovery re-invocation, and a council started while another runs
 are each a new launch with a new `mktemp -d` directory and its own
-`--discover`. The launch command's shell redirections truncate `out.md` and
-`err.log` before the runner starts, so relaunching into a directory whose
-council is still running tears that council's report, log, and follower
-apart; relaunching after it finished replaces its report and mixes two runs
-in `replies/`. The runner cannot object in time, so `--discover` and the
-pre-flight both exit 2 when `out.md`, `err.log`, or `replies/` already
-exists (`already holds a council launch`), and the recovery is a new
-directory, never cleaning up the old one. The launch itself does not check
-for an earlier launch, so this holds only when the pre-flight is its own
-Bash call and the launch follows in a separate call, only after the
-pre-flight exits 0: in one
-combined call a refused pre-flight does not stop the launch, whose
-redirections still truncate the directory's files. One launch per directory
-therefore rests on that order, not on an atomic guard at launch. A staged
-launch refused before dispatch (exit 2, no sentinel) has already claimed its
-directory the same way, so every recovery it writes to `err.log` (a missing,
-unreadable, or misplaced `roles.json` or `context.md`, a roles defect, an
-empty or non-UTF-8 `context.md`, a missing `codex`) starts over in a new
-directory with its own `--discover` instead of re-running the pre-flight
-there. The direct stdin mode, which stages no `context.md`, keeps its own
-recovery wording.
+`--discover`. `--discover`, the pre-flight, and `--start` exit 2 when
+`out.md`, `err.log`, `replies/`, `supervisor.lock`, or `supervisor.json`
+already exists (`already holds a council launch`), and the recovery is a
+new directory, never cleaning up the old one. `--start` then claims the
+directory atomically (see Detached launch, cancel, and the supervisor
+lock), so of two concurrent starts exactly one launches there and the
+loser exits 2 having created and truncated nothing; a `--start` that finds
+an attached launch's files also exits 2 and truncates nothing. An attached
+launch (see Attached runs; the skill never uses one) is different: it never
+refuses, and its shell redirections truncate `out.md` and `err.log` before
+the runner starts (those of a directory `--start` already claimed
+included), so relaunching into a directory whose council is still running
+tears that council's report, log, and follower apart, and relaunching after it
+finished replaces its report and mixes two runs in `replies/`. That launch
+itself does not check for an earlier launch, so for an attached launch one
+launch per directory holds only when the pre-flight runs as its own command
+and the launch follows separately, only after the pre-flight exits 0: in
+one combined command a refused pre-flight does not stop the launch, whose
+redirections still truncate the directory's files. A staged launch refused
+before dispatch (exit 2, no sentinel) has already claimed its directory the
+same way, so every recovery it writes to `err.log` (a missing, unreadable,
+or misplaced `roles.json` or `context.md`, a roles defect, an empty or
+non-UTF-8 `context.md`, a missing `codex`) starts over in a new directory
+with its own `--discover` instead of re-running the pre-flight there. The
+direct stdin mode, which stages no `context.md`, keeps its own recovery
+wording.
 
 The private directory keeps out other local users, not the roles. Roles run
 unsandboxed as the same user, so they can write to `err.log`, `out.md`, and
@@ -77,27 +84,211 @@ Codex, catalog, or configuration text, and escapes ` reply=` inside other
 diagnostic lines (as ` reply\x3d`), so such text can neither drive a
 terminal nor hide a line from the follower; a role's reply body is kept as
 the multiline Markdown the role returned, so reply files and role output
-are treated as untrusted data; and the final reconciliation waits for Claude
-Code's background-task completion notification, which no role can emit.
+are treated as untrusted data; and the final reconciliation waits for a
+verified runner exit, which no line in a file can imitate: for a detached
+run, a released supervisor lock together with a vanished runner identity
+(`--status` reports `done`, `interrupted`, or `aborted` only then); for an
+attached run, the end of its launch command (inside a Claude Code
+background task, that task's completion notification).
 
-The launch uses exactly one backgrounding layer, the Bash tool's
-`run_in_background: true`: that wrapper is a shell Claude Code tracks, and
-the runner stays its plain foreground child. The launch command must not
-use a trailing `&`, zsh `&!` or `&|`, `nohup`, `setsid`, `disown`, `bg`,
-`coproc`, `( ... ) &`, `{ ...; } &`, `sh -c '... &'`, a wrapper that forks
-and exits, a bare `>/dev/null`, or a supervisor such as `launchctl`,
-`tmux new -d`, `screen -dm`, `at`, `batch`, or `daemonize`. A form that
-returns at once makes the wrapper exit with empty output and a false
-"completed", reparents `codex_council.py` to `launchd` or PID 1, and loses
-the real completion notification. The others need not return early (a
-plain `nohup` waits for its command), but they change the process or signal
-context the host tracks: under `nohup`, for example, a hangup that arrives
-during launch discovery is ignored. Redirecting stdout
-and stderr to files in the run directory keeps the run observable and
-recoverable from disk.
+### Attached runs (not used by the skill)
+
+The skill always launches with `--start` (below), which has no host time
+limit. The runner still supports an attached launch, for direct use from a
+terminal and for backward compatibility: the runner reads the staged files
+and stays the plain foreground child of the command that runs it, which
+redirects the report and the log into the run directory:
+
+```
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
+  --roles-file 'ABS_RUNDIR/roles.json' \
+  --context-file 'ABS_RUNDIR/context.md' \
+  --skill-contract 4 \
+  > 'ABS_RUNDIR/out.md' \
+  2> 'ABS_RUNDIR/err.log'
+```
+
+An attached run lasts only as long as its launch command, and the
+redirections keep it observable and recoverable from disk. Its directory
+has no supervisor files; `--follow`, `--status`, and `--reap` still read
+such directories, including those an earlier version of the skill launched
+this way, and the notes below marked "for an attached run" apply to them.
+When an attached launch runs inside a Claude Code background task
+(`run_in_background`), the host stops it at the Bash tool's `timeout`: 30
+minutes by default and 2 hours at most, since Claude Code 2.1.285 (see the
+[changelog](https://code.claude.com/docs/en/changelog) and Host lifetime).
+The runner then logs `[codex-council] interrupted by SIGTERM`, exits 143,
+and keeps every reply already written. That cap is why the skill always
+uses `--start` and never launches a council as a background task, not
+even as a fallback.
+
+No detach wrapper makes an attached launch durable: a trailing `&`, zsh
+`&!` or `&|`, `nohup`, `setsid`, `disown`, `bg`, `coproc`, `( ... ) &`,
+`{ ...; } &`, `sh -c '... &'`, a wrapper that forks and exits, a bare
+`>/dev/null`, or a supervisor such as `launchctl`, `tmux new -d`,
+`screen -dm`, `at`, `batch`, or `daemonize`. Inside a background task, a
+form that returns at once makes the task's shell exit with empty output and
+a false "completed", reparents `codex_council.py` to `launchd` or PID 1, and
+loses the real completion notification. The others need not return early
+(a plain `nohup` waits for its command), but they change the process or
+signal context the host tracks: under `nohup`, for example, a hangup that
+arrives during launch discovery is ignored. None of them escapes the time
+limit either: stopping a background task also stops the processes that
+detached from its shell. The only supported way to outlive a background
+task is `--start`, never a manual detach wrapper.
 
 Bare invocation (no `--roles-file`) exits 2, as a guard against accidental
 fan-out.
+
+## Detached launch, cancel, and the supervisor lock
+
+`--start` is the skill's only launch. Run it as one ordinary foreground Bash
+call, never with `run_in_background` and never behind `&`, `nohup`, or
+`setsid`, after the pre-flight exits 0:
+
+```
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
+  --start 'ABS_RUNDIR' --skill-contract 4
+```
+
+What it does, in order:
+
+1. It validates the directory exactly as the pre-flight does. A refusal
+   exits 2 before anything is created, so the directory stays untouched.
+2. It claims the directory, each file created exclusively, without
+   following a symlink, with mode 0600: `supervisor.lock`, which it locks
+   with `flock` and writes a random token into, then `err.log` and
+   `out.md`. If `supervisor.lock` already
+   exists (a concurrent `--start`, or a planted or symlinked lock file), it
+   exits 2 with the launched-directory recovery, having created and
+   truncated nothing. If `err.log` or `out.md` appeared after the
+   validation (an attached launch racing in), it exits 2 the same
+   way and truncates neither, but the `supervisor.lock` it just created
+   stays. An attached launch never refuses: its redirections truncate a
+   claimed directory's `out.md` and `err.log`.
+3. It starts the unchanged staged launch as the supervisor, in its own
+   session, with stdout on `out.md`, stderr on `err.log`, stdin on
+   `/dev/null`, the same working directory and environment (so discovery
+   and native configuration behave exactly as in an attached run), and the
+   locked descriptor as its only extra one. The context stays in its file:
+   the supervisor's command line carries only paths.
+4. The supervisor checks that the descriptor it inherited is this run's
+   private `supervisor.lock` (same device and inode) and that it holds the
+   lock, marks the descriptor so no codex worker inherits it, keeps it open
+   for its whole life, and writes `supervisor.json` (mode 0600, atomically)
+   before any discovery or dispatch: its pid, start identity, process group
+   and session, the lock's device, inode and token, the plugin version, the
+   contract epoch, and the start time. Its `status.json` records
+   `runner.mode` `detached`. From there it is the ordinary runner: the
+   report goes to `out.md`, progress and the sentinel to `err.log`.
+5. `--start` waits up to 10 seconds for `supervisor.json` (or for the
+   supervisor to exit), then exits 0 and prints:
+
+```
+[codex-council] started: pid=<pid> dir=<ABS_RUNDIR> version=<plugin version>
+follow: <python> <script> --follow <ABS_RUNDIR> --skill-contract 4
+status: <python> <script> --status <ABS_RUNDIR> --skill-contract 4
+cancel: <python> <script> --cancel <ABS_RUNDIR> --skill-contract 4
+```
+
+The three commands are exact and shell-quoted, with the real script path.
+If `supervisor.json` is not written within those 10 seconds while the
+supervisor is still alive, a `note: supervisor.json is not written yet; the
+supervisor is still starting; run --status` line follows the first line and
+`--start` still exits 0. A supervisor that wrote `supervisor.json` and has
+already ended by then (a quick council) is still a start: exit 0, with a
+`note: the runner has already ended (exit <code>); run --status, then read
+out.md` line after the first. If the supervisor exits without writing
+`supervisor.json`, `--start` exits 1 with `[codex-council] start failed:
+...; read <ABS_RUNDIR>/err.log. Do not retry --start in this directory: it
+is used up.` The wait bounds only the
+start command, never a running council. A failed start consumes the
+directory: never retry `--start` there, and start over in a new `mktemp -d`
+directory with its own `--discover`.
+
+The lock is the runner's lifetime. The supervisor holds `supervisor.lock`
+locked from its first step to its exit, and the kernel releases it however
+the process ends, SIGKILL included. The lock file is never removed or
+replaced, and a free lock means "no holder", never "reusable": the
+directory stays used. Readers open it read-only, without following a
+symlink or creating anything, require a private regular file with the
+device, inode and token `supervisor.json` records (a replaced file reads
+`unknown`, even when it reuses the old inode number, as Linux often does),
+and try a shared lock without blocking. From the lock and the
+recorded identity, a detached runner is:
+
+- alive while the lock is held and the recorded pid still has its recorded
+  start time (and `status.json`, where present, names the same runner);
+- gone only when the lock is free and the recorded identity is gone (with
+  no `supervisor.json` yet, a free lock reads gone once the lock file is 3
+  seconds old; before that `--start` may still be locking it, so it reads
+  unknown);
+- unknown on any disagreement: a held lock with a dead or reused pid, a
+  free lock with the recorded process still present, a replaced or
+  unreadable lock file, or records naming different processes. Nothing is
+  signalled, reaped, or relaunched on unknown.
+
+`--status` reports a detached run with these `runner:` lines and `next:`
+actions:
+
+| `runner:` | `next:` |
+|---|---|
+| `starting (pid <pid>; supervisor lock held; no dispatch yet)` (`no pid recorded` before `supervisor.json` exists) | `keep following; --cancel stops it; do not relaunch` |
+| `running (pid <pid>; detached; status tick <N>s ago)` | `keep following; do not relaunch; --cancel stops it` |
+| `<state> (exit <N>); the runner is still exiting (pid <pid>; supervisor lock held)` | `re-check --status in a few seconds; out.md is final only once --status reports that the runner ended` |
+| `not responding (pid <pid> present; supervisor lock held; last status tick <N>s ago)` | `unless err.log says status.json not written, run --cancel on this directory, then --reap if it says to` |
+| `done (exit <N>)` (lock free, runner gone) | `read out.md; the run has ended` |
+| `interrupted (exit <N>)` or `aborted (exit <N>)` (lock free, runner gone) | `read err.log and replies/; re-run unfinished roles in a new directory` |
+| `ended before dispatch (pid <pid> gone; supervisor lock free)` | `read err.log; start over in a new directory, never in this one` |
+| `gone (pid <pid> is no longer this run's runner; supervisor lock free)`, then the live codex groups | `run --reap on this directory, then re-run unfinished roles in a new directory` (or, with no live group, `re-run unfinished roles in a new directory; replies/ keeps the settled ones`) |
+| `unknown (pid <pid>; supervisor lock <state>; the lock and the process records disagree or cannot be read)` | `re-check --status shortly; never --reap, --cancel, or relaunch while the runner reads unknown` |
+
+`--cancel` stops a detached run:
+
+```
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
+  --cancel 'ABS_RUNDIR' --skill-contract 4
+```
+
+It signals only a verified runner: the lock held with the recorded inode,
+the pid from `supervisor.json` alive with its recorded start time and
+process group, and `status.json`, where present, naming the same runner. It
+then sends SIGCONT and SIGTERM to that one pid, and the runner tears down
+its codex process groups and logs `[codex-council] interrupted by SIGTERM`
+(exit 143) with every settled reply kept. `--cancel` waits up to 30 seconds
+for the lock to be released and exits 0 with a `cancelled:` line. If the
+lock is still held then, it verifies the runner again, sends SIGKILL, waits
+up to 5 more seconds, and exits 0 telling you to run `--reap`, since a
+SIGKILLed runner cannot end its own codex groups. It refuses with exit 1,
+signalling nothing, when the run was not launched with `--start` (stop an
+attached run's launch command instead), when the runner has already ended
+(`run --status, then --reap if it lists live codex groups`), when the
+runner is still starting and has not written `supervisor.json` (run
+`--cancel` again in a few seconds), or when any check fails. It also exits
+1 when the re-check before SIGKILL fails or the lock is still held after
+SIGKILL. A process that reused the runner's pid is never signalled.
+
+`--follow` decides a detached runner's liveness the same way. A free lock
+with no dispatch line in `err.log` ends it at once with
+`[codex-council-follow] runner ended before dispatch: read <ABS_RUNDIR>/err.log`
+and exit 3 (a refused launch, or a stop during launch discovery). `--reap`
+refuses while the lock is held, even when `ps` says the pid is gone, and
+while the runner reads `unknown`. `--follow` and `--status` never write,
+repair, or signal anything. A run directory without supervisor files (an
+attached run, including one an earlier version of the skill launched)
+behaves exactly as before.
+
+Completion of a detached run is the follower's exit 0 followed by
+`--status` reporting that the runner ended (`done`, `interrupted`, or
+`aborted`, which it shows only once the lock is free and the runner's
+identity gone); only then is `out.md` final.
+
+A detached council keeps running, and spending, until it finishes or is
+cancelled, whatever happens to the session that started it. In `claude -p`
+or a subagent, keep the turn open until the council ends (the follower as
+a Monitor or a foreground call, as below), or run `--cancel` before the
+final response. The run directory stays on disk either way, so a later
+session can run `--status` on it and read what finished.
 
 ## Model discovery
 
@@ -378,15 +569,18 @@ atomically): the runner's pid and OS start time, its state (`running`, then
 `done`, `interrupted`, or `aborted` with the exit code), a tick that
 advances on every role transition and at least every 15 seconds, and each
 role's state (`queued`, `active`, `retry-wait`, `settled`), attempt, live
-codex process group, and outcome. `--follow` and `--status` read it together
-with `err.log` and never change the run; `--reap` is an explicit cleanup
-action for a runner that is gone (below).
+codex process group, and outcome; a detached runner also records
+`runner.mode` `detached`. `--follow` and `--status` read it together with
+`err.log` (and, for a detached run, the supervisor files) and never change
+the run; `--reap` is an explicit cleanup action for a runner that is gone,
+and `--cancel` stops a detached runner (see Detached launch, cancel, and the
+supervisor lock).
 
 The follower is designed for Claude Code's Monitor tool:
 
 ```
 python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
-  --follow 'ABS_RUNDIR' --skill-contract 3
+  --follow 'ABS_RUNDIR' --skill-contract 4
 ```
 
 It checks that `ABS_RUNDIR` is a private directory, waits for `err.log` to
@@ -396,17 +590,34 @@ warnings, completion, retry, stall, and the terminal line. Per-attempt start
 lines and the heartbeat stay in `err.log`; `--verbose` relays them too. A
 completion line whose `reply=` path is not directly inside
 `ABS_RUNDIR/replies/` is dropped, because the runner never prints one. Every
-2 seconds it also checks the runner recorded in `status.json` and its own
-parent process. Its exit codes:
+2 seconds it also checks the runner recorded in `status.json` (for a
+detached run, together with the supervisor lock) and its own parent
+process.
+
+After dispatch, while the runner is alive and ticking, a follower that has
+relayed nothing for 600 seconds prints one keepalive line:
+
+```
+[codex-council-follow] still running: 1/3 settled; active: architect quiet=41s, prober; status tick 4s ago
+```
+
+It names at most five active roles, each with its quiet seconds (a bare id
+before that role's first output), then `+N more`. It is built only from
+counts, validated role ids, and numbers, never from role output or a
+`reply=` path. It never appears before dispatch, after the terminal line, or
+while lines are flowing. Each keepalive is a Monitor event that wakes
+Claude, so a long, quiet council still shows progress and the session is
+never idle for long while it follows one. Its exit codes:
 
 | Exit | Last line | Meaning and action |
 |---|---|---|
-| 0 | `CODEX_COUNCIL_DONE`, `interrupted by ...`, `runner aborted exit=N: ...`, or `[codex-council-follow] runner finished: ...` | The run ended. Read `out.md` (empty or incomplete after an interruption or abort; `replies/` keeps every settled role) and `err.log`. |
+| 0 | `CODEX_COUNCIL_DONE`, `interrupted by ...`, `runner aborted exit=N: ...`, or `[codex-council-follow] runner finished: ...` | The run ended. For a detached run, confirm with `--status` that the runner ended (it shows `done`, `interrupted`, or `aborted` only once its lock is free and its identity gone; re-check while it says the runner is still exiting). Then read `out.md` (empty or incomplete after an interruption or abort; `replies/` keeps every settled role) and `err.log`. |
 | 1 | none | Its stdout has no reader any more (the watch ended, or the pipe closed). |
 | 2 | usage error on stderr | `ABS_RUNDIR` is wrong or not private. Fix the path; do not re-arm unchanged. |
-| 3 | `[codex-council-follow] no council activity: ...` | Within 120s either `err.log` never appeared or it has no dispatch line. The launch failed or never happened: read `err.log` and the background task output. |
-| 4 | `[codex-council-follow] runner gone: pid=<pid>; unfinished=<ids>; live codex groups=<pgids or none>; run --status` | The runner process is gone, or its pid now belongs to another process, and it wrote no terminal line. Stop re-arming: a new follower would exit 4 again at once. Run `--status` and follow the recovery triage below. |
-| 4 | `[codex-council-follow] runner not responding: no status tick for <N>s (pid <pid> still present); run --status` | The runner process exists but published no tick for 300s (the same line appears once at 120s, and `runner responding again` follows if it recovers): its event loop is blocked or the process is stopped. Stop re-arming; run `--status` and follow the recovery triage below. Never reap a runner that is still present. |
+| 3 | `[codex-council-follow] no council activity: ...` | Within 120s either `err.log` never appeared or it has no dispatch line. The launch failed or never happened: read `err.log` (and, for an attached run, its launch command's output). |
+| 3 | `[codex-council-follow] runner ended before dispatch: read <ABS_RUNDIR>/err.log` | A detached runner's lock is free and it never dispatched: the launch was refused or stopped during launch discovery. Read `err.log`; start over in a new directory. |
+| 4 | `[codex-council-follow] runner gone: pid=<pid>; unfinished=<ids>; live codex groups=<pgids or none>; run --status` | The runner process is gone, or its pid now belongs to another process (for a detached run: its lock is also free), and it wrote no terminal line. Stop re-arming: a new follower would exit 4 again at once. Run `--status` and follow the recovery triage below. |
+| 4 | `[codex-council-follow] runner not responding: no status tick for <N>s (pid <pid> still present); run --status` | The runner process exists but published no tick for 300s (the same line appears once at 120s, and `runner responding again` follows if it recovers): its event loop is blocked or the process is stopped. Stop re-arming; run `--status` and follow the recovery triage below (`--cancel` for a detached run). Never reap a runner that is still present. |
 | 5 | none | The follower's own parent process went away (its watch or host ended). |
 
 When `err.log` shows a Python traceback, the follower also prints one
@@ -428,8 +639,9 @@ file appears. A system suspend is detected and restarts the tick age.
 Monitor watches end at a deadline: at most 30 minutes interactively
 (`timeout_ms` 1800000) and at most 10 minutes in a non-interactive
 `claude -p` run (600000). Watch expiry ends the follower, not the council.
-Re-arm the same command on that expiry, and only then, and only while the
-background task is still running. A re-armed follower starts from the top of
+Re-arm the same command on that expiry, and only then, and only while
+`--status` says `running` (for an attached run, while its launch command
+is still running). A re-armed follower starts from the top of
 `err.log` and replays earlier lines; skip completions already handled.
 Monitor is not offered on every host (some cloud providers, or sessions with
 telemetry or nonessential traffic disabled), so check that it is available
@@ -439,31 +651,33 @@ For a spot check at any time:
 
 ```
 python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
-  --status 'ABS_RUNDIR' --skill-contract 3
+  --status 'ABS_RUNDIR' --skill-contract 4
 ```
 
 It prints about ten lines at most and exits 0: the runner's state
 (`running`, `not responding`, `gone`, `done`, `interrupted`, `aborted`, or
-`unknown`) with its pid and tick age, how many roles settled, up to five
-unfinished roles, one line each (state, attempt, quiet seconds, codex pid),
-then `... and N more unfinished` when there are more, the live codex
-process groups when the runner is gone, and one `next:` action. Quiet
-seconds count from the last output recorded at the latest status tick, so
-they can read up to 15 seconds high. It states facts (present, gone, tick
-age, quiet seconds), never health.
+`unknown`, plus `starting`, `ended before dispatch`, and a runner still
+exiting for a detached run; see the table above) with its pid and tick age,
+how many roles settled, up to five unfinished roles, one line each (state,
+attempt, quiet seconds, codex pid), then `... and N more unfinished` when
+there are more, the live codex process groups when the runner is gone, and
+one `next:` action. Quiet seconds count from the last output recorded at the
+latest status tick, so they can read up to 15 seconds high. It states facts
+(present, gone, tick age, quiet seconds), never health.
 
-When the runner is gone and `--status` lists live codex groups, first
-confirm that the council's background task has ended, then run:
+When the runner is gone and `--status` lists live codex groups (for an
+attached run, first confirm that its launch command has ended), run:
 
 ```
 python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
-  --reap 'ABS_RUNDIR' --skill-contract 3
+  --reap 'ABS_RUNDIR' --skill-contract 4
 ```
 
 `--reap` is the one command here that changes anything: it signals
 processes. It acts only when `status.json` shows the runner gone (its pid
-missing or started at another time); otherwise, or without a usable
-`status.json`, it refuses with exit 1. It sends SIGTERM, then SIGKILL, to each
+missing or started at another time) and, for a detached run, its
+supervisor lock is free; otherwise, or without a usable `status.json`, it
+refuses with exit 1. It sends SIGTERM, then SIGKILL, to each
 recorded codex process group whose leader is still this run's codex (same
 pid and start time) and to the process groups and processes descended from
 that live codex, found in one `ps` snapshot (current codex runs each tool
@@ -476,25 +690,27 @@ Without the Monitor tool, what works depends on whether the end of your
 turn ends the host. Never poll with a shell `sleep` loop in either case.
 
 - **Interactive session.** Schedule a one-shot 10-minute wake-up (session
-  cron) whose prompt names the background task id and the exact
-  `ABS_RUNDIR`. A wake-up fires only between turns while the session is
-  open, so it is a convenience, not durable supervision. At each wake-up,
-  run `--status` (not a follower), read any new reply files, update the user
-  (completed, active, queued), and schedule another wake-up only if the run
-  continues; delete a pending one once the run settles, and never let one
-  launch a new council. If scheduling is unavailable too, run `--status`
-  whenever you next act. Here the `run_in_background` completion
-  notification is the final backstop.
-- **`claude -p` or a subagent.** Your final response ends the council's
-  background shell (about five seconds later in `-p`, at once for a
-  subagent's command), so a session cron never fires in time and no
-  completion notification can arrive after it. Keep the turn open instead:
-  run the same `--follow` command as a foreground Bash call with the
-  maximum `timeout` (600000). A foreground command that reaches its timeout
-  is moved to the background rather than stopped; stop that moved follower,
-  then run the command again while the council's task is still running
-  (each run replays earlier lines, so skip what you already handled), and
-  handle exits 3 and 4 as the table says.
+  cron) whose prompt names the exact `ABS_RUNDIR` (and, for an attached
+  run in a background task, that task's id). A wake-up fires only between
+  turns while the session is open, so it is a convenience, not durable
+  supervision. At each wake-up, run `--status` (not a follower), read any
+  new reply files, update the user (completed, active, queued), and schedule
+  another wake-up only if the run continues; delete a pending one once the
+  run settles, and never let one launch a new council. If scheduling is
+  unavailable too, run `--status` whenever you next act. For an attached
+  run in a background task, that task's completion notification is the
+  final backstop.
+- **`claude -p` or a subagent.** Your final response ends your watch: a
+  session cron never fires in time, a detached council runs on unobserved
+  (and an attached run in a background shell would be stopped about five
+  seconds later in `-p`, at once for a subagent's command). Keep the turn
+  open instead (or run `--cancel` before the final response): run the same
+  `--follow` command as a foreground Bash call with the maximum `timeout`
+  (600000). A foreground command that reaches its timeout is moved to the
+  background rather than stopped; stop that moved follower, then run the
+  command again while `--status` says `running` (each run replays earlier
+  lines, so skip what you already handled), and handle exits 3 and 4 as the
+  table says.
 
 What to do with an early reply:
 
@@ -508,24 +724,56 @@ What to do with an early reply:
 
 ## Host lifetime
 
-The runner imposes no deadline, but the host's task lifetime still applies:
+The runner imposes no deadline. What the host imposes depends on the
+launch.
 
-- Claude Code cleans up background tasks when it exits, and background Bash
-  and Monitor tasks are not restored when a session is resumed.
-- In `claude -p`, a background shell is terminated about five seconds after
-  Claude's final result, and a foreground subagent's commands stop when it
-  gives its final response. A running Monitor watch keeps the run waiting
-  only until the watch times out, within the ten-minute cap. Keep the turn
-  going by re-arming the follower (or, without Monitor, re-running the
-  foreground follower above) while the council's task is running, and never
-  return a final "still running" answer on the assumption that the council
-  survives.
-- Keep the owning session open until the council's task has ended, keep its
-  task id and `ABS_RUNDIR`, and reconcile after the host reports the task
-  finished.
-- Do not add a detach layer or change host settings to outlive the host. If
-  background Bash is unavailable, say that this launch recipe is unsupported
-  in the session instead of detaching manually.
+- **Background time limit.** Since Claude Code 2.1.285, background Bash
+  and PowerShell commands stop after a time limit: their `timeout` with
+  `run_in_background`, 30 minutes by default and 2 hours at most (see the
+  [changelog](https://code.claude.com/docs/en/changelog)). Output does not
+  extend it: a silent task and one printing every second are stopped alike.
+  Earlier releases had no such limit. It bounds only an attached run inside
+  a background task, which is why the skill never launches one: such a
+  council gets SIGTERM at its `timeout`, logs `interrupted by SIGTERM`, and
+  keeps its settled replies. A long council stopped at 30 minutes by the
+  host was this limit meeting a background launch that passed no
+  `timeout`; a larger `timeout` only moves the stop to 2 hours at most.
+- **Idle memory-pressure stop.** Separately, Claude Code can stop background
+  shells under memory pressure once the session has been idle, with no turn
+  or subagent running, for 30 minutes or more.
+  `CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP` turns that off (see the
+  [environment variables](https://code.claude.com/docs/en/env-vars)); it is
+  the user's own setting, and the skill never sets it. It too applies only
+  to tracked tasks, and a follower's keepalive lines (above) keep a
+  following session from sitting idle.
+- **Detached lifetime.** A council started with `--start` is not a tracked
+  task, so neither stop applies, and it does not end when Claude Code
+  exits. It does not survive a reboot or anything that kills its processes
+  at the operating-system level. The test suite verifies that it completes
+  after SIGHUP, SIGTERM, and SIGKILL to the process group of the shell that
+  ran `--start`, and after `--start` itself is killed right after the
+  spawn; other ways a host can end (a sandbox that kills every process it
+  started, a logout that ends the user's processes) are not verified.
+- **Linux PID namespaces.** Liveness pairs the lock with the pid and start
+  time `ps` shows. From a different PID namespace than the runner's (a
+  container or sandbox), the recorded pid is not visible, so a held lock
+  reads `unknown` and nothing is signalled or reaped. Run `--status`,
+  `--cancel`, and `--reap` where `--start` ran.
+- **`claude -p` and subagents.** In `claude -p`, a background shell is
+  terminated about five seconds after Claude's final result, and a
+  foreground subagent's commands stop when it gives its final response. A
+  running Monitor watch keeps the turn waiting only until the watch times
+  out, within the ten-minute cap. Keep the turn going by re-arming the
+  follower (or, without Monitor, re-running the foreground follower above)
+  while `--status` says `running`, and never return a final "still running"
+  answer: a detached council would run on, and spend, with nobody to
+  reconcile it, and an attached one in a background task would be
+  stopped. Run `--cancel` first when the turn has to end.
+- Background Bash and Monitor tasks are not restored when a session is
+  resumed; keep `ABS_RUNDIR` so a later turn can run `--status` and
+  re-arm the follower.
+- Use only the supported `--start` to outlive a background task; never a
+  manual detach wrapper, and never change host settings for it.
 
 If the host ended a run anyway, recover from disk with the triage below:
 reply files already written survive.
@@ -536,13 +784,14 @@ If a run is lost, orphaned, or looks stuck, recover from disk:
 
 ```
 python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
-  --status 'ABS_RUNDIR' --skill-contract 3
+  --status 'ABS_RUNDIR' --skill-contract 4
 tail -n 40 'ABS_RUNDIR/err.log'
 ls 'ABS_RUNDIR/replies'
 ```
 
 `--status` decides liveness from `status.json` (the runner's pid and start
-time), and `err.log` ends in `[codex-council] CODEX_COUNCIL_DONE` when the
+time) and, for a detached run, from the supervisor lock too, and `err.log`
+ends in `[codex-council] CODEX_COUNCIL_DONE` when the
 run finished; `replies/` holds the roles that already settled.
 
 Work through these in order; the first match wins. The runner's state
@@ -555,29 +804,40 @@ only because it is active or quiet is low. Every re-invocation below is a
 new launch in a new `mktemp -d` directory.
 
 1. A line starting `[codex-council] CODEX_COUNCIL_DONE` (not the word inside
-   other text), or `--status` says `done` → finished; read `out.md`; do not
-   re-invoke. (If the background task still shows as running, trust the
-   task state.)
+   other text), or `--status` says `done` → finished; do not re-invoke.
+   Read `out.md` once the runner has ended: for a detached run, when
+   `--status` no longer says the runner is still exiting (re-check in a few
+   seconds); for an attached run, when its launch command has ended (if it
+   still shows as running, trust that state).
 2. No sentinel and no process (`--status` says `gone`, `interrupted`, or
    `aborted`) → it crashed, was killed, or was interrupted, even if stall or
    retry lines precede the end; read `err.log`, any reply files, and any
-   partial `out.md`. If `--status` lists live codex groups, confirm the
-   background task has ended and run `--reap`. Then re-invoke only the roles
-   that did not finish.
+   partial `out.md`. If `--status` lists live codex groups, run `--reap`
+   (for an attached run, confirm first that its launch command has
+   ended). Then re-invoke only the roles that did not finish. A detached
+   run that says `ended before dispatch` never started its roles: read
+   `err.log` and start over in a new directory.
 3. `--status` says `not responding` (the runner process is present, but its
    last status tick is at least 120 seconds old) → if `err.log` has a
    `status.json not written` line, the old tick only shows that the runner
    cannot update the file, so apply rule 4 instead; otherwise its event
    loop is blocked or the process is stopped, and no role rule below
-   applies: stop the council's tracked background task, confirm with
+   applies: run `--cancel` for a detached run (it replaces stopping a
+   task), or, for an attached run, stop its launch command; confirm with
    `--status` that the runner is now `gone`, `interrupted`, or `aborted`,
-   run `--reap` if it then lists live codex groups, and re-invoke the
-   unfinished roles. Never reap while the runner is present.
-4. `--status` says `unknown` (no usable `status.json`, or `ps` cannot tell)
-   → liveness cannot be read, so the tracked background task decides: while
-   it runs, keep following `err.log` and re-check `--status` later; once it
-   has ended without a sentinel, apply rule 2 (`--reap` refuses without a
-   usable `status.json`).
+   run `--reap` if it then lists live codex
+   groups (or if `--cancel` says to), and re-invoke the unfinished roles.
+   Never reap while the runner is present.
+4. `--status` says `unknown` → liveness cannot be read. For a detached run
+   the supervisor lock decides: `unknown` means the lock and the process
+   records disagree (a held lock whose recorded pid is gone or reused, a
+   replaced lock file, records naming different processes) or `ps` cannot
+   tell, so never `--reap`, `--cancel`, or relaunch; re-check `--status`
+   shortly, and if it stays `unknown`, tell the user what it prints. For an
+   attached run (no usable `status.json`, or `ps` cannot tell), its launch
+   command decides: while it runs, keep following `err.log` and re-check
+   `--status` later; once it has ended without a sentinel, apply rule 2
+   (`--reap` refuses without a usable `status.json`).
 5. A role's latest line is a stall termination (`[codex-council:<id>] stall
    threshold reached (...); terminating attempt`) or a retry
    (`[codex-council:<id>] retriable error on attempt N/M; sleeping Ns.`) →
@@ -589,12 +849,12 @@ new launch in a new `mktemp -d` directory.
    (rules 2 to 4) and the bounded post-exit drain still apply.
 7. Active roles with `quiet` below the printed `watchdog=` value → keep
    following; report the run as "output-active", not healthy.
-8. `quiet` at or past the watchdog with no stall line after a short grace and
-   a fresh read → the runner is responsive but its watchdog did not act:
-   stop the tracked background task, confirm with `--status` that the
-   runner is gone, run `--reap` if it then lists live codex groups, inspect
-   `err.log`, then re-invoke once. Replies already in `replies/` are still
-   valid.
+8. `quiet` at or past the watchdog with no stall line after a short grace
+   and a fresh read → the runner is responsive but its watchdog did not act:
+   run `--cancel` (for an attached run, stop its launch command),
+   confirm with `--status` that the runner is gone, run `--reap` if it then
+   lists live codex groups, inspect `err.log`, then re-invoke once. Replies
+   already in `replies/` are still valid.
 
 ## Exit code, report, and failure tags
 
@@ -756,14 +1016,15 @@ without drawing any stronger conclusion from it.
   message names (see Exit code, report, and failure tags).
 - The runner has no total elapsed-time or run-level deadline: a role may run
   as long as its codex subprocess keeps producing output bytes. The host's
-  task lifetime still bounds a run (see Host lifetime). Inside the runner,
-  the per-subprocess output-inactivity watchdog below is the only control
-  that stops a silent role, and the bounded post-exit drain ends an attempt
-  whose codex exited while something kept its output open; the runner's own
-  liveness is published in `status.json` for `--follow` and `--status` (see
-  Following a run). Codex's provider stream-idle guard covers a stalled
-  connection, not a run-level deadline. Ctrl+C tears down every in-flight
-  Codex process group.
+  background time limit bounds only an attached run inside a background
+  task, which the skill never launches (see Host lifetime). Inside the
+  runner, the per-subprocess output-inactivity watchdog below is the only
+  control that stops a silent role, and the bounded post-exit drain ends an
+  attempt whose codex exited while something kept its output open; the
+  runner's own liveness is published in `status.json` for `--follow` and
+  `--status` (see Following a run). Codex's provider stream-idle guard
+  covers a stalled connection, not a run-level deadline. Ctrl+C tears down
+  every in-flight Codex process group.
 - A role waiting for another council's same-role continuity lock remains queued.
   Each failed nonblocking probe closes its file descriptor and releases the
   subprocess permit before sleeping, so the waiter neither appears active nor
@@ -830,18 +1091,18 @@ deltas, so a healthy role can be byte-silent for long stretches.
 
 ## Progress lines, heartbeat, and version visibility
 
-All progress is advisory stderr (redirected to `err.log` by the launch
-command); its loss never changes role results or the exit code. The dispatch
-line is followed by the model-selection lines above. Per-attempt start lines
-look like
+All progress is advisory stderr, on `err.log` (opened for the supervisor by
+`--start`, or redirected there by an attached launch command); its loss
+never changes role results or the exit code. The dispatch line is followed
+by the model-selection lines above. Per-attempt start lines look like
 `[codex-council] <role>: started (fresh|resume) attempt=1/2 watchdog=1800s`
 (`watchdog=disabled` when the env var is 0). A stall termination logs
 `[codex-council:<role>] stall threshold reached (quiet=Ns, watchdog=Ns);
 terminating attempt` before the policy above is applied.
 
-While work remains, a heartbeat is emitted every `min(1800, stall_secs // 3)`
-seconds with a 300s floor while the watchdog is enabled (600s at the default
-threshold; 1800s when disabled):
+While work remains, a heartbeat is emitted every 300 seconds, whatever
+`CODEX_COUNCIL_STALL_SECS` is (enabled, 0, or very large); it is advisory
+and never resets a watchdog:
 
 ```
 [codex-council] still running after 1240s: completed=1/3; active=2 (architect quiet=41s, prober retry-wait); queued=0; watchdog=1800s; version=9.8.7.

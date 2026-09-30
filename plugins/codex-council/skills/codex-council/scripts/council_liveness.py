@@ -3,26 +3,35 @@
 The runner publishes RUNDIR/status.json through RunStatus: its own pid and
 OS start identity, its state, a tick that advances on every role transition
 and at least every STATUS_TICK_SECS, and per role the scheduling state, the
-attempt, the live codex process group, and the outcome. Two read-only
-commands and one explicit cleanup command use that file:
+attempt, the live codex process group, and the outcome. A detached run
+(launched with --start) also has RUNDIR/supervisor.lock, which its runner
+holds locked (flock) for its whole life, and RUNDIR/supervisor.json, which
+that runner writes about itself before any other work. Two read-only
+commands and two explicit commands use those files:
 
 * --follow RUNDIR relays the actionable lines of RUNDIR/err.log (one stdout
-  line per event, for a Claude Code Monitor) and reports a runner that is
-  gone or has stopped ticking;
+  line per event, for a Claude Code Monitor), reports a runner that is
+  gone or has stopped ticking, and after 600s with nothing relayed prints
+  one `still running` keepalive line while the runner is alive;
 * --status RUNDIR prints a short snapshot and one next action;
 * --reap RUNDIR, only once the runner is gone, terminates the recorded codex
   process groups whose leader is still this run's codex, and the process
-  groups and processes that live codex started.
+  groups and processes that live codex started;
+* --cancel RUNDIR stops a detached run's verified runner (SIGTERM, and
+  SIGKILL after a grace), which then tears down its own codex groups.
 
 A process identity is its pid plus its start time as `ps -o lstart=` prints
 it (C locale, UTC): the same pid with another start time is another
-process. Reports state facts (present, gone, tick age, quiet seconds),
-never health. Nothing here writes anything but status.json, and only the
-runner writes that.
+process. A detached runner is alive while its lock is held, and gone only
+when the lock is free and its recorded identity is gone; any disagreement
+reads unknown and nothing is signalled. Reports state facts (present, gone,
+tick age, quiet seconds), never health. Nothing here writes anything but
+status.json, and only the runner writes that (and supervisor.json).
 """
 
 import contextlib
 import dataclasses
+import fcntl
 import json
 import math
 import os
@@ -38,11 +47,14 @@ from council_common import (
     _READ_CHUNK_BYTES,
     REPLIES_SUBDIR,
     REPLY_MARKER,
+    SUPERVISOR_FILENAME,
+    SUPERVISOR_LOCK_FILENAME,
     _atomic_write_private,
     _check_private_dir,
     _diag,
     _log_inline,
     _print_stdout,
+    _private_stat_problem,
     _report_inline,
     _usage_exit,
 )
@@ -53,6 +65,9 @@ STATUS_SCHEMA = 1
 STATUS_TICK_SECS = 15
 ROLE_STATES = ("queued", "active", "retry-wait", "settled")
 TERMINAL_STATES = ("done", "interrupted", "aborted")
+# runner.mode in status.json (optional): "detached" for a --start runner.
+RUNNER_MODES = ("tracked", "detached")
+SUPERVISOR_SCHEMA = 1
 # Every ps call is bounded; a timeout reads as "cannot tell", never "gone".
 PS_TIMEOUT_SECS = 2
 # ps prints lstart in local time and the locale's words; pin both so the
@@ -82,8 +97,30 @@ FOLLOW_EXIT_STDOUT_GONE = 1
 FOLLOW_EXIT_NO_ACTIVITY = 3
 FOLLOW_EXIT_RUNNER_GONE = 4
 FOLLOW_EXIT_PARENT_GONE = 5
+# After dispatch, while the runner is alive and ticking, a follower that has
+# relayed nothing for FOLLOW_KEEPALIVE_SECS prints one `still running` line
+# naming at most KEEPALIVE_ROLES active roles. Each line is a Monitor event
+# that wakes Claude, so a long, quiet council still shows progress.
+FOLLOW_KEEPALIVE_SECS = 600
+KEEPALIVE_ROLES = 5
+# The runner's role-id grammar (codex_council.ROLE_ID_PATTERN): only ids of
+# this shape are named in a keepalive line.
+_ROLE_ID_RE = re.compile(r"^[a-z0-9_-]+\Z")
 # --reap: SIGTERM, up to this long for the group to empty, then SIGKILL.
 REAP_GRACE_SECS = 2
+# --start creates supervisor.lock and then locks it (retrying for up to a
+# second past a reader's momentary shared lock). For this long after the
+# file appears, a free lock with no record is "unknown", not "gone".
+LOCK_CLAIM_GRACE_SECS = 3
+# --cancel: SIGCONT and SIGTERM to the verified runner, then up to this long
+# for it to release its lock; a runner still holding it with the same
+# identity then gets SIGKILL and up to CANCEL_KILL_WAIT_SECS more. These
+# bound the cancel command only, never a running council.
+CANCEL_GRACE_SECS = 30
+CANCEL_KILL_WAIT_SECS = 5
+CANCEL_POLL_SECS = 0.1
+# --cancel exit codes: 0 = the runner has ended, 1 = refused or not ended.
+CANCEL_EXIT_REFUSED = 1
 # --status shows at most this many unfinished roles (about ten lines total).
 STATUS_ROLE_LINES = 5
 
@@ -108,13 +145,15 @@ FOLLOW_ROUTINE_PATTERN = re.compile(
     r"^\[codex-council\] (?:[a-z0-9_-]+: started \((?:fresh|resume)\) "
     r"attempt=\d+/\d+ watchdog=\S+|still running after \d+s: .*)\Z"
 )
-# Recovery for a rejected run directory. These commands only read, so the
-# fix is always "point at the real run directory", never chmod or mkdir.
+# Recovery for a rejected run directory. These commands only read (or
+# signal verified processes), so the fix is always "point at the real run
+# directory", never chmod or mkdir.
 RUN_DIR_RECOVERY = (
     "Recovery: pass the exact absolute mktemp directory the council was "
     "launched from (the directory holding roles.json, out.md, and err.log). "
-    "--follow, --status, and --reap only read DIR/err.log and "
-    "DIR/status.json; do not chmod or mkdir anything for them."
+    "--follow, --status, --reap, and --cancel only read DIR/err.log, "
+    "DIR/status.json, and the supervisor files; do not chmod or mkdir "
+    "anything for them."
 )
 
 
@@ -294,13 +333,19 @@ class RunStatus:
         self.seq = 0
         self._write_failed = False
 
-    def attach(self, path):
-        """Publish to `path` from now on (the launch path only)."""
+    def attach(self, path, mode=None):
+        """Publish to `path` from now on (the launch path only).
+
+        `mode` "detached" (a --start supervisor) is recorded as runner.mode,
+        an optional schema-1 field; a tracked launch records none.
+        """
         pid = os.getpid()
         self.path = path
         self.run_id = os.urandom(8).hex()
         self.runner = {"pid": pid, "start_identity": process_start_identity(pid),
                        "state": "running"}
+        if mode is not None:
+            self.runner["mode"] = mode
 
     def begin(self, role_ids):
         self.roles = {rid: {"state": "queued", "attempt": 0} for rid in role_ids}
@@ -396,6 +441,7 @@ class RunView:
     exit: int | None
     tick_at: float | None
     roles: dict
+    mode: str | None = None
 
 
 def _int(value, minimum):
@@ -463,7 +509,215 @@ def read_status(path):
         exit=_int(runner.get("exit"), 0),
         tick_at=_number(tick.get("at")),
         roles=roles,
+        mode=runner.get("mode") if runner.get("mode") in RUNNER_MODES
+        else None,
     )
+
+
+# ---------- supervisor.json and supervisor.lock: detached runs ----------
+
+@dataclasses.dataclass
+class SupervisorView:
+    """The supervisor.json fields the commands below use."""
+    pid: int | None
+    identity: str | None
+    pgid: int | None
+    sid: int | None
+    lock_dev: int | None
+    lock_ino: int | None
+    lock_token: str | None
+    version: str | None
+    epoch: int | None
+    started_at: str | None
+
+
+LOCK_TOKEN_MAX_BYTES = 64
+
+
+def read_lock_token(fd):
+    """The token --start wrote into supervisor.lock (read at offset 0 without
+    moving the descriptor), or None when there is none or it is unreadable."""
+    try:
+        raw = os.pread(fd, LOCK_TOKEN_MAX_BYTES + 1, 0)
+    except OSError:
+        return None
+    if not raw or len(raw) > LOCK_TOKEN_MAX_BYTES:
+        return None
+    try:
+        token = raw.decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    return token if re.fullmatch(r"[0-9a-f]{16,64}", token) else None
+
+
+def supervisor_record(pid, lock_stat, version, epoch, started_at,
+                      lock_token=None):
+    """The supervisor.json object a detached runner writes about itself."""
+    lock = {"dev": lock_stat.st_dev, "ino": lock_stat.st_ino}
+    if lock_token is not None:
+        lock["token"] = lock_token
+    return {
+        "schema": SUPERVISOR_SCHEMA,
+        "pid": pid,
+        "start_identity": process_start_identity(pid),
+        "pgid": os.getpgid(0),
+        "sid": os.getsid(0),
+        "lock": lock,
+        "version": version,
+        "epoch": epoch,
+        "started_at": started_at,
+    }
+
+
+def read_supervisor(path):
+    """supervisor.json as a SupervisorView, or None when unusable.
+
+    Tolerant like read_status: a field of the wrong type reads as unknown
+    (None). The file must also be a private regular file (not a symlink,
+    this user's, mode 0600 or tighter), since --cancel signals the pid it
+    names.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                     | os.O_CLOEXEC)
+        with os.fdopen(fd, "rb") as f:
+            if _private_stat_problem(os.fstat(f.fileno()),
+                                     directory=False) is not None:
+                return None
+            data = json.loads(f.read())
+    except (OSError, ValueError, RecursionError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    lock = data.get("lock") if isinstance(data.get("lock"), dict) else {}
+    return SupervisorView(
+        pid=_int(data.get("pid"), 2),
+        identity=_text(data.get("start_identity")),
+        pgid=_int(data.get("pgid"), 2),
+        sid=_int(data.get("sid"), 2),
+        lock_dev=_int(lock.get("dev"), 0),
+        lock_ino=_int(lock.get("ino"), 0),
+        lock_token=_text(lock.get("token")),
+        version=_text(data.get("version")),
+        epoch=_int(data.get("epoch"), 0),
+        started_at=_text(data.get("started_at")),
+    )
+
+
+def lock_state(run_dir, supervisor=None):
+    """"absent", "held", "free", or "unknown" for RUNDIR/supervisor.lock.
+
+    Opens read-only without following a symlink or creating anything,
+    requires a private regular file (and, when `supervisor` records one,
+    the same device and inode, plus the same token when one was recorded:
+    a replaced lock file is unknown even if it reuses the old inode
+    number), then tries
+    a shared lock without blocking: refused means the runner holds it. The
+    shared lock, if taken, is released at once by the close.
+    """
+    path = os.path.join(run_dir, SUPERVISOR_LOCK_FILENAME)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                     | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return "absent"
+    except OSError:
+        return "unknown"
+    try:
+        st = os.fstat(fd)
+        if _private_stat_problem(st, directory=False) is not None:
+            return "unknown"
+        if supervisor is not None and (
+                supervisor.lock_dev != st.st_dev
+                or supervisor.lock_ino != st.st_ino
+                or (supervisor.lock_token is not None
+                    and read_lock_token(fd) != supervisor.lock_token)):
+            return "unknown"
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return "held"
+        except OSError:
+            return "unknown"
+        return "free"
+    finally:
+        os.close(fd)
+
+
+def is_detached(run_dir, view=None):
+    """True for a run launched with --start (either supervisor file, or a
+    status.json that says so); every other run reads as before."""
+    return (
+        any(os.path.lexists(os.path.join(run_dir, name))
+            for name in (SUPERVISOR_LOCK_FILENAME, SUPERVISOR_FILENAME))
+        or (view is not None and view.mode == "detached")
+    )
+
+
+def _lock_just_created(run_dir):
+    """True while supervisor.lock is younger than LOCK_CLAIM_GRACE_SECS
+    (by its mtime: the file is written once, as it is created)."""
+    try:
+        st = os.lstat(os.path.join(run_dir, SUPERVISOR_LOCK_FILENAME))
+    except OSError:
+        return False
+    return -1 < time.time() - st.st_mtime < LOCK_CLAIM_GRACE_SECS
+
+
+@dataclasses.dataclass
+class Detached:
+    """A detached run's combined liveness (see supervisor_state)."""
+    state: str
+    supervisor: SupervisorView | None
+    lock: str
+
+    @property
+    def pid(self):
+        return self.supervisor.pid if self.supervisor is not None else None
+
+
+def supervisor_state(run_dir, view, table=None):
+    """Combined liveness of a detached run: "alive", "gone", or "unknown".
+
+    Alive: the lock is held and, once supervisor.json exists, its recorded
+    runner is alive and agrees with status.json. Gone: the lock is free and
+    the recorded identity is gone (or, with no supervisor.json yet, the
+    runner ended before it could write one; within LOCK_CLAIM_GRACE_SECS
+    of the lock file's creation that reads as unknown instead, since
+    --start may not have locked it yet). Anything else (a held lock
+    with a dead or unverifiable pid, a free lock with the recorded process
+    still present, a replaced or unreadable lock, records naming different
+    processes) is unknown: nothing may be signalled or reaped then.
+    `table` is a process table (None looks the recorded pid up once).
+    """
+    sup_path = os.path.join(run_dir, SUPERVISOR_FILENAME)
+    supervisor = read_supervisor(sup_path)
+    lock = lock_state(run_dir, supervisor)
+    if supervisor is None:
+        if os.path.lexists(sup_path):
+            return Detached("unknown", None, lock)
+        # No record yet: the runner has not reached its first step.
+        state = {"held": "alive", "free": "gone"}.get(lock, "unknown")
+        if view is not None and state != "unknown":
+            state = "unknown"  # status.json without supervisor.json
+        elif state == "gone" and _lock_just_created(run_dir):
+            state = "unknown"  # --start may not have locked it yet
+        return Detached(state, None, lock)
+    if supervisor.pid is None or lock not in ("held", "free"):
+        return Detached("unknown", supervisor, lock)
+    if view is not None and view.pid is not None and (
+            view.pid != supervisor.pid
+            or (view.identity is not None and supervisor.identity is not None
+                and view.identity != supervisor.identity)):
+        return Detached("unknown", supervisor, lock)
+    if table is None:
+        table = _process_table(supervisor.pid)
+    identity = _identity_state(table, supervisor.pid, supervisor.identity)
+    if lock == "held":
+        return Detached("alive" if identity == "alive" else "unknown",
+                        supervisor, lock)
+    return Detached("gone" if identity == "gone" else "unknown",
+                    supervisor, lock)
 
 
 def _unfinished(view):
@@ -539,6 +793,7 @@ class _Follower:
     """State for one --follow run; see follow()."""
 
     def __init__(self, run_dir, verbose):
+        self.run_dir = run_dir
         self.log_path = os.path.join(run_dir, "err.log")
         self.status_path = os.path.join(run_dir, STATUS_FILENAME)
         # Same construction as the runner's replies directory.
@@ -556,9 +811,18 @@ class _Follower:
         self.stale = False
         self.suspend_floor = 0.0
         self.last_wall, self.last_mono = time.time(), time.monotonic()
+        # The last line this follower printed, and the status.json view of
+        # a runner last seen alive and ticking (None otherwise): together
+        # they decide the keepalive.
+        self.last_emit = time.monotonic()
+        self.live_view = None
+
+    def emit(self, text):
+        _print_stdout(text)
+        self.last_emit = time.monotonic()
 
     def note(self, text):
-        _print_stdout(f"{FOLLOW_NOTE} {text}")
+        self.emit(f"{FOLLOW_NOTE} {text}")
 
     def relay(self):
         """Relay new complete err.log lines; 0 after a terminal line."""
@@ -595,7 +859,7 @@ class _Follower:
             self.dispatched_at = time.monotonic()
         if not self.verbose and FOLLOW_ROUTINE_PATTERN.match(line):
             return False
-        _print_stdout(line)
+        self.emit(line)
         return bool(
             FOLLOW_DONE_PATTERN.match(line)
             or FOLLOW_INTERRUPTED_PATTERN.match(line)
@@ -613,6 +877,7 @@ class _Follower:
 
     def check(self):
         """Parent, consumer, and runner checks; an exit code or None."""
+        self.live_view = None
         if os.getppid() != self.parent:
             return FOLLOW_EXIT_PARENT_GONE
         if _stdout_hung_up():
@@ -620,6 +885,16 @@ class _Follower:
                 sys.stdout.close()
             return FOLLOW_EXIT_STDOUT_GONE
         if self.dispatched_at is None:
+            if is_detached(self.run_dir) and supervisor_state(
+                    self.run_dir, read_status(self.status_path)
+            ).state == "gone":
+                # The lock is free and nothing dispatched: the runner has
+                # ended (a refused launch, or a stop during discovery).
+                if self.relay() == 0:
+                    return 0
+                self.note(f"runner ended before dispatch: read "
+                          f"{self.log_path}")
+                return FOLLOW_EXIT_NO_ACTIVITY
             if time.monotonic() - self.started < FOLLOW_START_SECS:
                 return None
             if self.fd is None:
@@ -633,7 +908,15 @@ class _Follower:
             return FOLLOW_EXIT_NO_ACTIVITY
         view = read_status(self.status_path)
         now = time.monotonic()
+        detached = (supervisor_state(self.run_dir, view)
+                    if is_detached(self.run_dir, view) else None)
         if view is None or view.pid is None:
+            if detached is not None and detached.state == "gone":
+                if self.relay() == 0:
+                    return 0
+                self.note(f"runner gone: pid={detached.pid}; no usable "
+                          f"{STATUS_FILENAME}; run --status")
+                return FOLLOW_EXIT_RUNNER_GONE
             # Nothing to check yet, or the runner could not write the file
             # (it says so in err.log, which is relayed): err.log alone, and
             # one line once that has lasted STATUS_UNUSABLE_WARN_SECS.
@@ -646,7 +929,12 @@ class _Follower:
                           "--status")
             return None
         self.status_seen_at = now
-        runner = runner_state(view.pid, view.identity)
+        if detached is not None:
+            # The lock decides: alive while held, gone only when it is free
+            # and the recorded identity is gone, unknown otherwise.
+            runner = detached.state
+        else:
+            runner = runner_state(view.pid, view.identity)
         if runner == "gone":
             # A terminal line written just before the exit wins.
             if self.relay() == 0:
@@ -677,7 +965,45 @@ class _Follower:
         elif self.stale:
             self.stale = False
             self.note("runner responding again")
+        else:
+            self.live_view = view
         return None
+
+    def keepalive(self):
+        """One `still running` line after FOLLOW_KEEPALIVE_SECS of silence.
+
+        Only after dispatch and while the last check saw the runner alive
+        and ticking. Built only from counts, validated role ids, and
+        numbers, so no text from a role or a file can reach it.
+        """
+        view = self.live_view
+        if view is None or self.dispatched_at is None:
+            return
+        if time.monotonic() - self.last_emit < FOLLOW_KEEPALIVE_SECS:
+            return
+        now = time.time()
+        unfinished = _unfinished(view)
+        active = [(rid, role) for rid, role in view.roles.items()
+                  if role["state"] == "active"]
+        shown = []
+        for role_id, role in active:
+            if len(shown) == KEEPALIVE_ROLES:
+                break
+            if not isinstance(role_id, str) or not _ROLE_ID_RE.match(role_id):
+                continue
+            if role["output_at"] is None:
+                shown.append(role_id)
+            else:
+                quiet = max(0.0, now - role["output_at"])
+                shown.append(f"{role_id} quiet={quiet:.0f}s")
+        if len(active) > len(shown):
+            shown.append(f"+{len(active) - len(shown)} more")
+        tick_age = max(0.0, now - max(view.tick_at, self.suspend_floor))
+        self.note(
+            f"still running: {len(view.roles) - len(unfinished)}/"
+            f"{len(view.roles)} settled; active: {', '.join(shown) or 'none'}"
+            f"; status tick {tick_age:.0f}s ago"
+        )
 
     def run(self):
         next_check = 0.0
@@ -691,6 +1017,7 @@ class _Follower:
                     code = self.check()
                     if code is not None:
                         return code
+                self.keepalive()
                 time.sleep(FOLLOW_POLL_SECS)
         finally:
             if self.fd is not None:
@@ -709,8 +1036,9 @@ def follow(run_dir, verbose=False):
     unsandboxed as the same user and can append to err.log directly, which
     no same-uid check can authenticate. The follower therefore drops any
     completion line whose reply= path is not directly inside this run's
-    replies/ directory, and SKILL.md bases the final verdict on the tracked
-    background-task completion. A new follower reads err.log from the
+    replies/ directory, and SKILL.md bases the final verdict on a verified
+    runner exit (the tracked task's completion, or for a detached run a
+    released lock and a vanished runner identity). A new follower reads err.log from the
     start.
 
     Every FOLLOW_CHECK_SECS it also checks its own parent (exit 5 once
@@ -724,6 +1052,11 @@ def follow(run_dir, verbose=False):
     after the CODEX_COUNCIL_DONE sentinel, an interruption line, or a
     `runner aborted` line; exit 3 when no dispatch line appears within
     FOLLOW_START_SECS. A Python traceback in err.log is one advisory line.
+    For a detached run the supervisor lock decides the runner's liveness
+    (supervisor_state), and a free lock with no dispatch line is one
+    `runner ended before dispatch` line and exit 3 at once. After dispatch,
+    FOLLOW_KEEPALIVE_SECS with nothing relayed while the runner is alive and
+    ticking prints one `still running` line (see keepalive).
     """
     run_dir = _check_private_dir(
         run_dir, prefix="--follow: ", recovery=RUN_DIR_RECOVERY
@@ -745,8 +1078,87 @@ def _role_line(role_id, role, now, table):
     return f"  {_report_inline(role_id)}: {', '.join(parts)}"
 
 
-def _status_lines(view, now, table):
-    """The --status report (at most about ten lines)."""
+def _detached_label(view, now, detached, unfinished, table):
+    """(label, action, groups) for a detached run's --status report."""
+    groups = ([], [])
+    pid = detached.pid if detached.pid is not None else (
+        view.pid if view is not None else None)
+    # A runner that has not written supervisor.json yet has no pid on record.
+    who = "no pid recorded" if pid is None else f"pid {pid}"
+    tick_age = (None if view is None or view.tick_at is None
+                else max(0.0, now - view.tick_at))
+    if detached.state == "unknown":
+        label = (f"unknown ({who}; supervisor lock {detached.lock}; the "
+                 "lock and the process records disagree or cannot be read)")
+        action = ("re-check --status shortly; never --reap, --cancel, or "
+                  "relaunch while the runner reads unknown")
+    elif detached.state == "alive":
+        if view is None:
+            label = (f"starting ({who}; supervisor lock held; no "
+                     "dispatch yet)")
+            action = ("keep following; --cancel stops it; do not relaunch")
+        elif view.state in TERMINAL_STATES:
+            label = (f"{view.state} (exit {view.exit}); the runner is still "
+                     f"exiting (pid {pid}; supervisor lock held)")
+            action = ("re-check --status in a few seconds; out.md is final "
+                      "only once --status reports that the runner ended")
+        elif tick_age is None or tick_age >= TICK_WARN_SECS:
+            age = "never" if tick_age is None else f"{tick_age:.0f}s ago"
+            label = (f"not responding (pid {pid} present; supervisor lock "
+                     f"held; last status tick {age})")
+            action = (f"unless err.log says {STATUS_FILENAME} not written, "
+                      "run --cancel on this directory, then --reap if it "
+                      "says to")
+        else:
+            label = (f"running (pid {pid}; detached; status tick "
+                     f"{tick_age:.0f}s ago)")
+            action = "keep following; do not relaunch; --cancel stops it"
+    elif view is None:
+        label = (f"ended before dispatch ({who}"
+                 f"{'' if pid is None else ' gone'}; supervisor lock free)")
+        action = ("read err.log; start over in a new directory, never in "
+                  "this one")
+    elif view.state in TERMINAL_STATES:
+        label = f"{view.state} (exit {view.exit})"
+        if view.state == "done":
+            action = "read out.md; the run has ended"
+        else:
+            action = ("read err.log and replies/; re-run unfinished roles in "
+                      "a new directory")
+    else:
+        label = (f"gone (pid {pid} is no longer this run's runner; "
+                 "supervisor lock free)")
+        groups = _codex_groups(view, table)
+        if groups[0]:
+            action = ("run --reap on this directory, then re-run unfinished "
+                      "roles in a new directory")
+        elif unfinished:
+            action = ("re-run unfinished roles in a new directory; replies/ "
+                      "keeps the settled ones")
+        else:
+            action = ("every role settled before the runner ended; read "
+                      "replies/ (out.md may be incomplete)")
+    return label, action, groups
+
+
+def _status_lines(view, now, table, detached=None):
+    """The --status report (at most about ten lines).
+
+    `detached` is a detached run's combined liveness (supervisor_state);
+    None reports a tracked run from status.json alone.
+    """
+    if detached is not None:
+        unfinished = _unfinished(view) if view is not None else []
+        label, action, groups = _detached_label(
+            view, now, detached, unfinished, table)
+        lines = [f"runner: {label}"]
+        if view is not None:
+            lines += _role_lines(view, now, table, unfinished)
+        if (detached.state == "gone" and view is not None
+                and view.state not in TERMINAL_STATES):
+            lines += _group_lines(groups)
+        lines.append(f"next: {action}")
+        return lines
     if view is None:
         return [
             f"runner: unknown (no usable {STATUS_FILENAME}: the council has "
@@ -791,33 +1203,53 @@ def _status_lines(view, now, table):
     else:
         label = f"running (pid {view.pid}; status tick {tick_age:.0f}s ago)"
         action = "keep following; do not relaunch"
-    lines = [f"runner: {label}",
-             f"roles: {len(view.roles) - len(unfinished)} of "
+    lines = [f"runner: {label}", *_role_lines(view, now, table, unfinished)]
+    if runner == "gone" and view.state not in TERMINAL_STATES:
+        lines += _group_lines(groups)
+    lines.append(f"next: {action}")
+    return lines
+
+
+def _role_lines(view, now, table, unfinished):
+    lines = [f"roles: {len(view.roles) - len(unfinished)} of "
              f"{len(view.roles)} settled"]
     for role_id in unfinished[:STATUS_ROLE_LINES]:
         lines.append(_role_line(role_id, view.roles[role_id], now, table))
     if len(unfinished) > STATUS_ROLE_LINES:
         lines.append(f"  ... and {len(unfinished) - STATUS_ROLE_LINES} more "
                      "unfinished")
+    return lines
+
+
+def _group_lines(groups):
     verified, unverified = groups
-    if runner == "gone" and view.state not in TERMINAL_STATES:
-        lines.append("live codex groups: " + _id_list(
-            [f"{pgid} ({role_id})" for role_id, pgid, _ in verified]))
-        if unverified:
-            lines.append("unverified groups (left alone): " + _id_list(
-                [f"{pgid} ({role_id})" for role_id, pgid, _ in unverified]))
-    lines.append(f"next: {action}")
+    lines = ["live codex groups: " + _id_list(
+        [f"{pgid} ({role_id})" for role_id, pgid, _ in verified])]
+    if unverified:
+        lines.append("unverified groups (left alone): " + _id_list(
+            [f"{pgid} ({role_id})" for role_id, pgid, _ in unverified]))
     return lines
 
 
 def status_command(run_dir):
-    """--status RUNDIR: print the run's snapshot; always exit 0."""
+    """--status RUNDIR: print the run's snapshot; always exit 0.
+
+    A detached run (see is_detached) is reported from its combined
+    liveness: starting, running, not responding, a terminal state once the
+    lock is free and the runner gone, ended before dispatch, gone, or
+    unknown. Read-only: it never writes, repairs, or signals anything.
+    """
     run_dir = _check_private_dir(
         run_dir, prefix="--status: ", recovery=RUN_DIR_RECOVERY
     )
     view = read_status(os.path.join(run_dir, STATUS_FILENAME))
-    table = _process_table() if view is not None else None
-    for line in _status_lines(view, time.time(), table):
+    detached = None
+    if is_detached(run_dir, view):
+        table = _process_table()
+        detached = supervisor_state(run_dir, view, table)
+    else:
+        table = _process_table() if view is not None else None
+    for line in _status_lines(view, time.time(), table, detached):
         _print_stdout(line)
     return 0
 
@@ -825,7 +1257,9 @@ def status_command(run_dir):
 def reap_command(run_dir):
     """--reap RUNDIR: end a gone runner's live codex groups; 0 or 1.
 
-    Refused (exit 1) unless status.json shows a runner that is gone. Only
+    Refused (exit 1) unless status.json shows a runner that is gone and,
+    for a detached run, its supervisor lock is free (a held lock refuses
+    even when ps says the pid is gone; see supervisor_state). Only
     verified groups are signalled (see _codex_groups); saved threads,
     replies, and every file are left as they are.
     """
@@ -838,6 +1272,17 @@ def reap_command(run_dir):
                       "nothing is known about this run's processes")
         return 1
     table = _process_table()
+    if is_detached(run_dir, view):
+        # The lock decides first: held means a live runner owns its groups
+        # whatever ps says, and any disagreement is unknown.
+        detached = supervisor_state(run_dir, view, table)
+        if detached.state != "gone":
+            why = ("its supervisor lock is still held" if detached.lock
+                   == "held" else "the supervisor lock and the process "
+                   "records disagree or cannot be read")
+            _print_stdout(f"--reap refused: the runner (pid {view.pid}): "
+                          f"{why}; run --status")
+            return 1
     runner = _identity_state(table, view.pid, view.identity)
     if runner != "gone":
         why = ("ps cannot tell whether it is running" if runner == "unknown"
@@ -864,3 +1309,118 @@ def reap_command(run_dir):
         f"; re-run unfinished roles ({_id_list(unfinished)}) in a new "
         "directory" if unfinished else ""))
     return 0
+
+
+# ---------- --cancel ----------
+
+def _verified_supervisor(run_dir, supervisor, view):
+    """Why the recorded supervisor may not be signalled, or None.
+
+    Requires the lock held (same inode as recorded), the recorded pid alive
+    with its recorded start identity and process group, and status.json
+    (when present) naming the same runner.
+    """
+    if supervisor is None or supervisor.pid is None \
+            or supervisor.identity is None:
+        return "supervisor.json names no verifiable runner"
+    if view is not None and view.pid is not None and (
+            view.pid != supervisor.pid
+            or (view.identity is not None
+                and view.identity != supervisor.identity)):
+        return (f"{STATUS_FILENAME} and {SUPERVISOR_FILENAME} name "
+                "different runners")
+    lock = lock_state(run_dir, supervisor)
+    if lock != "held":
+        return f"the supervisor lock is {lock}"
+    table = _process_table(supervisor.pid)
+    if _identity_state(table, supervisor.pid, supervisor.identity) != "alive":
+        return (f"pid {supervisor.pid} is not the recorded runner (gone, "
+                "reused, or ps cannot tell)")
+    entry = table.get(supervisor.pid)
+    if supervisor.pgid is not None and entry[0] != supervisor.pgid:
+        return f"pid {supervisor.pid} is in another process group"
+    return None
+
+
+def _wait_lock_released(run_dir, supervisor, seconds):
+    """True once the lock is no longer held (polls up to `seconds`)."""
+    deadline = time.monotonic() + seconds
+    while True:
+        if lock_state(run_dir, supervisor) != "held":
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(CANCEL_POLL_SECS)
+
+
+def cancel_command(run_dir):
+    """--cancel RUNDIR: stop a detached run's runner; 0 once it has ended.
+
+    Refused (exit 1, nothing signalled) unless the run was launched with
+    --start, its supervisor lock is held, and the recorded runner is
+    verified (see _verified_supervisor). Then SIGCONT and SIGTERM to that
+    one pid: the runner tears down its own codex process groups and writes
+    its interruption line. If it still holds the lock with the same
+    identity after CANCEL_GRACE_SECS, it is verified again and gets
+    SIGKILL, and --reap ends what it left behind.
+    """
+    run_dir = _check_private_dir(
+        run_dir, prefix="--cancel: ", recovery=RUN_DIR_RECOVERY
+    )
+    view = read_status(os.path.join(run_dir, STATUS_FILENAME))
+    if not is_detached(run_dir, view):
+        _print_stdout(
+            "--cancel refused: this run was not launched with --start (no "
+            f"{SUPERVISOR_LOCK_FILENAME}); a tracked run ends when its "
+            "background task is stopped")
+        return CANCEL_EXIT_REFUSED
+    detached = supervisor_state(run_dir, view)
+    supervisor = detached.supervisor
+    if detached.state == "gone":
+        _print_stdout(
+            f"--cancel refused: the runner "
+            f"{'' if detached.pid is None else f'(pid {detached.pid}) '}"
+            "has already ended; run --status, then --reap if it lists live "
+            "codex groups")
+        return CANCEL_EXIT_REFUSED
+    if detached.state == "alive" and supervisor is None:
+        _print_stdout(
+            "--cancel refused: the runner is starting and has not written "
+            f"{SUPERVISOR_FILENAME} yet; run --cancel again in a few seconds")
+        return CANCEL_EXIT_REFUSED
+    problem = _verified_supervisor(run_dir, supervisor, view)
+    if detached.state != "alive" or problem is not None:
+        _print_stdout(
+            f"--cancel refused: {problem or 'the runner reads unknown'}; "
+            "nothing was signalled; run --status")
+        return CANCEL_EXIT_REFUSED
+    pid = supervisor.pid
+    for sig in (signal.SIGCONT, signal.SIGTERM):
+        with contextlib.suppress(OSError):
+            os.kill(pid, sig)
+    if _wait_lock_released(run_dir, supervisor, CANCEL_GRACE_SECS):
+        _print_stdout(
+            f"cancelled: the runner (pid {pid}) ended after SIGTERM and "
+            "tore down its codex process groups; read err.log and "
+            "replies/, and run --status")
+        return 0
+    problem = _verified_supervisor(run_dir, supervisor, view)
+    if problem is not None:
+        _print_stdout(
+            f"--cancel: the runner (pid {pid}) did not end within "
+            f"{CANCEL_GRACE_SECS}s of SIGTERM, and SIGKILL was not sent: "
+            f"{problem}; run --status")
+        return CANCEL_EXIT_REFUSED
+    with contextlib.suppress(OSError):
+        os.kill(pid, signal.SIGKILL)
+    if _wait_lock_released(run_dir, supervisor, CANCEL_KILL_WAIT_SECS):
+        _print_stdout(
+            f"cancelled: the runner (pid {pid}) did not end within "
+            f"{CANCEL_GRACE_SECS}s of SIGTERM and was sent SIGKILL; its "
+            "codex process groups may still run: run --reap on this "
+            "directory")
+        return 0
+    _print_stdout(
+        f"--cancel: the runner (pid {pid}) still holds its lock after "
+        "SIGKILL; run --status")
+    return CANCEL_EXIT_REFUSED

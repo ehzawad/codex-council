@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Liveness scenarios: the real runner CLI end to end against a fake codex.
 
-Each scenario stages a private run directory, launches the council the way
-SKILL.md does (stdout to out.md, stderr to err.log) with the fake `codex`
-from fake_codex.py first on PATH, follows it with `--follow`, disturbs it,
-and prints one verdict line with the number of lines the follower emitted:
+Each scenario stages a private run directory, launches the council attached,
+as direct CLI use does (stdout to out.md, stderr to err.log; S8-S12 use
+--start) with the fake `codex` from fake_codex.py first on PATH, follows it
+with `--follow`, disturbs it, and prints one verdict line with the number
+of lines the follower emitted:
 
   S0  happy path: three roles succeed.
   S1  a descendant of codex holds codex's stdout open after codex exits.
@@ -14,6 +15,20 @@ and prints one verdict line with the number of lines the follower emitted:
   S5  a role is byte-silent for a while, then succeeds.
   S6  a role writes stdout lines no JSON parser accepts while its stderr
       keeps printing, then succeeds.
+  S7  the host stops an attached launch in a background task (SIGTERM to
+      its process group) while a role is silent: the interruption is clean
+      and settled replies stay.
+  S8  --start from a shell in its own session; after it returns, that
+      shell's group gets SIGHUP, SIGTERM, and SIGKILL: the council finishes.
+  S9  the --start process itself is SIGKILLed right after it spawned the
+      supervisor: the council still finishes.
+  S10 two concurrent --start calls on one directory, five times: one
+      supervisor, the loser exits 2 and truncates nothing.
+  S11 --cancel on a hanging role with a tool session: a clean interruption
+      and every fake process gone.
+  S12 only the supervisor is SIGKILLed: its lock is free at once, --status
+      says gone, --follow exits 4, --reap ends codex, and the directory
+      stays used up while a new one starts.
 
 S3 compresses time: while the runner is stopped nothing rewrites
 status.json, so the scenario backdates its tick to stand for the minutes a
@@ -31,6 +46,7 @@ import argparse
 import concurrent.futures
 import contextlib
 import dataclasses
+import fcntl
 import hashlib
 import json
 import os
@@ -130,6 +146,46 @@ def _ours(pid):
     return "fake_codex_impl.py" in command or "time.sleep(120)" in command
 
 
+def _our_supervisor(pid, runner):
+    """A detached runner this harness started (never a reused pid)."""
+    command = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                             capture_output=True, text=True).stdout
+    return runner in command and "--supervisor-lock-fd" in command
+
+
+def _lock(path):
+    """"held", "free", or "absent" for a supervisor.lock: the same
+    non-blocking shared-lock probe --status makes."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return "absent"
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return "held"
+    finally:
+        os.close(fd)
+    return "free"
+
+
+def _children(pid):
+    """Pids whose parent is pid, from one ps snapshot."""
+    out = subprocess.run(["ps", "-A", "-o", "pid=", "-o", "ppid="],
+                         capture_output=True, text=True).stdout
+    found = []
+    for line in out.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[1] == str(pid):
+            found.append(int(fields[0]))
+    return found
+
+
+def _started_pid(stdout):
+    match = re.search(r"^\[codex-council\] started: pid=(\d+) ", stdout, re.M)
+    return int(match.group(1)) if match else None
+
+
 class Follower:
     """A `--follow` process whose stdout lines are collected as they come."""
 
@@ -198,17 +254,12 @@ class Council:
 
     def __init__(self, runner, fake_bin, roles):
         self.runner = runner
+        self.roles = roles
         self.base = tempfile.mkdtemp(prefix="council-liveness-")
-        self.run_dir = os.path.join(self.base, "run")
-        os.mkdir(self.run_dir, 0o700)
+        self.staged = []
+        self.run_dir = self.stage("run")
         self.pid_dir = os.path.join(self.base, "pids")
         os.mkdir(self.pid_dir)
-        with open(os.path.join(self.run_dir, "roles.json"), "w",
-                  encoding="utf-8") as f:
-            json.dump(roles, f)
-        with open(os.path.join(self.run_dir, "context.md"), "w",
-                  encoding="utf-8") as f:
-            f.write("Liveness scenario context.\n")
         env = {key: value for key, value in os.environ.items()
                if not key.startswith(("CODEX_", "FAKE_CODEX_"))}
         env.update(
@@ -228,8 +279,51 @@ class Council:
     def __exit__(self, *exc):
         self.close()
 
+    def stage(self, name, roles=None):
+        """A new private run directory holding roles.json and context.md."""
+        run_dir = os.path.join(self.base, name)
+        os.mkdir(run_dir, 0o700)
+        with open(os.path.join(run_dir, "roles.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump(self.roles if roles is None else roles, f)
+        with open(os.path.join(run_dir, "context.md"), "w",
+                  encoding="utf-8") as f:
+            f.write("Liveness scenario context.\n")
+        self.staged.append(run_dir)
+        return run_dir
+
     def path(self, *parts):
         return os.path.join(self.run_dir, *parts)
+
+    def start_argv(self, run_dir=None):
+        return [PYTHON, self.runner, "--start", run_dir or self.run_dir]
+
+    def start(self, run_dir=None):
+        """--start as an ordinary foreground command."""
+        return subprocess.run(self.start_argv(run_dir), capture_output=True,
+                              text=True, env=self.env, cwd=self.run_dir,
+                              stdin=subprocess.DEVNULL, timeout=60)
+
+    def supervisor(self, run_dir=None):
+        try:
+            with open(os.path.join(run_dir or self.run_dir,
+                                   "supervisor.json"), encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return None
+
+    def lock(self, run_dir=None):
+        return _lock(os.path.join(run_dir or self.run_dir, "supervisor.lock"))
+
+    def wait_detached_end(self, timeout, run_dir=None):
+        """status.json once the supervisor lock is free, or None."""
+        run_dir = run_dir or self.run_dir
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.lock(run_dir) == "free":
+                return self.status(run_dir) or {}
+            time.sleep(0.05)
+        return None
 
     def launch(self):
         with open(self.path("out.md"), "wb") as out, \
@@ -251,10 +345,11 @@ class Council:
         self.followers.append(follower)
         return follower
 
-    def cli(self, *args):
-        return subprocess.run([PYTHON, self.runner, *args, self.run_dir],
-                              capture_output=True, text=True, env=self.env,
-                              timeout=60)
+    def cli(self, *args, run_dir=None):
+        return subprocess.run([PYTHON, self.runner, *args,
+                                run_dir or self.run_dir],
+                               capture_output=True, text=True, env=self.env,
+                               timeout=90)
 
     def wait_runner(self, timeout):
         try:
@@ -276,9 +371,10 @@ class Council:
                 return pids
             time.sleep(0.05)
 
-    def status(self):
+    def status(self, run_dir=None):
         try:
-            with open(self.path("status.json"), encoding="utf-8") as f:
+            with open(os.path.join(run_dir or self.run_dir, "status.json"),
+                      encoding="utf-8") as f:
                 return json.load(f)
         except (OSError, ValueError):
             return None
@@ -302,9 +398,10 @@ class Council:
         os.chmod(tmp, 0o600)
         os.replace(tmp, self.path("status.json"))
 
-    def read(self, *parts):
+    def read(self, *parts, run_dir=None):
         try:
-            with open(self.path(*parts), encoding="utf-8") as f:
+            with open(os.path.join(run_dir or self.run_dir, *parts),
+                      encoding="utf-8") as f:
                 return f.read()
         except OSError:
             return ""
@@ -328,7 +425,15 @@ class Council:
                 os.kill(self.proc.pid, signal.SIGCONT)
                 os.killpg(self.proc.pid, signal.SIGKILL)
             self.proc.wait()
-        for pid in self.recorded("exec") + self.recorded("holder"):
+        for run_dir in self.staged:
+            record = self.supervisor(run_dir) or {}
+            pid = record.get("pid")
+            if isinstance(pid, int) and _alive(pid) and _our_supervisor(
+                    pid, self.runner):
+                with contextlib.suppress(OSError):
+                    os.kill(pid, signal.SIGKILL)
+        for pid in (self.recorded("exec") + self.recorded("holder")
+                    + self.recorded("tool")):
             if _alive(pid) and _ours(pid):
                 with contextlib.suppress(OSError):
                     os.killpg(pid, signal.SIGKILL)
@@ -526,6 +631,254 @@ def s6_malformed_lines(runner, fake_bin):
                        detail, len(follower.lines))
 
 
+def _fake_survivors(c, timeout=10):
+    """Recorded fake codex, holder, and tool pids still alive after
+    `timeout`."""
+    pids = c.recorded("exec") + c.recorded("holder") + c.recorded("tool")
+    return [pid for pid in pids if _wait_gone(pid, timeout) is None]
+
+
+def s7_tracked_stop(runner, fake_bin):
+    roles = [_role("quick", "Review the quick lens."),
+             _role("silent", f"{SENTINELS['sleep_secs']}300.")]
+    with Council(runner, fake_bin, roles) as c:
+        c.launch()
+        follower = c.follow()
+        settled = follower.wait_for(r"^\[codex-council\] \d/2 quick: ok ", 30)
+        active = c.wait_status(_role_active("silent"), 15) is not None
+        # What the host does at its background time limit: SIGTERM to the
+        # tracked task's process group (the runner leads it).
+        os.killpg(c.proc.pid, signal.SIGTERM)
+        runner_code = c.wait_runner(30)
+        code = follower.wait_exit(15)
+        err = c.read("err.log")
+        status = c.status() or {}
+        runner_state = status.get("runner") or {}
+        survivors = _fake_survivors(c)
+        kept = "status=ok" in c.read("replies", "quick.md")
+        passed = (settled is not None and active and runner_code == 143
+                  and code == 0
+                  and "[codex-council] interrupted by SIGTERM" in err
+                  and runner_state.get("state") == "interrupted"
+                  and runner_state.get("exit") == 143
+                  and not survivors and kept)
+        detail = (f"runner exit={runner_code}; follower exit={code}; "
+                  f"status={runner_state.get('state')}/"
+                  f"{runner_state.get('exit')}; settled reply kept={kept}; "
+                  f"fake survivors={len(survivors)}")
+        return Outcome("S7", "host stops a tracked launch", passed, detail,
+                       len(follower.lines))
+
+
+# Runs --start from a shell leading its own session, records that --start
+# returned, then keeps the shell (and so its process group) alive.
+# After --start returns, the wrapper ignores HUP and TERM (set only then, so
+# --start and its supervisor inherit ordinary dispositions), so that all
+# three signals S8 sends reach a live wrapper group; only SIGKILL ends it.
+_WRAPPER = ('"$0" "$1" --start "$2" > "$3" 2>&1; rc=$?; trap \'\' HUP TERM; '
+            'echo "$rc" > "$4"; exec sleep 60')
+
+
+def _detached_done(c, timeout, run_dir=None):
+    """(ended status, err.log, out.md) of a detached run once it ends."""
+    status = c.wait_detached_end(timeout, run_dir) or {}
+    return (status, c.read("err.log", run_dir=run_dir),
+            c.read("out.md", run_dir=run_dir))
+
+
+def _completed(status, err, out, total=1):
+    runner_state = status.get("runner") or {}
+    return (runner_state.get("state") == "done"
+            and f"CODEX_COUNCIL_DONE ok={total} total={total} " in err
+            and f"{total}/{total} roles responded" in out)
+
+
+def s8_parent_death(runner, fake_bin):
+    roles = [_role("steady", f"{SENTINELS['sleep_secs']}4.")]
+    with Council(runner, fake_bin, roles) as c:
+        started_out = os.path.join(c.base, "start.out")
+        returned = os.path.join(c.base, "start.code")
+        wrapper = subprocess.Popen(
+            ["/bin/sh", "-c", _WRAPPER, PYTHON, runner, c.run_dir,
+             started_out, returned],
+            env=c.env, cwd=c.run_dir, stdin=subprocess.DEVNULL,
+            start_new_session=True)
+        try:
+            deadline = time.monotonic() + 30
+            while not os.path.exists(returned) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            with open(returned, encoding="utf-8") as f:
+                start_code = int(f.read().strip() or -1)
+            record = c.supervisor() or {}
+            active = c.wait_status(_role_active("steady"), 15) is not None
+            # Each signal must reach the wrapper's live group: a failed
+            # killpg, or a wrapper that died before SIGKILL, fails S8.
+            delivered = []
+            for sig in (signal.SIGHUP, signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.killpg(wrapper.pid, sig)
+                except OSError:
+                    delivered.append(False)
+                    continue
+                time.sleep(0.2)
+                delivered.append(sig == signal.SIGKILL
+                                 or wrapper.poll() is None)
+            wrapper.wait(10)
+            delivered.append(wrapper.returncode == -signal.SIGKILL)
+            status, err, out = _detached_done(c, 60)
+        finally:
+            with contextlib.suppress(OSError):
+                os.killpg(wrapper.pid, signal.SIGKILL)
+            wrapper.wait()
+        runner_pid = (status.get("runner") or {}).get("pid")
+        other_session = (record.get("sid") is not None
+                         and record.get("sid") != wrapper.pid)
+        passed = (start_code == 0 and active and all(delivered)
+                  and _completed(status, err, out)
+                  and other_session and runner_pid == record.get("pid"))
+        detail = (f"--start exit={start_code}; wrapper group killed while the "
+                  f"role ran={active}; HUP, TERM, KILL each reached the live "
+                  f"group and KILL ended it={all(delivered)}; completed="
+                  f"{_completed(status, err, out)}; supervisor sid="
+                  f"{record.get('sid')} vs wrapper sid={wrapper.pid}; same "
+                  f"runner={runner_pid == record.get('pid')}")
+        return Outcome("S8", "--start's shell dies after it returns", passed,
+                       detail, 0)
+
+
+def s9_start_killed(runner, fake_bin):
+    roles = [_role("steady", f"{SENTINELS['sleep_secs']}3.")]
+    with Council(runner, fake_bin, roles) as c:
+        launcher = subprocess.Popen(
+            c.start_argv(), env=c.env, cwd=c.run_dir,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True)
+        child = None
+        deadline = time.monotonic() + 20
+        while child is None and launcher.poll() is None \
+                and time.monotonic() < deadline:
+            found = _children(launcher.pid)
+            if found:
+                child = found[0]
+                with contextlib.suppress(OSError):
+                    os.killpg(launcher.pid, signal.SIGKILL)
+        launcher.wait()
+        killed = launcher.returncode == -signal.SIGKILL
+        status, err, out = _detached_done(c, 60)
+        record = c.supervisor() or {}
+        passed = (killed and child is not None and record.get("pid") == child
+                  and _completed(status, err, out))
+        detail = (f"--start killed right after spawning={killed}; "
+                  f"supervisor pid matches its child="
+                  f"{record.get('pid') == child}; completed="
+                  f"{_completed(status, err, out)}")
+        return Outcome("S9", "--start killed right after spawn", passed,
+                       detail, 0)
+
+
+def s10_concurrent_starts(runner, fake_bin):
+    roles = [_role("single", "Review the single lens.")]
+    rounds, problems = 5, []
+    with Council(runner, fake_bin, roles) as c:
+        for i in range(rounds):
+            run_dir = c.stage(f"dup{i}")
+            before = len(c.recorded("exec"))
+            procs = [subprocess.Popen(
+                c.start_argv(run_dir), env=c.env, cwd=run_dir,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True) for _ in range(2)]
+            results = [(p.returncode, out, err) for p in procs
+                       for out, err in [p.communicate(60)]]
+            codes = sorted(code for code, _, _ in results)
+            winner = next((r for r in results if r[0] == 0), None)
+            loser = next((r for r in results if r[0] == 2), None)
+            status, err_log, out = _detached_done(c, 60, run_dir)
+            record = c.supervisor(run_dir) or {}
+            execs = len(c.recorded("exec")) - before
+            ok = (codes == [0, 2] and winner is not None and loser is not None
+                  and "already holds a council launch" in loser[2]
+                  and _started_pid(winner[1]) == record.get("pid")
+                  and (status.get("runner") or {}).get("pid")
+                  == record.get("pid")
+                  and err_log.startswith("[codex-council] dispatching ")
+                  and err_log.count("CODEX_COUNCIL_DONE") == 1
+                  and _completed(status, err_log, out) and execs == 1)
+            if not ok:
+                problems.append(f"round {i}: exits={codes}; codex runs="
+                                f"{execs}; completed="
+                                f"{_completed(status, err_log, out)}")
+    detail = ("; ".join(problems) if problems else
+              f"{rounds} rounds: one exit 0 and one exit 2 each, one "
+              "supervisor and one codex run, nothing truncated")
+    return Outcome("S10", "concurrent --start on one directory",
+                   not problems, detail, 0)
+
+
+def s11_cancel(runner, fake_bin):
+    roles = [_role("hanger", f"{SENTINELS['tool_session']}.",
+                   f"{SENTINELS['sleep_secs']}300.")]
+    with Council(runner, fake_bin, roles) as c:
+        start = c.start()
+        active = c.wait_status(_role_active("hanger"), 20) is not None
+        tools = c.recorded("tool", timeout=10)
+        cancel = c.cli("--cancel")
+        status = c.status() or {}
+        runner_state = status.get("runner") or {}
+        err = c.read("err.log")
+        lock = c.lock()
+        survivors = _fake_survivors(c)
+        passed = (start.returncode == 0 and active and bool(tools)
+                  and cancel.returncode == 0
+                  and "[codex-council] interrupted by SIGTERM" in err
+                  and runner_state.get("state") == "interrupted"
+                  and runner_state.get("exit") == 143 and lock == "free"
+                  and not survivors)
+        detail = (f"--cancel exit={cancel.returncode}; status="
+                  f"{runner_state.get('state')}/{runner_state.get('exit')}; "
+                  f"lock={lock}; tool sessions={len(tools)}; fake survivors="
+                  f"{len(survivors)}")
+        return Outcome("S11", "--cancel a hanging role", passed, detail, 0)
+
+
+def s12_supervisor_killed(runner, fake_bin):
+    roles = [_role("sleeper", f"{SENTINELS['sleep_secs']}300.")]
+    with Council(runner, fake_bin, roles) as c:
+        start = c.start()
+        c.wait_status(_role_active("sleeper"), 20)
+        codex = c.recorded("exec", timeout=10)
+        pid = (c.supervisor() or {}).get("pid")
+        os.kill(pid, signal.SIGKILL)
+        deadline = time.monotonic() + 2
+        while c.lock() != "free" and time.monotonic() < deadline:
+            time.sleep(0.02)
+        freed = c.lock() == "free"
+        orphan = bool(codex) and _alive(codex[0])
+        status = c.cli("--status")
+        follower = c.follow()
+        follow_code = follower.wait_exit(30)
+        reap = c.cli("--reap")
+        reaped = bool(codex) and _wait_gone(codex[0], 10) is not None
+        again = c.start()
+        fresh_dir = c.stage("fresh", [_role("fresh", "Review the lens.")])
+        fresh = c.start(fresh_dir)
+        fresh_status, fresh_err, fresh_out = _detached_done(c, 60, fresh_dir)
+        first = (status.stdout.splitlines() or [""])[0]
+        passed = (start.returncode == 0 and freed and orphan
+                  and first.startswith("runner: gone ")
+                  and f"live codex groups: {codex[0]} (sleeper)"
+                  in status.stdout
+                  and follow_code == 4 and reap.returncode == 0 and reaped
+                  and again.returncode == 2 and fresh.returncode == 0
+                  and _completed(fresh_status, fresh_err, fresh_out))
+        detail = (f"lock free at once={freed}; codex orphaned={orphan}; "
+                  f"--status {first!r}; --follow exit={follow_code}; --reap "
+                  f"exit={reap.returncode} (codex ended={reaped}); --start "
+                  f"here exit={again.returncode}; new directory exit="
+                  f"{fresh.returncode}")
+        return Outcome("S12", "only the supervisor is SIGKILLed", passed,
+                       detail, len(follower.lines))
+
+
 SCENARIOS = {
     "S0": s0_happy_path,
     "S1": s1_held_pipe,
@@ -534,6 +887,12 @@ SCENARIOS = {
     "S4": s4_follower_orphaned,
     "S5": s5_silent_role,
     "S6": s6_malformed_lines,
+    "S7": s7_tracked_stop,
+    "S8": s8_parent_death,
+    "S9": s9_start_killed,
+    "S10": s10_concurrent_starts,
+    "S11": s11_cancel,
+    "S12": s12_supervisor_killed,
 }
 
 

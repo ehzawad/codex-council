@@ -3058,6 +3058,51 @@ class LaunchEndToEndTests(unittest.TestCase):
                     self.assertTrue(council_testlib.pid_gone(pid), pid)
                 self.assertEqual(self.argvs(), [])
 
+    def test_cancel_during_detached_launch_discovery_tears_it_down(self):
+        """--cancel while a --start supervisor is still in launch discovery
+        (a hung app-server with a grandchild holding its pipes): the
+        supervisor unwinds discovery's teardown, exits 143 with the
+        interruption line, frees its lock, and no worker ever starts."""
+        snapshot_id = self.discover()
+        self.stage([_routed(snapshot_id=snapshot_id)])
+        hung = fake_codex.default_scenario()
+        hung["methods"]["initialize"] = {"hang": True}
+        hung["server"] = {"grandchild": "ignore_sigterm"}
+        self.scenario(hung)
+        started = self.run_script("--start", self.run_dir,
+                                  "--skill-contract", EPOCH)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        paths = [os.path.join(self.pid_dir, p)
+                 for p in ("server.pid", "grandchild.pid")]
+        deadline = time.monotonic() + 30
+        while not all(os.path.exists(p) for p in paths) or (
+                "initialize" not in fake_codex.read_lines(self.method_log)):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.02)
+        children = []
+        for path in paths:
+            with open(path, encoding="utf-8") as f:
+                children.append(int(f.read()))
+        for pid in children:
+            self.addCleanup(council_testlib.kill_quietly, pid)
+        status = self.run_script("--status", self.run_dir)
+        self.assertTrue(status.stdout.startswith("runner: starting (pid "),
+                        status.stdout)
+        cancel = self.run_script("--cancel", self.run_dir,
+                                 "--skill-contract", EPOCH)
+        self.assertEqual(cancel.returncode, 0, cancel.stdout)
+        with open(os.path.join(self.run_dir, "err.log"),
+                  encoding="utf-8") as f:
+            self.assertEqual(f.read(),
+                             "\n[codex-council] interrupted by SIGTERM\n")
+        self.assertEqual(council_liveness.lock_state(self.run_dir), "free")
+        for pid in children:
+            self.assertTrue(council_testlib.pid_gone(pid), pid)
+        self.assertEqual(self.argvs(), [])
+        status = self.run_script("--status", self.run_dir)
+        self.assertTrue(status.stdout.startswith(
+            "runner: ended before dispatch (pid "), status.stdout)
+
     def test_launch_discovery_stderr_reaches_no_output(self):
         """An app-server that prints account data to stderr and exits:
         err.log, out.md, and the reply file name only the category."""

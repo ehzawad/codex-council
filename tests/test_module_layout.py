@@ -255,6 +255,7 @@ class ModuleStateTests(unittest.TestCase):
             ("_roles_recovery_text", "council_common"),
             ("_project_root_cache", "council_common"),
             ("_RUN", "codex_council"),
+            ("_SUPERVISOR", "codex_council"),
             ("STATE_DIR", "codex_council"),
         ):
             with self.subTest(state=state):

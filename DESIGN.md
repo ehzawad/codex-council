@@ -9,9 +9,12 @@ complete, compact operating procedure; and its references teach
 [context staging](plugins/codex-council/skills/codex-council/references/context-staging.md),
 and [operation, outputs, and recovery](plugins/codex-council/skills/codex-council/references/runtime-behavior.md).
 
-Every diagram has a stable id used for its Mermaid source
-(`docs/diagrams/<id>.mmd`), its PNG (`docs/diagrams/<id>.png`), and its
-caption here and in `docs/codex-council.pdf`. Each concern below follows
+The diagrams live in README as Mermaid source, the only copy:
+[Architecture](README.md#architecture) (components and who owns what),
+[Launch Flow](README.md#launch-flow) (one launch, from staging to
+reconciliation), and [State Scope](README.md#state-scope) (how a role's
+saved thread is keyed, locked, and resumed). `docs/codex-council.pdf`
+draws them as vector graphics beside this text. Each concern below follows
 the same template: purpose, how it works, key decisions and why, and
 limits.
 
@@ -56,8 +59,12 @@ Rules that hold everywhere:
 Trust boundaries: the run directory is private to the user, but roles run
 unsandboxed as that same user, so anything a role can reach it can also
 write, including `err.log`, `out.md`, and `replies/`. Claude therefore treats
-reply content as untrusted evidence, and only Claude Code's own task
-notification marks the end of a run.
+reply content as untrusted evidence, and only a verified runner exit marks
+the end of a run: for a detached run, a released supervisor lock together
+with a vanished runner identity; for an attached run (direct CLI use or a
+legacy directory), the end of its launch command, which Claude Code's own
+task notification reports when that command ran as a background task. No
+line a role writes can imitate either.
 
 Supported versions are the current ones only: Claude Code 2.1.x, codex-cli
 0.158 or later, and Python 3.12 or later on macOS or Linux.
@@ -66,11 +73,6 @@ Supported versions are the current ones only: Claude Code 2.1.x, codex-cli
 
 ### Level 0: the council in context
 
-![d00-context: the user, Claude Code with the skill, the council runner, the Codex workers, and the shared workspace, top to bottom](docs/diagrams/d00-context.png)
-
-*d00-context — Council in context. Source:
-[d00-context.mmd](docs/diagrams/d00-context.mmd).*
-
 The user states an objective; Claude investigates the workspace, briefs the
 runner, and the runner dispatches Codex workers that work in the same
 workspace. Workers return evidence to the runner, the runner returns replies
@@ -78,24 +80,29 @@ and a report to Claude, and Claude reconciles one result for the user.
 
 ### Level 1: runtime components
 
-![d10-components: Claude Code, the runner, the follower, the host task tracker, the run directory, saved threads, codex app-server, codex exec, and the workspace](docs/diagrams/d10-components.png)
-
-*d10-components — Runtime components and ownership. Source:
-[d10-components.mmd](docs/diagrams/d10-components.mmd).*
+README's [Architecture](README.md#architecture) diagram draws the runtime;
+this table says what each component owns and whom it talks to.
 
 | Component | Owns | Talks to |
 |---|---|---|
 | Claude Code with the skill | the panel, `roles.json`, `context.md`, early use of replies, reconciliation | the runner (commands), the run directory, the follower |
-| Runner CLI (`codex_council.py`) | validation, selection, fan-out, the watchdog, replies, the report, `status.json` | the run directory, `codex app-server`, `codex exec`, saved threads |
+| Runner CLI (`codex_council.py`) | validation, selection, fan-out, the watchdog, replies, the report, `status.json`; as a detached supervisor, also `supervisor.lock` (held for its life) and `supervisor.json` | the run directory, `codex app-server`, `codex exec`, saved threads |
 | `codex app-server` | model and configuration metadata only | the runner, over stdio JSON-RPC |
 | `codex exec`, one per role | the role's work in the workspace | the runner, over stdin, stdout, and stderr |
 | Follower (`--follow`) | relaying actionable progress, noticing a dead or stuck runner | reads `err.log` and `status.json`; writes only its own stdout |
-| Host task tracker | the background task's lifetime and its completion notification | Claude |
+| Host task tracker | an attached run's lifetime and completion notification when it runs as a background task (direct CLI use and legacy directories; the skill never launches one); nothing of a detached run | Claude |
 
-The launch command's shell, not the runner, creates `out.md` and `err.log`
-by redirecting stdout and stderr. Only the host task tracker reports that
-the runner's process ended; `out.md`, the `CODEX_COUNCIL_DONE` line, and the
-follower's exit are separate signals and none of them is that notification.
+Claude always launches with `--start`, which creates `out.md` and
+`err.log` itself and starts the runner as a detached supervisor, outside
+any host task and so outside any host time limit. An attached launch (the
+runner's tracked mode: direct CLI use, or a directory an earlier version
+launched) has its shell create them by redirecting stdout and stderr
+instead. What says the runner's process ended is, for a detached run, its
+released lock plus its vanished pid identity (`--status` reports the
+terminal state only then), and for an attached run, the end of its launch
+command (the host task tracker's notification when that command ran as a
+background task). `out.md`, the `CODEX_COUNCIL_DONE` line, and the
+follower's exit are separate signals and none of them is that proof.
 
 The run directory holds exactly one launch:
 
@@ -103,20 +110,20 @@ The run directory holds exactly one launch:
 |---|---|---|---|
 | `model-snapshot.json` | `--discover` | the preflight, the launch | 0600 |
 | `roles.json`, `context.md` | Claude | the preflight, the launch | Claude's Write |
-| `out.md` | the launch's stdout redirect | Claude | the shell's |
-| `err.log` | the launch's stderr redirect | the follower, Claude | the shell's |
+| `supervisor.lock` | `--start` (created exclusively; never removed or replaced), held locked by the supervisor | `--follow`, `--status`, `--cancel`, `--reap` | 0600 |
+| `supervisor.json` | the supervisor, about itself, before any other work | `--start`, `--follow`, `--status`, `--cancel`, `--reap` | 0600 |
+| `out.md` | `--start` (created exclusively), then the runner's stdout; or an attached launch's stdout redirect | Claude | 0600 detached; the shell's when attached |
+| `err.log` | `--start` (created exclusively), then the runner's stderr; or an attached launch's stderr redirect | the follower, Claude | 0600 detached; the shell's when attached |
 | `replies/<key>.md` | the runner, as each role settles | Claude | 0600, in a 0700 `replies/` |
-| `status.json` | the runner | `--follow`, `--status`, `--reap` | 0600 |
+| `status.json` | the runner | `--follow`, `--status`, `--cancel`, `--reap` | 0600 |
 
 ### Level 1: modules
 
-![d11-modules: codex_council imports council_selection, council_discovery, council_failures, council_liveness, and council_common](docs/diagrams/d11-modules.png)
-
-*d11-modules — Module responsibilities and imports, verified from the
-import statements. Source: [d11-modules.mmd](docs/diagrams/d11-modules.mmd).*
-
 The runner is standard-library Python in
-`plugins/codex-council/skills/codex-council/scripts/`.
+`plugins/codex-council/skills/codex-council/scripts/`. `codex_council.py`
+imports all five sibling modules; `council_selection` imports
+`council_discovery` and `council_common`; `council_discovery`,
+`council_failures`, and `council_liveness` import only `council_common`.
 
 | Module | Responsibility |
 |---|---|
@@ -124,13 +131,13 @@ The runner is standard-library Python in
 | `council_selection.py` | `Role`, the `selection` contract, authoring validation, the pure resolver, and selection text for plans and reports |
 | `council_discovery.py` | the `codex app-server` adapter, the snapshot file, the `--discover` command and summary, and `CODEX_COUNCIL_MODEL_ROUTING` |
 | `council_failures.py` | failure records, the ordered classifier, and failure tags with their recovery actions |
-| `council_liveness.py` | `status.json` (writer and tolerant reader), process identity, and `--follow`, `--status`, and `--reap` |
+| `council_liveness.py` | `status.json` (writer and tolerant reader), `supervisor.json` (record and tolerant reader), the supervisor lock's state, process identity, and `--follow`, `--status`, `--cancel`, and `--reap` |
 | `council_common.py` | shared primitives: escaping, the diagnostics sink, the private-path policy and launch gate, atomic private writes, strict JSON, the project root, and the plugin version |
 
 Imports point one way and no production module imports the entry point.
 Module state has one owner: the diagnostics sink and the cached project root
-live in `council_common`, the run's live state and `STATE_DIR` in
-`codex_council.py`. Siblings import names directly, so a test patches the
+live in `council_common`, the run's live state, the detached runner's
+supervisor-lock descriptor, and `STATE_DIR` in `codex_council.py`. Siblings import names directly, so a test patches the
 module whose global the calling code reads (for example
 `council_discovery._project_root`). The entry puts its own directory first
 on `sys.path`, because `python3 -P` and `PYTHONSAFEPATH=1` leave it off, and
@@ -143,12 +150,14 @@ imports its siblings with bytecode writes off, so a run writes no
 |---|---|---|---|
 | `--discover RUNDIR` | Codex metadata | `model-snapshot.json`; the summary on stdout | 0 (also when discovery is unavailable), 1 stdout gone, 2 usage or refused directory, 130 or 128 + signal when interrupted |
 | `--check-staging-dir RUNDIR` | `roles.json`, `context.md`, the snapshot | `staging OK` and the selection plan on stdout | 0, or 2 with a recovery |
-| launch (`--roles-file`, `--context-file`) | the staged inputs, the snapshot, Codex | the report on stdout, progress on stderr, `replies/`, `status.json`, saved threads | 0 some role responded, 1 all failed or aborted, 2 refused before dispatch, 130 or 128 + signal when interrupted |
-| `--follow RUNDIR` | `err.log`, `status.json` | relayed lines on stdout | 0, 1, 2, 3, 4, 5 (see [Progress](#progress-replies-and-reconciliation)) |
-| `--status RUNDIR` | `status.json`, one `ps` | about ten lines on stdout | 0 (2 for a bad directory) |
-| `--reap RUNDIR` | `status.json`, one `ps` | signals to verified groups and a live codex's descendants | 0 done, 1 refused, 2 bad directory |
+| `--start RUNDIR` | everything the preflight reads | `supervisor.lock`, `err.log`, and `out.md` (each exclusive, 0600); the detached supervisor; a `started:` line and the `--follow`, `--status`, and `--cancel` commands on stdout | 0 started, 1 the supervisor exited at once (the directory is used up), 2 refused or already claimed (nothing created or truncated) |
+| launch (`--roles-file`, `--context-file`) | the staged inputs, the snapshot, Codex | the report on stdout, progress on stderr, `replies/`, `status.json`, saved threads (and `supervisor.json` when `--start` runs it) | 0 some role responded, 1 all failed or aborted, 2 refused before dispatch, 130 or 128 + signal when interrupted |
+| `--follow RUNDIR` | `err.log`, `status.json`, the supervisor files | relayed lines and keepalives on stdout | 0, 1, 2, 3, 4, 5 (see [Progress](#progress-replies-and-reconciliation)) |
+| `--status RUNDIR` | `status.json`, the supervisor files, one `ps` | about ten lines on stdout | 0 (2 for a bad directory) |
+| `--cancel RUNDIR` | `status.json`, the supervisor files, `ps` | SIGCONT and SIGTERM, then SIGKILL after a grace, to the verified detached runner only | 0 the runner ended, 1 refused (nothing signalled) or not ended, 2 bad directory |
+| `--reap RUNDIR` | `status.json`, the supervisor files, one `ps` | signals to verified groups and a live codex's descendants | 0 done, 1 refused, 2 bad directory |
 
-Every command that SKILL.md shows passes `--skill-contract 3`, the contract
+Every command that SKILL.md shows passes `--skill-contract 4`, the contract
 epoch. The epoch changes only when SKILL.md's command contract changes
 incompatibly; a mismatch is refused (exit 2) as a stale SKILL/script pair,
 with the installed-plugin recovery first and the development-checkout one
@@ -217,11 +226,8 @@ path rather than inlined.
 advertises for this account and how native configuration resolves, without
 starting any Codex work.
 
-![d20-discovery: the caller, the execution context, codex --version, codex app-server, normalization, the snapshot file, and the summary](docs/diagrams/d20-discovery.png)
-
-*d20-discovery — Model discovery. `--discover` writes the snapshot and
-prints the summary; a launch keeps its fresh evidence in memory. Source:
-[d20-discovery.mmd](docs/diagrams/d20-discovery.mmd).*
+`--discover` writes the snapshot and prints the summary; a launch keeps
+its fresh evidence in memory.
 
 **How it works.** Discovery runs in the same execution context as the
 workers: the `codex` that `PATH` resolves, the runner's working directory
@@ -354,10 +360,8 @@ launch from.
 runner guarantees that an automatic choice rests on this run's evidence and
 that a user's pin is never altered.
 
-![d21-choose: what the user asked for decides first (a pin, or native settings kept); otherwise a routed pair, native-model effort, or inheritance, all written to roles.json](docs/diagrams/d21-choose.png)
-
-*d21-choose — Claude chooses one role's model and effort. The runner does
-none of this reasoning. Source: [d21-choose.mmd](docs/diagrams/d21-choose.mmd).*
+Claude chooses each role's model and effort; the runner does none of this
+reasoning.
 
 **How it works.** Claude walks the ladder once per role before launch. A
 user's explicit request wins (and a request to keep native settings means
@@ -382,12 +386,6 @@ or angle brackets, so `-m <model>` stays one argument, the TOML string in
 lines stay single-line. Case is preserved, and `inherit` and `default`, in
 any case, are refused as model values. A `model` or `effort` without
 `selection` is refused before the grammar is checked.
-
-![d22-resolve: only an automatic choice with routing on needs the snapshot; an unsupported one exits 2, rewritten at the preflight or started over at launch; a supported one reaches the pure resolver, through one fresh discovery at launch](docs/diagrams/d22-resolve.png)
-
-*d22-resolve — Validate authoring, then resolve against the newest
-evidence. User pins and inheritance need no snapshot. Source:
-[d22-resolve.mmd](docs/diagrams/d22-resolve.mmd).*
 
 Authoring validation runs at the preflight and again at launch, before any
 worker, and checks only automatic choices, and only while routing is on:
@@ -493,11 +491,10 @@ Every surface reports what was sent:
 **Purpose.** Refuse every bad input before a worker exists, keep reviewed
 content private, and never let a launch damage another launch's files.
 
-![d23-staging: mktemp, discovery, writing inputs, the foreground preflight, the separate background launch, and the launch gate](docs/diagrams/d23-staging.png)
-
-*d23-staging — Stage and pass the gates. Inputs exist before the
-preflight; outputs appear only when the separate launch call's redirects
-run. Source: [d23-staging.mmd](docs/diagrams/d23-staging.mmd).*
+Inputs exist before the preflight; outputs appear only when the separate
+`--start` call claims the directory (or an attached launch's redirects
+run). README's [Launch Flow](README.md#launch-flow) diagram shows the
+sequence.
 
 **How it works.** Every launch gets its own `mktemp -d` directory. Claude
 runs `--discover` there, writes `roles.json` and `context.md`, and runs
@@ -506,8 +503,8 @@ discovery and refuses (exit 2) whatever the launch would refuse before
 dispatch:
 
 - the directory is not private (below);
-- the directory already holds a launch (`out.md`, `err.log`, or
-  `replies/`);
+- the directory already holds a launch (`out.md`, `err.log`, `replies/`,
+  `supervisor.lock`, or `supervisor.json`);
 - `roles.json` or `context.md` is missing, not a regular non-symlink file, or
   unreadable; `context.md` is empty or not UTF-8;
 - a roles defect, including an unsupported automatic selection;
@@ -525,11 +522,14 @@ On success it prints the plan, one line per role:
 [codex-council] selection plan: user-pinned: explicit override (model acme/future-review-2034:rev2); unverified: not in the discovered catalog; forwarded unchanged
 ```
 
-Only after exit 0 does Claude launch, in a separate background call whose
-redirects create `out.md` and `err.log`. The launch repeats the same checks
-on each input's lexical parent directory (`dirname(abspath(...))`, never
-resolved through symlinks first) before reading any content, then parses,
-validates authoring, and resolves selections.
+Only after exit 0 does Claude launch, in a separate foreground call to
+`--start`, its only launch (an attached launch, for direct CLI use, has
+redirects that create `out.md` and `err.log`). `--start` repeats every
+preflight check before it creates anything, and the launch repeats the
+same checks on each input's lexical parent directory
+(`dirname(abspath(...))`, never resolved through symlinks first) before
+reading any content, then parses, validates authoring, and resolves
+selections.
 
 The private-directory predicate, shared with the replies directory and the
 snapshot reader, is: not a symlink, the right file type, owned by the
@@ -540,7 +540,8 @@ abandoned, never repaired: the recovery demands a new `mktemp -d`,
 `--discover` there, both files re-written with the new `snapshot_id`, and the
 preflight. A roles defect found by the preflight is fixed by rewriting the
 whole file in the same directory; any refusal at launch starts over in a new
-directory, because the launch's redirects have already claimed this one.
+directory, because `--start` (or an attached launch's redirects) has
+already claimed this one.
 
 **Key decisions and why.**
 
@@ -550,11 +551,12 @@ directory, because the launch's redirects have already claimed this one.
   report or plant a fake `CODEX_COUNCIL_DONE` line.
 - *Recovery never suggests chmod or mkdir.* A hint that could be satisfied
   on the same predictable path would defeat the privacy the gate exists for.
-- *One launch per directory, checked before the launch.* The launch
-  command's redirects truncate `out.md` and `err.log` before the runner
-  starts, so relaunching into a running council's directory would tear its
-  report, log, and follower apart. Only a step that runs before the launch
-  command can refuse in time.
+- *One launch per directory, claimed atomically by `--start`.* `--start`
+  creates `supervisor.lock`, `err.log`, and `out.md` with `O_EXCL` and
+  `O_NOFOLLOW`, so of two concurrent starts exactly one wins and the loser
+  creates and truncates nothing. An attached launch's redirects truncate
+  `out.md` and `err.log` before the runner starts, so for it only a step
+  that runs before the launch command can refuse in time.
 - *Preflight and launch are separate calls.* In one combined call a refused
   preflight would not stop the launch's redirects.
 - *Inputs live in files.* A large role array and multiline context stay out
@@ -563,27 +565,58 @@ directory, because the launch's redirects have already claimed this one.
 
 **Limits.**
 
-- **One launch per directory is not enforced atomically.** `--discover` and
-  the preflight refuse a directory holding `out.md`, `err.log`, or
-  `replies/`, but the launch itself does not check: its own redirects create
-  the first two before it starts, and direct CLI use accepts an existing
-  `replies/`. A launch without a preflight, a combined call that ignores the
-  preflight's exit, or two launches racing into one directory are not
-  prevented. "A fresh directory per launch" is the required workflow, not a
-  one-use token.
+- **One launch per directory is not enforced atomically for an attached
+  launch.** `--start` claims its directory atomically, but the attached
+  launch itself does not check: its own redirects create `out.md` and
+  `err.log` before it starts, and direct CLI use accepts an existing
+  `replies/`. An attached launch without a preflight, a combined call that
+  ignores the preflight's exit, or two attached launches racing into one
+  directory are not prevented, and an attached launch into a directory
+  `--start` already claimed still truncates its files (a `--start` after an
+  attached launch refuses on the files it finds). The skill never makes an
+  attached launch. "A fresh directory per launch" is the required workflow,
+  not a one-use token.
 
 ## Launch and fan-out
 
-**Purpose.** Run any number of roles with bounded concurrency, without two
-councils ever driving the same role thread at once, and deliver each
-result as soon as it settles.
+**Purpose.** Start the council where no host time limit reaches it, run
+any number of roles with bounded concurrency, without two councils ever
+driving the same role thread at once, and deliver each result as soon as it
+settles.
 
-![d24-fanout: the resolved panel, one task per role, permits, the nonblocking lock probe, waiting outside the permit, the attempt loop, the completion callback, and gathered results](docs/diagrams/d24-fanout.png)
+README's [Architecture](README.md#architecture) diagram shows the detached
+supervisor and its bounded fan-out.
 
-*d24-fanout — Launch and bounded fan-out. Source:
-[d24-fanout.mmd](docs/diagrams/d24-fanout.mmd).*
+**How it works.** `--start RUNDIR` is an ordinary foreground command that
+returns within seconds. After validating and claiming the directory (see
+[Staging and preflight](#staging-and-preflight)), it starts the unchanged
+staged launch as a supervisor with `start_new_session`: stdin on
+`/dev/null`, stdout on `out.md`, stderr on `err.log`, the caller's working
+directory and environment, and the locked `supervisor.lock` descriptor as
+its only extra one, passed by number through a hidden
+`--supervisor-lock-fd` that is accepted only with `--roles-file` and
+`--context-file`. The command line carries paths only; the context stays in
+its file and still reaches codex on stdin. The supervisor's first step,
+`_become_supervisor`, checks that the descriptor is this run's private
+lock file (same device and inode), that it holds the lock, and that no
+`supervisor.json` exists; it then makes the descriptor non-inheritable, so
+no codex worker ever holds the lock, keeps it open for its whole life, and
+writes `supervisor.json` (pid, start identity, process group and session,
+the lock's device, inode and token, version, epoch, start time) before discovery
+or dispatch. `--start` waits up to `START_WAIT_SECS = 10` seconds for that
+record. It polls the child before reading the record, so a supervisor that
+wrote it and already ended (a quick council, a slow launcher) is still a
+start, noted as already ended; only an exit without the record makes
+`--start` exit 1 (the directory is used up). It then prints `[codex-council] started: pid=<pid> dir=<ABS_RUNDIR>
+version=<v>` and the exact `--follow`, `--status`, and `--cancel` commands.
+From there the supervisor is the ordinary runner, recording `runner.mode`
+`detached` in `status.json` (still schema 1). An attached launch, for
+direct CLI use only, runs the same staged launch as the plain foreground
+child of its own command instead; inside a Claude Code background task it
+would be stopped at that task's `timeout`, which is why the skill has no
+such fallback.
 
-**How it works.** After the dispatch line and the model-selection lines, the
+After the dispatch line and the model-selection lines, the
 runner starts one task per role behind an `asyncio.Semaphore` of
 `CODEX_COUNCIL_MAX_PARALLEL` permits (default 6). A task holding a permit
 makes a nonblocking probe for its role's continuity lock. If another
@@ -604,11 +637,34 @@ completion order; the report keeps the input order.
   about provider capacity.
 - *Probe, don't block, on role locks.* A blocked task would hold a permit
   and a file descriptor while doing nothing.
+- *A detached supervisor, started by a foreground call.* Since Claude Code
+  2.1.285 a background command stops at its `timeout` (30 minutes by
+  default, 2 hours at most), whatever it prints, and stopping a background
+  task also stops what detached from that task's shell. A council with no
+  run-level deadline therefore has to run outside every tracked task, and
+  the call that starts it has to be a foreground one that returns at once.
+  Mirroring the runner's stderr into a tracked task would not help: a task
+  printing every second is stopped at its timeout like a silent one.
+- *Detach only inside `--start`.* The detach happens behind the directory
+  claim and the identity checks, never through `&`, `nohup`, or `setsid` in
+  Claude's own command, so there is exactly one runner per directory and
+  every later command can verify it.
+- *The supervisor writes its own record.* `supervisor.json` written by the
+  child is the readiness signal, so there is no second writer of state and
+  no handshake pipe.
 
 **Limits.** Lock acquisition is probe-based, not FIFO-fair: a long-waiting
 role can lose a race to a newer one. Each role has exactly one lock file.
 There is no partial cancellation: a running role cannot be stopped or
-steered on its own.
+steered on its own; `--cancel` stops the whole council. A detached council
+does not survive a reboot or an operating-system kill of its processes,
+and host exit is covered only as far as the tests verify it (SIGHUP,
+SIGTERM, and SIGKILL to the process group of the shell that ran `--start`,
+and `--start` killed right after the spawn). A plugin update while a
+supervisor runs leaves that runner on the code it loaded, but the commands
+`--start` printed name its script path, which the update may remove; the
+updated script's commands read the same files unless the contract epoch
+changed.
 
 ## Thread continuity
 
@@ -616,10 +672,8 @@ steered on its own.
 project and host session when Claude deliberately reuses its id, and never
 let two councils race on one thread.
 
-![d25-continuity: project root, session scope, and role id form the state key; the key names the role lock and the state file; the attempt resumes or starts fresh and saves when the outcome allows](docs/diagrams/d25-continuity.png)
-
-*d25-continuity — Thread identity and persistence. Source:
-[d25-continuity.mmd](docs/diagrams/d25-continuity.mmd).*
+README's [State Scope](README.md#state-scope) diagram shows how the state
+key is formed, locked, and resumed.
 
 **How it works.** The state key combines a hash of the project root (the Git
 top level, else the launch directory), an optional hash of the session
@@ -702,12 +756,8 @@ earlier turns is not guaranteed.
 a run-level deadline, and make sure codex's process group does not outlive
 the attempt.
 
-![d26-attempt: the prompt and argv, codex exec in its own process group, the output pumps and activity clock, the watchdog, live process-tree discovery, the termination owner, the post-exit drain, the group-only sweep, and the CodexRun result](docs/diagrams/d26-attempt.png)
-
-*d26-attempt — One subprocess attempt and its watchdog. Terminating a live
-codex reaches its descendants; after codex exits, only its group can be
-reached. Every invocation has its own copy of all of this. Source:
-[d26-attempt.mmd](docs/diagrams/d26-attempt.mmd).*
+Terminating a live codex reaches its descendants; after codex exits, only
+its group can be reached. Every invocation has its own copy of all of this.
 
 **How it works.** The runner starts `codex exec` with
 `start_new_session=True`, so codex leads a process group that belongs to
@@ -756,11 +806,6 @@ cancellation at any point, the drain and the sweep included, still tears the
 group down; SIGINT, SIGTERM, and SIGHUP cancel the whole fan-out and end the
 run without the `CODEX_COUNCIL_DONE` line.
 
-![d27-stall: a stalled attempt becomes ok with a warning, a terminal stall, or a retriable stall](docs/diagrams/d27-stall.png)
-
-*d27-stall — Classify a stalled attempt. Source:
-[d27-stall.mmd](docs/diagrams/d27-stall.mmd).*
-
 A stall is a structured verdict, handled before any text classification, so
 stale- or auth-looking stderr from a killed process can neither classify the
 failure nor clear saved state. If the turn had completed and a final message
@@ -802,11 +847,6 @@ watchdog to 0 permits an indefinitely silent role.
 
 **Purpose.** Name why a role failed, retry only what a retry can fix, and
 never lose a valid saved thread to a misread message.
-
-![d28-failures: the ordered classifier, terminal failures, stale resume and its fresh invocation with a prior continuity lost warning, the retry budget, the 5-second backoff, and exhausted failures](docs/diagrams/d28-failures.png)
-
-*d28-failures — Failure classification and saved-thread action. Source:
-[d28-failures.mmd](docs/diagrams/d28-failures.mmd).*
 
 **How it works.** A failed invocation that is not a stall is classified by
 `_failure_verdict` in one order, identical on the fresh and resume paths:
@@ -903,10 +943,8 @@ limit, so an inheriting re-run can meet the same `[quota]`.
 **Purpose.** Let Claude use finished work early without ever mistaking an
 early signal for the end of the run.
 
-![d29-progress: the runner writes a reply file then logs its completion line; the follower relays it to Claude's provisional work; the final report and the host's completion notification lead to reconciliation](docs/diagrams/d29-progress.png)
-
-*d29-progress — Progress, replies, follower, and reconciliation. Source:
-[d29-progress.mmd](docs/diagrams/d29-progress.mmd).*
+README's [Launch Flow](README.md#launch-flow) diagram shows replies
+landing, the follower, and the completion rule in order.
 
 **How it works.** stdout carries only the report; everything else is
 best-effort stderr through one diagnostics helper: the dispatch line, the
@@ -914,10 +952,10 @@ model-selection lines, per-attempt start lines, retry and adoption notices,
 stall lines, warnings, the heartbeat, completion lines, and the final
 `[codex-council] CODEX_COUNCIL_DONE ok=N total=M elapsed=…s exit=X
 version=…` sentinel. A dead stderr switches diagnostics to a no-op sink and
-never changes a result. The heartbeat runs every `min(1800, stall_secs //
-3)` seconds with a 300-second floor while the watchdog is on (600 s at the
-default, 1800 s when disabled) and lists completed, active, and queued
-roles, each active role's `quiet=Ns` (or `retry-wait`), the watchdog, and the
+never changes a result. The heartbeat runs every
+`PROGRESS_HEARTBEAT_SECS = 300` seconds whatever `CODEX_COUNCIL_STALL_SECS`
+is (enabled, 0, or very large), never resets a watchdog, and lists
+completed, active, and queued roles, each active role's `quiet=Ns` (or `retry-wait`), the watchdog, and the
 plugin version.
 
 As each role settles (ok, failed, or crashed), the runner writes its report
@@ -930,8 +968,8 @@ values. Reply files are best-effort: if `replies/` is not a private
 directory the runner owns, it logs one warning and the completion lines
 carry no `reply=`. Finished replies survive an interruption; the
 interrupted run has no sentinel, and because the shell opened `out.md`
-before the runner started and the report is written at the end, `out.md`
-may then be empty or partial.
+before the runner started (or `--start` created it) and the report is
+written at the end, `out.md` may then be empty or partial.
 
 `--follow RUNDIR` is a read-only companion for Claude Code's Monitor tool.
 It relays the actionable `[codex-council` lines of `err.log` with a flush
@@ -939,21 +977,29 @@ per line: dispatch, model selection, warnings, completions, retries,
 stalls, and the terminal line. Per-attempt start lines and the heartbeat
 stay in `err.log` unless `--verbose` is given, so a three-role happy path is
 six Monitor events. It drops a completion line whose `reply=` path is not
-directly inside `RUNDIR/replies/`, the only shape the runner prints.
+directly inside `RUNDIR/replies/`, the only shape the runner prints. After
+dispatch, while the runner is alive and ticking, `FOLLOW_KEEPALIVE_SECS =
+600` seconds with nothing relayed produce one keepalive,
+`[codex-council-follow] still running: K/M settled; active: <id> quiet=Ns,
+...; status tick Ns ago`, naming at most `KEEPALIVE_ROLES = 5` active roles.
+It is built only from counts, validated role ids, and numbers, never from
+role output, and never appears before dispatch, after the terminal line,
+or while lines flow. Each keepalive is a Monitor event, so a long council
+shows progress and the following session is never idle for long.
 
 | Follower exit | Meaning |
 |---|---|
 | 0 | a terminal line (`CODEX_COUNCIL_DONE`, `interrupted by …`, `runner aborted …`) or a terminal state in `status.json` |
 | 1 | its stdout has no reader |
 | 2 | usage error: the directory is wrong or not private |
-| 3 | no dispatch line within 120 s |
+| 3 | no dispatch line within 120 s, or at once when a detached runner's lock is free with no dispatch line (`runner ended before dispatch`) |
 | 4 | the runner is gone or stopped ticking (see [Run liveness](#run-liveness-and-recovery)) |
 | 5 | its own parent went away |
 
 Monitor watches expire after at most 30 minutes interactively and 10 in
 `claude -p`; the skill re-arms the same follower only on that expiry while
-the task still runs, and a re-armed follower replays earlier lines, which
-Claude skips. Without Monitor, an interactive session uses a one-shot
+`--status` says `running`, and a re-armed follower replays earlier lines,
+which Claude skips. Without Monitor, an interactive session uses a one-shot
 10-minute session cron that runs `--status`, and `claude -p` or a subagent
 keeps its turn open by running the follower as a foreground call with a
 600000 ms timeout.
@@ -961,20 +1007,27 @@ keeps its turn open by running the follower as a foreground call with a
 Claude may read a settled role's reply, tell the user, and act on work that
 does not depend on other roles. The final verdict, cross-role conflicts, and
 writes that overlap a running writer wait for the full report, which Claude
-reads after Claude Code's background-task notification.
+reads only after the completion rule holds: the follower exits 0 and then
+`--status` reports that the runner ended (for an attached run, the end of
+its launch command).
 
 **Key decisions and why.**
 
 - *Reply file first, then its line.* A `reply=` path always points at a
   complete file.
 - *The follower never writes.* It cannot forge the sentinel or change a run.
-- *The host's notification ends the run.* Roles run as the user and can
+- *A verified runner exit ends the run.* Roles run as the user and can
   append to `err.log`, and no same-user check can authenticate those lines,
   so `CODEX_COUNCIL_DONE` and the follower's exit are progress signals only.
+  The end is the host's task notification in tracked mode, and in detached
+  mode a released supervisor lock plus a vanished pid identity, which
+  `--status` checks before it reports a terminal state.
   Diagnostic lines that embed foreign text escape ` reply=` as
   ` reply\x3d`, so the follower's filter never hides one.
 - *Fewer notifications.* Routine start lines and heartbeats are for humans
-  reading `err.log`; every relayed line costs Claude context.
+  reading `err.log`; every relayed line costs Claude context. The keepalive
+  is the exception on purpose: one line per 600 quiet seconds keeps a long
+  run visible and the session active.
 
 **Limits.** Follower exit 0 means the run ended, not that every role
 succeeded; the report Summary and the sentinel's `ok=N total=M exit=X` say
@@ -983,14 +1036,12 @@ which. A running role cannot be steered.
 ## Run liveness and recovery
 
 **Purpose.** Notice within seconds when the runner itself dies, and within
-minutes when it stops responding, without adding a supervisor process, and
-give Claude a safe way to clean up.
+minutes when it stops responding, with no process beyond the runner itself
+(the detached runner is its own supervisor), and give Claude safe ways to
+stop a run and clean up.
 
-![d30-liveness: the runner writes status.json; the follower checks the runner every 2 seconds; a gone runner leads to --status, --reap, and a re-run in a new directory; a runner that is not responding is stopped through its tracked task first](docs/diagrams/d30-liveness.png)
-
-*d30-liveness — Runner liveness and recovery. A runner that is still
-present is never reaped: its tracked task is stopped first. Source:
-[d30-liveness.mmd](docs/diagrams/d30-liveness.mmd).*
+A runner that is still present is never reaped: it is cancelled (or its
+tracked task stopped) first.
 
 **How it works.** The launch publishes `RUNDIR/status.json` (mode 0600,
 replaced atomically) on every role transition and at least every 15 s from
@@ -1024,12 +1075,39 @@ after its last usable read), the follower prints one
 line and keeps relaying `err.log`, checking the runner again once a usable
 file appears. The follower also exits 5 when its own parent disappears.
 
+A detached run adds its supervisor lock to that evidence. `lock_state`
+opens `supervisor.lock` read-only, without following a symlink or creating
+anything, requires a private regular file with the device, inode and
+token `supervisor.json` records, and tries a shared lock without blocking:
+`absent`, `held`, `free`, or `unknown` (a replaced lock file reads
+`unknown`). The token is 32 random hex characters `--start` writes into the
+lock file as it claims it. It catches a replacement that reuses the old
+inode number, which Linux filesystems commonly do for a file created right
+after a delete; a record without one (none is written by older versions)
+is checked by device and inode alone.
+`supervisor_state` combines it with the recorded identity: `alive` while
+the lock is held and the recorded pid has its recorded start time, `gone`
+only when the lock is free and that identity is gone, and `unknown` on any
+disagreement (a held lock with a dead or reused pid, a free lock with the
+process present, `supervisor.json` and `status.json` naming different
+runners). With no `supervisor.json` yet, a free lock reads `unknown` while
+the lock file is younger than `LOCK_CLAIM_GRACE_SECS` (3 s): `--start`
+creates the file before it locks it, and a reader in that gap must not
+call the run ended. Nothing is signalled or reaped on `unknown`. The follower uses
+that liveness for a detached run, and a free lock with no dispatch line
+ends it at once with exit 3 (`runner ended before dispatch`). A run with no
+supervisor files is read exactly as before.
+
 `--status RUNDIR` prints about ten lines of facts and exits 0: the runner's
 state (`running`, `not responding`, `gone`, `done`, `interrupted`,
 `aborted`, or `unknown`) with its pid and tick age, the settled count, up
 to `STATUS_ROLE_LINES` (5) unfinished roles, one line each with its state,
 attempt, quiet seconds, and codex pid, then a count of any others, the live
-codex groups when the runner is gone, and one `next:` action.
+codex groups when the runner is gone, and one `next:` action. A detached
+run adds `starting` (lock held, no dispatch yet), a terminal state with
+`the runner is still exiting` while the lock is still held, and `ended
+before dispatch`; it reports `done`, `interrupted`, or `aborted` as final
+only once the lock is free and the runner's identity gone.
 Quiet seconds count from the last output recorded at the latest status
 tick, so they can read up to 15 s high; the heartbeat in `err.log` uses the
 live value.
@@ -1040,11 +1118,28 @@ start identity and to the groups and processes descended from that live
 codex (one `ps` snapshot, as in d26), reports and leaves alone every other
 group (and never its own), and never touches saved threads, replies, or
 other files. Otherwise it refuses with exit 1. Claude then re-runs the
-unfinished roles in a new directory. A runner that is present but not
-responding is never reaped: Claude stops the council's tracked background
-task, confirms with `--status` that the runner is gone, and only then runs
-`--reap` if live codex groups remain (the skill's recovery triage, which
-decides the runner's state before any rule about role output).
+unfinished roles in a new directory. For a detached run `--reap` also
+refuses while the lock is held, even when `ps` says the pid is gone, and
+while the run reads `unknown`. A runner that is present but not responding
+is never reaped: Claude runs `--cancel` (for an attached run, stops its
+launch command), confirms with `--status` that the runner is gone, and
+only then runs `--reap` if live codex groups remain (the skill's recovery
+triage, which decides the runner's state before any rule about role
+output).
+
+`--cancel RUNDIR` stops a detached run. It acts only while the lock is held
+with the recorded inode, the recorded pid is alive with its recorded start
+identity and process group, and `status.json`, where present, names the
+same runner; otherwise it refuses with exit 1 and signals nothing (and
+says to run `--reap` when the runner has already ended). It sends SIGCONT
+and SIGTERM to that one pid, so the runner's own signal handling tears
+down its codex groups and logs its interruption line, and waits up to
+`CANCEL_GRACE_SECS = 30` seconds for the lock to be released. A runner that
+still holds it is verified again and sent SIGKILL, with
+`CANCEL_KILL_WAIT_SECS = 5` more seconds; `--cancel` then says to run
+`--reap`. The runner latches the first SIGINT, SIGTERM, or SIGHUP: later
+ones are ignored, so a repeated signal can neither interrupt its cleanup
+nor change its exit code (128 + the first signal).
 
 **Key decisions and why.**
 
@@ -1054,9 +1149,14 @@ decides the runner's state before any rule about role output).
   no command claims health.
 - *Identity, never command-line matching.* A pid alone can be reused, and a
   command line can be imitated; a pid plus its start time cannot.
-- *Recovery stays with Claude.* A supervisor process would need its own
-  supervision; the follower already watches the run, and `--reap` is an
-  explicit, verified action.
+- *The runner is its own supervisor.* A separate watchdog process would
+  need its own supervision. The detached runner holds a lock the kernel
+  releases however it ends, the follower watches it, and `--cancel` and
+  `--reap` are explicit, verified actions that stay with Claude.
+- *The lock decides.* A pid and start time can be misread across PID
+  namespaces or while `ps` fails; a held lock cannot be faked by a reused
+  pid. So a held lock always means alive, and gone needs both a free lock
+  and a vanished identity.
 
 **Limits.**
 
@@ -1071,6 +1171,12 @@ decides the runner's state before any rule about role output).
   members remain, because it cannot verify them.
 - Liveness checks need a `ps` that supports `-A` and `-o pid,pgid,stat,lstart`;
   without one, commands report "unknown" instead of guessing.
+- Across Linux PID namespaces (a container or sandbox) the recorded pid is
+  not visible, so a detached run with a held lock reads `unknown` there and
+  nothing is signalled; run the commands where `--start` ran.
+- A SIGKILLed detached runner releases its lock at once (no codex worker
+  inherits it), so `--status` reads it `gone` and `--reap` can end the
+  workers it leaves.
 
 ## Testing and supported behavior
 
@@ -1081,13 +1187,26 @@ the concerns above: runner internals and the documentation contract
 (`test_codex_council.py`), the CLI end to end (`test_codex_council_cli.py`),
 discovery (`test_model_discovery.py`), selection (`test_model_selection.py`),
 reply files and overrides (`test_replies_and_overrides.py`), liveness
-(`test_liveness.py`), and the module layout (`test_module_layout.py`).
+(`test_liveness.py`), the detached launch (`test_supervisor.py`), and the
+module layout (`test_module_layout.py`).
 `tests/liveness_scenarios.py` runs the liveness scenarios end to end against
 the real CLI and prints a verdict and the follower's line count for each: the
 happy path, a descendant holding codex's output open, a SIGKILLed runner, a
 stopped runner, a follower whose parent dies, a role that is silent for a
-while and then succeeds, and a role whose stdout carries lines no JSON
-parser accepts while its stderr keeps printing.
+while and then succeeds, a role whose stdout carries lines no JSON
+parser accepts while its stderr keeps printing, and, for the detached
+launch: the host stopping an attached launch in a background task (the
+interruption is clean and settled replies stay), the shell that ran
+`--start` getting SIGHUP, SIGTERM, and SIGKILL after it returns and
+`--start` itself killed right after the spawn (the council finishes in
+both, in a session of its own),
+two concurrent `--start` calls on one directory (one supervisor; the loser
+exits 2 and truncates nothing), `--cancel` of a hanging role with a tool
+session (a clean interruption, every fake process gone), and a SIGKILLed
+supervisor (its lock free at once, `--status` gone, `--reap` ends codex,
+the directory stays used up). These real-process scenarios run with
+bounded deadlines and clean up in `finally`, and they depend on timing, so
+a slow machine can make one flaky.
 
 The documentation tests (`DocsContractTests` in `test_codex_council.py`)
 check three kinds of thing:
@@ -1108,25 +1227,26 @@ check three kinds of thing:
   the absence of product model names and effort ladders. A pin catches a
   deleted or reworded rule, not an inaccurate new sentence, so changed prose
   is still reviewed against the code.
-- *Diagrams and the PDF.* Every `.mmd` has a PNG with the same id and draws
-  at most nine nodes; every PNG is opaque (no alpha channel) and fits the
-  PDF's page box at 60% scale or more; DESIGN embeds every diagram once,
-  captioned with its id and a link to its source, and README embeds d00 and
-  d10 and indexes all of them; the PDF build's link rules send links to
-  in-document anchors or GitHub; and the committed PDF has only web and
-  in-document links, bookmarks for at least each document, and at least
-  one image per diagram.
+- *Diagrams and the PDF.* The repository tracks no image file and no
+  document links or embeds one; README holds exactly three `mermaid` blocks,
+  under Architecture, Launch Flow, and State Scope, each within a node or
+  message budget and naming the launch facts it draws (`--start`,
+  `supervisor.lock`, `--follow`, `CODEX_COUNCIL_DONE`, `--status`); the PDF
+  build turns every `mermaid` block into an inline SVG figure (checked with
+  a stand-in renderer, so the tests need no network), refuses an image,
+  and sends links to in-document anchors or GitHub; and the committed PDF
+  has only web and in-document links, bookmarks for at least each
+  document, and no raster image.
 
-Nothing checks that the committed PNGs and PDF were rebuilt after their
-sources changed: run `scripts/build-docs.sh --diagrams` after editing a
-`.mmd` file and `scripts/build-docs.sh` after editing any document it
-includes.
+Nothing checks that the committed PDF was rebuilt after its sources
+changed: run `scripts/build-docs.sh` after editing any document it
+includes, a diagram included.
 
 CI runs the suite on Python 3.12, 3.13, 3.14, and 3.15 and a pinned ruff.
 `tests/test_live_codex.py` holds opt-in smoke tests against a real, signed-in
 Codex (`CODEX_COUNCIL_LIVE_TESTS=1`). `scripts/build-docs.sh` rebuilds
-`docs/codex-council.pdf` and, with `--diagrams`, re-renders the PNGs from
-their `.mmd` sources.
+`docs/codex-council.pdf`, rendering each diagram to SVG through
+mermaid.ink at build time.
 
 ## Non-goals
 
@@ -1149,5 +1269,11 @@ their `.mmd` sources.
   overrides would change provenance.
 - **No recommended-default routing.** The catalog's default marker is shown
   as `recommended` and never picked automatically.
-- **No supervisor process.** Liveness is published by the runner and read by
-  the follower and `--status`.
+- **No supervisor beyond the runner.** The detached runner supervises
+  itself: it holds its lock and writes its own `supervisor.json`, and
+  liveness is published by it and read by the follower and `--status`.
+  There is no second event journal, no `--watch` or `--wait` command (the
+  follower over `err.log` serves), no status schema 2, no readiness
+  handshake pipe beyond `supervisor.json`, no stderr tee or log file, and
+  no per-role continuity record for codex workers that outlive a SIGKILLed
+  supervisor (`--reap` is that recovery, as in tracked mode).

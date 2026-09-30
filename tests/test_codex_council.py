@@ -20,6 +20,7 @@ import asyncio
 import contextlib
 import dataclasses
 import hashlib
+import html
 import importlib.util
 import inspect
 import io
@@ -28,6 +29,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -1915,31 +1917,41 @@ class RunCouncilProgressTests(unittest.IsolatedAsyncioTestCase):
         # The final sentinel is main()'s job, never run_council's.
         self.assertNotIn("CODEX_COUNCIL_DONE", err)
 
-    async def test_long_run_emits_periodic_status_heartbeat(self):
-        release = asyncio.Event()
+    class _HeartbeatWatch(io.StringIO):
+        """A stderr buffer that releases the fake roles once it holds
+        `wanted` heartbeat lines: the roles end on the heartbeats they
+        wait for, never on a wall-clock guess."""
 
+        def __init__(self, wanted):
+            super().__init__()
+            self.wanted = wanted
+            self.seen = asyncio.Event()
+
+        def write(self, text):
+            written = super().write(text)
+            if self.getvalue().count("still running after") >= self.wanted:
+                self.seen.set()
+            return written
+
+    def _waiting_role(self, watch):
         async def fake_role(role, prompt):
-            await release.wait()
+            await watch.seen.wait()
             return codex_council.RoleResult(
                 role=role, ok=True, text="ok", elapsed_seconds=0.1,
             )
+        return fake_role
 
-        async def release_after_heartbeats():
-            await asyncio.sleep(0.035)
-            release.set()
-
-        buf = io.StringIO()
-        with patch.object(codex_council, "_run_role_attempts", side_effect=fake_role):
-            with patch.object(codex_council, "PROGRESS_HEARTBEAT_SECS", 0.01), \
-                 patch.object(codex_council, "HEARTBEAT_FLOOR_SECS", 0):
+    async def test_long_run_emits_periodic_status_heartbeat(self):
+        buf = self._HeartbeatWatch(wanted=2)
+        with patch.object(codex_council, "_run_role_attempts",
+                          side_effect=self._waiting_role(buf)):
+            with patch.object(codex_council, "PROGRESS_HEARTBEAT_SECS", 0.01):
                 with contextlib.redirect_stderr(buf):
-                    releaser = asyncio.create_task(release_after_heartbeats())
                     await codex_council.run_council(
                         self._roles("architect", "security"),
                         "body",
                         max_parallel=1,
                     )
-                    await releaser
 
         heartbeats = [
             line for line in buf.getvalue().splitlines()
@@ -1953,31 +1965,16 @@ class RunCouncilProgressTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("version=", heartbeats[0])
 
     async def test_heartbeat_reports_watchdog_disabled_when_env_is_zero(self):
-        release = asyncio.Event()
-
-        async def fake_role(role, prompt):
-            await release.wait()
-            return codex_council.RoleResult(
-                role=role, ok=True, text="ok", elapsed_seconds=0.1,
-            )
-
-        async def release_after_heartbeat():
-            await asyncio.sleep(0.03)
-            release.set()
-
-        buf = io.StringIO()
+        buf = self._HeartbeatWatch(wanted=1)
         os.environ[codex_council.STALL_SECS_ENV] = "0"
         try:
-            with patch.object(
-                codex_council, "_run_role_attempts", side_effect=fake_role
-            ):
+            with patch.object(codex_council, "_run_role_attempts",
+                              side_effect=self._waiting_role(buf)):
                 with patch.object(codex_council, "PROGRESS_HEARTBEAT_SECS", 0.01):
                     with contextlib.redirect_stderr(buf):
-                        releaser = asyncio.create_task(release_after_heartbeat())
                         await codex_council.run_council(
                             self._roles("architect"), "body", max_parallel=1,
                         )
-                        await releaser
         finally:
             os.environ.pop(codex_council.STALL_SECS_ENV, None)
 
@@ -3041,6 +3038,71 @@ class ForceUtf8StreamsTests(unittest.TestCase):
             codex_council._force_utf8_streams()  # must not raise
 
 
+class SignalLatchTests(unittest.IsolatedAsyncioTestCase):
+    """The first SIGINT, SIGTERM, or SIGHUP is latched: it cancels the
+    council once and sets the exit; a repeated one can neither cancel the
+    cleanup it started nor change the exit code."""
+
+    def setUp(self):
+        for signum in codex_council.TERMINATION_SIGNALS:
+            self.addCleanup(signal.signal, signum, signal.getsignal(signum))
+
+    async def test_a_repeated_signal_never_disrupts_cleanup(self):
+        running = asyncio.Event()
+        cleanup = {"started": asyncio.Event(), "done": False, "cancels": 0}
+
+        async def fake_run_council(roles, body, max_parallel,
+                                   replies_dir=None):
+            running.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cleanup["cancels"] += 1
+                cleanup["started"].set()
+                # Teardown awaits: a second cancel() would land here.
+                for _ in range(20):
+                    try:
+                        await asyncio.sleep(0.01)
+                    except asyncio.CancelledError:
+                        cleanup["cancels"] += 1
+                        raise
+                cleanup["done"] = True
+                raise
+
+        with patch.object(codex_council, "run_council", fake_run_council):
+            task = asyncio.create_task(
+                codex_council._run_council_with_signals([], "body", 1))
+            await running.wait()
+            os.kill(os.getpid(), signal.SIGTERM)
+            await cleanup["started"].wait()
+            for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+                os.kill(os.getpid(), signum)
+                await asyncio.sleep(0.02)
+            results, signum = await task
+        self.assertIsNone(results)
+        self.assertEqual(signum, signal.SIGTERM)
+        self.assertTrue(cleanup["done"])
+        self.assertEqual(cleanup["cancels"], 1)
+        # After the latch, a late signal is ignored rather than fatal.
+        for signum in codex_council.TERMINATION_SIGNALS:
+            self.assertIs(signal.getsignal(signum), signal.SIG_IGN)
+
+    async def test_no_signal_leaves_the_dispositions_alone(self):
+        async def fake_run_council(roles, body, max_parallel,
+                                   replies_dir=None):
+            return ["result"]
+
+        before = {s: signal.getsignal(s)
+                  for s in codex_council.TERMINATION_SIGNALS}
+        with patch.object(codex_council, "run_council", fake_run_council):
+            outcome = await codex_council._run_council_with_signals(
+                [], "body", 1)
+        self.assertEqual(outcome, (["result"], None))
+        self.assertNotIn(signal.SIG_IGN, [
+            signal.getsignal(s) for s in codex_council.TERMINATION_SIGNALS
+            if before[s] is not signal.SIG_IGN])
+
+
 class NoRunLevelDeadlineTests(unittest.TestCase):
     """The council has no total elapsed-time or run-level deadline: a role
     may run indefinitely while its codex subprocess keeps producing output
@@ -3121,6 +3183,34 @@ class NoRunLevelDeadlineTests(unittest.TestCase):
         self.assertIn("timeout=timeout",
                       inspect.getsource(council_common._project_root))
 
+    def test_only_start_and_cancel_have_their_own_bounded_waits(self):
+        """The two control deadlines are not a council's: --start waits
+        (START_WAIT_SECS) only for its supervisor to start, and --cancel
+        (CANCEL_GRACE_SECS, CANCEL_KILL_WAIT_SECS) only for the runner it
+        signalled to end. Each constant is read in exactly its own
+        command, never on the path that runs roles."""
+        import ast as _ast
+        self.assertLessEqual(codex_council.START_WAIT_SECS, 30)
+        self.assertLessEqual(council_liveness.CANCEL_GRACE_SECS, 60)
+        self.assertLessEqual(council_liveness.CANCEL_KILL_WAIT_SECS, 30)
+        users = {}
+        for module in (codex_council, council_liveness):
+            tree = _ast.parse(inspect.getsource(module))
+            for func in _ast.walk(tree):
+                if not isinstance(func, (_ast.FunctionDef,
+                                         _ast.AsyncFunctionDef)):
+                    continue
+                for node in _ast.walk(func):
+                    if isinstance(node, _ast.Name) and node.id in (
+                            "START_WAIT_SECS", "CANCEL_GRACE_SECS",
+                            "CANCEL_KILL_WAIT_SECS"):
+                        users.setdefault(node.id, set()).add(func.name)
+        self.assertEqual(users, {
+            "START_WAIT_SECS": {"_start_command"},
+            "CANCEL_GRACE_SECS": {"cancel_command"},
+            "CANCEL_KILL_WAIT_SECS": {"cancel_command"},
+        })
+
 
 # ---------- output-inactivity watchdog (env, flags, policy) ----------
 
@@ -3158,20 +3248,23 @@ class StallSecsEnvTests(unittest.TestCase):
             expect_in_stderr="must be a positive integer",
         )
 
-    def test_heartbeat_cadence_adapts_with_floor(self):
-        # Enabled: min(PROGRESS_HEARTBEAT_SECS, stall // 3), floored at 300.
-        self.assertEqual(codex_council._heartbeat_secs(1800), 600)
-        self.assertEqual(codex_council._heartbeat_secs(600), 300)
-        self.assertEqual(codex_council._heartbeat_secs(90), 300)
-        self.assertEqual(
-            codex_council._heartbeat_secs(10**9),
-            codex_council.PROGRESS_HEARTBEAT_SECS,
-        )
-        # Disabled: unchanged 30-minute cadence.
-        self.assertEqual(
-            codex_council._heartbeat_secs(0),
-            codex_council.PROGRESS_HEARTBEAT_SECS,
-        )
+    def test_heartbeat_cadence_is_at_most_300s_for_every_watchdog(self):
+        """The heartbeat never goes quieter than five minutes: enabled at
+        the default, short, or very large, and disabled (0) alike. Read
+        from the computed cadence, never by sleeping."""
+        self.assertEqual(codex_council.PROGRESS_HEARTBEAT_SECS, 300)
+        for stall_secs in (0, 1, 90, 600, codex_council.DEFAULT_STALL_SECS,
+                           7200, 10**9):
+            with self.subTest(stall_secs=stall_secs):
+                cadence = codex_council._heartbeat_secs(stall_secs)
+                self.assertLessEqual(cadence, 300)
+                self.assertEqual(cadence, 300)
+        # The cadence comes from the environment the launch reads.
+        for raw in ("0", "86400"):
+            with self.subTest(env=raw), \
+                    patch.dict(os.environ, {codex_council.STALL_SECS_ENV: raw}):
+                self.assertEqual(codex_council._heartbeat_secs(
+                    codex_council._stall_secs()), 300)
 
     def test_watchdog_desc_rendering(self):
         self.assertEqual(codex_council._watchdog_desc(1800), "1800s")
@@ -4054,8 +4147,7 @@ class DocsContractTests(unittest.TestCase):
         r"(?:,\s*(?:and\s+|or\s+)?(?:minimal|low|medium|high|xhigh|max)\b)"
         r"{2,})"
     )
-    TEXT_SUFFIXES = (".md", ".py", ".json", ".sh", ".yml", ".yaml", ".toml",
-                     ".mmd")
+    TEXT_SUFFIXES = (".md", ".py", ".json", ".sh", ".yml", ".yaml", ".toml")
 
     # How every documented template invokes the runner; ${CLAUDE_PLUGIN_ROOT}
     # is the directory that holds .claude-plugin/plugin.json.
@@ -4119,7 +4211,7 @@ class DocsContractTests(unittest.TestCase):
 
     def _repo_text_files(self):
         """Repo-relative paths of the text files the repo ships or tests
-        with (root documents, plugin, scripts, diagrams, CI, and tests);
+        with (root documents, plugin, scripts, docs, CI, and tests);
         ignored local directories are never walked."""
         root = self._repo_file()
         paths = [name for name in sorted(os.listdir(root))
@@ -4197,10 +4289,14 @@ class DocsContractTests(unittest.TestCase):
             return "discover"
         if args.check_staging_dir is not None:
             return "check-staging-dir"
+        if args.start is not None:
+            return "start"
         if args.follow is not None:
             return "follow"
         if args.status is not None:
             return "status"
+        if args.cancel is not None:
+            return "cancel"
         if args.reap is not None:
             return "reap"
         if args.roles_file is not None and args.context_file is not None:
@@ -4642,7 +4738,7 @@ class DocsContractTests(unittest.TestCase):
         # user's pin, a routed pair, native-model effort, inheritance.
         order = [flat.index(marker) for marker in (
             "Run `mktemp -d` once per launch",
-            "--discover 'ABS_RUNDIR' --skill-contract 3",
+            "--discover 'ABS_RUNDIR' --skill-contract 4",
             '"selection": {"mode": "user"}',
             '"mode": "routed"',
             '"mode": "native_effort"',
@@ -4840,7 +4936,7 @@ class DocsContractTests(unittest.TestCase):
 
     # ---------- launch safety ----------
 
-    def test_launch_rules_keep_private_staging_and_one_background_layer(self):
+    def test_launch_rules_keep_private_staging_and_a_foreground_start(self):
         staging = self._section("## Step 3", "## Step 4")
         for required in (
             "Run `mktemp -d` once per launch",
@@ -4857,10 +4953,19 @@ class DocsContractTests(unittest.TestCase):
         flat = self._section("## Step 4", "## Step 5")
         for required in (
             "Do not wait for approval",
-            "`run_in_background: true`",
-            "keep the command itself in the foreground",
-            "stdout and stderr redirected to files",
-            "false \"completed\"",
+            # The only launch: --start in one foreground call. A
+            # background task is stopped at its timeout (Claude Code
+            # 2.1.285), and stopping it also stops what it detached.
+            "Launch with one foreground Bash call running `--start`",
+            "no redirects, never `run_in_background`, no `&`, `nohup`, or "
+            "`setsid`",
+            "It detaches the council itself and returns within seconds",
+            "stopping a background task would also stop what it detached",
+            # What --start prints and how a failed start is handled.
+            "`--start` prints a `started:` line and the exact `--follow`, "
+            "`--status`, and `--cancel` commands (exit 1: read `err.log`)",
+            "or `--start` exits 1, abandon that directory; never retry "
+            "`--start` there",
             "abandon that directory",
             "Do not chmod it, mkdir it, or reuse its name",
             # A new directory has no snapshot: discover again there.
@@ -4868,12 +4973,60 @@ class DocsContractTests(unittest.TestCase):
             "new `snapshot_id`",
         ):
             self.assertIn(required, flat)
-        # The core names the common detach forms and points at the full
-        # list, which lives in the runtime reference.
-        for forbidden in ("trailing `&`", "`nohup`", "`setsid`", "`disown`",
-                          "runtime-behavior.md lists"):
-            self.assertIn(forbidden, flat)
+        # The core never launches a time-limited council: no background
+        # launch with redirects, no host-maximum timeout, and no pointer to
+        # a tracked fallback. Its one mention of `run_in_background` is the
+        # prohibition above.
+        skill = self._skill()
+        flat_skill = self._flat(skill)
+        for retired in ("run_in_background: true", "> 'ABS_RUNDIR/out.md'",
+                        "2> 'ABS_RUNDIR/err.log'", "timeout: 7200000",
+                        "7200000", "tracked fallback", "--roles-file"):
+            with self.subTest(retired=retired):
+                self.assertNotIn(retired, flat_skill)
+        self.assertEqual(skill.count("run_in_background"), 1)
+        self.assertIn("never `run_in_background`", flat_skill)
         runtime = self._flat(self._ref("runtime-behavior.md"))
+        # The attached launch stays documented for direct CLI use and old
+        # directories, with the host's cap stated as a fact (cited), and
+        # the reason the skill never uses it, not even as a fallback.
+        self.assertNotIn("### The tracked fallback", runtime)
+        attached = runtime.split(
+            "### Attached runs (not used by the skill)", 1)[1].split(
+            "## Detached launch", 1)[0]
+        for required in (
+            "The skill always launches with `--start` (below), which has no "
+            "host time limit",
+            "for direct use from a terminal and for backward compatibility",
+            "including those an earlier version of the skill launched this "
+            "way",
+            "--roles-file 'ABS_RUNDIR/roles.json'",
+            "--context-file 'ABS_RUNDIR/context.md'",
+            "> 'ABS_RUNDIR/out.md'",
+            "2> 'ABS_RUNDIR/err.log'",
+            "When an attached launch runs inside a Claude Code background "
+            "task (`run_in_background`), the host stops it at the Bash "
+            "tool's `timeout`: 30 minutes by default and 2 hours at most, "
+            "since Claude Code 2.1.285",
+            "(https://code.claude.com/docs/en/changelog)",
+            "`[codex-council] interrupted by SIGTERM`, exits 143",
+            "That cap is why the skill always uses `--start` and never "
+            "launches a council as a background task, not even as a "
+            "fallback",
+            "stopping a background task also stops the processes that "
+            "detached from its shell",
+            "The only supported way to outlive a background task is "
+            "`--start`, never a manual detach wrapper",
+        ):
+            self.assertIn(required, attached)
+        # No shipped document offers a time-limited launch recipe or a
+        # tracked fallback.
+        for name, text in self._doc_surfaces().items():
+            for retired in ("7200000", "run_in_background: true",
+                            "tracked fallback"):
+                with self.subTest(surface=name, retired=retired):
+                    self.assertNotIn(retired, self._flat(text))
+        self.assertNotIn("Do not add a detach layer", runtime)
         for forbidden in (
             "trailing `&`", "`&!`", "`&|`", "`nohup`", "`setsid`",
             "`disown`", "`bg`", "`coproc`", "`( ... ) &`", "`{ ...; } &`",
@@ -4895,9 +5048,9 @@ class DocsContractTests(unittest.TestCase):
         self.assertLess(flat.index("For an installed plugin"),
                         flat.index("`scripts/dev-link.sh`"))
 
-    def test_templates_use_skill_contract_epoch_3_everywhere(self):
+    def test_templates_use_skill_contract_epoch_4_everywhere(self):
         epoch = str(codex_council.SKILL_CONTRACT_EPOCH)
-        self.assertEqual(epoch, "3")
+        self.assertEqual(epoch, "4")
         for name, text in self._doc_surfaces().items():
             with self.subTest(surface=name):
                 values = re.findall(r"--skill-contract (\d+)", text)
@@ -4906,15 +5059,26 @@ class DocsContractTests(unittest.TestCase):
                 self.assertLessEqual(set(values), {epoch})
         skill = self._skill()
         for fragment in (
-            "--discover 'ABS_RUNDIR' --skill-contract 3",
-            "--check-staging-dir 'ABS_RUNDIR' --skill-contract 3",
+            "--discover 'ABS_RUNDIR' --skill-contract 4",
+            "--check-staging-dir 'ABS_RUNDIR' --skill-contract 4",
+            "--start 'ABS_RUNDIR' --skill-contract 4",
+            "--follow 'ABS_RUNDIR' --skill-contract 4",
+        ):
+            self.assertIn(fragment, skill)
+        runtime = self._ref("runtime-behavior.md")
+        for fragment in (
+            "--start 'ABS_RUNDIR' --skill-contract 4",
+            "--cancel 'ABS_RUNDIR' --skill-contract 4",
+            # The attached launch, for direct CLI use (never the skill's).
             "--roles-file 'ABS_RUNDIR/roles.json'",
             "--context-file 'ABS_RUNDIR/context.md'",
             "> 'ABS_RUNDIR/out.md'",
             "2> 'ABS_RUNDIR/err.log'",
-            "--follow 'ABS_RUNDIR' --skill-contract 3",
         ):
-            self.assertIn(fragment, skill)
+            self.assertIn(fragment, runtime)
+        # The lines --start prints carry the same epoch.
+        self.assertIn(
+            f"--cancel <ABS_RUNDIR> --skill-contract {epoch}", runtime)
 
     def test_documented_runner_commands_parse_with_the_runner(self):
         """Every runner command a document shows is accepted by the runner's
@@ -4927,8 +5091,9 @@ class DocsContractTests(unittest.TestCase):
             plugin_root, "skills", "codex-council", "scripts",
             "codex_council.py")))
         expected = {
-            "SKILL.md": {"discover", "check-staging-dir", "launch", "follow"},
-            "runtime-behavior.md": {"follow", "status", "reap"},
+            "SKILL.md": {"discover", "check-staging-dir", "start", "follow"},
+            "runtime-behavior.md": {"launch", "start", "follow", "status",
+                                    "cancel", "reap"},
         }
         for name, text in self._doc_surfaces().items():
             modes = set()
@@ -4938,7 +5103,8 @@ class DocsContractTests(unittest.TestCase):
                     self.assertEqual(args.skill_contract,
                                      codex_council.SKILL_CONTRACT_EPOCH)
                     for value in (args.discover, args.check_staging_dir,
-                                  args.follow, args.status, args.reap,
+                                  args.start, args.follow, args.status,
+                                  args.cancel, args.reap,
                                   args.roles_file, args.context_file):
                         if value is not None:
                             self.assertTrue(value.startswith("ABS_RUNDIR"))
@@ -4948,12 +5114,13 @@ class DocsContractTests(unittest.TestCase):
 
     def test_preflight_and_launch_are_separate_calls_that_fail_closed(self):
         """A pre-flight that refuses a directory cannot stop a launch that
-        runs in the same Bash call: executed literally, the old one-block
-        template printed the refusal and launched anyway, truncating the
-        directory's out.md and err.log. So every SKILL code block holds at
-        most one runner command, the launch block holds nothing but that
-        command, and the prose makes the launch a separate call that runs
-        only after the pre-flight exits 0."""
+        runs in the same Bash call: executed literally, an old one-block
+        template printed the refusal and launched anyway. So every SKILL
+        code block holds at most one runner command, the --start block
+        holds nothing but that command (no redirect, no detach, no second
+        command), and the prose makes the launch a separate foreground call
+        that runs only after the pre-flight exits 0, so its plan is read
+        before anything starts."""
         skill = self._skill()
         blocks = re.findall(r"```[\w-]*\n(.*?)```", skill, re.S)
         modes = []
@@ -4965,27 +5132,31 @@ class DocsContractTests(unittest.TestCase):
                        block) for argv in commands]
         order = [mode for mode, _ in modes]
         self.assertLess(order.index("check-staging-dir"),
-                        order.index("launch"))
-        launch_block = dict(modes)["launch"]
+                        order.index("start"))
+        self.assertNotIn("launch", order)
+        launch_block = dict(modes)["start"]
         code = [line for line in launch_block.replace("\\\n", " ").splitlines()
                 if line.strip() and not line.lstrip().startswith("#")]
         self.assertEqual(len(code), 1, code)
         self.assertTrue(code[0].strip().startswith(self.RUNNER_COMMAND))
-        for token in ("&&", "||", ";", "&", "|"):
+        for token in ("&&", "||", ";", "&", "|", ">", "2>", "nohup",
+                      "setsid", "disown"):
             self.assertNotIn(token, shlex.split(code[0], posix=True)[3:])
+        self.assertEqual(shlex.split(code[0], posix=True)[2:],
+                         ["--start", "ABS_RUNDIR", "--skill-contract",
+                          str(codex_council.SKILL_CONTRACT_EPOCH)])
         comment = self._flat(" ".join(
             line.lstrip("# ") for line in launch_block.splitlines()
             if line.lstrip().startswith("#")))
-        self.assertIn("Only after the pre-flight exits 0, a separate call",
-                      comment)
+        self.assertIn("Only after the pre-flight exits 0, a separate "
+                      "foreground call", comment)
         self.assertIn("nothing else in it", comment)
         flat = self._section("## Step 4", "## Step 5")
         for required in (
             "**Two Bash calls.**",
             "Run the pre-flight in the foreground; launch only after it "
             "exits 0, in a separate call",
-            "Never combine them: a refused pre-flight would not stop the "
-            "launch",
+            "Never combine them: read the plan first",
         ):
             self.assertIn(required, flat)
 
@@ -5001,28 +5172,51 @@ class DocsContractTests(unittest.TestCase):
             "1800000",
             "600000",
             "re-arm the same command only on that expiry",
-            "only while the background task is still running",
+            "only while `--status` says `running`",
             "replays earlier lines",
+            # The follower's keepalive keeps a long council visible.
+            "prints a `still running` keepalive after 600 s of silence",
             # One follower, actionable lines only; --status for spot
             # checks; a gone runner is reaped before re-running its roles.
             "one Monitor",
             "relays actionable lines",
             "Swap in `--status` for a spot check",
             "`runner gone` or `runner not responding`",
-            "take its `next:` action",
-            "confirm its task ended, `--reap` the same way, re-run "
-            "unfinished roles in a new directory",
+            "`runner ended before dispatch`",
+            "take its `next:` action (`--reap` when gone, `--cancel` when "
+            "not responding)",
+            # A detached runner gone at once: one relaunch with --start in
+            # a new directory, then stop and report; never a time-limited
+            # background launch.
+            "If the runner is `gone` within a minute of `--start` with no "
+            "terminal line, relaunch once: `mktemp -d`, discovery, "
+            "pre-flight, `--start`",
+            "If that fails too, stop and report the `err.log` diagnosis",
+            "Never fall back to a time-limited background launch",
             "one-shot 10-minute wake-up",
             "that runs `--status`",
             "delete it once the run settles",
             "stop that task and run it again",
             "Never use a shell `sleep` loop",
-            "completion notification is the backstop",
-            # Where the final response ends the council, keep the turn open.
+            # The detached council outlives the host's limits and the
+            # turn; only --cancel stops it.
+            "It is detached, so the host's background time limit and exit "
+            "do not stop it; `--cancel` does",
+            "It runs, and spends, until it finishes or is cancelled",
+            "in `claude -p` or a subagent, keep the turn open until the "
+            "council ends, or run `--cancel` before your final response",
             "In `claude -p` or a subagent, where your final response ends "
-            "the council",
+            "your watch",
             "as a foreground Bash call with `timeout` 600000",
-            "while the council's task is still running",
+            "run it again while `--status` says `running`",
+            # The completion rule: the follower's exit, then a verified
+            # runner exit from --status, and only then out.md.
+            "**Completion:** the follower exits 0, then `--status` reports "
+            "the runner ended (`done`, `interrupted`, or `aborted`: lock "
+            "free, pid gone",
+            "Only then read `ABS_RUNDIR/out.md` and reconcile",
+            "`CODEX_COUNCIL_DONE` and the follower's exit alone are only "
+            "progress signals",
             "launch a separate council in a new directory",
             "Read that role's reply file and tell the user in one line",
             "act on work that does not depend on other roles",
@@ -5031,7 +5225,8 @@ class DocsContractTests(unittest.TestCase):
             "Never present a partial synthesis as final",
             "A running role cannot be steered",
             "`ok=N total=M exit=X`",
-            "Exit `2` with no sentinel means the launch was refused",
+            "Exit `2` with no sentinel (`ended before dispatch`) means the "
+            "launch was refused",
             # Exit 1 is also a runner that could not finish, maybe after
             # some roles succeeded.
             "the runner could not finish (`runner aborted`)",
@@ -5049,15 +5244,19 @@ class DocsContractTests(unittest.TestCase):
     def test_monitor_horizons_include_the_claude_p_limit(self):
         """A Monitor watch lasts at most 30 minutes interactively and 10 in
         `claude -p`; wherever a document states the interactive horizon it
-        states the non-interactive one too, and the host's task lifetime
-        bounds a run the runner itself never ends."""
+        states the non-interactive one too. A detached council outlives a
+        `claude -p` turn, so the core says to keep the turn open or cancel;
+        the reference keeps the host's five-second stop of a `-p`
+        background shell, which bounds an attached run in a background
+        task."""
         step5 = self._section("## Step 5", "## Step 6")
         runtime = self._flat(self._ref("runtime-behavior.md"))
-        for name, flat in (("SKILL.md", step5),
-                           ("runtime-behavior.md", runtime)):
+        for name, flat, extra in (
+                ("SKILL.md", step5, "or run `--cancel` before your final "
+                                    "response"),
+                ("runtime-behavior.md", runtime, "about five seconds")):
             with self.subTest(surface=name):
-                for required in ("1800000", "600000", "claude -p",
-                                 "about five seconds"):
+                for required in ("1800000", "600000", "claude -p", extra):
                     self.assertIn(required, flat)
         for name, text in self._doc_surfaces().items():
             for paragraph in re.split(r"\n\s*\n", text):
@@ -5071,7 +5270,7 @@ class DocsContractTests(unittest.TestCase):
     def test_runtime_reference_documents_follow_replies_and_triage(self):
         ref = self._flat(self._ref("runtime-behavior.md"))
         for required in (
-            "--follow 'ABS_RUNDIR' --skill-contract 3",
+            "--follow 'ABS_RUNDIR' --skill-contract 4",
             "read-only",
             "[codex-council-follow]",
             "no council activity",
@@ -5080,8 +5279,8 @@ class DocsContractTests(unittest.TestCase):
             "runner not responding: no status tick for <N>s",
             "runner responding again",
             "`--verbose` relays them",
-            "--status 'ABS_RUNDIR' --skill-contract 3",
-            "--reap 'ABS_RUNDIR' --skill-contract 3",
+            "--status 'ABS_RUNDIR' --skill-contract 4",
+            "--reap 'ABS_RUNDIR' --skill-contract 4",
             "Never reap a runner that is still present",
             "never touches saved threads, replies, or other files",
             "ABS_RUNDIR/status.json",
@@ -5107,7 +5306,8 @@ class DocsContractTests(unittest.TestCase):
             "up to five unfinished roles",
             "`watchdog=disabled`",
             "`[orchestrator-exception]`",
-            "exactly one backgrounding layer",
+            # No detach wrapper replaces --start for an attached launch.
+            "No detach wrapper makes an attached launch durable",
             "launchd",
             # One launch per directory; the guard runs before the launch.
             "A directory holds one launch",
@@ -5122,15 +5322,155 @@ class DocsContractTests(unittest.TestCase):
         self.assertEqual(council_common.LAUNCH_OUTPUTS,
                          ("out.md", "err.log", "replies"))
 
+    def test_runtime_reference_documents_the_detached_launch(self):
+        """The detached launch's reference section states what --start
+        creates and prints, the lock semantics, every --status line and
+        next: action for a detached run as the runner builds them, --cancel,
+        the keepalive line as the follower builds it, the completion rule,
+        and what a claude -p host must do."""
+        raw = self._ref("runtime-behavior.md")
+        ref = self._flat(raw)
+        heading = "Detached launch, cancel, and the supervisor lock"
+        self.assertIn(f"\n## {heading}\n", raw)
+        self.assertIn(f"\n- {heading}\n", raw)
+        runner = self._runner_source()
+        for required, source in (
+            ("[codex-council] started: pid=<pid> dir=<ABS_RUNDIR> "
+             "version=<plugin version>", "[codex-council] started: pid="),
+            ("follow: <python> <script> --follow <ABS_RUNDIR> "
+             "--skill-contract 4", 'f"follow: {command} --follow {quoted}'),
+            ("status: <python> <script> --status <ABS_RUNDIR> "
+             "--skill-contract 4", 'f"status: {command} --status {quoted}'),
+            ("cancel: <python> <script> --cancel <ABS_RUNDIR> "
+             "--skill-contract 4", 'f"cancel: {command} --cancel {quoted}'),
+            ("[codex-council-follow] runner ended before dispatch: read "
+             "<ABS_RUNDIR>/err.log", "runner ended before dispatch: read "),
+            ("[codex-council] start failed:", "[codex-council] start failed:"),
+        ):
+            with self.subTest(line=required):
+                self.assertIn(required, ref)
+                self.assertIn(source, runner)
+        for required in (
+            f"note: {council_common.SUPERVISOR_FILENAME} is not written yet; "
+            "the supervisor is still starting; run --status",
+            f"waits up to {codex_council.START_WAIT_SECS} seconds for "
+            f"`{council_common.SUPERVISOR_FILENAME}`",
+            "A refusal exits 2 before anything is created",
+            "it exits 2 with the launched-directory recovery, having created "
+            "and truncated nothing",
+            "the supervisor's command line carries only paths",
+            "marks the descriptor so no codex worker inherits it",
+            "`runner.mode` `detached`",
+            "never retry `--start` there",
+            "The lock file is never removed or replaced, and a free lock "
+            "means \"no holder\", never \"reusable\"",
+            "gone only when the lock is free and the recorded identity is "
+            "gone",
+            "Nothing is signalled, reaped, or relaunched on unknown",
+            f"waits up to {council_liveness.CANCEL_GRACE_SECS} seconds for "
+            "the lock to be released",
+            f"waits up to {council_liveness.CANCEL_KILL_WAIT_SECS} more "
+            "seconds",
+            "It refuses with exit 1, signalling nothing",
+            "A process that reused the runner's pid is never signalled",
+            "`--reap` refuses while the lock is held, even when `ps` says "
+            "the pid is gone",
+            "`--follow` and `--status` never write, repair, or signal "
+            "anything",
+            "behaves exactly as before",
+            "Completion of a detached run is the follower's exit 0 followed "
+            "by `--status` reporting that the runner ended",
+            "A detached council keeps running, and spending, until it "
+            "finishes or is cancelled",
+            "or run `--cancel` before the final response",
+            f"relayed nothing for {council_liveness.FOLLOW_KEEPALIVE_SECS} "
+            "seconds prints one keepalive line",
+            f"at most {'five' if council_liveness.KEEPALIVE_ROLES == 5 else ''}"
+            " active roles",
+            "never from role output or a `reply=` path",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, ref)
+        # Every --status line and next: action a detached run can get, as
+        # the runner builds them (placeholders for the variable parts).
+        now = 1_000_000.0
+        sup = council_liveness.SupervisorView(
+            pid=4242, identity="id", pgid=4242, sid=4242, lock_dev=1,
+            lock_ino=2, lock_token=None, version="9.8.7", epoch=4,
+            started_at="t")
+
+        def view(state="running", tick=5.0, roles=None):
+            return council_liveness.RunView(
+                pid=4242, identity="id", state=state,
+                exit=None if state == "running" else 0, tick_at=now - tick,
+                roles=roles if roles is not None else {"r": {
+                    "state": "active", "attempt": 1, "output_at": None,
+                    "pid": None, "pgid": None, "pgid_identity": None,
+                    "outcome": None}}, mode="detached")
+
+        settled = {"r": {"state": "settled", "attempt": 1, "output_at": None,
+                         "pid": None, "pgid": None, "pgid_identity": None,
+                         "outcome": "ok"}}
+        Det = council_liveness.Detached
+        cases = (
+            (None, Det("alive", sup, "held")),
+            (view(), Det("alive", sup, "held")),
+            (view("done"), Det("alive", sup, "held")),
+            (view(tick=200.0), Det("alive", sup, "held")),
+            (view("done", roles=settled), Det("gone", sup, "free")),
+            (view("interrupted"), Det("gone", sup, "free")),
+            (view("aborted"), Det("gone", sup, "free")),
+            (None, Det("gone", sup, "free")),
+            (view(), Det("gone", sup, "free")),
+            (view(), Det("unknown", sup, "held")),
+        )
+        placeholders = (("4242", "<pid>"), ("exit 0", "exit <N>"),
+                        ("200s ago", "<N>s ago"), ("5s ago", "<N>s ago"))
+        for run_view, detached in cases:
+            unfinished = (council_liveness._unfinished(run_view)
+                          if run_view is not None else [])
+            label, action, _ = council_liveness._detached_label(
+                run_view, now, detached, unfinished, {})
+            for old, new in placeholders:
+                label = label.replace(old, new)
+            if "still exiting" in label:
+                label = "<state>" + label[label.index(" (exit"):]
+            if label.startswith("unknown"):
+                label = label.replace("lock held", "lock <state>")
+            if label.startswith(("interrupted", "aborted")):
+                label = label.split(" (")[0]
+            with self.subTest(state=label):
+                self.assertIn(f"`{action}`", ref)
+                self.assertIn(f"`{label}", ref)
+        # The keepalive example is what the follower prints.
+        follower = object.__new__(council_liveness._Follower)
+        follower.live_view = council_liveness.RunView(
+            pid=4242, identity="id", state="running", exit=None,
+            tick_at=now - 4, roles={
+                "architect": {"state": "active", "output_at": now - 41},
+                "prober": {"state": "active", "output_at": None},
+                "done": {"state": "settled", "output_at": None},
+            })
+        follower.dispatched_at = 0.0
+        follower.last_emit = -1e9
+        follower.suspend_floor = 0.0
+        printed = []
+        with patch.object(council_liveness.time, "time", return_value=now), \
+                patch.object(council_liveness, "_print_stdout",
+                             printed.append):
+            follower.keepalive()
+        self.assertEqual(len(printed), 1)
+        self.assertIn(printed[0] + "\n", raw)
+
     def test_recovery_triage_decides_runner_state_before_role_output(self):
         """A runner killed after a stall leaves stall and retry lines in
         err.log's tail, and a stopped runner leaves every role's quiet below
         the watchdog: every runner-state rule (finished, gone, not
         responding, unknown) must match before a rule that reads role output
         as the runner handling it or as a reason to keep waiting. An
-        unresponsive runner is stopped through its tracked task, confirmed
-        gone, and only then reaped, unless err.log says status.json could
-        not be written."""
+        unresponsive runner is stopped (--cancel, or an attached run's
+        launch command), confirmed gone, and only then reaped, unless
+        err.log says status.json could not be written."""
         ref = self._flat(self._ref("runtime-behavior.md"))
         triage = ref.split("the first match wins", 1)[1]
         triage = triage.split("## Exit code", 1)[0]
@@ -5147,7 +5487,8 @@ class DocsContractTests(unittest.TestCase):
         self.assertIn("even if stall or retry lines precede the end",
                       text["2"])
         stop = [text["3"].index(step) for step in (
-            "stop the council's tracked background task",
+            "run `--cancel` for a detached run",
+            "for an attached run, stop its launch command",
             "confirm with `--status` that the runner is now `gone`",
             "run `--reap` if it then lists live codex groups",
         )]
@@ -5162,6 +5503,16 @@ class DocsContractTests(unittest.TestCase):
                 self.assertIn(fragment, self._runner_source())
         self.assertIn("appears only in reply files and `out.md`, never in "
                       "`err.log`", text["5"])
+        # For a detached run the lock decides unknown, and --cancel replaces
+        # stopping an attached run's command wherever a present runner must
+        # stop.
+        self.assertIn("the supervisor lock decides", text["4"])
+        self.assertIn("never `--reap`, `--cancel`, or relaunch", text["4"])
+        self.assertIn("run `--cancel` (for an attached run, stop its launch "
+                      "command)", text["8"])
+        self.assertIn("`ended before dispatch`", text["2"])
+        self.assertIn("`--status` no longer says the runner is still "
+                      "exiting", text["1"])
         self.assertIn("`watchdog=disabled`", text["6"])
         self.assertIn("Runner monitoring", text["6"])
         self.assertIn("Every re-invocation below is a new launch in a new "
@@ -5196,8 +5547,32 @@ class DocsContractTests(unittest.TestCase):
             "runs on the current native configuration",
             # Stale recovery names the warning the role's result carries.
             codex_council.STALE_RESUME_WARNING,
+            # Host lifetime: the background time limit (cited), the separate
+            # idle memory-pressure stop (the user's setting, never the
+            # skill's), and what a detached council does and does not
+            # survive.
+            "Since Claude Code 2.1.285, background Bash and PowerShell "
+            "commands stop after a time limit",
+            "30 minutes by default and 2 hours at most",
+            "(https://code.claude.com/docs/en/changelog)",
+            "Output does not extend it",
+            "It bounds only an attached run inside a background task, which "
+            "is why the skill never launches one",
+            "a larger `timeout` only moves the stop to 2 hours at most",
+            "`CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP` turns that off",
+            "(https://code.claude.com/docs/en/env-vars)",
+            "the user's own setting, and the skill never sets it",
+            "A council started with `--start` is not a tracked task, so "
+            "neither stop applies",
+            "It does not survive a reboot",
+            "are not verified",
+            "**Linux PID namespaces.**",
+            "a held lock reads `unknown` and nothing is signalled or reaped",
+            "Use only the supported `--start` to outlive a background task; "
+            "never a manual detach wrapper",
         ):
             self.assertIn(required, ref)
+        self.assertNotIn("Do not add a detach layer", ref)
         panel = self._flat(self._ref("panel-design.md"))
         for required in (
             "its state file records the thread id, never a model or effort",
@@ -5743,8 +6118,9 @@ class DocsContractTests(unittest.TestCase):
 
     def test_design_is_honest_about_what_the_runner_does_not_enforce(self):
         """User-pin provenance and a reason's meaning are trusted to the
-        orchestrator, and one launch per directory is enforced by
-        discovery and the pre-flight, not atomically at launch."""
+        orchestrator, and one launch per directory is claimed atomically
+        only by --start: for an attached launch (never the skill's) it rests
+        on discovery and the pre-flight, not on the launch."""
         def limits(section):
             text = self._flat(self._design_section(section))
             self.assertIn("**Limits.**", text)
@@ -5762,8 +6138,13 @@ class DocsContractTests(unittest.TestCase):
             self.assertIn(required, selection)
         staging = limits("Staging and preflight")
         for required in (
-            "**One launch per directory is not enforced atomically.**",
-            "the launch itself does not check",
+            "**One launch per directory is not enforced atomically for an "
+            "attached launch.**",
+            "`--start` claims its directory atomically",
+            "the attached launch itself does not check",
+            "an attached launch into a directory `--start` already claimed "
+            "still truncates its files",
+            "The skill never makes an attached launch.",
         ):
             self.assertIn(required, staging)
         # The runner really does accept any non-empty single-line reason.
@@ -5773,6 +6154,57 @@ class DocsContractTests(unittest.TestCase):
                 "mode": "routed", "snapshot_id": "0123456789abcdef",
                 "reason": "picked the newest-looking id"}})
         self.assertEqual(role.selection.reason, "picked the newest-looking id")
+
+    def test_design_and_readme_explain_the_detached_launch(self):
+        """DESIGN and README say what ends a run (a verified runner exit,
+        not only the host's notification), why the council runs detached
+        (the host's background time limit, cited), and what a detached run
+        does not survive; the old claims that only the host bounds a run
+        and that there is no supervisor are gone."""
+        design = self._flat(self._read_repo_file("DESIGN.md"))
+        for required in (
+            "only a verified runner exit marks the end of a run",
+            "a released supervisor lock together with a vanished runner "
+            "identity",
+            "*A verified runner exit ends the run.*",
+            "a released supervisor lock plus a vanished pid identity",
+            "*A detached supervisor, started by a foreground call.*",
+            "Since Claude Code 2.1.285 a background command stops at its "
+            "`timeout`",
+            "Mirroring the runner's stderr into a tracked task would not help",
+            "*Detach only inside `--start`.*",
+            "`_become_supervisor`",
+            "does not survive a reboot",
+            "A plugin update while a supervisor runs",
+            "Across Linux PID namespaces",
+            "**No supervisor beyond the runner.**",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, design)
+        for retired in ("*The host's notification ends the run.*",
+                        "**No supervisor process.**",
+                        "without adding a supervisor process"):
+            self.assertNotIn(retired, design)
+        readme = self._flat(self._read_repo_file("README.md"))
+        for required in (
+            "A separate foreground call runs `--start`",
+            "`--cancel` stops the council.",
+            "`--status` confirms the runner has ended (its lock is free and "
+            "its process gone)",
+            "Since Claude Code 2.1.285 a background command stops at its "
+            "time limit, 30 minutes by default and 2 hours at most",
+            "(https://code.claude.com/docs/en/changelog)",
+            "`CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP`",
+            "(https://code.claude.com/docs/en/env-vars)",
+            "the plugin never sets it",
+            "The skill always uses `--start` and never falls back to a "
+            "background launch.",
+            "inside a background task is subject to both, and so lasts at "
+            "most 2 hours.",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, readme)
+        self.assertNotIn("only the host bounds a run's lifetime", readme)
 
     # ---------- reconciliation ----------
 
@@ -5844,9 +6276,9 @@ class DocsContractTests(unittest.TestCase):
     # ---------- README and DESIGN structure ----------
 
     README_SECTIONS = (
-        "Requirements", "Install", "Usage", "How a run works",
-        "Configuration", "Results and failures", "Security", "Diagrams",
-        "Development", "License",
+        "Requirements", "Install", "Usage", "Architecture", "Launch Flow",
+        "State Scope", "How a run works", "Configuration",
+        "Results and failures", "Security", "Development", "License",
     )
     DESIGN_CONCERNS = (
         "Panel and context contract", "Model discovery",
@@ -5857,10 +6289,20 @@ class DocsContractTests(unittest.TestCase):
         "Progress, replies, and reconciliation",
         "Run liveness and recovery",
     )
-    DIAGRAM_NODE_BUDGET = 9
-    # Mermaid draws 16 px labels. A diagram shrunk below this to fit the
-    # PDF's page box prints them under about 7 pt.
-    DIAGRAM_MIN_PRINT_SCALE = 0.6
+    # README's three diagrams, in order, with the kind each has drawn since
+    # 0.9.0. They are the only diagram source; the PDF build draws them as
+    # vector graphics.
+    README_DIAGRAMS = (
+        ("Architecture", "flowchart LR"),
+        ("Launch Flow", "sequenceDiagram"),
+        ("State Scope", "flowchart TD"),
+    )
+    # Nodes (a flowchart) or messages (the sequence diagram) at most: past
+    # this a diagram stops being readable at print size.
+    DIAGRAM_BUDGET = 25
+    # No tracked file may have one of these suffixes.
+    IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp",
+                      ".bmp", ".ico", ".tif", ".tiff", ".avif", ".mmd")
 
     @staticmethod
     def _top_sections(text):
@@ -5907,7 +6349,8 @@ class DocsContractTests(unittest.TestCase):
         directory, under the names the runner uses."""
         entries = (council_discovery.SNAPSHOT_FILENAME,
                    council_liveness.STATUS_FILENAME,
-                   *council_common.LAUNCH_OUTPUTS)
+                   *council_common.LAUNCH_OUTPUTS,
+                   *council_common.SUPERVISOR_FILES)
         for name in ("README.md", "DESIGN.md"):
             text = self._read_repo_file(name)
             rows = "\n".join(line for line in text.splitlines()
@@ -5924,8 +6367,8 @@ class DocsContractTests(unittest.TestCase):
         rows = [line for line in commands.splitlines()
                 if line.startswith("| ")]
         for flag in ("--discover RUNDIR", "--check-staging-dir RUNDIR",
-                     "--roles-file", "--follow RUNDIR", "--status RUNDIR",
-                     "--reap RUNDIR"):
+                     "--start RUNDIR", "--roles-file", "--follow RUNDIR",
+                     "--status RUNDIR", "--cancel RUNDIR", "--reap RUNDIR"):
             with self.subTest(flag=flag):
                 self.assertTrue(any(flag in row for row in rows), flag)
                 args = codex_council._parse_args(
@@ -6029,130 +6472,392 @@ class DocsContractTests(unittest.TestCase):
             f"no usable `status.json` for "
             f"{council_liveness.STATUS_UNUSABLE_WARN_SECS} s after dispatch",
             f"`STATUS_ROLE_LINES` ({council_liveness.STATUS_ROLE_LINES})",
+            f"`CANCEL_GRACE_SECS = {council_liveness.CANCEL_GRACE_SECS}`",
+            f"`CANCEL_KILL_WAIT_SECS = "
+            f"{council_liveness.CANCEL_KILL_WAIT_SECS}`",
         ):
             with self.subTest(text=text):
                 self.assertIn(text, liveness)
+        launch = self._flat(self._design_section("Launch and fan-out"))
+        self.assertIn(f"`START_WAIT_SECS = {codex_council.START_WAIT_SECS}`",
+                      launch)
+        progress = self._flat(self._design_section(
+            "Progress, replies, and reconciliation"))
+        for text in (
+            f"`PROGRESS_HEARTBEAT_SECS = "
+            f"{codex_council.PROGRESS_HEARTBEAT_SECS}`",
+            f"`FOLLOW_KEEPALIVE_SECS = "
+            f"{council_liveness.FOLLOW_KEEPALIVE_SECS}`",
+            f"`KEEPALIVE_ROLES = {council_liveness.KEEPALIVE_ROLES}`",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(text, progress)
 
     # ---------- diagrams and the PDF ----------
 
-    def _diagram_ids(self):
-        folder = self._repo_file("docs", "diagrams")
-        return sorted(name[:-4] for name in os.listdir(folder)
-                      if name.endswith(".mmd"))
+    def _repo_files(self):
+        """Repo-relative paths of every tracked file (every file outside
+        the ignored local directories when Git is unavailable)."""
+        root = self._repo_file()
+        try:
+            listed = subprocess.run(
+                ["git", "-C", root, "ls-files", "-z"], capture_output=True,
+                check=True, timeout=30).stdout.decode("utf-8")
+            return sorted(path for path in listed.split("\0") if path)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        paths = []
+        skip = {".git", "__pycache__", "Agents-docs", ".claude", ".codex",
+                ".in_use"}
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(d for d in dirnames if d not in skip)
+            paths += [os.path.relpath(os.path.join(dirpath, name), root)
+                      for name in filenames]
+        return sorted(paths)
 
-    def test_every_diagram_has_a_source_a_png_and_a_small_budget(self):
-        """Each diagram id has its Mermaid source and a PNG export, and no
-        diagram draws more than DIAGRAM_NODE_BUDGET nodes (details belong
-        in the tables beside it)."""
-        ids = self._diagram_ids()
-        self.assertTrue(ids)
-        folder = self._repo_file("docs", "diagrams")
-        pngs = sorted(name[:-4] for name in os.listdir(folder)
-                      if name.endswith(".png"))
-        self.assertEqual(pngs, ids)
-        for ident in ids:
-            with self.subTest(diagram=ident):
-                self.assertRegex(ident, r"^d\d\d-[a-z0-9-]+$")
-                with open(os.path.join(folder, f"{ident}.png"), "rb") as f:
-                    self.assertEqual(f.read(8), b"\x89PNG\r\n\x1a\n")
-                source = self._read_repo_file("docs", "diagrams",
-                                              f"{ident}.mmd")
-                self.assertRegex(source, r"^flowchart (?:LR|TD)\n")
-                nodes = set()
-                for line in source.splitlines():
-                    line = line.strip()
-                    if line.startswith(("classDef ", "class ")):
-                        continue
-                    nodes.update(re.findall(
-                        r"\b([A-Za-z][A-Za-z0-9_]*)(?=\(|\[|\{)", line))
-                self.assertTrue(nodes)
-                self.assertLessEqual(len(nodes), self.DIAGRAM_NODE_BUDGET)
+    def _mermaid_blocks(self, text):
+        """(heading, source) for each ```mermaid block in `text`, heading
+        being the `## ` section it sits in."""
+        blocks, heading = [], None
+        for match in re.finditer(r"^## ([^\n]+)$|^```mermaid\n(.*?)^```$",
+                                 text, re.M | re.S):
+            if match.group(1) is not None:
+                heading = match.group(1)
+            else:
+                blocks.append((heading, match.group(2)))
+        return blocks
 
-    def test_docs_embed_every_diagram_with_its_source_beside_it(self):
-        """README embeds the level 0 and level 1 views and indexes every
-        diagram; DESIGN embeds every diagram once, each followed by a
-        caption naming its id and linking its Mermaid source."""
-        ids = self._diagram_ids()
-        readme = self._read_repo_file("README.md")
-        design = self._read_repo_file("DESIGN.md")
-        embed = r"!\[[^\]]*\]\(docs/diagrams/({0})\.png\)"
-        for name, text, expected in (
-                ("README.md", readme, {"d00-context", "d10-components"}),
-                ("DESIGN.md", design, set(ids))):
-            embedded = re.findall(embed.format(r"[a-z0-9-]+"), text)
+    def _readme_diagrams(self):
+        """README's mermaid sources by section heading."""
+        blocks = self._mermaid_blocks(self._read_repo_file("README.md"))
+        return {heading: source for heading, source in blocks}
+
+    def test_repository_holds_no_image_files(self):
+        """No image file and no separate diagram source is tracked: the
+        three README diagrams are the only diagram source, and the one
+        binary document is the PDF."""
+        files = self._repo_files()
+        self.assertIn("README.md", files)
+        for path in files:
+            with self.subTest(path=path):
+                self.assertFalse(path.lower().endswith(self.IMAGE_SUFFIXES))
+                self.assertFalse(path.startswith("docs/diagrams/"))
+        self.assertEqual([p for p in files if p.startswith("docs/")],
+                         ["docs/codex-council.pdf"])
+
+    def test_docs_embed_and_link_no_images(self):
+        """No document embeds an image (Markdown or HTML) or links to an
+        image file; where a picture helps, README draws it in Mermaid."""
+        suffixes = "|".join(re.escape(s) for s in self.IMAGE_SUFFIXES)
+        link = re.compile(rf"\]\([^)\s]*(?:{suffixes})(?:#[^)]*)?\)", re.I)
+        for name, text in self._doc_surfaces().items():
             with self.subTest(doc=name):
-                self.assertEqual(set(embedded), expected)
-                self.assertEqual(len(embedded), len(set(embedded)))
-            for ident in embedded:
-                with self.subTest(doc=name, diagram=ident):
-                    after = text.split(f"(docs/diagrams/{ident}.png)", 1)[1]
-                    caption = self._flat(after.split("\n\n", 2)[1])
-                    self.assertTrue(caption.startswith(f"*{ident} — "))
-                    self.assertIn(f"[{ident}.mmd](docs/diagrams/{ident}.mmd)",
-                                  caption)
-        index = self._flat(readme.split("\n## Diagrams\n", 1)[1]
-                           .split("\n## ", 1)[0])
-        for ident in ids:
-            with self.subTest(index=ident):
-                self.assertIn(f"[{ident}](docs/diagrams/{ident}.png)", index)
+                self.assertNotRegex(text, r"!\[")
+                self.assertNotRegex(text, r"(?i)<img\b")
+                self.assertNotRegex(text, link)
+                self.assertNotIn("docs/diagrams", text)
+                if name != "README.md":
+                    self.assertEqual(self._mermaid_blocks(text), [])
+
+    def test_readme_draws_three_mermaid_diagrams_in_place(self):
+        """README holds exactly three mermaid blocks, one under each
+        diagram heading and each of the kind it has drawn since 0.9.0, and
+        points to the PDF for the full design."""
+        readme = self._read_repo_file("README.md")
+        blocks = self._mermaid_blocks(readme)
+        self.assertEqual([heading for heading, _ in blocks],
+                         [heading for heading, _ in self.README_DIAGRAMS])
+        self.assertEqual(readme.count("```mermaid"), 3)
+        for (heading, source), (_, kind) in zip(blocks, self.README_DIAGRAMS):
+            with self.subTest(diagram=heading):
+                self.assertEqual(source.splitlines()[0], kind)
+        # The PDF link sits with the diagrams, in the Architecture section.
+        architecture = readme.split("\n## Architecture\n", 1)[1].split(
+            "\n## ", 1)[0]
+        self.assertIn("[`docs/codex-council.pdf`](docs/codex-council.pdf)",
+                      architecture)
+        self.assertIn("full design", self._flat(architecture))
+
+    def test_readme_diagrams_stay_readable(self):
+        """Each diagram draws at most DIAGRAM_BUDGET nodes (flowcharts) or
+        messages (the sequence diagram); detail belongs in the text."""
+        for heading, source in self._readme_diagrams().items():
+            with self.subTest(diagram=heading):
+                if source.startswith("sequenceDiagram"):
+                    count = len(re.findall(r"^\s*\w+\s*-+>>\s*\w+\s*:",
+                                           source, re.M))
+                else:
+                    nodes = set()
+                    for line in source.splitlines():
+                        line = line.strip()
+                        if line.startswith(("subgraph ", "direction ",
+                                            "classDef ", "class ")):
+                            continue
+                        nodes.update(re.findall(
+                            r"\b([A-Za-z][A-Za-z0-9_]*)(?=\[|\(|\{)", line))
+                    count = len(nodes)
+                self.assertGreater(count, 5)
+                self.assertLessEqual(count, self.DIAGRAM_BUDGET)
+
+    def test_readme_diagrams_draw_the_current_launch_and_state(self):
+        """The diagrams name what the code does today: the detached --start
+        launch that claims supervisor.lock, the read-only follower and its
+        keepalive, the sentinel, the completion rule, and the session-key
+        and state-path rules, taken from the runner's own constants."""
+        diagrams = self._readme_diagrams()
+        combined = "\n".join(diagrams.values())
+        for fact in ("--start", "supervisor.lock", "--follow",
+                     "CODEX_COUNCIL_DONE", "--status"):
+            with self.subTest(fact=fact):
+                self.assertIn(fact, combined)
+        keepalive = f"{council_liveness.FOLLOW_KEEPALIVE_SECS} s"
+        expected = {
+            "Architecture": (
+                "mktemp -d", "--discover", council_discovery.SNAPSHOT_FILENAME,
+                "native_effort", "--check-staging-dir", "+ token",
+                council_common.SUPERVISOR_FILENAME,
+                council_liveness.STATUS_FILENAME, codex_council.MAX_PARALLEL_ENV,
+                "watchdog", "fresh or resumed", "replies/", keepalive,
+                "Monitor", "lock free, pid gone", "--cancel", "--reap"),
+            "Launch Flow": (
+                "mktemp -d", "--discover", "roles.json, context.md",
+                "--check-staging-dir", "own foreground call",
+                "claim supervisor.lock", "own session",
+                "follow, status, cancel", "never a time-limited background launch",
+                "relaunch once in a NEW dir", "report err.log", "par ",
+                "Monitor runs --follow", "reply=path", keepalive,
+                "Monitor watch expires", "--status says running", "re-arm",
+                "the follower exits 0", "done: lock free, pid gone",
+                "only now read out.md",
+                "reconcile"),
+            "State Scope": (
+                "Git top level", "launch directory", "sha256, 16 hex",
+                codex_council.SESSION_KEY_ENV, "NAME=value", "project-wide",
+                "role-sha256-", "$XDG_STATE_HOME", "~/.local/state",
+                "project-session__role.json", "project__role.json", ".lock",
+                f"{codex_council.LOCK_PROBE_INITIAL_BACKOFF_SECS:g} s",
+                f"{codex_council.LOCK_PROBE_MAX_BACKOFF_SECS:g} s",
+                "resume", "fresh", "prior continuity lost",
+                "never a model or effort"),
+        }
+        for heading, facts in expected.items():
+            flat = re.sub(r"\s+", " ", diagrams[heading].replace("<br/>", " "))
+            for fact in facts:
+                with self.subTest(diagram=heading, fact=fact):
+                    self.assertIn(fact, flat)
+        scope = diagrams["State Scope"]
+        # The host ids in the runner's own order, and nothing retired.
+        positions = [scope.find(name)
+                     for name in codex_council.AUTO_SESSION_ENV_VARS]
+        self.assertNotIn(-1, positions)
+        self.assertEqual(positions, sorted(positions))
+        self.assertNotIn("DISABLE_AUTO_SESSION_KEY", scope)
+        # "32 chars or fewer" is the runner's cut-off for a readable key.
+        self.assertIn("32 chars or fewer", scope)
+        self.assertEqual(codex_council._state_role_component("r" * 32),
+                         "r" * 32)
+        self.assertTrue(codex_council._state_role_component(
+            "r" * 33).startswith("role-sha256-"))
+        # The hashes are the runner's: 16 hex digits of sha256.
+        with patch.object(codex_council, "_project_root",
+                          return_value="/p"), \
+                patch.dict(os.environ, {codex_council.SESSION_KEY_ENV: "k"}):
+            self.assertEqual(
+                codex_council._project_key("r"),
+                hashlib.sha256(b"/p").hexdigest()[:16] + "-"
+                + hashlib.sha256(b"k").hexdigest()[:16] + "__r")
 
     def _docs_html(self):
-        """scripts/docs_html.py, which lays out the PDF; its link rules and
-        page box need no Markdown package."""
+        """scripts/docs_html.py, which lays out the PDF; its link, diagram,
+        and layout rules need no Markdown package and no network."""
         spec = importlib.util.spec_from_file_location(
             "docs_html", self._repo_file("scripts", "docs_html.py"))
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return module
 
-    @staticmethod
-    def _png_info(path):
-        """(width, height, colour type, chunk types) of a PNG file."""
-        with open(path, "rb") as f:
-            data = f.read()
-        chunks, pos = set(), 8
-        while pos + 8 <= len(data):
-            chunks.add(data[pos + 4:pos + 8])
-            pos += 12 + int.from_bytes(data[pos:pos + 4], "big")
-        return (int.from_bytes(data[16:20], "big"),
-                int.from_bytes(data[20:24], "big"), data[25], chunks)
+    # A reply shaped like mermaid.ink's: a root id that scopes the
+    # stylesheet and prefixes markers, an external font import, bare ids
+    # that another inline SVG could repeat, and a fixed max-width.
+    FAKE_SVG = (
+        '<svg id="mermaid-svg" width="100%" xmlns="http://www.w3.org/2000/svg"'
+        ' style="max-width: 400px;" viewBox="0 0 400 300">'
+        '<style xmlns="http://www.w3.org/1999/xhtml">@import url('
+        '"https://example.invalid/icons.css");</style>'
+        '<style>#mermaid-svg{font-family:"trebuchet ms";}</style>'
+        '<marker id="mermaid-svg_pointEnd"/><marker id="arrowhead"/>'
+        '<path data-id="L_A_B_0" marker-end="url(#mermaid-svg_pointEnd)"/>'
+        '<path marker-end="url(#arrowhead)"/><use xlink:href="#arrowhead"/>'
+        '<g id="X"><text>label</text></g></svg>')
 
-    def test_diagram_pngs_are_opaque_and_print_legibly(self):
-        """Every diagram PNG is opaque (greyscale or RGB, with no alpha
-        channel and no tRNS chunk), so its dark lines stay visible on a dark
-        page, and it fits the PDF's page box without shrinking below
-        DIAGRAM_MIN_PRINT_SCALE, so an ultra-wide strip or a squeezed tall
-        column fails here."""
+    def test_pdf_build_renders_each_mermaid_block_as_inline_svg(self):
+        """The PDF layout replaces every mermaid block with an inline SVG
+        figure captioned with its heading: rendered through mermaid.ink's
+        SVG endpoint (a stand-in renderer here), every id prefixed so the
+        diagrams cannot collide, and no external import or image left."""
         docs_html = self._docs_html()
-        # The PNGs are rendered at the scale the PDF layout assumes.
-        self.assertIn(f"scale={docs_html.PNG_SCALE}",
-                      self._read_repo_file("scripts", "build-docs.sh"))
-        px_per_mm = 96 / 25.4
-        box = (docs_html.CONTENT_WIDTH_MM * px_per_mm,
-               docs_html.FIGURE_MAX_HEIGHT_MM * px_per_mm)
-        for ident in self._diagram_ids():
-            with self.subTest(diagram=ident):
-                width, height, colour, chunks = self._png_info(
-                    self._repo_file("docs", "diagrams", f"{ident}.png"))
-                self.assertIn(colour, (0, 2))
-                self.assertNotIn(b"tRNS", chunks)
-                natural = (width / docs_html.PNG_SCALE,
-                           height / docs_html.PNG_SCALE)
-                scale = min(1, box[0] / natural[0], box[1] / natural[1])
-                self.assertGreaterEqual(scale, self.DIAGRAM_MIN_PRINT_SCALE)
+        self.assertEqual(docs_html.MERMAID_INK, "https://mermaid.ink/svg/")
+        sources = []
+
+        def render(source):
+            sources.append(source)
+            return self.FAKE_SVG
+
+        docset = docs_html.DocSet(self._repo_file(), ["README.md"],
+                                  render=render)
+        # README's diagram sections as Python-Markdown writes them.
+        body = "".join(
+            f'<h2 id="readme--{docs_html.github_slug(heading)}">{heading}'
+            f'</h2>\n<p>text</p>\n<pre><code class="language-mermaid">'
+            f"{html.escape(source, quote=True)}</code></pre>\n"
+            for heading, source in self._readme_diagrams().items())
+        body = docset.take_diagrams("README.md", body)
+        self.assertNotIn("language-mermaid", body)
+        self.assertEqual(re.findall(r"<!--diagram-(\d+)-->", body),
+                         ["0", "1", "2"])
+        with contextlib.redirect_stderr(io.StringIO()):
+            figures = [docset.figure(i) for i in range(3)]
+        self.assertEqual(sources, list(self._readme_diagrams().values()))
+        ids = []
+        for index, (figure, (heading, _)) in enumerate(
+                zip(figures, self.README_DIAGRAMS)):
+            with self.subTest(diagram=heading):
+                self.assertTrue(figure.startswith('<figure class="diagram'))
+                self.assertIn(f"<figcaption>{heading}</figcaption>", figure)
+                self.assertEqual(figure.count("<svg"), 1)
+                self.assertNotIn("@import", figure)
+                self.assertNotIn("<img", figure)
+                self.assertNotIn("max-width: 400px", figure)
+                self.assertNotIn("mermaid-svg", figure)
+                prefix = f"diagram-{index}"
+                self.assertIn(f"#{prefix}{{", figure)
+                for name in re.findall(r'(?<![\w:-])id="([^"]+)"', figure):
+                    self.assertTrue(name.startswith(prefix), name)
+                    ids.append(name)
+                for ref in re.findall(r"url\(#([^)]+)\)|href=\"#([^\"]+)\"",
+                                      figure):
+                    self.assertTrue("".join(ref).startswith(prefix), ref)
+                self.assertIn('data-id="L_A_B_0"', figure)
+                self.assertRegex(figure, r'<svg style="width: [\d.]+mm; '
+                                         r'height: [\d.]+mm"')
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_pdf_build_refuses_images_and_unreadable_diagrams(self):
+        """An image in a document stops the build, and so does a diagram
+        that would print below MIN_PRINT_SCALE; a wide diagram gets a
+        landscape page when that prints it larger, and a small one keeps
+        its natural size."""
+        docs_html = self._docs_html()
+        docset = docs_html.DocSet(self._repo_file(), ["README.md"])
+        with self.assertRaises(SystemExit):
+            docset.take_diagrams("README.md", '<p><img src="a.png"></p>')
+        mm = 1 / docs_html.MM_PER_PX
+        self.assertEqual(docs_html.layout(300, 200), (False, 1))
+        wide, scale = docs_html.layout(docs_html.WIDE_WIDTH_MM * mm,
+                                       docs_html.WIDE_MAX_HEIGHT_MM * mm)
+        self.assertTrue(wide)
+        self.assertAlmostEqual(scale, 1)
+        wide, scale = docs_html.layout(docs_html.CONTENT_WIDTH_MM * mm,
+                                       docs_html.FIGURE_MAX_HEIGHT_MM * 2 * mm)
+        self.assertFalse(wide)
+        self.assertAlmostEqual(scale, 0.5)
+        huge = self.FAKE_SVG.replace('viewBox="0 0 400 300"',
+                                     'viewBox="0 0 9000 9000"')
+        docset = docs_html.DocSet(self._repo_file(), ["README.md"],
+                                  render=lambda source: huge)
+        docset.take_diagrams(
+            "README.md", '<pre><code class="language-mermaid">flowchart TD\n'
+            "</code></pre>")
+        with contextlib.redirect_stderr(io.StringIO()), \
+                self.assertRaises(SystemExit):
+            docset.figure(0)
+
+    def test_mermaid_ink_retries_server_errors_only(self):
+        """A 5xx answer or a network failure is retried with a pause; a 4xx
+        answer (mermaid.ink's syntax error) stops the build at once."""
+        import urllib.error
+        docs_html = self._docs_html()
+
+        class Reply(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def error(code):
+            return urllib.error.HTTPError(
+                "https://mermaid.ink/svg/x", code, "error", {},
+                io.BytesIO(b"Parse error on line 2"))
+
+        calls = []
+
+        def flaky(request, timeout):
+            calls.append(request.full_url)
+            if len(calls) == 1:
+                raise error(502)
+            if len(calls) == 2:
+                raise urllib.error.URLError("connection reset")
+            return Reply(b"<svg/>")
+
+        with patch.object(docs_html.urllib.request, "urlopen", flaky), \
+                patch.object(docs_html.time, "sleep") as sleep, \
+                contextlib.redirect_stderr(io.StringIO()) as log:
+            self.assertEqual(docs_html.mermaid_ink_svg("flowchart TD"),
+                             "<svg/>")
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(calls[0].startswith(docs_html.MERMAID_INK))
+        self.assertIn("HTTP 502; retrying", log.getvalue())
+        self.assertEqual([c.args[0] for c in sleep.call_args_list],
+                         [docs_html.RENDER_BACKOFF_SECS,
+                          docs_html.RENDER_BACKOFF_SECS * 2])
+        refused = []
+
+        def syntax_error(request, timeout):
+            refused.append(request)
+            raise error(400)
+
+        with patch.object(docs_html.urllib.request, "urlopen", syntax_error), \
+                patch.object(docs_html.time, "sleep"), \
+                self.assertRaises(SystemExit) as stop:
+            docs_html.mermaid_ink_svg("flowchart TD")
+        self.assertEqual(len(refused), 1)
+        self.assertIn("Parse error", str(stop.exception))
+
+    def test_docs_build_renders_svg_and_writes_no_png(self):
+        """The build script has no PNG step and no diagram directory: it
+        renders through docs_html.py's SVG path, prints in a temporary
+        directory, and refuses a PDF holding any raster image."""
+        script = self._read_repo_file("scripts", "build-docs.sh")
+        layout = self._read_repo_file("scripts", "docs_html.py")
+        for text in (script, layout):
+            # No PNG file, no PNG endpoint, no PNG content type.
+            self.assertNotRegex(text, r"(?i)\.png\b|/img/|type=png|image/png")
+            self.assertNotIn("docs/diagrams", text)
+            self.assertNotIn("--diagrams", text)
+        self.assertIn("mermaid.ink", script)
+        self.assertIn("SVG", script)
+        self.assertIn('mktemp -d "${TMPDIR:-/tmp}/codex-council-docs', script)
+        self.assertIn('--print-to-pdf="$printed"', script)
+        self.assertIn(r'images = len(re.findall(rb"/Subtype\s*/Image", data))',
+                      script)
+        self.assertRegex(script, r"if images:\n    sys\.exit\(")
+        self.assertIn('mv -f "$printed" "$pdf"', script)
+        # docs_html.py never writes a file other than the HTML page.
+        self.assertEqual(re.findall(r"\.write_(?:text|bytes)\(", layout),
+                         [".write_text("])
+        self.assertNotRegex(layout, r"\bopen\(")
 
     def test_pdf_links_stay_in_the_pdf_or_point_at_github(self):
         """The PDF build turns a link to a document in the PDF, or to one of
-        its headings, into an in-document link, a link to an embedded
-        diagram into a jump to its figure, and any other repository path
-        into its GitHub URL; a link to a missing path stops the build."""
+        its headings, into an in-document link, and any other repository
+        path into its GitHub URL; a link to a missing path stops the
+        build."""
         docs_html = self._docs_html()
         skill = "/".join(self.SKILL_PARTS)
         runtime = "/".join(self.REF_PARTS + ("runtime-behavior.md",))
         docset = docs_html.DocSet(self._repo_file(),
                                   ["README.md", "DESIGN.md", skill, runtime])
-        # As convert() records the first embed of each diagram.
-        docset.figures["docs/diagrams/d00-context.png"] = "fig-d00-context"
         blob = f"{docs_html.REPO_URL}/blob/{docs_html.BRANCH}"
         for (doc, href), expected in {
             ("README.md", "DESIGN.md"): "#design",
@@ -6160,13 +6865,12 @@ class DocsContractTests(unittest.TestCase):
                 "#design--run-liveness-and-recovery",
             ("README.md", "#model-and-effort-per-role"):
                 "#readme--model-and-effort-per-role",
+            ("DESIGN.md", "README.md#launch-flow"): "#readme--launch-flow",
             (skill, "references/runtime-behavior.md"): "#runtime-behavior",
-            ("README.md", "docs/diagrams/d00-context.png"):
-                "#fig-d00-context",
-            ("README.md", "docs/diagrams/d00-context.mmd"):
-                f"{blob}/docs/diagrams/d00-context.mmd",
-            ("README.md", "docs/diagrams/"):
-                f"{docs_html.REPO_URL}/tree/{docs_html.BRANCH}/docs/diagrams",
+            ("README.md", "docs/codex-council.pdf"):
+                f"{blob}/docs/codex-council.pdf",
+            ("README.md", "docs/"):
+                f"{docs_html.REPO_URL}/tree/{docs_html.BRANCH}/docs",
             ("README.md", "https://claude.ai/code"): "https://claude.ai/code",
         }.items():
             with self.subTest(doc=doc, href=href):
@@ -6184,7 +6888,8 @@ class DocsContractTests(unittest.TestCase):
         """The committed PDF, built by the script from every document it
         promises, links only to the web or within itself (never to a file
         on the machine that built it), has in-document links and a bookmark
-        per document at least, and embeds every diagram."""
+        per document at least, and holds no raster image: its diagrams are
+        vector."""
         script = self._repo_file("scripts", "build-docs.sh")
         self.assertTrue(os.access(script, os.X_OK))
         text = self._read_repo_file("scripts", "build-docs.sh")
@@ -6207,8 +6912,8 @@ class DocsContractTests(unittest.TestCase):
         bookmarks = re.findall(rb"/Title\s*[(<][^\n]*\n/Dest\s*\[", data)
         self.assertGreaterEqual(
             len(bookmarks), 3 + len(os.listdir(self._repo_file(*self.REF_PARTS))))
-        self.assertGreaterEqual(len(re.findall(rb"/Subtype\s*/Image", data)),
-                                len(self._diagram_ids()))
+        self.assertNotRegex(data, rb"/Subtype\s*/Image")
+        self.assertNotRegex(data, rb"/DCTDecode|/JPXDecode")
 
     # ---------- other docs ----------
 

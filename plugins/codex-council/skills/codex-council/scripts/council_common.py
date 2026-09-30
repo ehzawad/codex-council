@@ -59,6 +59,13 @@ STAGING_DIR_RECOVERY = (
 # directory, so any of them means the directory has already launched.
 REPLIES_SUBDIR = "replies"
 LAUNCH_OUTPUTS = ("out.md", "err.log", REPLIES_SUBDIR)
+# A detached launch (--start) claims its directory with these two files
+# before anything else: the lifetime lock the supervisor holds, and the
+# record the supervisor writes about itself. Either one also means the
+# directory has launched, and neither is ever removed or replaced.
+SUPERVISOR_LOCK_FILENAME = "supervisor.lock"
+SUPERVISOR_FILENAME = "supervisor.json"
+SUPERVISOR_FILES = (SUPERVISOR_LOCK_FILENAME, SUPERVISOR_FILENAME)
 # Recovery for a directory that already launched. The action is always a NEW
 # directory: relaunching here truncates a running council's out.md and
 # err.log, or replaces a finished council's report and mixes two runs in
@@ -424,16 +431,19 @@ def _check_private_dir(path, prefix="--check-staging-dir: ",
 def _usage_exit_if_launched(run_dir, prefix):
     """Usage-error when run_dir already holds a council launch.
 
-    Called by --discover and the pre-flight after the private-directory
-    gate. Any of LAUNCH_OUTPUTS counts (lexists, so a dangling symlink
-    does too). The launch command's shell redirections truncate out.md and
-    err.log before the runner starts, so only a step that runs before that
-    command can stop a relaunch into a directory whose council may still be
-    running; the launch itself never checks. For the same reason, a staged
+    Called by --discover, the pre-flight, and --start after the
+    private-directory gate. Any of LAUNCH_OUTPUTS or SUPERVISOR_FILES
+    counts (lexists, so a dangling symlink does too). The tracked launch
+    command's shell redirections truncate out.md and err.log before the
+    runner starts, so only a step that runs before that command can stop a
+    relaunch into a directory whose council may still be running; the
+    tracked launch itself never checks. For the same reason, a staged
     launch that refuses before dispatch never asks for a pre-flight re-run
-    in its own directory (STAGED_LAUNCH_RESTART).
+    in its own directory (STAGED_LAUNCH_RESTART). --start also claims the
+    directory atomically after this check (O_EXCL), so two concurrent
+    starts cannot both pass.
     """
-    present = [name for name in LAUNCH_OUTPUTS
+    present = [name for name in (*LAUNCH_OUTPUTS, *SUPERVISOR_FILES)
                if os.path.lexists(os.path.join(run_dir, name))]
     if present:
         _usage_exit(
