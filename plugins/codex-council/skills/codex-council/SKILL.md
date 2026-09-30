@@ -227,9 +227,7 @@ that role's `model`, `effort`, and `selection` to inherit. Launch
 revalidation can still fall back to inheritance.
 
 `--start` prints a `started:` line and the exact `--follow`, `--status`, and
-`--cancel` commands (exit 1: read `err.log`). The tracked fallback
-(`run_in_background`, `timeout: 7200000`, at most 2 hours) is in
-runtime-behavior.md.
+`--cancel` commands (exit 1: read `err.log`).
 
 `--skill-contract 4` pins the SKILL/script contract epoch; on a mismatch,
 stop. For an installed plugin, update it and start a fresh session; in the
@@ -248,8 +246,8 @@ comes from a per-process output-inactivity watchdog
 it), a bounded post-exit drain, and runner monitoring through
 `status.json`. The runner logs progress and a status heartbeat to
 `err.log`.
-The runner is detached, so the host's background time limit and exit do
-not stop it; `--cancel` does. It runs, and spends, until it finishes or is
+It is detached, so the host's background time limit and exit do not stop
+it; `--cancel` does. It runs, and spends, until it finishes or is
 cancelled: in `claude -p` or a subagent, keep the turn open until the
 council ends, or run `--cancel` before your final response.
 
@@ -277,7 +275,9 @@ nonzero exit: on 3 (`no council activity`, `runner ended before dispatch`)
 read `err.log`; on 4 (`runner gone` or `runner not responding`) run
 `--status` and take its `next:` action (`--reap` when gone, `--cancel` when
 not responding). If the runner is `gone` within a minute of `--start` with
-no terminal line, relaunch once with the tracked fallback.
+no terminal line, relaunch once: `mktemp -d`, discovery, pre-flight,
+`--start`. If that fails too, stop and report the `err.log` diagnosis.
+Never fall back to a time-limited background launch.
 
 Never use a shell `sleep` loop. Without the Monitor tool:
 

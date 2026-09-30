@@ -4953,7 +4953,7 @@ class DocsContractTests(unittest.TestCase):
         flat = self._section("## Step 4", "## Step 5")
         for required in (
             "Do not wait for approval",
-            # The default launch: --start in one foreground call. A
+            # The only launch: --start in one foreground call. A
             # background task is stopped at its timeout (Claude Code
             # 2.1.285), and stopping it also stops what it detached.
             "Launch with one foreground Bash call running `--start`",
@@ -4966,10 +4966,6 @@ class DocsContractTests(unittest.TestCase):
             "`--status`, and `--cancel` commands (exit 1: read `err.log`)",
             "or `--start` exits 1, abandon that directory; never retry "
             "`--start` there",
-            # The tracked fallback is named, bounded, and lives in the
-            # runtime reference.
-            "The tracked fallback (`run_in_background`, `timeout: 7200000`, "
-            "at most 2 hours) is in runtime-behavior.md",
             "abandon that directory",
             "Do not chmod it, mkdir it, or reuse its name",
             # A new directory has no snapshot: discover again there.
@@ -4977,31 +4973,59 @@ class DocsContractTests(unittest.TestCase):
             "new `snapshot_id`",
         ):
             self.assertIn(required, flat)
-        # The old default (a background launch with redirects) is gone
-        # from the core.
+        # The core never launches a time-limited council: no background
+        # launch with redirects, no host-maximum timeout, and no pointer to
+        # a tracked fallback. Its one mention of `run_in_background` is the
+        # prohibition above.
+        skill = self._skill()
+        flat_skill = self._flat(skill)
         for retired in ("run_in_background: true", "> 'ABS_RUNDIR/out.md'",
-                        "2> 'ABS_RUNDIR/err.log'"):
-            self.assertNotIn(retired, self._skill())
+                        "2> 'ABS_RUNDIR/err.log'", "timeout: 7200000",
+                        "7200000", "tracked fallback", "--roles-file"):
+            with self.subTest(retired=retired):
+                self.assertNotIn(retired, flat_skill)
+        self.assertEqual(skill.count("run_in_background"), 1)
+        self.assertIn("never `run_in_background`", flat_skill)
         runtime = self._flat(self._ref("runtime-behavior.md"))
-        # The tracked fallback keeps its full recipe, with the host maximum
-        # as its timeout and the 2-hour bound stated.
-        fallback = runtime.split("### The tracked fallback", 1)[1].split(
+        # The attached launch stays documented for direct CLI use and old
+        # directories, with the host's cap stated as a fact (cited), and
+        # the reason the skill never uses it, not even as a fallback.
+        self.assertNotIn("### The tracked fallback", runtime)
+        attached = runtime.split(
+            "### Attached runs (not used by the skill)", 1)[1].split(
             "## Detached launch", 1)[0]
         for required in (
-            "`run_in_background: true` and `timeout: 7200000` (the host "
-            "maximum)",
-            "at most 2 hours",
+            "The skill always launches with `--start` (below), which has no "
+            "host time limit",
+            "for direct use from a terminal and for backward compatibility",
+            "including those an earlier version of the skill launched this "
+            "way",
             "--roles-file 'ABS_RUNDIR/roles.json'",
             "--context-file 'ABS_RUNDIR/context.md'",
             "> 'ABS_RUNDIR/out.md'",
             "2> 'ABS_RUNDIR/err.log'",
+            "When an attached launch runs inside a Claude Code background "
+            "task (`run_in_background`), the host stops it at the Bash "
+            "tool's `timeout`: 30 minutes by default and 2 hours at most, "
+            "since Claude Code 2.1.285",
+            "(https://code.claude.com/docs/en/changelog)",
             "`[codex-council] interrupted by SIGTERM`, exits 143",
+            "That cap is why the skill always uses `--start` and never "
+            "launches a council as a background task, not even as a "
+            "fallback",
             "stopping a background task also stops the processes that "
             "detached from its shell",
             "The only supported way to outlive a background task is "
             "`--start`, never a manual detach wrapper",
         ):
-            self.assertIn(required, fallback)
+            self.assertIn(required, attached)
+        # No shipped document offers a time-limited launch recipe or a
+        # tracked fallback.
+        for name, text in self._doc_surfaces().items():
+            for retired in ("7200000", "run_in_background: true",
+                            "tracked fallback"):
+                with self.subTest(surface=name, retired=retired):
+                    self.assertNotIn(retired, self._flat(text))
         self.assertNotIn("Do not add a detach layer", runtime)
         for forbidden in (
             "trailing `&`", "`&!`", "`&|`", "`nohup`", "`setsid`",
@@ -5045,7 +5069,7 @@ class DocsContractTests(unittest.TestCase):
         for fragment in (
             "--start 'ABS_RUNDIR' --skill-contract 4",
             "--cancel 'ABS_RUNDIR' --skill-contract 4",
-            # The tracked fallback's recipe.
+            # The attached launch, for direct CLI use (never the skill's).
             "--roles-file 'ABS_RUNDIR/roles.json'",
             "--context-file 'ABS_RUNDIR/context.md'",
             "> 'ABS_RUNDIR/out.md'",
@@ -5161,9 +5185,14 @@ class DocsContractTests(unittest.TestCase):
             "`runner ended before dispatch`",
             "take its `next:` action (`--reap` when gone, `--cancel` when "
             "not responding)",
-            # A detached runner gone at once: one tracked-fallback retry.
+            # A detached runner gone at once: one relaunch with --start in
+            # a new directory, then stop and report; never a time-limited
+            # background launch.
             "If the runner is `gone` within a minute of `--start` with no "
-            "terminal line, relaunch once with the tracked fallback",
+            "terminal line, relaunch once: `mktemp -d`, discovery, "
+            "pre-flight, `--start`",
+            "If that fails too, stop and report the `err.log` diagnosis",
+            "Never fall back to a time-limited background launch",
             "one-shot 10-minute wake-up",
             "that runs `--status`",
             "delete it once the run settles",
@@ -5171,8 +5200,8 @@ class DocsContractTests(unittest.TestCase):
             "Never use a shell `sleep` loop",
             # The detached council outlives the host's limits and the
             # turn; only --cancel stops it.
-            "The runner is detached, so the host's background time limit "
-            "and exit do not stop it; `--cancel` does",
+            "It is detached, so the host's background time limit and exit "
+            "do not stop it; `--cancel` does",
             "It runs, and spends, until it finishes or is cancelled",
             "in `claude -p` or a subagent, keep the turn open until the "
             "council ends, or run `--cancel` before your final response",
@@ -5218,7 +5247,8 @@ class DocsContractTests(unittest.TestCase):
         states the non-interactive one too. A detached council outlives a
         `claude -p` turn, so the core says to keep the turn open or cancel;
         the reference keeps the host's five-second stop of a `-p`
-        background shell, which bounds the tracked fallback."""
+        background shell, which bounds an attached run in a background
+        task."""
         step5 = self._section("## Step 5", "## Step 6")
         runtime = self._flat(self._ref("runtime-behavior.md"))
         for name, flat, extra in (
@@ -5276,7 +5306,8 @@ class DocsContractTests(unittest.TestCase):
             "up to five unfinished roles",
             "`watchdog=disabled`",
             "`[orchestrator-exception]`",
-            "exactly one backgrounding layer",
+            # No detach wrapper replaces --start for an attached launch.
+            "No detach wrapper makes an attached launch durable",
             "launchd",
             # One launch per directory; the guard runs before the launch.
             "A directory holds one launch",
@@ -5436,9 +5467,9 @@ class DocsContractTests(unittest.TestCase):
         the watchdog: every runner-state rule (finished, gone, not
         responding, unknown) must match before a rule that reads role output
         as the runner handling it or as a reason to keep waiting. An
-        unresponsive runner is stopped through its tracked task, confirmed
-        gone, and only then reaped, unless err.log says status.json could
-        not be written."""
+        unresponsive runner is stopped (--cancel, or an attached run's
+        launch command), confirmed gone, and only then reaped, unless
+        err.log says status.json could not be written."""
         ref = self._flat(self._ref("runtime-behavior.md"))
         triage = ref.split("the first match wins", 1)[1]
         triage = triage.split("## Exit code", 1)[0]
@@ -5456,7 +5487,7 @@ class DocsContractTests(unittest.TestCase):
                       text["2"])
         stop = [text["3"].index(step) for step in (
             "run `--cancel` for a detached run",
-            "stop the council's tracked background task",
+            "for an attached run, stop its launch command",
             "confirm with `--status` that the runner is now `gone`",
             "run `--reap` if it then lists live codex groups",
         )]
@@ -5472,11 +5503,12 @@ class DocsContractTests(unittest.TestCase):
         self.assertIn("appears only in reply files and `out.md`, never in "
                       "`err.log`", text["5"])
         # For a detached run the lock decides unknown, and --cancel replaces
-        # stopping a tracked task wherever a present runner must stop.
+        # stopping an attached run's command wherever a present runner must
+        # stop.
         self.assertIn("the supervisor lock decides", text["4"])
         self.assertIn("never `--reap`, `--cancel`, or relaunch", text["4"])
-        self.assertIn("run `--cancel` (for the tracked fallback, stop its "
-                      "background task)", text["8"])
+        self.assertIn("run `--cancel` (for an attached run, stop its launch "
+                      "command)", text["8"])
         self.assertIn("`ended before dispatch`", text["2"])
         self.assertIn("`--status` no longer says the runner is still "
                       "exiting", text["1"])
@@ -5523,8 +5555,9 @@ class DocsContractTests(unittest.TestCase):
             "30 minutes by default and 2 hours at most",
             "(https://code.claude.com/docs/en/changelog)",
             "Output does not extend it",
-            "It bounds the tracked fallback only, which is why that recipe "
-            "passes `timeout: 7200000`",
+            "It bounds only an attached run inside a background task, which "
+            "is why the skill never launches one",
+            "a larger `timeout` only moves the stop to 2 hours at most",
             "`CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP` turns that off",
             "(https://code.claude.com/docs/en/env-vars)",
             "the user's own setting, and the skill never sets it",
@@ -6085,8 +6118,8 @@ class DocsContractTests(unittest.TestCase):
     def test_design_is_honest_about_what_the_runner_does_not_enforce(self):
         """User-pin provenance and a reason's meaning are trusted to the
         orchestrator, and one launch per directory is claimed atomically
-        only by --start: for the tracked fallback it rests on discovery and
-        the pre-flight, not on the launch."""
+        only by --start: for an attached launch (never the skill's) it rests
+        on discovery and the pre-flight, not on the launch."""
         def limits(section):
             text = self._flat(self._design_section(section))
             self.assertIn("**Limits.**", text)
@@ -6104,12 +6137,13 @@ class DocsContractTests(unittest.TestCase):
             self.assertIn(required, selection)
         staging = limits("Staging and preflight")
         for required in (
-            "**One launch per directory is not enforced atomically for the "
-            "tracked fallback.**",
+            "**One launch per directory is not enforced atomically for an "
+            "attached launch.**",
             "`--start` claims its directory atomically",
-            "the tracked launch itself does not check",
-            "a tracked launch into a directory `--start` already claimed "
+            "the attached launch itself does not check",
+            "an attached launch into a directory `--start` already claimed "
             "still truncates its files",
+            "The skill never makes an attached launch.",
         ):
             self.assertIn(required, staging)
         # The runner really does accept any non-empty single-line reason.
@@ -6162,8 +6196,10 @@ class DocsContractTests(unittest.TestCase):
             "`CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP`",
             "(https://code.claude.com/docs/en/env-vars)",
             "the plugin never sets it",
-            "The tracked fallback runs inside them and so lasts at most 2 "
-            "hours.",
+            "The skill always uses `--start` and never falls back to a "
+            "background launch.",
+            "inside a background task is subject to both, and so lasts at "
+            "most 2 hours.",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, readme)

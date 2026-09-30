@@ -58,8 +58,10 @@ unsandboxed as that same user, so anything a role can reach it can also
 write, including `err.log`, `out.md`, and `replies/`. Claude therefore treats
 reply content as untrusted evidence, and only a verified runner exit marks
 the end of a run: for a detached run, a released supervisor lock together
-with a vanished runner identity; for the tracked fallback, Claude Code's own
-task notification. No line a role writes can imitate either.
+with a vanished runner identity; for an attached run (direct CLI use or a
+legacy directory), the end of its launch command, which Claude Code's own
+task notification reports when that command ran as a background task. No
+line a role writes can imitate either.
 
 Supported versions are the current ones only: Claude Code 2.1.x, codex-cli
 0.158 or later, and Python 3.12 or later on macOS or Linux.
@@ -80,7 +82,7 @@ and a report to Claude, and Claude reconciles one result for the user.
 
 ### Level 1: runtime components
 
-![d10-components: Claude Code, the runner detached by --start, the follower, the host task tracker for the tracked fallback, the run directory with its supervisor lock, saved threads, codex app-server, codex exec, and the workspace](docs/diagrams/d10-components.png)
+![d10-components: Claude Code, the runner detached by --start, the follower, the host task tracker (attached runs only), the run directory with its supervisor lock, saved threads, codex app-server, codex exec, and the workspace](docs/diagrams/d10-components.png)
 
 *d10-components — Runtime components and ownership. Source:
 [d10-components.mmd](docs/diagrams/d10-components.mmd).*
@@ -92,17 +94,19 @@ and a report to Claude, and Claude reconciles one result for the user.
 | `codex app-server` | model and configuration metadata only | the runner, over stdio JSON-RPC |
 | `codex exec`, one per role | the role's work in the workspace | the runner, over stdin, stdout, and stderr |
 | Follower (`--follow`) | relaying actionable progress, noticing a dead or stuck runner | reads `err.log` and `status.json`; writes only its own stdout |
-| Host task tracker | the tracked fallback's lifetime and its completion notification; nothing of a detached run | Claude |
+| Host task tracker | an attached run's lifetime and completion notification when it runs as a background task (direct CLI use and legacy directories; the skill never launches one); nothing of a detached run | Claude |
 
-By default Claude launches with `--start`, which creates `out.md` and
+Claude always launches with `--start`, which creates `out.md` and
 `err.log` itself and starts the runner as a detached supervisor, outside
-any host task; the tracked fallback's shell creates them by redirecting
-stdout and stderr instead. What says the runner's process ended is, for a
-detached run, its released lock plus its vanished pid identity (`--status`
-reports the terminal state only then), and for the tracked fallback, the
-host task tracker's notification. `out.md`, the `CODEX_COUNCIL_DONE` line,
-and the follower's exit are separate signals and none of them is that
-proof.
+any host task and so outside any host time limit. An attached launch (the
+runner's tracked mode: direct CLI use, or a directory an earlier version
+launched) has its shell create them by redirecting stdout and stderr
+instead. What says the runner's process ended is, for a detached run, its
+released lock plus its vanished pid identity (`--status` reports the
+terminal state only then), and for an attached run, the end of its launch
+command (the host task tracker's notification when that command ran as a
+background task). `out.md`, the `CODEX_COUNCIL_DONE` line, and the
+follower's exit are separate signals and none of them is that proof.
 
 The run directory holds exactly one launch:
 
@@ -112,8 +116,8 @@ The run directory holds exactly one launch:
 | `roles.json`, `context.md` | Claude | the preflight, the launch | Claude's Write |
 | `supervisor.lock` | `--start` (created exclusively; never removed or replaced), held locked by the supervisor | `--follow`, `--status`, `--cancel`, `--reap` | 0600 |
 | `supervisor.json` | the supervisor, about itself, before any other work | `--start`, `--follow`, `--status`, `--cancel`, `--reap` | 0600 |
-| `out.md` | `--start` (created exclusively), then the runner's stdout; or the tracked launch's stdout redirect | Claude | 0600 detached; the shell's tracked |
-| `err.log` | `--start` (created exclusively), then the runner's stderr; or the tracked launch's stderr redirect | the follower, Claude | 0600 detached; the shell's tracked |
+| `out.md` | `--start` (created exclusively), then the runner's stdout; or an attached launch's stdout redirect | Claude | 0600 detached; the shell's when attached |
+| `err.log` | `--start` (created exclusively), then the runner's stderr; or an attached launch's stderr redirect | the follower, Claude | 0600 detached; the shell's when attached |
 | `replies/<key>.md` | the runner, as each role settles | Claude | 0600, in a 0700 `replies/` |
 | `status.json` | the runner | `--follow`, `--status`, `--cancel`, `--reap` | 0600 |
 
@@ -508,7 +512,7 @@ content private, and never let a launch damage another launch's files.
 
 *d23-staging — Stage and pass the gates. Inputs exist before the
 preflight; outputs appear only when the separate `--start` call claims the
-directory (or the tracked fallback's redirects run). Source: [d23-staging.mmd](docs/diagrams/d23-staging.mmd).*
+directory (or an attached launch's redirects run). Source: [d23-staging.mmd](docs/diagrams/d23-staging.mmd).*
 
 **How it works.** Every launch gets its own `mktemp -d` directory. Claude
 runs `--discover` there, writes `roles.json` and `context.md`, and runs
@@ -537,12 +541,13 @@ On success it prints the plan, one line per role:
 ```
 
 Only after exit 0 does Claude launch, in a separate foreground call to
-`--start` (or, as the fallback, a separate background call whose redirects
-create `out.md` and `err.log`). `--start` repeats every preflight check
-before it creates anything, and the launch repeats the same checks
-on each input's lexical parent directory (`dirname(abspath(...))`, never
-resolved through symlinks first) before reading any content, then parses,
-validates authoring, and resolves selections.
+`--start`, its only launch (an attached launch, for direct CLI use, has
+redirects that create `out.md` and `err.log`). `--start` repeats every
+preflight check before it creates anything, and the launch repeats the
+same checks on each input's lexical parent directory
+(`dirname(abspath(...))`, never resolved through symlinks first) before
+reading any content, then parses, validates authoring, and resolves
+selections.
 
 The private-directory predicate, shared with the replies directory and the
 snapshot reader, is: not a symlink, the right file type, owned by the
@@ -553,8 +558,8 @@ abandoned, never repaired: the recovery demands a new `mktemp -d`,
 `--discover` there, both files re-written with the new `snapshot_id`, and the
 preflight. A roles defect found by the preflight is fixed by rewriting the
 whole file in the same directory; any refusal at launch starts over in a new
-directory, because `--start` or the fallback's redirects have already
-claimed this one.
+directory, because `--start` (or an attached launch's redirects) has
+already claimed this one.
 
 **Key decisions and why.**
 
@@ -567,7 +572,7 @@ claimed this one.
 - *One launch per directory, claimed atomically by `--start`.* `--start`
   creates `supervisor.lock`, `err.log`, and `out.md` with `O_EXCL` and
   `O_NOFOLLOW`, so of two concurrent starts exactly one wins and the loser
-  creates and truncates nothing. The tracked fallback's redirects truncate
+  creates and truncates nothing. An attached launch's redirects truncate
   `out.md` and `err.log` before the runner starts, so for it only a step
   that runs before the launch command can refuse in time.
 - *Preflight and launch are separate calls.* In one combined call a refused
@@ -578,16 +583,17 @@ claimed this one.
 
 **Limits.**
 
-- **One launch per directory is not enforced atomically for the tracked
-  fallback.** `--start` claims its directory atomically, but the tracked
+- **One launch per directory is not enforced atomically for an attached
+  launch.** `--start` claims its directory atomically, but the attached
   launch itself does not check: its own redirects create `out.md` and
   `err.log` before it starts, and direct CLI use accepts an existing
-  `replies/`. A tracked launch without a preflight, a combined call that
-  ignores the preflight's exit, or two tracked launches racing into one
-  directory are not prevented, and a tracked launch into a directory
-  `--start` already claimed still truncates its files (a `--start` after a
-  tracked launch refuses on the files it finds). "A fresh directory per launch" is the
-  required workflow, not a one-use token.
+  `replies/`. An attached launch without a preflight, a combined call that
+  ignores the preflight's exit, or two attached launches racing into one
+  directory are not prevented, and an attached launch into a directory
+  `--start` already claimed still truncates its files (a `--start` after an
+  attached launch refuses on the files it finds). The skill never makes an
+  attached launch. "A fresh directory per launch" is the required workflow,
+  not a one-use token.
 
 ## Launch and fan-out
 
@@ -624,8 +630,11 @@ start, noted as already ended; only an exit without the record makes
 `--start` exit 1 (the directory is used up). It then prints `[codex-council] started: pid=<pid> dir=<ABS_RUNDIR>
 version=<v>` and the exact `--follow`, `--status`, and `--cancel` commands.
 From there the supervisor is the ordinary runner, recording `runner.mode`
-`detached` in `status.json` (still schema 1). The tracked fallback runs the
-same launch as a Claude Code background task instead.
+`detached` in `status.json` (still schema 1). An attached launch, for
+direct CLI use only, runs the same staged launch as the plain foreground
+child of its own command instead; inside a Claude Code background task it
+would be stopped at that task's `timeout`, which is why the skill has no
+such fallback.
 
 After the dispatch line and the model-selection lines, the
 runner starts one task per role behind an `asyncio.Semaphore` of
@@ -1037,8 +1046,8 @@ Claude may read a settled role's reply, tell the user, and act on work that
 does not depend on other roles. The final verdict, cross-role conflicts, and
 writes that overlap a running writer wait for the full report, which Claude
 reads only after the completion rule holds: the follower exits 0 and then
-`--status` reports that the runner ended (for the tracked fallback, Claude
-Code's background-task notification).
+`--status` reports that the runner ended (for an attached run, the end of
+its launch command).
 
 **Key decisions and why.**
 
@@ -1149,11 +1158,11 @@ other files. Otherwise it refuses with exit 1. Claude then re-runs the
 unfinished roles in a new directory. For a detached run `--reap` also
 refuses while the lock is held, even when `ps` says the pid is gone, and
 while the run reads `unknown`. A runner that is present but not responding
-is never reaped: Claude runs `--cancel` (for the tracked fallback, stops
-the council's tracked background task), confirms with `--status` that the
-runner is gone, and only then runs `--reap` if live codex groups remain
-(the skill's recovery triage, which decides the runner's state before any
-rule about role output).
+is never reaped: Claude runs `--cancel` (for an attached run, stops its
+launch command), confirms with `--status` that the runner is gone, and
+only then runs `--reap` if live codex groups remain (the skill's recovery
+triage, which decides the runner's state before any rule about role
+output).
 
 `--cancel RUNDIR` stops a detached run. It acts only while the lock is held
 with the recorded inode, the recorded pid is alive with its recorded start
@@ -1223,10 +1232,11 @@ happy path, a descendant holding codex's output open, a SIGKILLed runner, a
 stopped runner, a follower whose parent dies, a role that is silent for a
 while and then succeeds, a role whose stdout carries lines no JSON
 parser accepts while its stderr keeps printing, and, for the detached
-launch: the host stopping a tracked launch (the interruption is clean and
-settled replies stay), the shell that ran `--start` getting SIGHUP,
-SIGTERM, and SIGKILL after it returns and `--start` itself killed right
-after the spawn (the council finishes in both, in a session of its own),
+launch: the host stopping an attached launch in a background task (the
+interruption is clean and settled replies stay), the shell that ran
+`--start` getting SIGHUP, SIGTERM, and SIGKILL after it returns and
+`--start` itself killed right after the spawn (the council finishes in
+both, in a session of its own),
 two concurrent `--start` calls on one directory (one supervisor; the loser
 exits 2 and truncates nothing), `--cancel` of a hanging role with a tool
 session (a clean interruption, every fake process gone), and a SIGKILLed

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Liveness scenarios: the real runner CLI end to end against a fake codex.
 
-Each scenario stages a private run directory, launches the council the way
-the tracked fallback does (stdout to out.md, stderr to err.log; S8-S12 use
+Each scenario stages a private run directory, launches the council attached,
+as direct CLI use does (stdout to out.md, stderr to err.log; S8-S12 use
 --start) with the fake `codex` from fake_codex.py first on PATH, follows it
 with `--follow`, disturbs it, and prints one verdict line with the number
 of lines the follower emitted:
@@ -15,8 +15,9 @@ of lines the follower emitted:
   S5  a role is byte-silent for a while, then succeeds.
   S6  a role writes stdout lines no JSON parser accepts while its stderr
       keeps printing, then succeeds.
-  S7  the host stops a tracked launch (SIGTERM to its process group) while
-      a role is silent: the interruption is clean and settled replies stay.
+  S7  the host stops an attached launch in a background task (SIGTERM to
+      its process group) while a role is silent: the interruption is clean
+      and settled replies stay.
   S8  --start from a shell in its own session; after it returns, that
       shell's group gets SIGHUP, SIGTERM, and SIGKILL: the council finishes.
   S9  the --start process itself is SIGKILLed right after it spawned the

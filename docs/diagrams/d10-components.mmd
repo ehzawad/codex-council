@@ -1,6 +1,6 @@
 flowchart LR
     Claude("Claude Code<br/>orchestrator")
-    Host("Host task tracker<br/>tracked fallback only")
+    Host("Host task tracker<br/>attached runs only")
     Runner("Runner CLI<br/>detached by --start")
     Follower("Follower<br/>--follow")
     RunDir[("Run directory<br/>private, one launch,<br/>supervisor lock")]
@@ -18,7 +18,7 @@ flowchart LR
     Runner <-->|"thread ids"| State
     RunDir -->|"err.log, status.json"| Follower
     Follower -->|"events"| Claude
-    Runner -->|"exit, if tracked"| Host
+    Runner -->|"exit, if attached"| Host
     Host -->|"task notification"| Claude
 
     classDef ours fill:#dbeafe,stroke:#1d4ed8,color:#0f172a

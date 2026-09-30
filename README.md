@@ -97,12 +97,12 @@ and [runtime behavior](plugins/codex-council/skills/codex-council/references/run
 
 ## How a run works
 
-![d10-components: Claude Code, the runner detached by --start, the follower, the host task tracker for the tracked fallback, the run directory with its supervisor lock, saved threads, codex app-server, codex exec, and the workspace](docs/diagrams/d10-components.png)
+![d10-components: Claude Code, the runner detached by --start, the follower, the host task tracker (attached runs only), the run directory with its supervisor lock, saved threads, codex app-server, codex exec, and the workspace](docs/diagrams/d10-components.png)
 
 *d10-components — Runtime components and ownership. The runner talks to
 Codex; Claude and the runner hand work to each other through the run
-directory; a released supervisor lock and a vanished runner (or, for the
-tracked fallback, the host's task tracker) say the run is over. Source:
+directory; a released supervisor lock and a vanished runner (or, for an
+attached run, the end of its launch command) say the run is over. Source:
 [d10-components.mmd](docs/diagrams/d10-components.mmd).*
 
 1. **Stage.** Claude creates a private directory with `mktemp -d`, runs
@@ -141,10 +141,14 @@ tracked fallback, the host's task tracker) say the run is over. Source:
 | `replies/<role>.md` | the runner, as each role settles | that role's section of the report |
 | `status.json` | the runner | runner and role liveness, for `--follow`, `--status`, `--cancel`, and `--reap` |
 
-A fallback launch runs the council as a Claude Code background task
-instead, with `out.md` and `err.log` created by shell redirects and no
-supervisor files; the skill uses it only when a detached launch cannot run
-(see [runtime behavior](plugins/codex-council/skills/codex-council/references/runtime-behavior.md)).
+The skill has no fallback launch. The runner still accepts an attached
+launch (`--roles-file` and `--context-file`, with `out.md` and `err.log`
+created by shell redirects and no supervisor files) for direct CLI use, and
+`--follow`, `--status`, and `--reap` still read the directories such runs,
+or earlier versions of the skill, left behind. Inside a Claude Code
+background task an attached launch is stopped at the host's time limit, so
+the skill never uses it (see
+[runtime behavior](plugins/codex-council/skills/codex-council/references/runtime-behavior.md)).
 
 Every mechanism has its own section and diagram in [DESIGN.md](DESIGN.md);
 the [diagram index](#diagrams) below lists them all.
@@ -176,7 +180,10 @@ session has sat idle for half an hour; that stop is yours to turn off with
 plugin never sets it. A council started with `--start` is outside both: it
 ends when it finishes, when Claude runs `--cancel`, or when something
 outside Claude Code stops its processes (a reboot, for example). The
-tracked fallback runs inside them and so lasts at most 2 hours.
+skill always uses `--start` and never falls back to a background launch.
+An attached run (the runner started directly with `--roles-file`, or one
+an earlier version launched) inside a background task is subject to both,
+and so lasts at most 2 hours.
 
 ### Model and effort per role
 
