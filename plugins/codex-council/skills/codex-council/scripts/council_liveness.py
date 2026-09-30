@@ -108,6 +108,10 @@ KEEPALIVE_ROLES = 5
 _ROLE_ID_RE = re.compile(r"^[a-z0-9_-]+\Z")
 # --reap: SIGTERM, up to this long for the group to empty, then SIGKILL.
 REAP_GRACE_SECS = 2
+# --start creates supervisor.lock and then locks it (retrying for up to a
+# second past a reader's momentary shared lock). For this long after the
+# file appears, a free lock with no record is "unknown", not "gone".
+LOCK_CLAIM_GRACE_SECS = 3
 # --cancel: SIGCONT and SIGTERM to the verified runner, then up to this long
 # for it to release its lock; a runner still holding it with the same
 # identity then gets SIGKILL and up to CANCEL_KILL_WAIT_SECS more. These
@@ -621,6 +625,16 @@ def is_detached(run_dir, view=None):
     )
 
 
+def _lock_just_created(run_dir):
+    """True while supervisor.lock is younger than LOCK_CLAIM_GRACE_SECS
+    (by its mtime: nothing ever writes to the file)."""
+    try:
+        st = os.lstat(os.path.join(run_dir, SUPERVISOR_LOCK_FILENAME))
+    except OSError:
+        return False
+    return -1 < time.time() - st.st_mtime < LOCK_CLAIM_GRACE_SECS
+
+
 @dataclasses.dataclass
 class Detached:
     """A detached run's combined liveness (see supervisor_state)."""
@@ -639,7 +653,9 @@ def supervisor_state(run_dir, view, table=None):
     Alive: the lock is held and, once supervisor.json exists, its recorded
     runner is alive and agrees with status.json. Gone: the lock is free and
     the recorded identity is gone (or, with no supervisor.json yet, the
-    runner ended before it could write one). Anything else (a held lock
+    runner ended before it could write one; within LOCK_CLAIM_GRACE_SECS
+    of the lock file's creation that reads as unknown instead, since
+    --start may not have locked it yet). Anything else (a held lock
     with a dead or unverifiable pid, a free lock with the recorded process
     still present, a replaced or unreadable lock, records naming different
     processes) is unknown: nothing may be signalled or reaped then.
@@ -655,6 +671,8 @@ def supervisor_state(run_dir, view, table=None):
         state = {"held": "alive", "free": "gone"}.get(lock, "unknown")
         if view is not None and state != "unknown":
             state = "unknown"  # status.json without supervisor.json
+        elif state == "gone" and _lock_just_created(run_dir):
+            state = "unknown"  # --start may not have locked it yet
         return Detached(state, None, lock)
     if supervisor.pid is None or lock not in ("held", "free"):
         return Detached("unknown", supervisor, lock)

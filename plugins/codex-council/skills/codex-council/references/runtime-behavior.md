@@ -51,11 +51,12 @@ are each a new launch with a new `mktemp -d` directory and its own
 already exists (`already holds a council launch`), and the recovery is a
 new directory, never cleaning up the old one. `--start` then claims the
 directory atomically (see Detached launch, cancel, and the supervisor
-lock), so two concurrent starts, or a start racing the tracked fallback,
-cannot both launch there: the loser exits 2 having created and truncated
-nothing. The tracked fallback's launch command is different: its shell
-redirections truncate `out.md` and `err.log` before the runner starts, so
-relaunching into a directory whose council is still running tears that
+lock), so of two concurrent starts exactly one launches there and the
+loser exits 2 having created and truncated nothing; a `--start` that finds
+a tracked launch's files also exits 2 and truncates nothing. The tracked
+fallback's launch command is different: it never refuses, and its shell
+redirections truncate `out.md` and `err.log` before the runner starts
+(those of a directory `--start` already claimed included), so relaunching into a directory whose council is still running tears that
 council's report, log, and follower apart, and relaunching after it
 finished replaces its report and mixes two runs in `replies/`. That launch
 itself does not check for an earlier launch, so for the fallback one launch
@@ -150,10 +151,14 @@ What it does, in order:
    exits 2 before anything is created, so the directory stays untouched.
 2. It claims the directory, each file created exclusively, without
    following a symlink, with mode 0600: `supervisor.lock`, which it locks
-   with `flock`, then `err.log` and `out.md`. If any of them already exists
-   (a concurrent `--start`, the tracked fallback, or a planted or symlinked
-   lock file), it exits 2 with the launched-directory recovery, having
-   created and truncated nothing.
+   with `flock`, then `err.log` and `out.md`. If `supervisor.lock` already
+   exists (a concurrent `--start`, or a planted or symlinked lock file), it
+   exits 2 with the launched-directory recovery, having created and
+   truncated nothing. If `err.log` or `out.md` appeared after the
+   validation (a tracked fallback launch racing in), it exits 2 the same
+   way and truncates neither, but the `supervisor.lock` it just created
+   stays. A tracked launch never refuses: its redirections truncate a
+   claimed directory's `out.md` and `err.log`.
 3. It starts the unchanged staged launch as the supervisor, in its own
    session, with stdout on `out.md`, stderr on `err.log`, stdin on
    `/dev/null`, the same working directory and environment (so discovery
@@ -183,9 +188,13 @@ The three commands are exact and shell-quoted, with the real script path.
 If `supervisor.json` is not written within those 10 seconds while the
 supervisor is still alive, a `note: supervisor.json is not written yet; the
 supervisor is still starting; run --status` line follows the first line and
-`--start` still exits 0. If the supervisor exits at once, `--start` exits 1
-with `[codex-council] start failed: ...; read <ABS_RUNDIR>/err.log. Do not
-retry --start in this directory: it is used up.` The wait bounds only the
+`--start` still exits 0. A supervisor that wrote `supervisor.json` and has
+already ended by then (a quick council) is still a start: exit 0, with a
+`note: the runner has already ended (exit <code>); run --status, then read
+out.md` line after the first. If the supervisor exits without writing
+`supervisor.json`, `--start` exits 1 with `[codex-council] start failed:
+...; read <ABS_RUNDIR>/err.log. Do not retry --start in this directory: it
+is used up.` The wait bounds only the
 start command, never a running council. A failed start consumes the
 directory: never retry `--start` there, and start over in a new `mktemp -d`
 directory with its own `--discover`.
@@ -202,7 +211,10 @@ recorded identity, a detached runner is:
 
 - alive while the lock is held and the recorded pid still has its recorded
   start time (and `status.json`, where present, names the same runner);
-- gone only when the lock is free and the recorded identity is gone;
+- gone only when the lock is free and the recorded identity is gone (with
+  no `supervisor.json` yet, a free lock reads gone once the lock file is 3
+  seconds old; before that `--start` may still be locking it, so it reads
+  unknown);
 - unknown on any disagreement: a held lock with a dead or reused pid, a
   free lock with the recorded process still present, a replaced or
   unreadable lock file, or records naming different processes. Nothing is

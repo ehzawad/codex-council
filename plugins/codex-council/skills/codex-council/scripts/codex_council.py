@@ -2487,6 +2487,23 @@ async def _run_council_with_signals(roles, body, max_parallel, replies_dir=None)
 
 # ---------- detached launch: --start and its supervised child ----------
 
+def _fill_closed_standard_fds():
+    """Open /dev/null onto any closed descriptor 0, 1, or 2.
+
+    Otherwise a --start run with a standard stream closed would get that
+    number back for supervisor.lock, err.log, or out.md, and the child's
+    stdin/stdout/stderr setup would overwrite the handed-off descriptor.
+    """
+    for fd in (0, 1, 2):
+        try:
+            os.fstat(fd)
+        except OSError:
+            null = os.open(os.devnull, os.O_RDWR)
+            if null != fd:
+                os.dup2(null, fd, inheritable=False)
+                os.close(null)
+
+
 def _start_command(run_dir):
     """--start RUNDIR: launch the staged council detached; exit 0, 1, or 2.
 
@@ -2494,19 +2511,24 @@ def _start_command(run_dir):
        anything is created, so the directory stays untouched.
     2. Claim the directory, in this order and each exclusively (O_EXCL,
        O_NOFOLLOW, 0600): supervisor.lock, locked with flock(LOCK_EX), then
-       err.log and out.md. A concurrent --start (or a tracked launch) that
-       got there first makes this one exit 2 having created and truncated
-       nothing. The lock file is never removed or replaced.
+       err.log and out.md. A concurrent --start that got there first makes
+       this one exit 2 having created and truncated nothing; a tracked
+       launch whose err.log or out.md appeared after step 1 makes it exit 2
+       truncating nothing, though the lock file it created stays. The lock
+       file is never removed or replaced.
     3. Start this script's staged launch as the supervisor, in its own
        session, with stdout on out.md, stderr on err.log, stdin on
        /dev/null, the same cwd and environment, and the locked descriptor
        as its only extra one (--supervisor-lock-fd). The context stays in
        its file; the command line carries only paths.
     4. Close this process's copies (the lock stays held by the child) and
-       wait up to START_WAIT_SECS for the child to write supervisor.json,
-       or to exit early (exit 1: read err.log; the directory is used up).
+       wait up to START_WAIT_SECS for the child to write supervisor.json.
+       A child that wrote it is a start (exit 0) even if it has already
+       ended; one that exits without writing it is exit 1 (read err.log;
+       the directory is used up).
     """
     prefix = "--start: "
+    _fill_closed_standard_fds()
     path, _, _ = _validate_staging_dir(run_dir, prefix, "re-run --start.")
     abs_dir = os.path.abspath(path)
     claimed = []
@@ -2578,7 +2600,15 @@ def _start_command(run_dir):
     deadline = time.monotonic() + START_WAIT_SECS
     ready = False
     while True:
+        # Poll before reading: a record written before the exit is then
+        # always seen, so a supervisor that wrote supervisor.json and has
+        # already finished (a quick council, or a slow launcher) is a
+        # start, never a failure.
         code = proc.poll()
+        record = read_supervisor(sup_path)
+        if record is not None and record.pid == proc.pid:
+            ready = True
+            break
         if code is not None:
             print(
                 f"[codex-council] start failed: the supervisor (pid "
@@ -2589,13 +2619,10 @@ def _start_command(run_dir):
                 file=sys.stderr,
             )
             sys.exit(1)
-        record = read_supervisor(sup_path)
-        if record is not None and record.pid == proc.pid:
-            ready = True
-            break
         if time.monotonic() >= deadline:
             break
         time.sleep(START_POLL_SECS)
+    ended = proc.poll()
     command = (f"{shlex.quote(sys.executable)} "
                f"{shlex.quote(os.path.realpath(__file__))}")
     quoted = shlex.quote(abs_dir)
@@ -2605,6 +2632,9 @@ def _start_command(run_dir):
     if not ready:
         print(f"note: {SUPERVISOR_FILENAME} is not written yet; the "
               "supervisor is still starting; run --status")
+    elif ended is not None:
+        print(f"note: the runner has already ended (exit {ended}); run "
+              "--status, then read out.md")
     print(f"follow: {command} --follow {quoted} {contract}")
     print(f"status: {command} --status {quoted} {contract}")
     print(f"cancel: {command} --cancel {quoted} {contract}")

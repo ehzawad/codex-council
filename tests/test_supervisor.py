@@ -125,6 +125,10 @@ class StartCommandTests(StartCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stderr, "")
         lines = proc.stdout.splitlines()
+        # A quick council can end before --start looks: still a start.
+        if len(lines) == 5 and lines[1].startswith(
+                "note: the runner has already ended (exit 0)"):
+            del lines[1]
         self.assertEqual(len(lines), 4, lines)
         match = STARTED_RE.match(lines[0])
         self.assertIsNotNone(match, lines[0])
@@ -278,6 +282,61 @@ class StartCommandTests(StartCase):
                 self.assertEqual(f.read(), f"winner's {name}\n")
         self.assertFalse(os.path.exists(
             os.path.join(self.run_dir, "supervisor.json")))
+
+    def test_a_supervisor_that_wrote_its_record_and_ended_is_a_start(self):
+        """A slow launcher can first look after the supervisor wrote
+        supervisor.json and already finished: that is a start (exit 0,
+        with a note), never 'start failed'."""
+        real_popen = subprocess.Popen
+        writer = (
+            "import json, os, sys\n"
+            "fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_EXCL"
+            " | os.O_NOFOLLOW, 0o600)\n"
+            "os.write(fd, json.dumps({'schema': 1, 'pid': os.getpid()})"
+            ".encode())\n"
+            "os.close(fd)\n")
+        sup_path = os.path.join(self.run_dir, "supervisor.json")
+
+        def finished_child(argv, **kwargs):
+            proc = real_popen([sys.executable, "-c", writer, sup_path],
+                              **kwargs)
+            proc.wait()  # ended before --start's first look
+            return proc
+
+        err, out = io.StringIO(), io.StringIO()
+        with patch.dict(os.environ, self.env, clear=True), \
+                patch.object(codex_council.subprocess, "Popen",
+                             finished_child), \
+                patch.object(codex_council, "START_POLL_SECS", 3), \
+                contextlib.redirect_stderr(err), \
+                contextlib.redirect_stdout(out):
+            codex_council._start_command(self.run_dir)
+        self.assertEqual(err.getvalue(), "")
+        lines = out.getvalue().splitlines()
+        self.assertIsNotNone(STARTED_RE.match(lines[0]), lines)
+        self.assertEqual(lines[1], "note: the runner has already ended "
+                                   "(exit 0); run --status, then read out.md")
+        self.assertEqual(len(lines), 5, lines)
+
+    def test_a_start_with_a_standard_stream_closed_still_starts(self):
+        """With fd 0 or 1 closed, the claimed files must not land on a
+        standard-stream number the child's setup would overwrite."""
+        for closed in (0, 1):
+            with self.subTest(closed=closed):
+                run_dir = self.stage(f"closed{closed}")
+                proc = subprocess.run(
+                    [sys.executable, SCRIPT, "--start", run_dir,
+                     "--skill-contract", EPOCH],
+                    stderr=subprocess.PIPE, text=True, env=self.env,
+                    cwd=self.base, timeout=60,
+                    stdin=None if closed == 0 else subprocess.DEVNULL,
+                    stdout=None if closed == 1 else subprocess.DEVNULL,
+                    preexec_fn=lambda fd=closed: os.close(fd))
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.wait_end(run_dir)
+                with open(os.path.join(run_dir, "out.md"),
+                          encoding="utf-8") as f:
+                    self.assertIn("1/1 roles responded", f.read())
 
     def test_a_supervisor_that_exits_at_once_is_exit_1(self):
         real_popen = subprocess.Popen

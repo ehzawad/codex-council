@@ -107,10 +107,15 @@ def _lock_path(run_dir):
     return os.path.join(run_dir, council_common.SUPERVISOR_LOCK_FILENAME)
 
 
-def _make_lock(run_dir):
+def _make_lock(run_dir, fresh=False):
+    """RUNDIR/supervisor.lock; unless `fresh`, dated past the lock-claim
+    grace, like the lock of a run that started a while ago."""
     path = _lock_path(run_dir)
     if not os.path.exists(path):
         os.close(os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600))
+        if not fresh:
+            old = time.time() - 60
+            os.utime(path, (old, old))
     return path
 
 
@@ -410,6 +415,16 @@ class SupervisorStateTests(unittest.TestCase):
         _make_lock(self.run_dir)
         self.assertEqual(self._state(), "gone")  # ended before its record
         _supervisor(self.run_dir, _dead_pid(), "Thu Jan  1 00:00:00 1970")
+        self.assertEqual(self._state(), "gone")
+
+    def test_a_just_created_free_lock_with_no_record_is_unknown(self):
+        """--start creates supervisor.lock and only then locks it; a reader
+        in that gap must not call the run ended."""
+        path = _make_lock(self.run_dir, fresh=True)
+        self.assertEqual(self._state(), "unknown")
+        old = (time.time()
+               - council_liveness.LOCK_CLAIM_GRACE_SECS - 1)
+        os.utime(path, (old, old))
         self.assertEqual(self._state(), "gone")
 
     def test_free_lock_with_the_recorded_runner_present_is_unknown(self):

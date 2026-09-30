@@ -618,8 +618,10 @@ no codex worker ever holds the lock, keeps it open for its whole life, and
 writes `supervisor.json` (pid, start identity, process group and session,
 the lock's device and inode, version, epoch, start time) before discovery
 or dispatch. `--start` waits up to `START_WAIT_SECS = 10` seconds for that
-record (or an early exit, which makes it exit 1: the directory is used up),
-then prints `[codex-council] started: pid=<pid> dir=<ABS_RUNDIR>
+record. It polls the child before reading the record, so a supervisor that
+wrote it and already ended (a quick council, a slow launcher) is still a
+start, noted as already ended; only an exit without the record makes
+`--start` exit 1 (the directory is used up). It then prints `[codex-council] started: pid=<pid> dir=<ABS_RUNDIR>
 version=<v>` and the exact `--follow`, `--status`, and `--cancel` commands.
 From there the supervisor is the ordinary runner, recording `runner.mode`
 `detached` in `status.json` (still schema 1). The tracked fallback runs the
@@ -1116,7 +1118,10 @@ the lock is held and the recorded pid has its recorded start time, `gone`
 only when the lock is free and that identity is gone, and `unknown` on any
 disagreement (a held lock with a dead or reused pid, a free lock with the
 process present, `supervisor.json` and `status.json` naming different
-runners). Nothing is signalled or reaped on `unknown`. The follower uses
+runners). With no `supervisor.json` yet, a free lock reads `unknown` while
+the lock file is younger than `LOCK_CLAIM_GRACE_SECS` (3 s): `--start`
+creates the file before it locks it, and a reader in that gap must not
+call the run ended. Nothing is signalled or reaped on `unknown`. The follower uses
 that liveness for a detached run, and a free lock with no dispatch line
 ends it at once with exit 3 (`runner ended before dispatch`). A run with no
 supervisor files is read exactly as before.

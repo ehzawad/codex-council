@@ -671,8 +671,11 @@ def s7_tracked_stop(runner, fake_bin):
 
 # Runs --start from a shell leading its own session, records that --start
 # returned, then keeps the shell (and so its process group) alive.
-_WRAPPER = ('"$0" "$1" --start "$2" > "$3" 2>&1; echo "$?" > "$4"; '
-            'exec sleep 60')
+# After --start returns, the wrapper ignores HUP and TERM (set only then, so
+# --start and its supervisor inherit ordinary dispositions), so that all
+# three signals S8 sends reach a live wrapper group; only SIGKILL ends it.
+_WRAPPER = ('"$0" "$1" --start "$2" > "$3" 2>&1; rc=$?; trap \'\' HUP TERM; '
+            'echo "$rc" > "$4"; exec sleep 60')
 
 
 def _detached_done(c, timeout, run_dir=None):
@@ -707,11 +710,20 @@ def s8_parent_death(runner, fake_bin):
                 start_code = int(f.read().strip() or -1)
             record = c.supervisor() or {}
             active = c.wait_status(_role_active("steady"), 15) is not None
+            # Each signal must reach the wrapper's live group: a failed
+            # killpg, or a wrapper that died before SIGKILL, fails S8.
+            delivered = []
             for sig in (signal.SIGHUP, signal.SIGTERM, signal.SIGKILL):
-                with contextlib.suppress(OSError):
+                try:
                     os.killpg(wrapper.pid, sig)
+                except OSError:
+                    delivered.append(False)
+                    continue
                 time.sleep(0.2)
+                delivered.append(sig == signal.SIGKILL
+                                 or wrapper.poll() is None)
             wrapper.wait(10)
+            delivered.append(wrapper.returncode == -signal.SIGKILL)
             status, err, out = _detached_done(c, 60)
         finally:
             with contextlib.suppress(OSError):
@@ -720,10 +732,12 @@ def s8_parent_death(runner, fake_bin):
         runner_pid = (status.get("runner") or {}).get("pid")
         other_session = (record.get("sid") is not None
                          and record.get("sid") != wrapper.pid)
-        passed = (start_code == 0 and active and _completed(status, err, out)
+        passed = (start_code == 0 and active and all(delivered)
+                  and _completed(status, err, out)
                   and other_session and runner_pid == record.get("pid"))
         detail = (f"--start exit={start_code}; wrapper group killed while the "
-                  f"role ran={active}; completed="
+                  f"role ran={active}; HUP, TERM, KILL each reached the live "
+                  f"group and KILL ended it={all(delivered)}; completed="
                   f"{_completed(status, err, out)}; supervisor sid="
                   f"{record.get('sid')} vs wrapper sid={wrapper.pid}; same "
                   f"runner={runner_pid == record.get('pid')}")
