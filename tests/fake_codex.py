@@ -52,8 +52,10 @@ Subcommands:
   a sleeper in its process group that holds stdout/stderr open after the
   fake exits, and ``PLEASE_EMIT_MALFORMED_LINES`` writes MALFORMED_LINES
   to stdout after thread.started, one stderr line after each (combined
-  with a sleep, the malformed lines come first). Each exec writes
-  ``exec-<pid>.pid`` (and a holder ``holder-<pid>.pid``) into
+  with a sleep, the malformed lines come first). ``PLEASE_SPAWN_TOOL_SESSION``
+  starts a sleeper in its own session, as codex starts a tool command,
+  before any sleep. Each exec writes ``exec-<pid>.pid`` (and a holder
+  ``holder-<pid>.pid``, a tool session ``tool-<pid>.pid``) into
   FAKE_CODEX_PID_DIR.
 
 Scenario format (every key optional)::
@@ -416,6 +418,13 @@ def run_exec(argv, scenario):
             sys.stderr.write("fake codex: still working\n")
             sys.stderr.flush()
             time.sleep(0.2)
+    if SENTINELS["tool_session"] in prompt:
+        # A tool command in its own session, like codex starts one.
+        tool = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(120)"],
+            start_new_session=True, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        _record(f"tool-{tool.pid}.pid", str(tool.pid))
     silent = re.search(re.escape(SENTINELS["sleep_secs"]) + r"(\d+)", prompt)
     if silent:
         _emit(events)
@@ -497,6 +506,7 @@ EXEC_SENTINELS = {
     "quota_429": "PLEASE_QUOTA_429",
     "sleep_secs": "PLEASE_SLEEP_SECS=",
     "leak_output_holder": "PLEASE_LEAK_OUTPUT_HOLDER",
+    "tool_session": "PLEASE_SPAWN_TOOL_SESSION",
     "malformed_lines": "PLEASE_EMIT_MALFORMED_LINES",
     "fail": "PLEASE_FAIL",
     "hang": "PLEASE_HANG_SILENTLY",
