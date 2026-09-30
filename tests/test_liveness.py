@@ -112,7 +112,12 @@ def _make_lock(run_dir, fresh=False):
     grace, like the lock of a run that started a while ago."""
     path = _lock_path(run_dir)
     if not os.path.exists(path):
-        os.close(os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600))
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            # A random token, as --start writes one.
+            os.write(fd, os.urandom(16).hex().encode("ascii"))
+        finally:
+            os.close(fd)
         if not fresh:
             old = time.time() - 60
             os.utime(path, (old, old))
@@ -142,10 +147,13 @@ def _lock_holder(test, run_dir, ignore_sigterm=False):
 
 def _supervisor(run_dir, pid, identity, pgid=None):
     """Write RUNDIR/supervisor.json naming (pid, identity) and the lock."""
-    st = os.stat(_make_lock(run_dir))
+    path = _make_lock(run_dir)
+    st = os.stat(path)
+    with open(path, "rb") as f:
+        token = f.read().decode("ascii")
     record = {"schema": 1, "pid": pid, "start_identity": identity,
               "pgid": pid if pgid is None else pgid, "sid": pid,
-              "lock": {"dev": st.st_dev, "ino": st.st_ino},
+              "lock": {"dev": st.st_dev, "ino": st.st_ino, "token": token},
               "version": "9.9.9", "epoch": codex_council.SKILL_CONTRACT_EPOCH,
               "started_at": "2026-09-30T00:00:00Z"}
     council_common._atomic_write_private(
@@ -327,6 +335,35 @@ class LockStateTests(unittest.TestCase):
         os.replace(replacement, _lock_path(self.run_dir))
         self.assertEqual(state(self.run_dir, record), "unknown")
         self.assertEqual(state(self.run_dir), "free")
+
+    def test_a_reused_inode_with_another_token_is_unknown(self):
+        # Linux often gives a file created after a delete the old inode
+        # number, so device and inode alone cannot tell a replaced lock
+        # apart; the recorded token can.
+        state = council_liveness.lock_state
+        _supervisor(self.run_dir, *_own_runner())
+        path = os.path.join(self.run_dir, council_common.SUPERVISOR_FILENAME)
+        with open(path, encoding="utf-8") as f:
+            record = json.load(f)
+        record["lock"]["token"] = "0" * 32
+        council_common._atomic_write_private(path, json.dumps(record).encode())
+        view = council_liveness.read_supervisor(path)
+        self.assertEqual((view.lock_dev, view.lock_ino),
+                         (os.stat(_lock_path(self.run_dir)).st_dev,
+                          os.stat(_lock_path(self.run_dir)).st_ino))
+        self.assertEqual(state(self.run_dir, view), "unknown")
+
+    def test_a_record_without_a_token_checks_device_and_inode_only(self):
+        state = council_liveness.lock_state
+        _supervisor(self.run_dir, *_own_runner())
+        path = os.path.join(self.run_dir, council_common.SUPERVISOR_FILENAME)
+        with open(path, encoding="utf-8") as f:
+            record = json.load(f)
+        del record["lock"]["token"]
+        council_common._atomic_write_private(path, json.dumps(record).encode())
+        view = council_liveness.read_supervisor(path)
+        self.assertIsNone(view.lock_token)
+        self.assertEqual(state(self.run_dir, view), "free")
 
     def test_reading_never_creates_or_changes_the_lock(self):
         council_liveness.lock_state(self.run_dir)

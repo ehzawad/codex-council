@@ -525,20 +525,44 @@ class SupervisorView:
     sid: int | None
     lock_dev: int | None
     lock_ino: int | None
+    lock_token: str | None
     version: str | None
     epoch: int | None
     started_at: str | None
 
 
-def supervisor_record(pid, lock_stat, version, epoch, started_at):
+LOCK_TOKEN_MAX_BYTES = 64
+
+
+def read_lock_token(fd):
+    """The token --start wrote into supervisor.lock (read at offset 0 without
+    moving the descriptor), or None when there is none or it is unreadable."""
+    try:
+        raw = os.pread(fd, LOCK_TOKEN_MAX_BYTES + 1, 0)
+    except OSError:
+        return None
+    if not raw or len(raw) > LOCK_TOKEN_MAX_BYTES:
+        return None
+    try:
+        token = raw.decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    return token if re.fullmatch(r"[0-9a-f]{16,64}", token) else None
+
+
+def supervisor_record(pid, lock_stat, version, epoch, started_at,
+                      lock_token=None):
     """The supervisor.json object a detached runner writes about itself."""
+    lock = {"dev": lock_stat.st_dev, "ino": lock_stat.st_ino}
+    if lock_token is not None:
+        lock["token"] = lock_token
     return {
         "schema": SUPERVISOR_SCHEMA,
         "pid": pid,
         "start_identity": process_start_identity(pid),
         "pgid": os.getpgid(0),
         "sid": os.getsid(0),
-        "lock": {"dev": lock_stat.st_dev, "ino": lock_stat.st_ino},
+        "lock": lock,
         "version": version,
         "epoch": epoch,
         "started_at": started_at,
@@ -573,6 +597,7 @@ def read_supervisor(path):
         sid=_int(data.get("sid"), 2),
         lock_dev=_int(lock.get("dev"), 0),
         lock_ino=_int(lock.get("ino"), 0),
+        lock_token=_text(lock.get("token")),
         version=_text(data.get("version")),
         epoch=_int(data.get("epoch"), 0),
         started_at=_text(data.get("started_at")),
@@ -584,7 +609,9 @@ def lock_state(run_dir, supervisor=None):
 
     Opens read-only without following a symlink or creating anything,
     requires a private regular file (and, when `supervisor` records one,
-    the same device and inode: a replaced lock file is unknown), then tries
+    the same device and inode, plus the same token when one was recorded:
+    a replaced lock file is unknown even if it reuses the old inode
+    number), then tries
     a shared lock without blocking: refused means the runner holds it. The
     shared lock, if taken, is released at once by the close.
     """
@@ -602,7 +629,9 @@ def lock_state(run_dir, supervisor=None):
             return "unknown"
         if supervisor is not None and (
                 supervisor.lock_dev != st.st_dev
-                or supervisor.lock_ino != st.st_ino):
+                or supervisor.lock_ino != st.st_ino
+                or (supervisor.lock_token is not None
+                    and read_lock_token(fd) != supervisor.lock_token)):
             return "unknown"
         try:
             fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
@@ -627,7 +656,7 @@ def is_detached(run_dir, view=None):
 
 def _lock_just_created(run_dir):
     """True while supervisor.lock is younger than LOCK_CLAIM_GRACE_SECS
-    (by its mtime: nothing ever writes to the file)."""
+    (by its mtime: the file is written once, as it is created)."""
     try:
         st = os.lstat(os.path.join(run_dir, SUPERVISOR_LOCK_FILENAME))
     except OSError:

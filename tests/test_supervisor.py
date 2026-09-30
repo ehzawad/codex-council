@@ -157,9 +157,14 @@ class StartCommandTests(StartCase):
                 self.assertTrue(stat.S_ISREG(st.st_mode))
                 self.assertEqual(stat.S_IMODE(st.st_mode), 0o600)
         record = self.record()
-        lock = os.stat(os.path.join(self.run_dir, "supervisor.lock"))
+        lock_path = os.path.join(self.run_dir, "supervisor.lock")
+        lock = os.stat(lock_path)
+        with open(lock_path, "rb") as f:
+            token = f.read().decode("ascii")
+        self.assertRegex(token, r"^[0-9a-f]{32}$")
         self.assertEqual(record["lock"], {"dev": lock.st_dev,
-                                          "ino": lock.st_ino})
+                                          "ino": lock.st_ino,
+                                          "token": token})
         self.assertEqual(record["epoch"], codex_council.SKILL_CONTRACT_EPOCH)
         self.assertEqual(record["pgid"], record["pid"])
         self.assertEqual(record["sid"], record["pid"])

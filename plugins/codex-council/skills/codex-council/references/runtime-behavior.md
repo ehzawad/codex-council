@@ -157,7 +157,8 @@ What it does, in order:
    exits 2 before anything is created, so the directory stays untouched.
 2. It claims the directory, each file created exclusively, without
    following a symlink, with mode 0600: `supervisor.lock`, which it locks
-   with `flock`, then `err.log` and `out.md`. If `supervisor.lock` already
+   with `flock` and writes a random token into, then `err.log` and
+   `out.md`. If `supervisor.lock` already
    exists (a concurrent `--start`, or a planted or symlinked lock file), it
    exits 2 with the launched-directory recovery, having created and
    truncated nothing. If `err.log` or `out.md` appeared after the
@@ -176,7 +177,7 @@ What it does, in order:
    lock, marks the descriptor so no codex worker inherits it, keeps it open
    for its whole life, and writes `supervisor.json` (mode 0600, atomically)
    before any discovery or dispatch: its pid, start identity, process group
-   and session, the lock's device and inode, the plugin version, the
+   and session, the lock's device, inode and token, the plugin version, the
    contract epoch, and the start time. Its `status.json` records
    `runner.mode` `detached`. From there it is the ordinary runner: the
    report goes to `out.md`, progress and the sentinel to `err.log`.
@@ -211,8 +212,9 @@ the process ends, SIGKILL included. The lock file is never removed or
 replaced, and a free lock means "no holder", never "reusable": the
 directory stays used. Readers open it read-only, without following a
 symlink or creating anything, require a private regular file with the
-device and inode `supervisor.json` records (a replaced file reads
-`unknown`), and try a shared lock without blocking. From the lock and the
+device, inode and token `supervisor.json` records (a replaced file reads
+`unknown`, even when it reuses the old inode number, as Linux often does),
+and try a shared lock without blocking. From the lock and the
 recorded identity, a detached runner is:
 
 - alive while the lock is held and the recorded pid still has its recorded

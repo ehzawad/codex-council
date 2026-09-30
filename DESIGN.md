@@ -622,7 +622,7 @@ lock file (same device and inode), that it holds the lock, and that no
 `supervisor.json` exists; it then makes the descriptor non-inheritable, so
 no codex worker ever holds the lock, keeps it open for its whole life, and
 writes `supervisor.json` (pid, start identity, process group and session,
-the lock's device and inode, version, epoch, start time) before discovery
+the lock's device, inode and token, version, epoch, start time) before discovery
 or dispatch. `--start` waits up to `START_WAIT_SECS = 10` seconds for that
 record. It polls the child before reading the record, so a supervisor that
 wrote it and already ended (a quick council, a slow launcher) is still a
@@ -1119,9 +1119,14 @@ file appears. The follower also exits 5 when its own parent disappears.
 
 A detached run adds its supervisor lock to that evidence. `lock_state`
 opens `supervisor.lock` read-only, without following a symlink or creating
-anything, requires a private regular file with the device and inode
-`supervisor.json` records, and tries a shared lock without blocking:
-`absent`, `held`, `free`, or `unknown` (a replaced inode reads `unknown`).
+anything, requires a private regular file with the device, inode and
+token `supervisor.json` records, and tries a shared lock without blocking:
+`absent`, `held`, `free`, or `unknown` (a replaced lock file reads
+`unknown`). The token is 32 random hex characters `--start` writes into the
+lock file as it claims it. It catches a replacement that reuses the old
+inode number, which Linux filesystems commonly do for a file created right
+after a delete; a record without one (none is written by older versions)
+is checked by device and inode alone.
 `supervisor_state` combines it with the recorded identity: `alive` while
 the lock is held and the recorded pid has its recorded start time, `gone`
 only when the lock is free and that identity is gone, and `unknown` on any

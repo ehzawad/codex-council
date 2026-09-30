@@ -142,6 +142,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 import signal
@@ -213,6 +214,7 @@ from council_liveness import (  # noqa: E402
     cancel_command,
     descendant_targets,
     follow,
+    read_lock_token,
     read_supervisor,
     reap_command,
     signal_targets,
@@ -2564,6 +2566,13 @@ def _start_command(run_dir):
             if time.monotonic() >= lock_deadline:
                 refuse(SUPERVISOR_LOCK_FILENAME, e)
             time.sleep(0.01)
+    # The lock's only content: a random token the supervisor records, so a
+    # replaced lock file is recognised even where the filesystem hands the
+    # new file the old inode number (common on Linux).
+    try:
+        os.write(lock_fd, secrets.token_hex(16).encode("ascii"))
+    except OSError as e:
+        refuse(SUPERVISOR_LOCK_FILENAME, e)
     for name, mode in (("err.log", os.O_WRONLY | os.O_APPEND),
                        ("out.md", os.O_WRONLY)):
         try:
@@ -2676,7 +2685,8 @@ def _become_supervisor(run_dir, lock_fd):
     os.set_inheritable(lock_fd, False)
     _SUPERVISOR["lock_fd"] = lock_fd
     record = supervisor_record(os.getpid(), held, _plugin_version(),
-                               SKILL_CONTRACT_EPOCH, _utc_iso(time.time()))
+                               SKILL_CONTRACT_EPOCH, _utc_iso(time.time()),
+                               lock_token=read_lock_token(lock_fd))
     try:
         _atomic_write_private(sup_path, json.dumps(record).encode("utf-8"))
     except OSError as e:

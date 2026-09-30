@@ -5396,7 +5396,8 @@ class DocsContractTests(unittest.TestCase):
         now = 1_000_000.0
         sup = council_liveness.SupervisorView(
             pid=4242, identity="id", pgid=4242, sid=4242, lock_dev=1,
-            lock_ino=2, version="9.8.7", epoch=4, started_at="t")
+            lock_ino=2, lock_token=None, version="9.8.7", epoch=4,
+            started_at="t")
 
         def view(state="running", tick=5.0, roles=None):
             return council_liveness.RunView(
