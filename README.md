@@ -372,7 +372,7 @@ startup hook fails open; the skill's launch and context recipes fail closed.
 Two guards catch a stale pairing. Every discovery summary, preflight,
 dispatch, heartbeat, and `CODEX_COUNCIL_DONE` line carries
 `version=<plugin version>`, which shows which plugin actually ran. And
-SKILL.md's commands pass `--skill-contract 3`: when the script's contract
+SKILL.md's commands pass `--skill-contract 4`: when the script's contract
 epoch differs, the command is refused as a stale SKILL/script pair. In a
 checkout, re-run `scripts/dev-link.sh` and restart the session; never change
 the epoch to get past it.

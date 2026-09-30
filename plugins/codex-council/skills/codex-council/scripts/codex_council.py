@@ -66,17 +66,28 @@ RUNDIR/err.log and reports a runner that is gone or stopped ticking;
 `--status RUNDIR` prints a short snapshot and `--reap RUNDIR` ends the codex
 process groups of a runner that is gone (see council_liveness.py).
 
-One launch per RUNDIR: `--discover` and `--check-staging-dir` refuse a
-directory that already holds out.md, err.log, or replies/, because the
-launch command's own redirections would truncate a running council's files
-before this script could object.
+Detached launch: `--start RUNDIR` validates the staged directory exactly as
+`--check-staging-dir` does, claims it atomically (RUNDIR/supervisor.lock,
+err.log, and out.md, each created exclusively and 0600), and starts the
+unchanged staged launch as a supervisor in its own session, with stdout on
+out.md and stderr on err.log. That supervisor holds the lock for its whole
+life and writes RUNDIR/supervisor.json about itself before any other work;
+`--start` returns once it has, so the council runs outside any host
+background task. `--cancel RUNDIR` stops a verified supervisor.
+
+One launch per RUNDIR: `--discover`, `--check-staging-dir`, and `--start`
+refuse a directory that already holds out.md, err.log, replies/, or a
+supervisor file, because a tracked launch command's own redirections would
+truncate a running council's files before this script could object.
 
 Usage:
     python3 codex_council.py --discover RUNDIR
     python3 codex_council.py --check-staging-dir RUNDIR
+    python3 codex_council.py --start RUNDIR
     python3 codex_council.py --roles-file roles.json --context-file context.md
     python3 codex_council.py --follow RUNDIR [--verbose]
     python3 codex_council.py --status RUNDIR
+    python3 codex_council.py --cancel RUNDIR
     python3 codex_council.py --reap RUNDIR
 
 Env vars:
@@ -131,8 +142,11 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
+import stat
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -150,6 +164,7 @@ _DONT_WRITE_BYTECODE = sys.dont_write_bytecode
 sys.dont_write_bytecode = True
 from council_common import (  # noqa: E402
     _READ_CHUNK_BYTES,
+    LAUNCHED_DIR_RECOVERY,
     LINEBREAK_CHARS,
     REPLIES_SUBDIR,
     REPLY_MARKER,
@@ -157,6 +172,8 @@ from council_common import (  # noqa: E402
     STAGED_LAUNCH_RESTART,
     STAGED_LAUNCH_ROLES_RECOVERY,
     STAGING_DIR_RECOVERY,
+    SUPERVISOR_FILENAME,
+    SUPERVISOR_LOCK_FILENAME,
     _atomic_write_private,
     _check_private_dir,
     _dedupe_preserve_order,
@@ -193,11 +210,14 @@ from council_liveness import (  # noqa: E402
     TICK_GIVE_UP_SECS,
     TICK_WARN_SECS,
     RunStatus,
+    cancel_command,
     descendant_targets,
     follow,
+    read_supervisor,
     reap_command,
     signal_targets,
     status_command,
+    supervisor_record,
 )
 from council_selection import (  # noqa: E402
     MODEL_SELECTION_CAVEAT,
@@ -263,16 +283,23 @@ DEFAULT_MAX_PARALLEL = 6
 MAX_PARALLEL_ENV = "CODEX_COUNCIL_MAX_PARALLEL"
 STALL_SECS_ENV = "CODEX_COUNCIL_STALL_SECS"
 DEFAULT_STALL_SECS = 1800
-PROGRESS_HEARTBEAT_SECS = 30 * 60
-# Heartbeat cadence floor while the watchdog is enabled; the cadence adapts to
-# min(PROGRESS_HEARTBEAT_SECS, stall_secs // 3), so a watchdog of at least
-# 3 * HEARTBEAT_FLOOR_SECS gets two heartbeats reporting a rising quiet value
-# before it fires (a shorter one may get fewer).
-HEARTBEAT_FLOOR_SECS = 300
+# The err.log heartbeat's cadence, whatever CODEX_COUNCIL_STALL_SECS is
+# (enabled, disabled with 0, or very large): a long council shows progress
+# at least every five minutes. The heartbeat is advisory; it never resets a
+# role's watchdog. At the default watchdog (1800s) a silent role gets five
+# heartbeats with a rising quiet value before the watchdog fires.
+PROGRESS_HEARTBEAT_SECS = 300
 # Contract epoch for the optional --skill-contract handshake. Bump only when
 # SKILL.md's launch/preflight command contract changes incompatibly (3: the
-# `selection` object and --discover).
-SKILL_CONTRACT_EPOCH = 3
+# `selection` object and --discover; 4: the detached --start launch with
+# --cancel, and the completion rule that a detached run has ended only once
+# its supervisor lock is free and its runner identity is gone).
+SKILL_CONTRACT_EPOCH = 4
+# --start waits at most this long for its supervisor to write
+# supervisor.json (or exit early). It bounds the start command only, never
+# a running council.
+START_WAIT_SECS = 10
+START_POLL_SECS = 0.05
 REQUIRED_SCOPE_PHRASE = "nothing material"
 REQUIRED_CADENCE_SENTENCE = "Thoroughness beats speed."
 # Count-neutral on purpose: a council may have exactly one role. Verifier
@@ -398,12 +425,13 @@ def _watchdog_desc(stall_secs):
 
 
 def _heartbeat_secs(stall_secs):
-    """Adaptive heartbeat cadence: denser while the watchdog is armed."""
-    if stall_secs <= 0:
-        return PROGRESS_HEARTBEAT_SECS
-    return max(
-        HEARTBEAT_FLOOR_SECS, min(PROGRESS_HEARTBEAT_SECS, stall_secs // 3)
-    )
+    """Heartbeat cadence: PROGRESS_HEARTBEAT_SECS for every watchdog value.
+
+    Independent of CODEX_COUNCIL_STALL_SECS on purpose: a disabled or very
+    long watchdog must not make a long council's err.log go quiet.
+    """
+    del stall_secs
+    return PROGRESS_HEARTBEAT_SECS
 
 
 # The run's live state: role transitions from the scheduler and retry loop,
@@ -412,6 +440,10 @@ def _heartbeat_secs(stall_secs):
 # Module-level because run_council and the pumps are far apart; same-role
 # concurrency is already excluded by the continuity lock.
 _RUN = RunStatus()
+# A detached runner's supervisor.lock descriptor (see _become_supervisor):
+# held open, and so locked, for the runner's whole life, and never
+# inherited by a codex worker.
+_SUPERVISOR = {"lock_fd": None}
 
 
 # \Z, not $: in Python `$` also matches just before a trailing "\n", so
@@ -1704,7 +1736,7 @@ def _parse_args(argv):
             "CODEX_COUNCIL_MODEL_ROUTING=off disables automatic selection. "
             "A model Codex rejects fails the role as [model-rejected] and a "
             "usage or credit limit as [quota]; neither is retried. SKILL "
-            "contract epoch 3.\n\n"
+            f"contract epoch {SKILL_CONTRACT_EPOCH}.\n\n"
             "Direct CLI use: every on-disk input's parent directory must be "
             "private (0700, user-owned, non-symlink) at launch as well as "
             "preflight, e.g. one created by `mktemp -d`, and --discover and "
@@ -1715,7 +1747,9 @@ def _parse_args(argv):
             f"<RUNDIR>/{STATUS_FILENAME}; --follow RUNDIR relays the "
             "council's actionable err.log progress, --status RUNDIR prints "
             "a snapshot, and --reap RUNDIR ends the codex process groups of "
-            "a runner that is gone."
+            "a runner that is gone. --start RUNDIR launches the staged "
+            "council detached (outside any host background task), and "
+            "--cancel RUNDIR stops it."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1794,6 +1828,40 @@ def _parse_args(argv):
         ),
     )
     parser.add_argument(
+        "--start", default=None, metavar="RUNDIR",
+        help=(
+            "Detached launch of the staged council in RUNDIR (roles.json and "
+            "context.md): validate it exactly as --check-staging-dir does "
+            "(a refusal exits 2 and leaves RUNDIR untouched), claim it "
+            f"atomically ({SUPERVISOR_LOCK_FILENAME}, err.log, and out.md, "
+            "each created exclusively and 0600; a directory that already "
+            "launched exits 2), and start the council as a supervisor in "
+            "its own session that holds the lock for its whole life and "
+            f"writes {SUPERVISOR_FILENAME}. Exits 0 with one 'started' line "
+            "and the --follow, --status, and --cancel commands once the "
+            "supervisor is running, or 1 when it exited at once (read "
+            "err.log; the directory is used up). Run it as an ordinary "
+            "foreground command, never in a background task and never "
+            "with &, nohup, or setsid. Never retry it in the same RUNDIR."
+        ),
+    )
+    parser.add_argument(
+        "--cancel", default=None, metavar="RUNDIR",
+        help=(
+            "Stop a council launched with --start: only while its "
+            f"supervisor lock is held and {SUPERVISOR_FILENAME} (and "
+            f"{STATUS_FILENAME}) name the same live runner, SIGTERM that "
+            "runner, which tears down its codex process groups; after a "
+            "grace, SIGKILL it if it is still the same process (then run "
+            "--reap). Exits 0 once the runner has ended, 1 when refused "
+            "(nothing is signalled) or when it did not end."
+        ),
+    )
+    parser.add_argument(
+        "--supervisor-lock-fd", default=None, type=int,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--reap", default=None, metavar="RUNDIR",
         help=(
             f"Only when RUNDIR/{STATUS_FILENAME} shows the runner is "
@@ -1852,8 +1920,10 @@ def _parse_args(argv):
     )
     commands = (
         ("--discover", args.discover),
+        ("--start", args.start),
         ("--follow", args.follow),
         ("--status", args.status),
+        ("--cancel", args.cancel),
         ("--reap", args.reap),
     )
     for name, value in commands:
@@ -1866,6 +1936,11 @@ def _parse_args(argv):
                 parser.error(f"{name} cannot be combined with {flag}")
     if args.verbose and args.follow is None:
         parser.error("--verbose requires --follow")
+    # The supervised child of --start only: never a public launch route.
+    if args.supervisor_lock_fd is not None and (
+            args.roles_file is None or args.context_file is None
+            or args.supervisor_lock_fd < 3):
+        parser.error("unrecognized arguments: --supervisor-lock-fd")
     if (
         args.skill_contract is not None
         and args.skill_contract != SKILL_CONTRACT_EPOCH
@@ -2239,26 +2314,26 @@ def _usage_exit_unless_parent_private(arg_name, path, recovery):
     _check_private_dir(parent, prefix=f"{arg_name}: ", recovery=recovery)
 
 
-def _check_staging_dir(path):
-    """Validate the per-run staging dir before launching Codex.
+def _validate_staging_dir(path, prefix="--check-staging-dir: ",
+                          next_step="re-run --check-staging-dir and launch."):
+    """Every check the launch makes before dispatch; (path, roles, max
+    parallel) or a usage exit (2) that leaves the directory untouched.
 
-    A directory that already holds a launch (out.md, err.log, or replies/)
-    is refused first: the launch command's redirections would truncate a
-    running council's files before the runner could object. Every check
-    the launch makes before dispatch runs here too, so a
-    directory, roles file, context, missing codex binary, or environment
-    override (CODEX_COUNCIL_MAX_PARALLEL, CODEX_COUNCIL_STALL_SECS,
-    CODEX_COUNCIL_MODEL_ROUTING) the launch would refuse never reports
-    "staging OK". Prints the staging-OK line, then one selection-plan line
-    per role. No discovery runs here: automatic selections are validated
-    against this run's planning snapshot (DIR/model-snapshot.json) through
-    the orchestration the launch uses (_resolve_run_selections), and are
-    revalidated by a fresh discovery at launch.
+    A directory that already holds a launch (out.md, err.log, replies/, or
+    a supervisor file) is refused first: a tracked launch command's
+    redirections would truncate a running council's files before the
+    runner could object. A directory, roles file, context, missing codex
+    binary, or environment override (CODEX_COUNCIL_MAX_PARALLEL,
+    CODEX_COUNCIL_STALL_SECS, CODEX_COUNCIL_MODEL_ROUTING) the launch would
+    refuse is refused here too. No discovery runs: automatic selections are
+    validated against this run's planning snapshot (DIR/model-snapshot.json)
+    through the orchestration the launch uses (_resolve_run_selections),
+    and are revalidated by a fresh discovery at launch. `prefix` names the
+    command (the pre-flight or --start) and `next_step` follows a missing
+    codex's PATH fix. Returns the roles with their plan decisions.
     """
-    if path == "":
-        _usage_exit("--check-staging-dir must be non-empty.")
-    path = _check_private_dir(path)
-    _usage_exit_if_launched(path, "--check-staging-dir: ")
+    path = _check_private_dir(path, prefix=prefix)
+    _usage_exit_if_launched(path, prefix)
     roles_path = os.path.join(path, "roles.json")
     context_path = os.path.join(path, "context.md")
     _usage_exit_if_file_arg_problems(
@@ -2270,13 +2345,26 @@ def _check_staging_dir(path):
     # The codex binary is the one hard external dependency; a preflight
     # that says "staging OK" while codex is missing defers the failure to
     # a background launch whose error lands only in err.log.
-    _usage_exit_if_codex_missing("--check-staging-dir: ")
+    _usage_exit_if_codex_missing(prefix, next_step)
     max_parallel = _max_parallel_roles()
     _stall_secs()  # the launch refuses an invalid watchdog override (exit 2)
     routing_mode = _model_routing_mode()
     roles, _ = _resolve_run_selections(
         roles, path, routing_mode, at_launch=False
     )
+    return path, roles, max_parallel
+
+
+def _check_staging_dir(path):
+    """Validate the per-run staging dir before launching Codex.
+
+    Runs _validate_staging_dir, so a directory the launch would refuse
+    never reports "staging OK", then prints the staging-OK line and one
+    selection-plan line per role.
+    """
+    if path == "":
+        _usage_exit("--check-staging-dir must be non-empty.")
+    path, roles, max_parallel = _validate_staging_dir(path)
     print(
         f"[codex-council] staging OK: {os.path.abspath(path)} "
         f"({len(roles)} roles; max parallel {max_parallel}) "
@@ -2334,14 +2422,33 @@ def _termination_raises():
             signal.signal(signum, handler)
 
 
+TERMINATION_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+
+def _ignore_termination_signals():
+    """After the first termination signal has been handled: ignore later
+    ones, so a repeated signal cannot cut the exit path short or change
+    the exit code the first one set."""
+    for signum in TERMINATION_SIGNALS:
+        with contextlib.suppress(OSError, RuntimeError, ValueError):
+            signal.signal(signum, signal.SIG_IGN)
+
+
 def _exit_interrupted(signum, line):
     """Write the one-line interruption notice and exit 128 + signum."""
+    _ignore_termination_signals()
     _diag(f"{line} {signal.Signals(signum).name}")
     sys.exit(128 + int(signum))
 
 
 async def _run_council_with_signals(roles, body, max_parallel, replies_dir=None):
-    """Run the council and translate POSIX termination signals into cleanup."""
+    """Run the council and translate POSIX termination signals into cleanup.
+
+    The first SIGINT, SIGTERM, or SIGHUP is latched: it cancels the council
+    once and decides the exit code (128 + that signal). A repeated signal
+    is ignored, so it can neither cancel the cleanup the first one started
+    (process-group teardown, reply files) nor change the exit code.
+    """
     loop = asyncio.get_running_loop()
     council_task = asyncio.create_task(
         run_council(
@@ -2352,11 +2459,12 @@ async def _run_council_with_signals(roles, body, max_parallel, replies_dir=None)
     registered = []
 
     def _cancel_for_signal(signum):
-        if interrupted["signum"] is None:
-            interrupted["signum"] = signum
+        if interrupted["signum"] is not None:
+            return
+        interrupted["signum"] = signum
         council_task.cancel()
 
-    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    for signum in TERMINATION_SIGNALS:
         try:
             loop.add_signal_handler(signum, _cancel_for_signal, signum)
             registered.append(signum)
@@ -2371,6 +2479,180 @@ async def _run_council_with_signals(roles, body, max_parallel, replies_dir=None)
         for signum in registered:
             with contextlib.suppress(RuntimeError, ValueError):
                 loop.remove_signal_handler(signum)
+        if interrupted["signum"] is not None:
+            # Removing a handler restores the default action; after the
+            # latch a late signal must not kill the exit path instead.
+            _ignore_termination_signals()
+
+
+# ---------- detached launch: --start and its supervised child ----------
+
+def _start_command(run_dir):
+    """--start RUNDIR: launch the staged council detached; exit 0, 1, or 2.
+
+    1. Validate exactly as the pre-flight does; a refusal exits 2 before
+       anything is created, so the directory stays untouched.
+    2. Claim the directory, in this order and each exclusively (O_EXCL,
+       O_NOFOLLOW, 0600): supervisor.lock, locked with flock(LOCK_EX), then
+       err.log and out.md. A concurrent --start (or a tracked launch) that
+       got there first makes this one exit 2 having created and truncated
+       nothing. The lock file is never removed or replaced.
+    3. Start this script's staged launch as the supervisor, in its own
+       session, with stdout on out.md, stderr on err.log, stdin on
+       /dev/null, the same cwd and environment, and the locked descriptor
+       as its only extra one (--supervisor-lock-fd). The context stays in
+       its file; the command line carries only paths.
+    4. Close this process's copies (the lock stays held by the child) and
+       wait up to START_WAIT_SECS for the child to write supervisor.json,
+       or to exit early (exit 1: read err.log; the directory is used up).
+    """
+    prefix = "--start: "
+    path, _, _ = _validate_staging_dir(run_dir, prefix, "re-run --start.")
+    abs_dir = os.path.abspath(path)
+    claimed = []
+    flags = os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+
+    def refuse(name, e):
+        for fd in claimed:
+            os.close(fd)
+        if isinstance(e, FileExistsError):
+            why = f"{name} already exists"
+        else:
+            why = f"cannot create {name}: {e.strerror or e}"
+        _usage_exit(
+            f"{prefix}{abs_dir!r} already holds a council launch or cannot "
+            f"be claimed ({why}); nothing here was started, truncated, or "
+            f"replaced. {LAUNCHED_DIR_RECOVERY}"
+        )
+
+    try:
+        lock_fd = os.open(os.path.join(abs_dir, SUPERVISOR_LOCK_FILENAME),
+                          os.O_RDWR | flags, 0o600)
+    except OSError as e:
+        refuse(SUPERVISOR_LOCK_FILENAME, e)
+    claimed.append(lock_fd)
+    # A reader's momentary shared lock (--status, --follow) may be in the
+    # way for an instant; nobody else can hold a file this call created.
+    lock_deadline = time.monotonic() + 1
+    while True:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError as e:
+            if time.monotonic() >= lock_deadline:
+                refuse(SUPERVISOR_LOCK_FILENAME, e)
+            time.sleep(0.01)
+    for name, mode in (("err.log", os.O_WRONLY | os.O_APPEND),
+                       ("out.md", os.O_WRONLY)):
+        try:
+            claimed.append(os.open(os.path.join(abs_dir, name),
+                                   mode | flags, 0o600))
+        except OSError as e:
+            refuse(name, e)
+    _, err_fd, out_fd = claimed
+    argv = [
+        sys.executable, os.path.realpath(__file__),
+        "--roles-file", os.path.join(abs_dir, "roles.json"),
+        "--context-file", os.path.join(abs_dir, "context.md"),
+        "--skill-contract", str(SKILL_CONTRACT_EPOCH),
+        "--supervisor-lock-fd", str(lock_fd),
+    ]
+    try:
+        proc = subprocess.Popen(
+            argv, stdin=subprocess.DEVNULL, stdout=out_fd, stderr=err_fd,
+            start_new_session=True, close_fds=True, pass_fds=(lock_fd,),
+        )
+    except OSError as e:
+        print(
+            f"[codex-council] start failed: cannot start the supervisor "
+            f"({_report_inline(e)}); {abs_dir!r} is used up. "
+            f"{LAUNCHED_DIR_RECOVERY}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    finally:
+        # Never LOCK_UN: the child shares this lock and keeps it.
+        for fd in claimed:
+            os.close(fd)
+    sup_path = os.path.join(abs_dir, SUPERVISOR_FILENAME)
+    deadline = time.monotonic() + START_WAIT_SECS
+    ready = False
+    while True:
+        code = proc.poll()
+        if code is not None:
+            print(
+                f"[codex-council] start failed: the supervisor (pid "
+                f"{proc.pid}) exited with status {code} before the council "
+                f"was running; read {_report_inline(abs_dir)}/err.log. Do "
+                "not retry --start in this directory: it is used up. "
+                f"{LAUNCHED_DIR_RECOVERY}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        record = read_supervisor(sup_path)
+        if record is not None and record.pid == proc.pid:
+            ready = True
+            break
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(START_POLL_SECS)
+    command = (f"{shlex.quote(sys.executable)} "
+               f"{shlex.quote(os.path.realpath(__file__))}")
+    quoted = shlex.quote(abs_dir)
+    contract = f"--skill-contract {SKILL_CONTRACT_EPOCH}"
+    print(f"[codex-council] started: pid={proc.pid} "
+          f"dir={_report_inline(abs_dir)} version={_plugin_version()}")
+    if not ready:
+        print(f"note: {SUPERVISOR_FILENAME} is not written yet; the "
+              "supervisor is still starting; run --status")
+    print(f"follow: {command} --follow {quoted} {contract}")
+    print(f"status: {command} --status {quoted} {contract}")
+    print(f"cancel: {command} --cancel {quoted} {contract}")
+
+
+def _become_supervisor(run_dir, lock_fd):
+    """The --start child's first step; exits 2 (or 1) before any work.
+
+    Verifies that the inherited descriptor is RUNDIR/supervisor.lock (same
+    device and inode, a private regular file), that this process holds its
+    lock, and that no supervisor.json exists yet; stops the descriptor
+    from reaching any codex worker and keeps it open for this runner's
+    life; then writes supervisor.json (0600, atomically) about itself.
+    """
+    lock_path = os.path.join(run_dir, SUPERVISOR_LOCK_FILENAME)
+    sup_path = os.path.join(run_dir, SUPERVISOR_FILENAME)
+    prefix = "--supervisor-lock-fd: "
+    try:
+        held = os.fstat(lock_fd)
+        on_disk = os.lstat(lock_path)
+    except OSError as e:
+        _usage_exit(f"{prefix}cannot verify {lock_path!r} "
+                    f"({e.strerror or e}); only --start runs this. "
+                    f"{LAUNCHED_DIR_RECOVERY}")
+    if (_private_stat_problem(on_disk, directory=False) is not None
+            or not stat.S_ISREG(held.st_mode)
+            or (held.st_dev, held.st_ino) != (on_disk.st_dev, on_disk.st_ino)):
+        _usage_exit(f"{prefix}the descriptor is not this run's private "
+                    f"{SUPERVISOR_LOCK_FILENAME}; only --start runs this. "
+                    f"{LAUNCHED_DIR_RECOVERY}")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        _usage_exit(f"{prefix}another process holds {lock_path!r}. "
+                    f"{LAUNCHED_DIR_RECOVERY}")
+    if os.path.lexists(sup_path):
+        _usage_exit(f"{prefix}{sup_path!r} already exists: this directory "
+                    f"already had a supervisor. {LAUNCHED_DIR_RECOVERY}")
+    os.set_inheritable(lock_fd, False)
+    _SUPERVISOR["lock_fd"] = lock_fd
+    record = supervisor_record(os.getpid(), held, _plugin_version(),
+                               SKILL_CONTRACT_EPOCH, _utc_iso(time.time()))
+    try:
+        _atomic_write_private(sup_path, json.dumps(record).encode("utf-8"))
+    except OSError as e:
+        _diag(f"[codex-council] {SUPERVISOR_FILENAME} not written "
+              f"({_log_inline(e)}); the supervisor stopped before any work")
+        sys.exit(1)
 
 
 def _force_utf8_streams():
@@ -2417,6 +2699,9 @@ def main():
                               "[codex-council] --discover interrupted by")
         return
 
+    if args.start is not None:
+        _start_command(args.start)
+        return
     if args.follow is not None:
         try:
             code = follow(args.follow, verbose=args.verbose)
@@ -2425,6 +2710,12 @@ def main():
         sys.exit(code)
     if args.status is not None:
         sys.exit(status_command(args.status))
+    if args.cancel is not None:
+        try:
+            code = cancel_command(args.cancel)
+        except KeyboardInterrupt:
+            code = 130
+        sys.exit(code)
     if args.reap is not None:
         sys.exit(reap_command(args.reap))
 
@@ -2453,6 +2744,11 @@ def main():
         )
     _usage_exit_if_staging_dirs_differ(args.roles_file, args.context_file,
                                       path_hint)
+    if args.supervisor_lock_fd is not None:
+        # The --start child: verify the claim and publish supervisor.json
+        # before reading any input, discovering, or dispatching.
+        _become_supervisor(os.path.dirname(os.path.abspath(args.context_file)),
+                           args.supervisor_lock_fd)
     _usage_exit_if_file_arg_problems(
         ("--roles-file", args.roles_file),
         ("--context-file", args.context_file),
@@ -2516,7 +2812,9 @@ def main():
     replies_dir = _prepare_replies_dir(run_dir)
     # From here on the run publishes status.json (a failed write only costs
     # the liveness view, never the council).
-    _RUN.attach(os.path.join(run_dir, STATUS_FILENAME))
+    _RUN.attach(os.path.join(run_dir, STATUS_FILENAME),
+                mode="detached" if _SUPERVISOR["lock_fd"] is not None
+                else None)
 
     _diag(
         f"[codex-council] dispatching {len(roles)} roles "

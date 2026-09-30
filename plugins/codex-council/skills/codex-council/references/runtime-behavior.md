@@ -386,7 +386,7 @@ The follower is designed for Claude Code's Monitor tool:
 
 ```
 python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
-  --follow 'ABS_RUNDIR' --skill-contract 3
+  --follow 'ABS_RUNDIR' --skill-contract 4
 ```
 
 It checks that `ABS_RUNDIR` is a private directory, waits for `err.log` to
@@ -439,7 +439,7 @@ For a spot check at any time:
 
 ```
 python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
-  --status 'ABS_RUNDIR' --skill-contract 3
+  --status 'ABS_RUNDIR' --skill-contract 4
 ```
 
 It prints about ten lines at most and exits 0: the runner's state
@@ -457,7 +457,7 @@ confirm that the council's background task has ended, then run:
 
 ```
 python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
-  --reap 'ABS_RUNDIR' --skill-contract 3
+  --reap 'ABS_RUNDIR' --skill-contract 4
 ```
 
 `--reap` is the one command here that changes anything: it signals
@@ -536,7 +536,7 @@ If a run is lost, orphaned, or looks stuck, recover from disk:
 
 ```
 python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
-  --status 'ABS_RUNDIR' --skill-contract 3
+  --status 'ABS_RUNDIR' --skill-contract 4
 tail -n 40 'ABS_RUNDIR/err.log'
 ls 'ABS_RUNDIR/replies'
 ```

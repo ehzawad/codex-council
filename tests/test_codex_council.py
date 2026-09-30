@@ -28,6 +28,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -1915,31 +1916,41 @@ class RunCouncilProgressTests(unittest.IsolatedAsyncioTestCase):
         # The final sentinel is main()'s job, never run_council's.
         self.assertNotIn("CODEX_COUNCIL_DONE", err)
 
-    async def test_long_run_emits_periodic_status_heartbeat(self):
-        release = asyncio.Event()
+    class _HeartbeatWatch(io.StringIO):
+        """A stderr buffer that releases the fake roles once it holds
+        `wanted` heartbeat lines: the roles end on the heartbeats they
+        wait for, never on a wall-clock guess."""
 
+        def __init__(self, wanted):
+            super().__init__()
+            self.wanted = wanted
+            self.seen = asyncio.Event()
+
+        def write(self, text):
+            written = super().write(text)
+            if self.getvalue().count("still running after") >= self.wanted:
+                self.seen.set()
+            return written
+
+    def _waiting_role(self, watch):
         async def fake_role(role, prompt):
-            await release.wait()
+            await watch.seen.wait()
             return codex_council.RoleResult(
                 role=role, ok=True, text="ok", elapsed_seconds=0.1,
             )
+        return fake_role
 
-        async def release_after_heartbeats():
-            await asyncio.sleep(0.035)
-            release.set()
-
-        buf = io.StringIO()
-        with patch.object(codex_council, "_run_role_attempts", side_effect=fake_role):
-            with patch.object(codex_council, "PROGRESS_HEARTBEAT_SECS", 0.01), \
-                 patch.object(codex_council, "HEARTBEAT_FLOOR_SECS", 0):
+    async def test_long_run_emits_periodic_status_heartbeat(self):
+        buf = self._HeartbeatWatch(wanted=2)
+        with patch.object(codex_council, "_run_role_attempts",
+                          side_effect=self._waiting_role(buf)):
+            with patch.object(codex_council, "PROGRESS_HEARTBEAT_SECS", 0.01):
                 with contextlib.redirect_stderr(buf):
-                    releaser = asyncio.create_task(release_after_heartbeats())
                     await codex_council.run_council(
                         self._roles("architect", "security"),
                         "body",
                         max_parallel=1,
                     )
-                    await releaser
 
         heartbeats = [
             line for line in buf.getvalue().splitlines()
@@ -1953,31 +1964,16 @@ class RunCouncilProgressTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("version=", heartbeats[0])
 
     async def test_heartbeat_reports_watchdog_disabled_when_env_is_zero(self):
-        release = asyncio.Event()
-
-        async def fake_role(role, prompt):
-            await release.wait()
-            return codex_council.RoleResult(
-                role=role, ok=True, text="ok", elapsed_seconds=0.1,
-            )
-
-        async def release_after_heartbeat():
-            await asyncio.sleep(0.03)
-            release.set()
-
-        buf = io.StringIO()
+        buf = self._HeartbeatWatch(wanted=1)
         os.environ[codex_council.STALL_SECS_ENV] = "0"
         try:
-            with patch.object(
-                codex_council, "_run_role_attempts", side_effect=fake_role
-            ):
+            with patch.object(codex_council, "_run_role_attempts",
+                              side_effect=self._waiting_role(buf)):
                 with patch.object(codex_council, "PROGRESS_HEARTBEAT_SECS", 0.01):
                     with contextlib.redirect_stderr(buf):
-                        releaser = asyncio.create_task(release_after_heartbeat())
                         await codex_council.run_council(
                             self._roles("architect"), "body", max_parallel=1,
                         )
-                        await releaser
         finally:
             os.environ.pop(codex_council.STALL_SECS_ENV, None)
 
@@ -3041,6 +3037,71 @@ class ForceUtf8StreamsTests(unittest.TestCase):
             codex_council._force_utf8_streams()  # must not raise
 
 
+class SignalLatchTests(unittest.IsolatedAsyncioTestCase):
+    """The first SIGINT, SIGTERM, or SIGHUP is latched: it cancels the
+    council once and sets the exit; a repeated one can neither cancel the
+    cleanup it started nor change the exit code."""
+
+    def setUp(self):
+        for signum in codex_council.TERMINATION_SIGNALS:
+            self.addCleanup(signal.signal, signum, signal.getsignal(signum))
+
+    async def test_a_repeated_signal_never_disrupts_cleanup(self):
+        running = asyncio.Event()
+        cleanup = {"started": asyncio.Event(), "done": False, "cancels": 0}
+
+        async def fake_run_council(roles, body, max_parallel,
+                                   replies_dir=None):
+            running.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cleanup["cancels"] += 1
+                cleanup["started"].set()
+                # Teardown awaits: a second cancel() would land here.
+                for _ in range(20):
+                    try:
+                        await asyncio.sleep(0.01)
+                    except asyncio.CancelledError:
+                        cleanup["cancels"] += 1
+                        raise
+                cleanup["done"] = True
+                raise
+
+        with patch.object(codex_council, "run_council", fake_run_council):
+            task = asyncio.create_task(
+                codex_council._run_council_with_signals([], "body", 1))
+            await running.wait()
+            os.kill(os.getpid(), signal.SIGTERM)
+            await cleanup["started"].wait()
+            for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+                os.kill(os.getpid(), signum)
+                await asyncio.sleep(0.02)
+            results, signum = await task
+        self.assertIsNone(results)
+        self.assertEqual(signum, signal.SIGTERM)
+        self.assertTrue(cleanup["done"])
+        self.assertEqual(cleanup["cancels"], 1)
+        # After the latch, a late signal is ignored rather than fatal.
+        for signum in codex_council.TERMINATION_SIGNALS:
+            self.assertIs(signal.getsignal(signum), signal.SIG_IGN)
+
+    async def test_no_signal_leaves_the_dispositions_alone(self):
+        async def fake_run_council(roles, body, max_parallel,
+                                   replies_dir=None):
+            return ["result"]
+
+        before = {s: signal.getsignal(s)
+                  for s in codex_council.TERMINATION_SIGNALS}
+        with patch.object(codex_council, "run_council", fake_run_council):
+            outcome = await codex_council._run_council_with_signals(
+                [], "body", 1)
+        self.assertEqual(outcome, (["result"], None))
+        self.assertNotIn(signal.SIG_IGN, [
+            signal.getsignal(s) for s in codex_council.TERMINATION_SIGNALS
+            if before[s] is not signal.SIG_IGN])
+
+
 class NoRunLevelDeadlineTests(unittest.TestCase):
     """The council has no total elapsed-time or run-level deadline: a role
     may run indefinitely while its codex subprocess keeps producing output
@@ -3121,6 +3182,34 @@ class NoRunLevelDeadlineTests(unittest.TestCase):
         self.assertIn("timeout=timeout",
                       inspect.getsource(council_common._project_root))
 
+    def test_only_start_and_cancel_have_their_own_bounded_waits(self):
+        """The two control deadlines are not a council's: --start waits
+        (START_WAIT_SECS) only for its supervisor to start, and --cancel
+        (CANCEL_GRACE_SECS, CANCEL_KILL_WAIT_SECS) only for the runner it
+        signalled to end. Each constant is read in exactly its own
+        command, never on the path that runs roles."""
+        import ast as _ast
+        self.assertLessEqual(codex_council.START_WAIT_SECS, 30)
+        self.assertLessEqual(council_liveness.CANCEL_GRACE_SECS, 60)
+        self.assertLessEqual(council_liveness.CANCEL_KILL_WAIT_SECS, 30)
+        users = {}
+        for module in (codex_council, council_liveness):
+            tree = _ast.parse(inspect.getsource(module))
+            for func in _ast.walk(tree):
+                if not isinstance(func, (_ast.FunctionDef,
+                                         _ast.AsyncFunctionDef)):
+                    continue
+                for node in _ast.walk(func):
+                    if isinstance(node, _ast.Name) and node.id in (
+                            "START_WAIT_SECS", "CANCEL_GRACE_SECS",
+                            "CANCEL_KILL_WAIT_SECS"):
+                        users.setdefault(node.id, set()).add(func.name)
+        self.assertEqual(users, {
+            "START_WAIT_SECS": {"_start_command"},
+            "CANCEL_GRACE_SECS": {"cancel_command"},
+            "CANCEL_KILL_WAIT_SECS": {"cancel_command"},
+        })
+
 
 # ---------- output-inactivity watchdog (env, flags, policy) ----------
 
@@ -3158,20 +3247,23 @@ class StallSecsEnvTests(unittest.TestCase):
             expect_in_stderr="must be a positive integer",
         )
 
-    def test_heartbeat_cadence_adapts_with_floor(self):
-        # Enabled: min(PROGRESS_HEARTBEAT_SECS, stall // 3), floored at 300.
-        self.assertEqual(codex_council._heartbeat_secs(1800), 600)
-        self.assertEqual(codex_council._heartbeat_secs(600), 300)
-        self.assertEqual(codex_council._heartbeat_secs(90), 300)
-        self.assertEqual(
-            codex_council._heartbeat_secs(10**9),
-            codex_council.PROGRESS_HEARTBEAT_SECS,
-        )
-        # Disabled: unchanged 30-minute cadence.
-        self.assertEqual(
-            codex_council._heartbeat_secs(0),
-            codex_council.PROGRESS_HEARTBEAT_SECS,
-        )
+    def test_heartbeat_cadence_is_at_most_300s_for_every_watchdog(self):
+        """The heartbeat never goes quieter than five minutes: enabled at
+        the default, short, or very large, and disabled (0) alike. Read
+        from the computed cadence, never by sleeping."""
+        self.assertEqual(codex_council.PROGRESS_HEARTBEAT_SECS, 300)
+        for stall_secs in (0, 1, 90, 600, codex_council.DEFAULT_STALL_SECS,
+                           7200, 10**9):
+            with self.subTest(stall_secs=stall_secs):
+                cadence = codex_council._heartbeat_secs(stall_secs)
+                self.assertLessEqual(cadence, 300)
+                self.assertEqual(cadence, 300)
+        # The cadence comes from the environment the launch reads.
+        for raw in ("0", "86400"):
+            with self.subTest(env=raw), \
+                    patch.dict(os.environ, {codex_council.STALL_SECS_ENV: raw}):
+                self.assertEqual(codex_council._heartbeat_secs(
+                    codex_council._stall_secs()), 300)
 
     def test_watchdog_desc_rendering(self):
         self.assertEqual(codex_council._watchdog_desc(1800), "1800s")
@@ -4197,10 +4289,14 @@ class DocsContractTests(unittest.TestCase):
             return "discover"
         if args.check_staging_dir is not None:
             return "check-staging-dir"
+        if args.start is not None:
+            return "start"
         if args.follow is not None:
             return "follow"
         if args.status is not None:
             return "status"
+        if args.cancel is not None:
+            return "cancel"
         if args.reap is not None:
             return "reap"
         if args.roles_file is not None and args.context_file is not None:
@@ -4642,7 +4738,7 @@ class DocsContractTests(unittest.TestCase):
         # user's pin, a routed pair, native-model effort, inheritance.
         order = [flat.index(marker) for marker in (
             "Run `mktemp -d` once per launch",
-            "--discover 'ABS_RUNDIR' --skill-contract 3",
+            "--discover 'ABS_RUNDIR' --skill-contract 4",
             '"selection": {"mode": "user"}',
             '"mode": "routed"',
             '"mode": "native_effort"',
@@ -4895,9 +4991,9 @@ class DocsContractTests(unittest.TestCase):
         self.assertLess(flat.index("For an installed plugin"),
                         flat.index("`scripts/dev-link.sh`"))
 
-    def test_templates_use_skill_contract_epoch_3_everywhere(self):
+    def test_templates_use_skill_contract_epoch_4_everywhere(self):
         epoch = str(codex_council.SKILL_CONTRACT_EPOCH)
-        self.assertEqual(epoch, "3")
+        self.assertEqual(epoch, "4")
         for name, text in self._doc_surfaces().items():
             with self.subTest(surface=name):
                 values = re.findall(r"--skill-contract (\d+)", text)
@@ -4906,13 +5002,13 @@ class DocsContractTests(unittest.TestCase):
                 self.assertLessEqual(set(values), {epoch})
         skill = self._skill()
         for fragment in (
-            "--discover 'ABS_RUNDIR' --skill-contract 3",
-            "--check-staging-dir 'ABS_RUNDIR' --skill-contract 3",
+            "--discover 'ABS_RUNDIR' --skill-contract 4",
+            "--check-staging-dir 'ABS_RUNDIR' --skill-contract 4",
             "--roles-file 'ABS_RUNDIR/roles.json'",
             "--context-file 'ABS_RUNDIR/context.md'",
             "> 'ABS_RUNDIR/out.md'",
             "2> 'ABS_RUNDIR/err.log'",
-            "--follow 'ABS_RUNDIR' --skill-contract 3",
+            "--follow 'ABS_RUNDIR' --skill-contract 4",
         ):
             self.assertIn(fragment, skill)
 
@@ -4938,7 +5034,8 @@ class DocsContractTests(unittest.TestCase):
                     self.assertEqual(args.skill_contract,
                                      codex_council.SKILL_CONTRACT_EPOCH)
                     for value in (args.discover, args.check_staging_dir,
-                                  args.follow, args.status, args.reap,
+                                  args.start, args.follow, args.status,
+                                  args.cancel, args.reap,
                                   args.roles_file, args.context_file):
                         if value is not None:
                             self.assertTrue(value.startswith("ABS_RUNDIR"))
@@ -5071,7 +5168,7 @@ class DocsContractTests(unittest.TestCase):
     def test_runtime_reference_documents_follow_replies_and_triage(self):
         ref = self._flat(self._ref("runtime-behavior.md"))
         for required in (
-            "--follow 'ABS_RUNDIR' --skill-contract 3",
+            "--follow 'ABS_RUNDIR' --skill-contract 4",
             "read-only",
             "[codex-council-follow]",
             "no council activity",
@@ -5080,8 +5177,8 @@ class DocsContractTests(unittest.TestCase):
             "runner not responding: no status tick for <N>s",
             "runner responding again",
             "`--verbose` relays them",
-            "--status 'ABS_RUNDIR' --skill-contract 3",
-            "--reap 'ABS_RUNDIR' --skill-contract 3",
+            "--status 'ABS_RUNDIR' --skill-contract 4",
+            "--reap 'ABS_RUNDIR' --skill-contract 4",
             "Never reap a runner that is still present",
             "never touches saved threads, replies, or other files",
             "ABS_RUNDIR/status.json",

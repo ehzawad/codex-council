@@ -118,7 +118,7 @@ its work has a 20-second budget, then a brief bounded cleanup:
 
 ```bash
 python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
-  --discover 'ABS_RUNDIR' --skill-contract 3
+  --discover 'ABS_RUNDIR' --skill-contract 4
 ```
 
 It writes `ABS_RUNDIR/model-snapshot.json` and prints the `snapshot_id`,
@@ -214,7 +214,7 @@ it.
 
 # 2. Pre-flight (foreground): private, parsable inputs; supported selections.
 python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
-  --check-staging-dir 'ABS_RUNDIR' --skill-contract 3
+  --check-staging-dir 'ABS_RUNDIR' --skill-contract 4
 ```
 
 ```bash
@@ -223,7 +223,7 @@ python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
 python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
   --roles-file 'ABS_RUNDIR/roles.json' \
   --context-file 'ABS_RUNDIR/context.md' \
-  --skill-contract 3 \
+  --skill-contract 4 \
   > 'ABS_RUNDIR/out.md' \
   2> 'ABS_RUNDIR/err.log'
 ```
@@ -235,7 +235,7 @@ exits 2 naming the entry: rewrite `roles.json` from the summary, or omit
 that role's `model`, `effort`, and `selection` to inherit. Launch
 revalidation can still fall back to inheritance.
 
-`--skill-contract 3` pins the SKILL/script contract epoch; on a mismatch,
+`--skill-contract 4` pins the SKILL/script contract epoch; on a mismatch,
 stop. For an installed plugin, update it and start a fresh session; in the
 development checkout, re-run `scripts/dev-link.sh`. Never change the epoch.
 
@@ -269,7 +269,7 @@ its limit: 1800000 interactively, 600000 in a `claude -p` run:
 
 ```bash
 python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" \
-  --follow 'ABS_RUNDIR' --skill-contract 3
+  --follow 'ABS_RUNDIR' --skill-contract 4
 ```
 
 It relays actionable lines and exits 0 when the run ends. Watch expiry ends

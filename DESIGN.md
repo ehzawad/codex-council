@@ -148,7 +148,7 @@ imports its siblings with bytecode writes off, so a run writes no
 | `--status RUNDIR` | `status.json`, one `ps` | about ten lines on stdout | 0 (2 for a bad directory) |
 | `--reap RUNDIR` | `status.json`, one `ps` | signals to verified groups and a live codex's descendants | 0 done, 1 refused, 2 bad directory |
 
-Every command that SKILL.md shows passes `--skill-contract 3`, the contract
+Every command that SKILL.md shows passes `--skill-contract 4`, the contract
 epoch. The epoch changes only when SKILL.md's command contract changes
 incompatibly; a mismatch is refused (exit 2) as a stale SKILL/script pair,
 with the installed-plugin recovery first and the development-checkout one

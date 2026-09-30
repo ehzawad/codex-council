@@ -606,7 +606,7 @@ class SkillContractTests(CouncilCLITestCase):
         ])
         proc = self._run(
             input="please review\n",
-            args=("--roles-file", roles_path, "--skill-contract", "3"),
+            args=("--roles-file", roles_path, "--skill-contract", council_testlib.EPOCH),
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("# Codex Council", proc.stdout)
@@ -616,7 +616,7 @@ class SkillContractTests(CouncilCLITestCase):
         proc = self._run(
             input="",
             args=("--check-staging-dir", self.workdir.name,
-                  "--skill-contract", "3"),
+                  "--skill-contract", council_testlib.EPOCH),
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("staging OK", proc.stdout)
@@ -645,6 +645,32 @@ class SkillContractTests(CouncilCLITestCase):
         self.assertIn("Never change the epoch", flat)
         self.assertNotIn("[codex-council] dispatching", proc.stderr)
         self.assertEqual(proc.stdout, "")
+
+    def test_the_previous_epoch_3_is_a_stale_pair_on_every_path(self):
+        """Epoch 4 only: a SKILL.md written for epoch 3 (the tracked
+        launch as the default) is refused with the stale-pair recovery on
+        the pre-flight, the launch, and every run command alike."""
+        self.assertEqual(council_testlib.EPOCH, "4")
+        self._staged()
+        run_dir = self.workdir.name
+        for args in (
+            ("--check-staging-dir", run_dir),
+            ("--roles-file", os.path.join(run_dir, "roles.json"),
+             "--context-file", os.path.join(run_dir, "context.md")),
+            ("--start", run_dir), ("--follow", run_dir),
+            ("--status", run_dir), ("--cancel", run_dir),
+            ("--reap", run_dir),
+        ):
+            with self.subTest(command=args[0]):
+                proc = self._run(input="", args=(*args, "--skill-contract",
+                                                  "3"))
+                self.assertEqual(proc.returncode, 2, proc.stderr)
+                self.assertIn("--skill-contract 3 does not match this "
+                              "script's contract epoch 4: stale SKILL/script "
+                              "pair", proc.stderr)
+                self.assertEqual(proc.stdout, "")
+        self.assertEqual(sorted(os.listdir(run_dir)),
+                         ["context.md", "roles.json"])
 
     def test_mismatched_epoch_rejected_on_preflight_too(self):
         self._staged()
@@ -799,7 +825,7 @@ class StallWatchdogCliTests(CouncilCLITestCase):
         self._write_context("please review\n")
         self.env["CODEX_COUNCIL_STALL_SECS"] = "30m"
         proc = self._run(input="", args=(
-            "--check-staging-dir", self.workdir.name, "--skill-contract", "3"))
+            "--check-staging-dir", self.workdir.name, "--skill-contract", council_testlib.EPOCH))
         self.assertEqual(proc.returncode, 2, proc.stdout)
         self.assertIn("CODEX_COUNCIL_STALL_SECS must be a positive integer "
                       "(or 0 to disable the watchdog); got '30m'",

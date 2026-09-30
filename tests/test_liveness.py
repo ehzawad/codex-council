@@ -14,6 +14,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import signal
 import stat
 import subprocess
@@ -31,10 +32,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from council_testlib import (  # noqa: E402
     assert_usage_exit,
     clean_env,
+    default_signal_dispositions,
     pid_gone,
     pid_running,
 )
 import codex_council  # noqa: E402
+import council_common  # noqa: E402
 import council_liveness  # noqa: E402
 import liveness_scenarios  # noqa: E402
 
@@ -86,6 +89,65 @@ def _own_runner():
     return pid, council_liveness.process_start_identity(pid)
 
 
+# A stand-in for a detached runner: takes the exclusive lock on the file
+# named by argv[1] (SIGTERM ignored when argv[2] is "ignore"), says so, and
+# sleeps holding it.
+_LOCK_HOLDER = (
+    "import fcntl, os, signal, sys, time\n"
+    "if sys.argv[2] == 'ignore':\n"
+    "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+    "fd = os.open(sys.argv[1], os.O_RDWR)\n"
+    "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+    "print('locked', flush=True)\n"
+    "time.sleep(120)\n"
+)
+
+
+def _lock_path(run_dir):
+    return os.path.join(run_dir, council_common.SUPERVISOR_LOCK_FILENAME)
+
+
+def _make_lock(run_dir):
+    path = _lock_path(run_dir)
+    if not os.path.exists(path):
+        os.close(os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600))
+    return path
+
+
+def _lock_holder(test, run_dir, ignore_sigterm=False):
+    """A process in its own session holding RUNDIR/supervisor.lock:
+    (process, start identity)."""
+    path = _make_lock(run_dir)
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _LOCK_HOLDER, path,
+         "ignore" if ignore_sigterm else "-"],
+        stdout=subprocess.PIPE, start_new_session=True,
+        preexec_fn=default_signal_dispositions)
+
+    def cleanup():
+        with contextlib.suppress(OSError):
+            os.kill(proc.pid, signal.SIGKILL)
+        proc.wait()
+        proc.stdout.close()
+
+    test.addCleanup(cleanup)
+    test.assertEqual(proc.stdout.readline(), b"locked\n")
+    return proc, council_liveness.process_start_identity(proc.pid)
+
+
+def _supervisor(run_dir, pid, identity, pgid=None):
+    """Write RUNDIR/supervisor.json naming (pid, identity) and the lock."""
+    st = os.stat(_make_lock(run_dir))
+    record = {"schema": 1, "pid": pid, "start_identity": identity,
+              "pgid": pid if pgid is None else pgid, "sid": pid,
+              "lock": {"dev": st.st_dev, "ino": st.st_ino},
+              "version": "9.9.9", "epoch": codex_council.SKILL_CONTRACT_EPOCH,
+              "started_at": "2026-09-30T00:00:00Z"}
+    council_common._atomic_write_private(
+        os.path.join(run_dir, council_common.SUPERVISOR_FILENAME),
+        json.dumps(record).encode())
+
+
 def _sleeper_group(test, seconds=60):
     """A sleeping process leading its own group: (pid, start identity)."""
     proc = subprocess.Popen(["sleep", str(seconds)], start_new_session=True)
@@ -103,7 +165,8 @@ def _sleeper_group(test, seconds=60):
 
 class LivenessArgTests(unittest.TestCase):
     def test_each_command_excludes_every_other_mode(self):
-        commands = ("--follow", "--status", "--reap", "--discover")
+        commands = ("--follow", "--status", "--reap", "--discover",
+                    "--start", "--cancel")
         others = (["--roles-file", "r.json"], ["--context-file", "c.md"],
                   ["--check-staging-dir", "d"])
         for command in commands:
@@ -121,7 +184,8 @@ class LivenessArgTests(unittest.TestCase):
                         in err, err)
 
     def test_empty_values_are_rejected(self):
-        for command in ("--follow", "--status", "--reap"):
+        for command in ("--follow", "--status", "--reap", "--start",
+                        "--cancel"):
             with self.subTest(command=command):
                 assert_usage_exit(
                     self, lambda c=command: codex_council._parse_args([c, ""]),
@@ -136,11 +200,39 @@ class LivenessArgTests(unittest.TestCase):
 
     def test_commands_accept_the_skill_contract(self):
         epoch = str(codex_council.SKILL_CONTRACT_EPOCH)
-        for command in ("--follow", "--status", "--reap"):
+        for command in ("--follow", "--status", "--reap", "--start",
+                        "--cancel"):
             with self.subTest(command=command):
                 args = codex_council._parse_args(
                     [command, "/x", "--skill-contract", epoch])
                 self.assertEqual(getattr(args, command[2:]), "/x")
+
+    def test_the_supervisor_fd_is_hidden_and_launch_only(self):
+        """--supervisor-lock-fd is --start's private handoff: absent from
+        --help, and refused unless it rides on a staged launch."""
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), \
+                self.assertRaises(SystemExit):
+            codex_council._parse_args(["--help"])
+        self.assertNotIn("supervisor-lock-fd", out.getvalue())
+        self.assertIn("--start RUNDIR", out.getvalue())
+        self.assertIn("--cancel RUNDIR", out.getvalue())
+        launch = ["--roles-file", "/d/roles.json", "--context-file",
+                  "/d/context.md"]
+        args = codex_council._parse_args([*launch, "--supervisor-lock-fd",
+                                          "5"])
+        self.assertEqual(args.supervisor_lock_fd, 5)
+        for argv in (["--supervisor-lock-fd", "5"],
+                     ["--roles-file", "/d/roles.json",
+                      "--supervisor-lock-fd", "5"],
+                     [*launch, "--supervisor-lock-fd", "1"],
+                     ["--check-staging-dir", "/d", "--supervisor-lock-fd",
+                      "5"],
+                     ["--start", "/d", "--supervisor-lock-fd", "5"]):
+            with self.subTest(argv=argv):
+                assert_usage_exit(
+                    self, lambda a=argv: codex_council._parse_args(a),
+                    expect_in_stderr="--supervisor-lock-fd")
 
 
 # ---------- process identity ----------
@@ -187,6 +279,169 @@ class ProcessIdentityTests(unittest.TestCase):
                           return_value=failed):
             self.assertEqual(council_liveness.runner_state(1234, None),
                              "unknown")
+
+
+# ---------- supervisor.json and supervisor.lock ----------
+
+class LockStateTests(unittest.TestCase):
+    def setUp(self):
+        self.run_dir = _private_dir(self)
+
+    def test_absent_held_and_free(self):
+        state = council_liveness.lock_state
+        self.assertEqual(state(self.run_dir), "absent")
+        holder, _ = _lock_holder(self, self.run_dir)
+        self.assertEqual(state(self.run_dir), "held")
+        # A reader's probe never takes the lock from its holder.
+        self.assertEqual(state(self.run_dir), "held")
+        holder.kill()
+        holder.wait()
+        self.assertEqual(state(self.run_dir), "free")
+
+    def test_a_symlink_public_fifo_or_replaced_lock_is_unknown(self):
+        state = council_liveness.lock_state
+        target = os.path.join(self.run_dir, "elsewhere")
+        os.close(os.open(target, os.O_CREAT | os.O_WRONLY, 0o600))
+        os.symlink(target, _lock_path(self.run_dir))
+        self.assertEqual(state(self.run_dir), "unknown")
+        os.remove(_lock_path(self.run_dir))
+        os.mkfifo(_lock_path(self.run_dir), 0o600)
+        self.assertEqual(state(self.run_dir), "unknown")
+        os.remove(_lock_path(self.run_dir))
+        _make_lock(self.run_dir)
+        os.chmod(_lock_path(self.run_dir), 0o644)
+        self.assertEqual(state(self.run_dir), "unknown")
+        os.chmod(_lock_path(self.run_dir), 0o600)
+        _supervisor(self.run_dir, *_own_runner())
+        record = council_liveness.read_supervisor(os.path.join(
+            self.run_dir, council_common.SUPERVISOR_FILENAME))
+        self.assertEqual(state(self.run_dir, record), "free")
+        # Same name, another inode: not the lock the runner recorded.
+        replacement = os.path.join(self.run_dir, "replacement")
+        os.close(os.open(replacement, os.O_CREAT | os.O_WRONLY, 0o600))
+        os.replace(replacement, _lock_path(self.run_dir))
+        self.assertEqual(state(self.run_dir, record), "unknown")
+        self.assertEqual(state(self.run_dir), "free")
+
+    def test_reading_never_creates_or_changes_the_lock(self):
+        council_liveness.lock_state(self.run_dir)
+        self.assertEqual(os.listdir(self.run_dir), [])
+
+
+class ReadSupervisorTests(unittest.TestCase):
+    def setUp(self):
+        self.run_dir = _private_dir(self)
+        self.path = os.path.join(self.run_dir,
+                                 council_common.SUPERVISOR_FILENAME)
+
+    def test_reads_the_record_the_runner_writes(self):
+        _make_lock(self.run_dir)
+        pid, identity = _own_runner()
+        record = council_liveness.supervisor_record(
+            pid, os.stat(_lock_path(self.run_dir)), "9.9.9", 4,
+            "2026-09-30T00:00:00Z")
+        self.assertEqual(record["start_identity"], identity)
+        self.assertEqual((record["pgid"], record["sid"]),
+                         (os.getpgrp(), os.getsid(0)))
+        council_common._atomic_write_private(
+            self.path, json.dumps(record).encode())
+        self.assertEqual(stat.S_IMODE(os.stat(self.path).st_mode), 0o600)
+        view = council_liveness.read_supervisor(self.path)
+        self.assertEqual((view.pid, view.identity, view.version, view.epoch),
+                         (pid, identity, "9.9.9", 4))
+        st = os.stat(_lock_path(self.run_dir))
+        self.assertEqual((view.lock_dev, view.lock_ino),
+                         (st.st_dev, st.st_ino))
+
+    def test_bad_types_read_as_unknown_and_bad_files_as_none(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump({"pid": "12", "start_identity": 5, "lock": [1],
+                       "pgid": True}, f)
+        os.chmod(self.path, 0o600)
+        view = council_liveness.read_supervisor(self.path)
+        self.assertEqual((view.pid, view.identity, view.pgid, view.lock_ino),
+                         (None, None, None, None))
+        os.chmod(self.path, 0o644)
+        self.assertIsNone(council_liveness.read_supervisor(self.path))
+        for text in ("[]", "{not json"):
+            with open(self.path, "w", encoding="utf-8") as f:
+                f.write(text)
+            os.chmod(self.path, 0o600)
+            self.assertIsNone(council_liveness.read_supervisor(self.path))
+        os.remove(self.path)
+        self.assertIsNone(council_liveness.read_supervisor(self.path))
+
+
+class SupervisorStateTests(unittest.TestCase):
+    """Combined liveness: the lock decides, every disagreement is
+    unknown."""
+
+    def setUp(self):
+        self.run_dir = _private_dir(self)
+
+    def _state(self):
+        view = council_liveness.read_status(
+            os.path.join(self.run_dir, council_liveness.STATUS_FILENAME))
+        return council_liveness.supervisor_state(self.run_dir, view).state
+
+    def test_held_lock_with_the_recorded_runner_alive_is_alive(self):
+        holder, identity = _lock_holder(self, self.run_dir)
+        self.assertEqual(self._state(), "alive")  # starting: no record yet
+        _supervisor(self.run_dir, holder.pid, identity)
+        self.assertEqual(self._state(), "alive")
+        _status(self.run_dir, pid=holder.pid, identity=identity)
+        self.assertEqual(self._state(), "alive")
+
+    def test_held_lock_with_a_dead_or_reused_pid_is_unknown(self):
+        _lock_holder(self, self.run_dir)
+        _supervisor(self.run_dir, _dead_pid(), None)
+        self.assertEqual(self._state(), "unknown")
+        pid, _ = _own_runner()
+        _supervisor(self.run_dir, pid, "Thu Jan  1 00:00:00 1970")
+        self.assertEqual(self._state(), "unknown")
+
+    def test_records_naming_different_runners_are_unknown(self):
+        holder, identity = _lock_holder(self, self.run_dir)
+        _supervisor(self.run_dir, holder.pid, identity)
+        _status(self.run_dir, pid=os.getpid())
+        self.assertEqual(self._state(), "unknown")
+
+    def test_free_lock_and_gone_identity_is_gone(self):
+        _make_lock(self.run_dir)
+        self.assertEqual(self._state(), "gone")  # ended before its record
+        _supervisor(self.run_dir, _dead_pid(), "Thu Jan  1 00:00:00 1970")
+        self.assertEqual(self._state(), "gone")
+
+    def test_free_lock_with_the_recorded_runner_present_is_unknown(self):
+        _supervisor(self.run_dir, *_own_runner())
+        self.assertEqual(self._state(), "unknown")
+
+    def test_an_unreadable_record_or_a_missing_lock_is_unknown(self):
+        _make_lock(self.run_dir)
+        path = os.path.join(self.run_dir, council_common.SUPERVISOR_FILENAME)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{not json")
+        self.assertEqual(self._state(), "unknown")
+        _supervisor(self.run_dir, _dead_pid(), None)
+        os.remove(_lock_path(self.run_dir))
+        self.assertEqual(self._state(), "unknown")
+
+    def test_ps_failure_is_unknown(self):
+        holder, identity = _lock_holder(self, self.run_dir)
+        _supervisor(self.run_dir, holder.pid, identity)
+        with patch.object(council_liveness.subprocess, "run",
+                          side_effect=OSError("no ps")):
+            self.assertEqual(self._state(), "unknown")
+
+    def test_a_tracked_run_is_not_detached(self):
+        _status(self.run_dir, pid=os.getpid())
+        view = council_liveness.read_status(
+            os.path.join(self.run_dir, council_liveness.STATUS_FILENAME))
+        self.assertFalse(council_liveness.is_detached(self.run_dir, view))
+        view.mode = "detached"
+        self.assertTrue(council_liveness.is_detached(self.run_dir, view))
+        _make_lock(self.run_dir)
+        self.assertTrue(council_liveness.is_detached(self.run_dir))
 
 
 # ---------- status.json ----------
@@ -240,6 +495,20 @@ class RunStatusTests(unittest.TestCase):
         self.assertEqual((final["runner"]["state"], final["runner"]["exit"]),
                          ("done", 0))
         self.assertEqual(sorted(os.listdir(self.run_dir)), ["status.json"])
+
+    def test_only_a_detached_runner_records_its_mode(self):
+        self.run.attach(self.path)
+        self.run.publish()
+        self.assertNotIn("mode", self._read()["runner"])
+        self.assertIsNone(council_liveness.read_status(self.path).mode)
+        detached = council_liveness.RunStatus()
+        detached.attach(self.path, mode="detached")
+        detached.publish()
+        data = self._read()
+        self.assertEqual(data["schema"], 1)
+        self.assertEqual(data["runner"]["mode"], "detached")
+        self.assertEqual(council_liveness.read_status(self.path).mode,
+                         "detached")
 
     def test_a_failed_write_is_reported_once_and_never_raises(self):
         self.run.attach(os.path.join(self.run_dir, "missing", "status.json"))
@@ -323,8 +592,8 @@ class RunStatusTests(unittest.TestCase):
 
 # ---------- --follow ----------
 
-class FollowTests(unittest.TestCase):
-    """Drive follow() in-process with shortened windows."""
+class _FollowHarness(unittest.TestCase):
+    """Drive follow() in-process with shortened windows (no tests here)."""
 
     def setUp(self):
         self.run_dir = _private_dir(self)
@@ -351,6 +620,9 @@ class FollowTests(unittest.TestCase):
             code = council_liveness.follow(self.run_dir, verbose)
         return code, out.getvalue().splitlines()
 
+
+
+class FollowTests(_FollowHarness):
     def test_relays_actionable_lines_and_exits_0_on_sentinel(self):
         reply = os.path.join(self.run_dir, "replies", "architect.md")
         completion = f"[codex-council] 1/1 architect: ok (1.0s) reply={reply}"
@@ -604,6 +876,169 @@ class FollowTests(unittest.TestCase):
         self.assertEqual(contents(), before)
 
 
+class FollowKeepaliveTests(_FollowHarness):
+    """The keepalive: one `still running` line per FOLLOW_KEEPALIVE_SECS
+    of silence after dispatch while the runner is alive and ticking."""
+
+    KEEPALIVE_RE = (r"^\[codex-council-follow\] still running: (\d+)/(\d+) "
+                    r"settled; active: (.*); status tick \d+s ago$")
+
+    def setUp(self):
+        super().setUp()
+        patcher = patch.object(council_liveness, "FOLLOW_KEEPALIVE_SECS", 0.3)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.pid, self.identity = _own_runner()
+
+    def _keepalives(self, lines):
+        return [ln for ln in lines if ln.startswith(
+            "[codex-council-follow] still running")]
+
+    def test_silence_after_dispatch_gets_exact_keepalive_lines(self):
+        now = time.time()
+        roles = {
+            "architect": {"state": "active", "attempt": 1,
+                          "output_at": now - 42},
+            "prober": {"state": "active", "attempt": 2},
+            "done": {"state": "settled", "outcome": "ok"},
+            "later": {"state": "queued"},
+            # A key no runner writes is never echoed.
+            "x reply=/etc/hostname": {"state": "active", "attempt": 1},
+        }
+        self._write(DISPATCH_LINE + "\n")
+        _status(self.run_dir, pid=self.pid, identity=self.identity,
+                roles=roles)
+        self._later(1.1, lambda: self._write(DONE_LINE + "\n"))
+        code, lines = self._follow()
+        self.assertEqual(code, 0)
+        self.assertEqual((lines[0], lines[-1]), (DISPATCH_LINE, DONE_LINE))
+        keepalives = self._keepalives(lines)
+        self.assertGreaterEqual(len(keepalives), 2, lines)
+        self.assertEqual(len(keepalives), len(lines) - 2, lines)
+        for line in keepalives:
+            match = re.match(self.KEEPALIVE_RE, line)
+            self.assertIsNotNone(match, line)
+            self.assertEqual(match.group(1, 2), ("1", "5"))
+            self.assertRegex(match.group(3),
+                             r"^architect quiet=4\ds, prober, \+1 more$")
+            self.assertNotIn(" reply=", line)
+            self.assertNotIn("hostname", line)
+
+    def test_at_most_five_roles_are_named(self):
+        roles = {f"r{i}": {"state": "active", "attempt": 1}
+                 for i in range(7)}
+        self._write(DISPATCH_LINE + "\n")
+        _status(self.run_dir, pid=self.pid, identity=self.identity,
+                roles=roles)
+        self._later(0.7, lambda: self._write(DONE_LINE + "\n"))
+        _, lines = self._follow()
+        keepalive = self._keepalives(lines)[0]
+        self.assertIn("0/7 settled; active: r0, r1, r2, r3, r4, +2 more;",
+                      keepalive)
+
+    def test_flowing_lines_hold_the_keepalive_back(self):
+        _status(self.run_dir, pid=self.pid, identity=self.identity)
+        self._write(DISPATCH_LINE + "\n")
+        retry = ("[codex-council:architect] retriable error on attempt 1/2; "
+                 "sleeping 5s.")
+        for i in range(1, 9):
+            self._later(0.1 * i, lambda: self._write(retry + "\n"))
+        self._later(0.95, lambda: self._write(DONE_LINE + "\n"))
+        code, lines = self._follow()
+        self.assertEqual(code, 0)
+        self.assertEqual(self._keepalives(lines), [])
+
+    def test_no_keepalive_before_dispatch_or_after_the_terminal_line(self):
+        _status(self.run_dir, pid=self.pid, identity=self.identity)
+        self._write("[codex-council] model selection: routing=auto\n")
+        code, lines = self._follow()
+        self.assertEqual(code, council_liveness.FOLLOW_EXIT_NO_ACTIVITY)
+        self.assertEqual(self._keepalives(lines), [])
+        with open(self.log, "w", encoding="utf-8") as f:
+            f.write(DISPATCH_LINE + "\n" + DONE_LINE + "\n")
+        code, lines = self._follow()
+        self.assertEqual((code, lines), (0, [DISPATCH_LINE, DONE_LINE]))
+
+    def test_no_keepalive_for_a_stale_or_gone_runner(self):
+        self._write(DISPATCH_LINE + "\n")
+        _status(self.run_dir, pid=self.pid, identity=self.identity,
+                tick_age=130)
+        self._later(0.9, lambda: self._write(DONE_LINE + "\n"))
+        _, lines = self._follow()
+        self.assertEqual(self._keepalives(lines), [])
+        with open(self.log, "w", encoding="utf-8") as f:
+            f.write(DISPATCH_LINE + "\n")
+        _status(self.run_dir, pid=_dead_pid())
+        code, lines = self._follow()
+        self.assertEqual(code, council_liveness.FOLLOW_EXIT_RUNNER_GONE)
+        self.assertEqual(self._keepalives(lines), [])
+
+
+class DetachedFollowTests(_FollowHarness):
+    """--follow on a --start run: the lock decides liveness."""
+
+    def test_a_free_lock_before_dispatch_ends_at_once(self):
+        _make_lock(self.run_dir)
+        _supervisor(self.run_dir, _dead_pid(), None)
+        self._write("--roles-file: bad input\n")
+        started = time.monotonic()
+        with patch.object(council_liveness, "FOLLOW_START_SECS", 60):
+            code, lines = self._follow()
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual(code, council_liveness.FOLLOW_EXIT_NO_ACTIVITY)
+        self.assertEqual(lines, [f"[codex-council-follow] runner ended "
+                                 f"before dispatch: read {self.log}"])
+
+    def test_an_interruption_before_dispatch_is_still_terminal(self):
+        _make_lock(self.run_dir)
+        _supervisor(self.run_dir, _dead_pid(), None)
+        self._write("\n[codex-council] interrupted by SIGTERM\n")
+        code, lines = self._follow()
+        self.assertEqual((code, lines),
+                         (0, ["[codex-council] interrupted by SIGTERM"]))
+
+    def test_a_held_lock_is_never_reported_gone(self):
+        """A held lock with a dead recorded pid is unknown: keep following
+        (never `runner gone`, never exit 4)."""
+        _lock_holder(self, self.run_dir)
+        dead = _dead_pid()
+        _supervisor(self.run_dir, dead, None)
+        _status(self.run_dir, pid=dead)
+        self._write(DISPATCH_LINE + "\n")
+        self._later(0.6, lambda: self._write(DONE_LINE + "\n"))
+        code, lines = self._follow()
+        self.assertEqual((code, lines), (0, [DISPATCH_LINE, DONE_LINE]))
+
+    def test_a_free_lock_and_gone_runner_after_dispatch_exits_4(self):
+        dead = _dead_pid()
+        _supervisor(self.run_dir, dead, None)
+        _status(self.run_dir, pid=dead)
+        self._write(DISPATCH_LINE + "\n")
+        code, lines = self._follow()
+        self.assertEqual(code, council_liveness.FOLLOW_EXIT_RUNNER_GONE)
+        self.assertRegex(lines[-1], rf"^\[codex-council-follow\] runner gone: "
+                                    rf"pid={dead}; ")
+
+    def test_follow_never_writes_or_signals_a_detached_run(self):
+        holder, identity = _lock_holder(self, self.run_dir)
+        _supervisor(self.run_dir, holder.pid, identity)
+        _status(self.run_dir, pid=holder.pid, identity=identity)
+        self._write(DISPATCH_LINE + "\n" + DONE_LINE + "\n")
+
+        def contents():
+            found = {}
+            for name in sorted(os.listdir(self.run_dir)):
+                with open(os.path.join(self.run_dir, name), "rb") as f:
+                    found[name] = f.read()
+            return found
+
+        before = contents()
+        self._follow()
+        self.assertEqual(contents(), before)
+        self.assertTrue(pid_running(holder.pid))
+        self.assertEqual(council_liveness.lock_state(self.run_dir), "held")
+
+
 class FollowProcessTests(unittest.TestCase):
     """The follower as a real process: its stdout reader goes away."""
 
@@ -772,6 +1207,223 @@ class ReapCommandTests(unittest.TestCase):
         self.assertIn("and 1 more process group it started terminated", out)
         leader.wait(timeout=5)
         self.assertTrue(pid_gone(tool))
+
+
+class DetachedStatusTests(unittest.TestCase):
+    """--status for a --start run: the detached states and actions."""
+
+    def setUp(self):
+        self.run_dir = _private_dir(self)
+
+    def _lines(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(council_liveness.status_command(self.run_dir), 0)
+        return out.getvalue().splitlines()
+
+    def test_starting_then_running(self):
+        holder, identity = _lock_holder(self, self.run_dir)
+        lines = self._lines()
+        self.assertEqual(lines[0], "runner: starting (no pid recorded; "
+                                   "supervisor lock held; no dispatch yet)")
+        self.assertIn("--cancel stops it", lines[-1])
+        _supervisor(self.run_dir, holder.pid, identity)
+        self.assertTrue(self._lines()[0].startswith(
+            f"runner: starting (pid {holder.pid}; "))
+        _status(self.run_dir, pid=holder.pid, identity=identity, tick_age=3)
+        lines = self._lines()
+        self.assertRegex(lines[0], rf"^runner: running \(pid {holder.pid}; "
+                                   r"detached; status tick \ds ago\)$")
+        self.assertEqual(lines[-1], "next: keep following; do not relaunch; "
+                                    "--cancel stops it")
+
+    def test_not_responding_points_at_cancel(self):
+        holder, identity = _lock_holder(self, self.run_dir)
+        _supervisor(self.run_dir, holder.pid, identity)
+        _status(self.run_dir, pid=holder.pid, identity=identity,
+                tick_age=200)
+        lines = self._lines()
+        self.assertRegex(lines[0], r"^runner: not responding \(pid \d+ "
+                                   r"present; supervisor lock held; last "
+                                   r"status tick 20\ds ago\)$")
+        self.assertIn("run --cancel on this directory", lines[-1])
+        self.assertNotIn("background task", lines[-1])
+
+    def test_gone_names_groups_and_the_reap_without_a_task_step(self):
+        sleeper, identity = _sleeper_group(self)
+        dead = _dead_pid()
+        _supervisor(self.run_dir, dead, None)
+        _status(self.run_dir, pid=dead, roles={"architect": {
+            "state": "active", "attempt": 1, "pid": sleeper.pid,
+            "pgid": sleeper.pid, "start_identity": identity}})
+        lines = self._lines()
+        self.assertEqual(lines[0], f"runner: gone (pid {dead} is no longer "
+                                   "this run's runner; supervisor lock free)")
+        self.assertIn(f"live codex groups: {sleeper.pid} (architect)", lines)
+        self.assertEqual(lines[-1], "next: run --reap on this directory, "
+                                    "then re-run unfinished roles in a new "
+                                    "directory")
+
+    def test_ended_before_dispatch(self):
+        dead = _dead_pid()
+        _supervisor(self.run_dir, dead, None)
+        lines = self._lines()
+        self.assertEqual(lines, [
+            f"runner: ended before dispatch (pid {dead} gone; supervisor "
+            "lock free)",
+            "next: read err.log; start over in a new directory, never in "
+            "this one"])
+
+    def test_unknown_is_never_reaped(self):
+        _lock_holder(self, self.run_dir)
+        dead = _dead_pid()
+        _supervisor(self.run_dir, dead, None)
+        _status(self.run_dir, pid=dead)
+        lines = self._lines()
+        self.assertTrue(lines[0].startswith(f"runner: unknown (pid {dead}; "
+                                            "supervisor lock held;"))
+        self.assertIn("never --reap", lines[-1])
+
+    def test_the_run_has_ended_only_once_the_lock_is_free(self):
+        holder, identity = _lock_holder(self, self.run_dir)
+        _supervisor(self.run_dir, holder.pid, identity)
+        _status(self.run_dir, pid=holder.pid, identity=identity,
+                state="done", exit_code=0)
+        lines = self._lines()
+        self.assertIn("still exiting", lines[0])
+        self.assertNotIn("the run has ended", lines[-1])
+        holder.kill()
+        holder.wait()
+        lines = self._lines()
+        self.assertEqual(lines[0], "runner: done (exit 0)")
+        self.assertEqual(lines[-1], "next: read out.md; the run has ended")
+
+
+class DetachedReapTests(unittest.TestCase):
+    def setUp(self):
+        self.run_dir = _private_dir(self)
+
+    def _reap(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = council_liveness.reap_command(self.run_dir)
+        return code, out.getvalue()
+
+    def _stage(self, runner_pid):
+        sleeper, identity = _sleeper_group(self)
+        _status(self.run_dir, pid=runner_pid, roles={"architect": {
+            "state": "active", "attempt": 1, "pid": sleeper.pid,
+            "pgid": sleeper.pid, "start_identity": identity}})
+        return sleeper
+
+    def test_a_held_lock_refuses_even_when_the_pid_is_gone(self):
+        _lock_holder(self, self.run_dir)
+        dead = _dead_pid()
+        _supervisor(self.run_dir, dead, None)
+        sleeper = self._stage(dead)
+        code, out = self._reap()
+        self.assertEqual(code, 1)
+        self.assertIn("its supervisor lock is still held", out)
+        self.assertTrue(pid_running(sleeper.pid))
+
+    def test_a_free_lock_and_gone_runner_is_reaped(self):
+        dead = _dead_pid()
+        _supervisor(self.run_dir, dead, None)
+        sleeper = self._stage(dead)
+        code, out = self._reap()
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"reaped architect: process group {sleeper.pid}", out)
+        self.assertTrue(pid_gone(sleeper.pid))
+
+    def test_a_replaced_lock_is_unknown_and_refused(self):
+        dead = _dead_pid()
+        _supervisor(self.run_dir, dead, None)
+        os.remove(_lock_path(self.run_dir))
+        _make_lock(self.run_dir)
+        sleeper = self._stage(dead)
+        code, out = self._reap()
+        self.assertEqual(code, 1)
+        self.assertIn("disagree or cannot be read", out)
+        self.assertTrue(pid_running(sleeper.pid))
+
+
+class CancelCommandTests(unittest.TestCase):
+    def setUp(self):
+        self.run_dir = _private_dir(self)
+        for name, value in (("CANCEL_GRACE_SECS", 0.5),
+                            ("CANCEL_POLL_SECS", 0.02)):
+            patcher = patch.object(council_liveness, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _cancel(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = council_liveness.cancel_command(self.run_dir)
+        return code, out.getvalue()
+
+    def test_sigterm_ends_a_verified_runner(self):
+        holder, identity = _lock_holder(self, self.run_dir)
+        _supervisor(self.run_dir, holder.pid, identity)
+        _status(self.run_dir, pid=holder.pid, identity=identity)
+        code, out = self._cancel()
+        self.assertEqual(code, 0, out)
+        self.assertTrue(out.startswith(f"cancelled: the runner (pid "
+                                       f"{holder.pid}) ended after SIGTERM"))
+        self.assertEqual(holder.wait(5), -signal.SIGTERM)
+        self.assertEqual(council_liveness.lock_state(self.run_dir), "free")
+
+    def test_a_runner_ignoring_sigterm_gets_sigkill_after_the_grace(self):
+        holder, identity = _lock_holder(self, self.run_dir,
+                                        ignore_sigterm=True)
+        _supervisor(self.run_dir, holder.pid, identity)
+        started = time.monotonic()
+        code, out = self._cancel()
+        self.assertEqual(code, 0, out)
+        self.assertGreaterEqual(time.monotonic() - started, 0.5)
+        self.assertIn("was sent SIGKILL", out)
+        self.assertIn("run --reap", out)
+        self.assertEqual(holder.wait(5), -signal.SIGKILL)
+
+    def test_a_decoy_with_another_identity_is_never_signalled(self):
+        holder, identity = _lock_holder(self, self.run_dir)
+        decoy, _ = _sleeper_group(self)
+        # The recorded pid is alive but started at another time: a reuse.
+        _supervisor(self.run_dir, decoy.pid, "Thu Jan  1 00:00:00 1970")
+        code, out = self._cancel()
+        self.assertEqual(code, 1)
+        self.assertIn("nothing was signalled", out)
+        _supervisor(self.run_dir, holder.pid, identity)
+        _status(self.run_dir, pid=decoy.pid)
+        code, out = self._cancel()
+        self.assertEqual(code, 1)
+        self.assertIn("nothing was signalled", out)
+        self.assertTrue(pid_running(decoy.pid))
+        self.assertTrue(pid_running(holder.pid))
+
+    def test_refused_when_gone_starting_or_tracked(self):
+        code, out = self._cancel()
+        self.assertEqual(code, 1)
+        self.assertIn("not launched with --start", out)
+        holder, identity = _lock_holder(self, self.run_dir)
+        code, out = self._cancel()
+        self.assertEqual(code, 1)
+        self.assertIn("has not written supervisor.json yet", out)
+        holder.kill()
+        holder.wait()
+        dead = _dead_pid()
+        _supervisor(self.run_dir, dead, None)
+        code, out = self._cancel()
+        self.assertEqual(code, 1)
+        self.assertIn(f"the runner (pid {dead}) has already ended", out)
+        self.assertIn("--reap", out)
+
+    def test_cancel_writes_nothing(self):
+        holder, identity = _lock_holder(self, self.run_dir)
+        _supervisor(self.run_dir, holder.pid, identity)
+        before = sorted(os.listdir(self.run_dir))
+        self._cancel()
+        self.assertEqual(sorted(os.listdir(self.run_dir)), before)
 
 
 class DescendantTargetsTests(unittest.TestCase):
@@ -1104,6 +1756,24 @@ class LivenessScenarioTests(unittest.TestCase):
 
     def test_s6_malformed_lines(self):
         self._assert_passed("S6")
+
+    def test_s7_host_stop_of_a_tracked_launch_is_clean(self):
+        self._assert_passed("S7")
+
+    def test_s8_start_survives_its_shell_group_dying(self):
+        self._assert_passed("S8")
+
+    def test_s9_start_survives_its_own_death_after_spawn(self):
+        self._assert_passed("S9")
+
+    def test_s10_concurrent_starts_make_one_supervisor(self):
+        self._assert_passed("S10")
+
+    def test_s11_cancel_ends_the_run_and_every_process(self):
+        self._assert_passed("S11")
+
+    def test_s12_a_killed_supervisor_frees_its_lock_and_can_be_reaped(self):
+        self._assert_passed("S12")
 
 
 if __name__ == "__main__":
