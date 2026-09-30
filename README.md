@@ -77,14 +77,16 @@ On every invocation Claude:
    (see [Model and effort per role](#model-and-effort-per-role));
 4. announces the panel and launches it, with no approval gate;
 5. follows the run, reads each role's reply as it lands, and reconciles one
-   answer once the council's background task has ended.
+   answer once the council has ended.
 
 Roles do not message each other: Claude gives every role the same context,
 reconciles their replies, and stages material findings into a follow-up
 round when one is needed. All roles share your working tree, so when several
 roles may edit files, one role owns the writes and the others inspect, test,
-or propose. Keep the Claude Code session open until the council's task has
-ended: Claude Code stops background tasks when it exits.
+or propose. The council runs detached from Claude Code, so a long one is not
+cut off by the host's limits on background tasks; it keeps running (and
+spending) until it finishes or Claude cancels it, and Claude follows it
+until it ends.
 
 Claude's operating procedure is
 [`SKILL.md`](plugins/codex-council/skills/codex-council/SKILL.md). Its
@@ -95,11 +97,12 @@ and [runtime behavior](plugins/codex-council/skills/codex-council/references/run
 
 ## How a run works
 
-![d10-components: Claude Code, the runner, the follower, the host task tracker, the run directory, saved threads, codex app-server, codex exec, and the workspace](docs/diagrams/d10-components.png)
+![d10-components: Claude Code, the runner detached by --start, the follower, the host task tracker for the tracked fallback, the run directory with its supervisor lock, saved threads, codex app-server, codex exec, and the workspace](docs/diagrams/d10-components.png)
 
 *d10-components — Runtime components and ownership. The runner talks to
 Codex; Claude and the runner hand work to each other through the run
-directory; only the host's task tracker says the run is over. Source:
+directory; a released supervisor lock and a vanished runner (or, for the
+tracked fallback, the host's task tracker) say the run is over. Source:
 [d10-components.mmd](docs/diagrams/d10-components.mmd).*
 
 1. **Stage.** Claude creates a private directory with `mktemp -d`, runs
@@ -107,27 +110,41 @@ directory; only the host's task tracker says the run is over. Source:
    `roles.json` and `context.md`.
 2. **Preflight.** `--check-staging-dir` runs as its own foreground call and
    refuses anything the launch would refuse, before any worker exists.
-3. **Launch.** A separate background call starts the runner with stdout
-   redirected to `out.md` and stderr to `err.log`. The runner checks its
-   inputs again, resolves each role's model and effort, and runs one
-   `codex exec` per role, at most `CODEX_COUNCIL_MAX_PARALLEL` at a time.
+3. **Launch.** A separate foreground call runs `--start`, which checks the
+   directory again, claims it (`supervisor.lock`, `err.log`, and `out.md`,
+   each created exclusively), starts the runner detached in a session of
+   its own, and returns within seconds with the exact `--follow`,
+   `--status`, and `--cancel` commands. The runner holds `supervisor.lock`
+   locked for its whole life, writes `supervisor.json` about itself,
+   resolves each role's model and effort, and runs one `codex exec` per
+   role, at most `CODEX_COUNCIL_MAX_PARALLEL` at a time.
 4. **Follow.** A read-only follower (`--follow`) relays the actionable lines
    of `err.log` to Claude, and each role's reply lands in `replies/` as the
    role settles. The runner also keeps `status.json` current, so the
    follower reports within seconds a runner that has died; for a runner
    that is still present but has stopped publishing status ticks, it warns
-   after 120 seconds and stops at 300.
-5. **Reconcile.** When Claude Code reports the background task finished,
-   Claude reads `out.md` and reconciles one result for you.
+   after 120 seconds and stops at 300. After ten quiet minutes it prints a
+   `still running` line, so a long council keeps showing progress.
+   `--cancel` stops the council.
+5. **Reconcile.** When the follower exits and `--status` confirms the
+   runner has ended (its lock is free and its process gone), Claude reads
+   `out.md` and reconciles one result for you.
 
 | Run directory entry | Written by | Holds |
 |---|---|---|
 | `model-snapshot.json` | `--discover` | this run's model catalog and what routing may do |
 | `roles.json`, `context.md` | Claude | the panel and the shared brief |
-| `out.md` | the launch (stdout) | the final report |
-| `err.log` | the launch (stderr) | progress lines, the heartbeat, and the final `CODEX_COUNCIL_DONE` line |
+| `supervisor.lock` | `--start`; held locked by the runner while it lives | the runner's lifetime: held means running; never removed |
+| `supervisor.json` | the runner, before any other work | who the runner is (pid, start time, process group), for `--status` and `--cancel` |
+| `out.md` | `--start` creates it; the runner's stdout | the final report |
+| `err.log` | `--start` creates it; the runner's stderr | progress lines, the heartbeat, and the final `CODEX_COUNCIL_DONE` line |
 | `replies/<role>.md` | the runner, as each role settles | that role's section of the report |
-| `status.json` | the runner | runner and role liveness, for `--follow`, `--status`, and `--reap` |
+| `status.json` | the runner | runner and role liveness, for `--follow`, `--status`, `--cancel`, and `--reap` |
+
+A fallback launch runs the council as a Claude Code background task
+instead, with `out.md` and `err.log` created by shell redirects and no
+supervisor files; the skill uses it only when a detached launch cannot run
+(see [runtime behavior](plugins/codex-council/skills/codex-council/references/runtime-behavior.md)).
 
 Every mechanism has its own section and diagram in [DESIGN.md](DESIGN.md);
 the [diagram index](#diagrams) below lists them all.
@@ -146,8 +163,20 @@ the [diagram index](#diagrams) below lists them all.
 
 The council has no total elapsed-time or run-level deadline: a role may run
 as long as its Codex process keeps writing output, and a council takes as
-long as its slowest role. The watchdog measures output bytes, not progress,
-and only the host bounds a run's lifetime.
+long as its slowest role. The watchdog measures output bytes, not progress.
+
+Claude Code bounds background tasks, which is why a council does not run as
+one. Since Claude Code 2.1.285 a background command stops at its time
+limit, 30 minutes by default and 2 hours at most, however much it prints
+(see the [changelog](https://code.claude.com/docs/en/changelog)), and
+Claude Code can also stop background shells under memory pressure once a
+session has sat idle for half an hour; that stop is yours to turn off with
+`CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP` (see the
+[environment variables](https://code.claude.com/docs/en/env-vars)), and the
+plugin never sets it. A council started with `--start` is outside both: it
+ends when it finishes, when Claude runs `--cancel`, or when something
+outside Claude Code stops its processes (a reboot, for example). The
+tracked fallback runs inside them and so lasts at most 2 hours.
 
 ### Model and effort per role
 

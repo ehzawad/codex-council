@@ -1,11 +1,11 @@
 flowchart TD
     Runner("Runner event loop")
-    Status[("status.json<br/>tick at least every 15 s,<br/>pids and start times")]
-    Check{"Follower, every 2 s:<br/>runner present,<br/>tick fresh?"}
+    Status[("status.json, supervisor lock<br/>tick at least every 15 s,<br/>pids and start times")]
+    Check{"Follower, every 2 s:<br/>lock held, runner present,<br/>tick fresh?"}
     Gone(["runner gone<br/>exit 4 at once"])
     Stuck(["runner not responding<br/>120 s warn, 300 s exit 4"])
     StatusCmd["--status<br/>facts and one next: action"]
-    Stop["Stop the tracked task,<br/>confirm with --status<br/>that the runner is gone"]
+    Stop["--cancel (tracked: stop<br/>the task), confirm with<br/>--status that it is gone"]
     Reap["--reap: TERM, KILL each<br/>verified group and a live<br/>codex's descendants"]
     Rerun(["Re-run unfinished roles<br/>in a new directory"])
 
@@ -17,7 +17,7 @@ flowchart TD
     Stuck --> StatusCmd
     StatusCmd -->|"not responding"| Stop
     Stop --> StatusCmd
-    StatusCmd -->|"gone, task ended,<br/>live codex groups"| Reap
+    StatusCmd -->|"gone, lock free,<br/>live codex groups"| Reap
     StatusCmd -->|"gone, no live groups"| Rerun
     Reap --> Rerun
 

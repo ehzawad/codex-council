@@ -4936,7 +4936,7 @@ class DocsContractTests(unittest.TestCase):
 
     # ---------- launch safety ----------
 
-    def test_launch_rules_keep_private_staging_and_one_background_layer(self):
+    def test_launch_rules_keep_private_staging_and_a_foreground_start(self):
         staging = self._section("## Step 3", "## Step 4")
         for required in (
             "Run `mktemp -d` once per launch",
@@ -4953,10 +4953,23 @@ class DocsContractTests(unittest.TestCase):
         flat = self._section("## Step 4", "## Step 5")
         for required in (
             "Do not wait for approval",
-            "`run_in_background: true`",
-            "keep the command itself in the foreground",
-            "stdout and stderr redirected to files",
-            "false \"completed\"",
+            # The default launch: --start in one foreground call. A
+            # background task is stopped at its timeout (Claude Code
+            # 2.1.285), and stopping it also stops what it detached.
+            "Launch with one foreground Bash call running `--start`",
+            "no redirects, never `run_in_background`, no `&`, `nohup`, or "
+            "`setsid`",
+            "It detaches the council itself and returns within seconds",
+            "stopping a background task would also stop what it detached",
+            # What --start prints and how a failed start is handled.
+            "`--start` prints a `started:` line and the exact `--follow`, "
+            "`--status`, and `--cancel` commands (exit 1: read `err.log`)",
+            "or `--start` exits 1, abandon that directory; never retry "
+            "`--start` there",
+            # The tracked fallback is named, bounded, and lives in the
+            # runtime reference.
+            "The tracked fallback (`run_in_background`, `timeout: 7200000`, "
+            "at most 2 hours) is in runtime-behavior.md",
             "abandon that directory",
             "Do not chmod it, mkdir it, or reuse its name",
             # A new directory has no snapshot: discover again there.
@@ -4964,12 +4977,32 @@ class DocsContractTests(unittest.TestCase):
             "new `snapshot_id`",
         ):
             self.assertIn(required, flat)
-        # The core names the common detach forms and points at the full
-        # list, which lives in the runtime reference.
-        for forbidden in ("trailing `&`", "`nohup`", "`setsid`", "`disown`",
-                          "runtime-behavior.md lists"):
-            self.assertIn(forbidden, flat)
+        # The old default (a background launch with redirects) is gone
+        # from the core.
+        for retired in ("run_in_background: true", "> 'ABS_RUNDIR/out.md'",
+                        "2> 'ABS_RUNDIR/err.log'"):
+            self.assertNotIn(retired, self._skill())
         runtime = self._flat(self._ref("runtime-behavior.md"))
+        # The tracked fallback keeps its full recipe, with the host maximum
+        # as its timeout and the 2-hour bound stated.
+        fallback = runtime.split("### The tracked fallback", 1)[1].split(
+            "## Detached launch", 1)[0]
+        for required in (
+            "`run_in_background: true` and `timeout: 7200000` (the host "
+            "maximum)",
+            "at most 2 hours",
+            "--roles-file 'ABS_RUNDIR/roles.json'",
+            "--context-file 'ABS_RUNDIR/context.md'",
+            "> 'ABS_RUNDIR/out.md'",
+            "2> 'ABS_RUNDIR/err.log'",
+            "`[codex-council] interrupted by SIGTERM`, exits 143",
+            "stopping a background task also stops the processes that "
+            "detached from its shell",
+            "The only supported way to outlive a background task is "
+            "`--start`, never a manual detach wrapper",
+        ):
+            self.assertIn(required, fallback)
+        self.assertNotIn("Do not add a detach layer", runtime)
         for forbidden in (
             "trailing `&`", "`&!`", "`&|`", "`nohup`", "`setsid`",
             "`disown`", "`bg`", "`coproc`", "`( ... ) &`", "`{ ...; } &`",
@@ -5004,13 +5037,24 @@ class DocsContractTests(unittest.TestCase):
         for fragment in (
             "--discover 'ABS_RUNDIR' --skill-contract 4",
             "--check-staging-dir 'ABS_RUNDIR' --skill-contract 4",
+            "--start 'ABS_RUNDIR' --skill-contract 4",
+            "--follow 'ABS_RUNDIR' --skill-contract 4",
+        ):
+            self.assertIn(fragment, skill)
+        runtime = self._ref("runtime-behavior.md")
+        for fragment in (
+            "--start 'ABS_RUNDIR' --skill-contract 4",
+            "--cancel 'ABS_RUNDIR' --skill-contract 4",
+            # The tracked fallback's recipe.
             "--roles-file 'ABS_RUNDIR/roles.json'",
             "--context-file 'ABS_RUNDIR/context.md'",
             "> 'ABS_RUNDIR/out.md'",
             "2> 'ABS_RUNDIR/err.log'",
-            "--follow 'ABS_RUNDIR' --skill-contract 4",
         ):
-            self.assertIn(fragment, skill)
+            self.assertIn(fragment, runtime)
+        # The lines --start prints carry the same epoch.
+        self.assertIn(
+            f"--cancel <ABS_RUNDIR> --skill-contract {epoch}", runtime)
 
     def test_documented_runner_commands_parse_with_the_runner(self):
         """Every runner command a document shows is accepted by the runner's
@@ -5023,8 +5067,9 @@ class DocsContractTests(unittest.TestCase):
             plugin_root, "skills", "codex-council", "scripts",
             "codex_council.py")))
         expected = {
-            "SKILL.md": {"discover", "check-staging-dir", "launch", "follow"},
-            "runtime-behavior.md": {"follow", "status", "reap"},
+            "SKILL.md": {"discover", "check-staging-dir", "start", "follow"},
+            "runtime-behavior.md": {"launch", "start", "follow", "status",
+                                    "cancel", "reap"},
         }
         for name, text in self._doc_surfaces().items():
             modes = set()
@@ -5045,12 +5090,13 @@ class DocsContractTests(unittest.TestCase):
 
     def test_preflight_and_launch_are_separate_calls_that_fail_closed(self):
         """A pre-flight that refuses a directory cannot stop a launch that
-        runs in the same Bash call: executed literally, the old one-block
-        template printed the refusal and launched anyway, truncating the
-        directory's out.md and err.log. So every SKILL code block holds at
-        most one runner command, the launch block holds nothing but that
-        command, and the prose makes the launch a separate call that runs
-        only after the pre-flight exits 0."""
+        runs in the same Bash call: executed literally, an old one-block
+        template printed the refusal and launched anyway. So every SKILL
+        code block holds at most one runner command, the --start block
+        holds nothing but that command (no redirect, no detach, no second
+        command), and the prose makes the launch a separate foreground call
+        that runs only after the pre-flight exits 0, so its plan is read
+        before anything starts."""
         skill = self._skill()
         blocks = re.findall(r"```[\w-]*\n(.*?)```", skill, re.S)
         modes = []
@@ -5062,27 +5108,31 @@ class DocsContractTests(unittest.TestCase):
                        block) for argv in commands]
         order = [mode for mode, _ in modes]
         self.assertLess(order.index("check-staging-dir"),
-                        order.index("launch"))
-        launch_block = dict(modes)["launch"]
+                        order.index("start"))
+        self.assertNotIn("launch", order)
+        launch_block = dict(modes)["start"]
         code = [line for line in launch_block.replace("\\\n", " ").splitlines()
                 if line.strip() and not line.lstrip().startswith("#")]
         self.assertEqual(len(code), 1, code)
         self.assertTrue(code[0].strip().startswith(self.RUNNER_COMMAND))
-        for token in ("&&", "||", ";", "&", "|"):
+        for token in ("&&", "||", ";", "&", "|", ">", "2>", "nohup",
+                      "setsid", "disown"):
             self.assertNotIn(token, shlex.split(code[0], posix=True)[3:])
+        self.assertEqual(shlex.split(code[0], posix=True)[2:],
+                         ["--start", "ABS_RUNDIR", "--skill-contract",
+                          str(codex_council.SKILL_CONTRACT_EPOCH)])
         comment = self._flat(" ".join(
             line.lstrip("# ") for line in launch_block.splitlines()
             if line.lstrip().startswith("#")))
-        self.assertIn("Only after the pre-flight exits 0, a separate call",
-                      comment)
+        self.assertIn("Only after the pre-flight exits 0, a separate "
+                      "foreground call", comment)
         self.assertIn("nothing else in it", comment)
         flat = self._section("## Step 4", "## Step 5")
         for required in (
             "**Two Bash calls.**",
             "Run the pre-flight in the foreground; launch only after it "
             "exits 0, in a separate call",
-            "Never combine them: a refused pre-flight would not stop the "
-            "launch",
+            "Never combine them: read the plan first",
         ):
             self.assertIn(required, flat)
 
@@ -5098,28 +5148,46 @@ class DocsContractTests(unittest.TestCase):
             "1800000",
             "600000",
             "re-arm the same command only on that expiry",
-            "only while the background task is still running",
+            "only while `--status` says `running`",
             "replays earlier lines",
+            # The follower's keepalive keeps a long council visible.
+            "prints a `still running` keepalive after 600 s of silence",
             # One follower, actionable lines only; --status for spot
             # checks; a gone runner is reaped before re-running its roles.
             "one Monitor",
             "relays actionable lines",
             "Swap in `--status` for a spot check",
             "`runner gone` or `runner not responding`",
-            "take its `next:` action",
-            "confirm its task ended, `--reap` the same way, re-run "
-            "unfinished roles in a new directory",
+            "`runner ended before dispatch`",
+            "take its `next:` action (`--reap` when gone, `--cancel` when "
+            "not responding)",
+            # A detached runner gone at once: one tracked-fallback retry.
+            "If the runner is `gone` within a minute of `--start` with no "
+            "terminal line, relaunch once with the tracked fallback",
             "one-shot 10-minute wake-up",
             "that runs `--status`",
             "delete it once the run settles",
             "stop that task and run it again",
             "Never use a shell `sleep` loop",
-            "completion notification is the backstop",
-            # Where the final response ends the council, keep the turn open.
+            # The detached council outlives the host's limits and the
+            # turn; only --cancel stops it.
+            "The runner is detached, so the host's background time limit "
+            "and exit do not stop it; `--cancel` does",
+            "It runs, and spends, until it finishes or is cancelled",
+            "in `claude -p` or a subagent, keep the turn open until the "
+            "council ends, or run `--cancel` before your final response",
             "In `claude -p` or a subagent, where your final response ends "
-            "the council",
+            "your watch",
             "as a foreground Bash call with `timeout` 600000",
-            "while the council's task is still running",
+            "run it again while `--status` says `running`",
+            # The completion rule: the follower's exit, then a verified
+            # runner exit from --status, and only then out.md.
+            "**Completion:** the follower exits 0, then `--status` reports "
+            "the runner ended (`done`, `interrupted`, or `aborted`: lock "
+            "free, pid gone",
+            "Only then read `ABS_RUNDIR/out.md` and reconcile",
+            "`CODEX_COUNCIL_DONE` and the follower's exit alone are only "
+            "progress signals",
             "launch a separate council in a new directory",
             "Read that role's reply file and tell the user in one line",
             "act on work that does not depend on other roles",
@@ -5128,7 +5196,8 @@ class DocsContractTests(unittest.TestCase):
             "Never present a partial synthesis as final",
             "A running role cannot be steered",
             "`ok=N total=M exit=X`",
-            "Exit `2` with no sentinel means the launch was refused",
+            "Exit `2` with no sentinel (`ended before dispatch`) means the "
+            "launch was refused",
             # Exit 1 is also a runner that could not finish, maybe after
             # some roles succeeded.
             "the runner could not finish (`runner aborted`)",
@@ -5146,15 +5215,18 @@ class DocsContractTests(unittest.TestCase):
     def test_monitor_horizons_include_the_claude_p_limit(self):
         """A Monitor watch lasts at most 30 minutes interactively and 10 in
         `claude -p`; wherever a document states the interactive horizon it
-        states the non-interactive one too, and the host's task lifetime
-        bounds a run the runner itself never ends."""
+        states the non-interactive one too. A detached council outlives a
+        `claude -p` turn, so the core says to keep the turn open or cancel;
+        the reference keeps the host's five-second stop of a `-p`
+        background shell, which bounds the tracked fallback."""
         step5 = self._section("## Step 5", "## Step 6")
         runtime = self._flat(self._ref("runtime-behavior.md"))
-        for name, flat in (("SKILL.md", step5),
-                           ("runtime-behavior.md", runtime)):
+        for name, flat, extra in (
+                ("SKILL.md", step5, "or run `--cancel` before your final "
+                                    "response"),
+                ("runtime-behavior.md", runtime, "about five seconds")):
             with self.subTest(surface=name):
-                for required in ("1800000", "600000", "claude -p",
-                                 "about five seconds"):
+                for required in ("1800000", "600000", "claude -p", extra):
                     self.assertIn(required, flat)
         for name, text in self._doc_surfaces().items():
             for paragraph in re.split(r"\n\s*\n", text):
@@ -5219,6 +5291,145 @@ class DocsContractTests(unittest.TestCase):
         self.assertEqual(council_common.LAUNCH_OUTPUTS,
                          ("out.md", "err.log", "replies"))
 
+    def test_runtime_reference_documents_the_detached_launch(self):
+        """The detached launch's reference section states what --start
+        creates and prints, the lock semantics, every --status line and
+        next: action for a detached run as the runner builds them, --cancel,
+        the keepalive line as the follower builds it, the completion rule,
+        and what a claude -p host must do."""
+        raw = self._ref("runtime-behavior.md")
+        ref = self._flat(raw)
+        heading = "Detached launch, cancel, and the supervisor lock"
+        self.assertIn(f"\n## {heading}\n", raw)
+        self.assertIn(f"\n- {heading}\n", raw)
+        runner = self._runner_source()
+        for required, source in (
+            ("[codex-council] started: pid=<pid> dir=<ABS_RUNDIR> "
+             "version=<plugin version>", "[codex-council] started: pid="),
+            ("follow: <python> <script> --follow <ABS_RUNDIR> "
+             "--skill-contract 4", 'f"follow: {command} --follow {quoted}'),
+            ("status: <python> <script> --status <ABS_RUNDIR> "
+             "--skill-contract 4", 'f"status: {command} --status {quoted}'),
+            ("cancel: <python> <script> --cancel <ABS_RUNDIR> "
+             "--skill-contract 4", 'f"cancel: {command} --cancel {quoted}'),
+            ("[codex-council-follow] runner ended before dispatch: read "
+             "<ABS_RUNDIR>/err.log", "runner ended before dispatch: read "),
+            ("[codex-council] start failed:", "[codex-council] start failed:"),
+        ):
+            with self.subTest(line=required):
+                self.assertIn(required, ref)
+                self.assertIn(source, runner)
+        for required in (
+            f"note: {council_common.SUPERVISOR_FILENAME} is not written yet; "
+            "the supervisor is still starting; run --status",
+            f"waits up to {codex_council.START_WAIT_SECS} seconds for "
+            f"`{council_common.SUPERVISOR_FILENAME}`",
+            "A refusal exits 2 before anything is created",
+            "it exits 2 with the launched-directory recovery, having created "
+            "and truncated nothing",
+            "the supervisor's command line carries only paths",
+            "marks the descriptor so no codex worker inherits it",
+            "`runner.mode` `detached`",
+            "never retry `--start` there",
+            "The lock file is never removed or replaced, and a free lock "
+            "means \"no holder\", never \"reusable\"",
+            "gone only when the lock is free and the recorded identity is "
+            "gone",
+            "Nothing is signalled, reaped, or relaunched on unknown",
+            f"waits up to {council_liveness.CANCEL_GRACE_SECS} seconds for "
+            "the lock to be released",
+            f"waits up to {council_liveness.CANCEL_KILL_WAIT_SECS} more "
+            "seconds",
+            "It refuses with exit 1, signalling nothing",
+            "A process that reused the runner's pid is never signalled",
+            "`--reap` refuses while the lock is held, even when `ps` says "
+            "the pid is gone",
+            "`--follow` and `--status` never write, repair, or signal "
+            "anything",
+            "behaves exactly as before",
+            "Completion of a detached run is the follower's exit 0 followed "
+            "by `--status` reporting that the runner ended",
+            "A detached council keeps running, and spending, until it "
+            "finishes or is cancelled",
+            "or run `--cancel` before the final response",
+            f"relayed nothing for {council_liveness.FOLLOW_KEEPALIVE_SECS} "
+            "seconds prints one keepalive line",
+            f"at most {'five' if council_liveness.KEEPALIVE_ROLES == 5 else ''}"
+            " active roles",
+            "never from role output or a `reply=` path",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, ref)
+        # Every --status line and next: action a detached run can get, as
+        # the runner builds them (placeholders for the variable parts).
+        now = 1_000_000.0
+        sup = council_liveness.SupervisorView(
+            pid=4242, identity="id", pgid=4242, sid=4242, lock_dev=1,
+            lock_ino=2, version="9.8.7", epoch=4, started_at="t")
+
+        def view(state="running", tick=5.0, roles=None):
+            return council_liveness.RunView(
+                pid=4242, identity="id", state=state,
+                exit=None if state == "running" else 0, tick_at=now - tick,
+                roles=roles if roles is not None else {"r": {
+                    "state": "active", "attempt": 1, "output_at": None,
+                    "pid": None, "pgid": None, "pgid_identity": None,
+                    "outcome": None}}, mode="detached")
+
+        settled = {"r": {"state": "settled", "attempt": 1, "output_at": None,
+                         "pid": None, "pgid": None, "pgid_identity": None,
+                         "outcome": "ok"}}
+        Det = council_liveness.Detached
+        cases = (
+            (None, Det("alive", sup, "held")),
+            (view(), Det("alive", sup, "held")),
+            (view("done"), Det("alive", sup, "held")),
+            (view(tick=200.0), Det("alive", sup, "held")),
+            (view("done", roles=settled), Det("gone", sup, "free")),
+            (view("interrupted"), Det("gone", sup, "free")),
+            (view("aborted"), Det("gone", sup, "free")),
+            (None, Det("gone", sup, "free")),
+            (view(), Det("gone", sup, "free")),
+            (view(), Det("unknown", sup, "held")),
+        )
+        placeholders = (("4242", "<pid>"), ("exit 0", "exit <N>"),
+                        ("200s ago", "<N>s ago"), ("5s ago", "<N>s ago"))
+        for run_view, detached in cases:
+            unfinished = (council_liveness._unfinished(run_view)
+                          if run_view is not None else [])
+            label, action, _ = council_liveness._detached_label(
+                run_view, now, detached, unfinished, {})
+            for old, new in placeholders:
+                label = label.replace(old, new)
+            if "still exiting" in label:
+                label = "<state>" + label[label.index(" (exit"):]
+            if label.startswith("unknown"):
+                label = label.replace("lock held", "lock <state>")
+            if label.startswith(("interrupted", "aborted")):
+                label = label.split(" (")[0]
+            with self.subTest(state=label):
+                self.assertIn(f"`{action}`", ref)
+                self.assertIn(f"`{label}", ref)
+        # The keepalive example is what the follower prints.
+        follower = object.__new__(council_liveness._Follower)
+        follower.live_view = council_liveness.RunView(
+            pid=4242, identity="id", state="running", exit=None,
+            tick_at=now - 4, roles={
+                "architect": {"state": "active", "output_at": now - 41},
+                "prober": {"state": "active", "output_at": None},
+                "done": {"state": "settled", "output_at": None},
+            })
+        follower.dispatched_at = 0.0
+        follower.last_emit = -1e9
+        follower.suspend_floor = 0.0
+        printed = []
+        with patch.object(council_liveness.time, "time", return_value=now), \
+                patch.object(council_liveness, "_print_stdout",
+                             printed.append):
+            follower.keepalive()
+        self.assertEqual(len(printed), 1)
+        self.assertIn(printed[0] + "\n", raw)
+
     def test_recovery_triage_decides_runner_state_before_role_output(self):
         """A runner killed after a stall leaves stall and retry lines in
         err.log's tail, and a stopped runner leaves every role's quiet below
@@ -5244,6 +5455,7 @@ class DocsContractTests(unittest.TestCase):
         self.assertIn("even if stall or retry lines precede the end",
                       text["2"])
         stop = [text["3"].index(step) for step in (
+            "run `--cancel` for a detached run",
             "stop the council's tracked background task",
             "confirm with `--status` that the runner is now `gone`",
             "run `--reap` if it then lists live codex groups",
@@ -5259,6 +5471,15 @@ class DocsContractTests(unittest.TestCase):
                 self.assertIn(fragment, self._runner_source())
         self.assertIn("appears only in reply files and `out.md`, never in "
                       "`err.log`", text["5"])
+        # For a detached run the lock decides unknown, and --cancel replaces
+        # stopping a tracked task wherever a present runner must stop.
+        self.assertIn("the supervisor lock decides", text["4"])
+        self.assertIn("never `--reap`, `--cancel`, or relaunch", text["4"])
+        self.assertIn("run `--cancel` (for the tracked fallback, stop its "
+                      "background task)", text["8"])
+        self.assertIn("`ended before dispatch`", text["2"])
+        self.assertIn("`--status` no longer says the runner is still "
+                      "exiting", text["1"])
         self.assertIn("`watchdog=disabled`", text["6"])
         self.assertIn("Runner monitoring", text["6"])
         self.assertIn("Every re-invocation below is a new launch in a new "
@@ -5293,8 +5514,31 @@ class DocsContractTests(unittest.TestCase):
             "runs on the current native configuration",
             # Stale recovery names the warning the role's result carries.
             codex_council.STALE_RESUME_WARNING,
+            # Host lifetime: the background time limit (cited), the separate
+            # idle memory-pressure stop (the user's setting, never the
+            # skill's), and what a detached council does and does not
+            # survive.
+            "Since Claude Code 2.1.285, background Bash and PowerShell "
+            "commands stop after a time limit",
+            "30 minutes by default and 2 hours at most",
+            "(https://code.claude.com/docs/en/changelog)",
+            "Output does not extend it",
+            "It bounds the tracked fallback only, which is why that recipe "
+            "passes `timeout: 7200000`",
+            "`CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP` turns that off",
+            "(https://code.claude.com/docs/en/env-vars)",
+            "the user's own setting, and the skill never sets it",
+            "A council started with `--start` is not a tracked task, so "
+            "neither stop applies",
+            "It does not survive a reboot",
+            "are not verified",
+            "**Linux PID namespaces.**",
+            "a held lock reads `unknown` and nothing is signalled or reaped",
+            "Use only the supported `--start` to outlive a background task; "
+            "never a manual detach wrapper",
         ):
             self.assertIn(required, ref)
+        self.assertNotIn("Do not add a detach layer", ref)
         panel = self._flat(self._ref("panel-design.md"))
         for required in (
             "its state file records the thread id, never a model or effort",
@@ -5840,8 +6084,9 @@ class DocsContractTests(unittest.TestCase):
 
     def test_design_is_honest_about_what_the_runner_does_not_enforce(self):
         """User-pin provenance and a reason's meaning are trusted to the
-        orchestrator, and one launch per directory is enforced by
-        discovery and the pre-flight, not atomically at launch."""
+        orchestrator, and one launch per directory is claimed atomically
+        only by --start: for the tracked fallback it rests on discovery and
+        the pre-flight, not on the launch."""
         def limits(section):
             text = self._flat(self._design_section(section))
             self.assertIn("**Limits.**", text)
@@ -5859,8 +6104,12 @@ class DocsContractTests(unittest.TestCase):
             self.assertIn(required, selection)
         staging = limits("Staging and preflight")
         for required in (
-            "**One launch per directory is not enforced atomically.**",
-            "the launch itself does not check",
+            "**One launch per directory is not enforced atomically for the "
+            "tracked fallback.**",
+            "`--start` claims its directory atomically",
+            "the tracked launch itself does not check",
+            "a tracked launch into a directory `--start` already claimed "
+            "still truncates its files",
         ):
             self.assertIn(required, staging)
         # The runner really does accept any non-empty single-line reason.
@@ -5870,6 +6119,55 @@ class DocsContractTests(unittest.TestCase):
                 "mode": "routed", "snapshot_id": "0123456789abcdef",
                 "reason": "picked the newest-looking id"}})
         self.assertEqual(role.selection.reason, "picked the newest-looking id")
+
+    def test_design_and_readme_explain_the_detached_launch(self):
+        """DESIGN and README say what ends a run (a verified runner exit,
+        not only the host's notification), why the council runs detached
+        (the host's background time limit, cited), and what a detached run
+        does not survive; the old claims that only the host bounds a run
+        and that there is no supervisor are gone."""
+        design = self._flat(self._read_repo_file("DESIGN.md"))
+        for required in (
+            "only a verified runner exit marks the end of a run",
+            "a released supervisor lock together with a vanished runner "
+            "identity",
+            "*A verified runner exit ends the run.*",
+            "a released supervisor lock plus a vanished pid identity",
+            "*A detached supervisor, started by a foreground call.*",
+            "Since Claude Code 2.1.285 a background command stops at its "
+            "`timeout`",
+            "Mirroring the runner's stderr into a tracked task would not help",
+            "*Detach only inside `--start`.*",
+            "`_become_supervisor`",
+            "does not survive a reboot",
+            "A plugin update while a supervisor runs",
+            "Across Linux PID namespaces",
+            "**No supervisor beyond the runner.**",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, design)
+        for retired in ("*The host's notification ends the run.*",
+                        "**No supervisor process.**",
+                        "without adding a supervisor process"):
+            self.assertNotIn(retired, design)
+        readme = self._flat(self._read_repo_file("README.md"))
+        for required in (
+            "A separate foreground call runs `--start`",
+            "`--cancel` stops the council.",
+            "`--status` confirms the runner has ended (its lock is free and "
+            "its process gone)",
+            "Since Claude Code 2.1.285 a background command stops at its "
+            "time limit, 30 minutes by default and 2 hours at most",
+            "(https://code.claude.com/docs/en/changelog)",
+            "`CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP`",
+            "(https://code.claude.com/docs/en/env-vars)",
+            "the plugin never sets it",
+            "The tracked fallback runs inside them and so lasts at most 2 "
+            "hours.",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, readme)
+        self.assertNotIn("only the host bounds a run's lifetime", readme)
 
     # ---------- reconciliation ----------
 
@@ -6004,7 +6302,8 @@ class DocsContractTests(unittest.TestCase):
         directory, under the names the runner uses."""
         entries = (council_discovery.SNAPSHOT_FILENAME,
                    council_liveness.STATUS_FILENAME,
-                   *council_common.LAUNCH_OUTPUTS)
+                   *council_common.LAUNCH_OUTPUTS,
+                   *council_common.SUPERVISOR_FILES)
         for name in ("README.md", "DESIGN.md"):
             text = self._read_repo_file(name)
             rows = "\n".join(line for line in text.splitlines()
@@ -6021,8 +6320,8 @@ class DocsContractTests(unittest.TestCase):
         rows = [line for line in commands.splitlines()
                 if line.startswith("| ")]
         for flag in ("--discover RUNDIR", "--check-staging-dir RUNDIR",
-                     "--roles-file", "--follow RUNDIR", "--status RUNDIR",
-                     "--reap RUNDIR"):
+                     "--start RUNDIR", "--roles-file", "--follow RUNDIR",
+                     "--status RUNDIR", "--cancel RUNDIR", "--reap RUNDIR"):
             with self.subTest(flag=flag):
                 self.assertTrue(any(flag in row for row in rows), flag)
                 args = codex_council._parse_args(
@@ -6126,9 +6425,26 @@ class DocsContractTests(unittest.TestCase):
             f"no usable `status.json` for "
             f"{council_liveness.STATUS_UNUSABLE_WARN_SECS} s after dispatch",
             f"`STATUS_ROLE_LINES` ({council_liveness.STATUS_ROLE_LINES})",
+            f"`CANCEL_GRACE_SECS = {council_liveness.CANCEL_GRACE_SECS}`",
+            f"`CANCEL_KILL_WAIT_SECS = "
+            f"{council_liveness.CANCEL_KILL_WAIT_SECS}`",
         ):
             with self.subTest(text=text):
                 self.assertIn(text, liveness)
+        launch = self._flat(self._design_section("Launch and fan-out"))
+        self.assertIn(f"`START_WAIT_SECS = {codex_council.START_WAIT_SECS}`",
+                      launch)
+        progress = self._flat(self._design_section(
+            "Progress, replies, and reconciliation"))
+        for text in (
+            f"`PROGRESS_HEARTBEAT_SECS = "
+            f"{codex_council.PROGRESS_HEARTBEAT_SECS}`",
+            f"`FOLLOW_KEEPALIVE_SECS = "
+            f"{council_liveness.FOLLOW_KEEPALIVE_SECS}`",
+            f"`KEEPALIVE_ROLES = {council_liveness.KEEPALIVE_ROLES}`",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(text, progress)
 
     # ---------- diagrams and the PDF ----------
 

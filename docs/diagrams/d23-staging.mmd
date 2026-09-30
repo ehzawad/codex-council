@@ -4,7 +4,7 @@ flowchart TD
     Write["Claude writes<br/>roles.json and context.md"]
     Preflight{"Preflight, its own<br/>foreground call:<br/>exit 0?"}
     Fix(["exit 2: rewrite the file,<br/>or a new directory"])
-    Launch["Separate background call<br/>redirects create<br/>out.md and err.log"]
+    Launch["--start, a separate<br/>foreground call, claims<br/>out.md and err.log"]
     Gate{"Launch gate:<br/>same checks pass?"}
     Restart(["exit 2: start over<br/>in a new directory"])
     Resolve(["Selection resolution,<br/>then fan-out"])

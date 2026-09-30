@@ -530,7 +530,7 @@ class EndToEndTests(unittest.TestCase):
                 "--skill-contract", EPOCH]
 
     def _launch_redirected(self):
-        """Launch like SKILL.md does: stdout > out.md, stderr > err.log."""
+        """Launch like the tracked fallback: stdout > out.md, stderr > err.log."""
         out = open(os.path.join(self.run_dir, "out.md"), "wb")
         err = open(os.path.join(self.run_dir, "err.log"), "wb")
         self.addCleanup(out.close)

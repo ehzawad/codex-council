@@ -1,24 +1,24 @@
 flowchart LR
     Claude("Claude Code<br/>orchestrator")
-    Host("Host task tracker<br/>run_in_background")
-    Runner("Runner CLI<br/>codex_council.py")
+    Host("Host task tracker<br/>tracked fallback only")
+    Runner("Runner CLI<br/>detached by --start")
     Follower("Follower<br/>--follow")
-    RunDir[("Run directory<br/>private, one launch")]
+    RunDir[("Run directory<br/>private, one launch,<br/>supervisor lock")]
     State[("Thread state<br/>project, session, role")]
     AppServer[["codex app-server<br/>metadata only"]]
     Workers[["codex exec<br/>one per role"]]
     Workspace[("Workspace")]
 
     Claude <-->|"inputs in, results out"| RunDir
-    Claude -->|"commands"| Runner
-    Runner <-->|"inputs, outputs"| RunDir
+    Claude -->|"--start, --cancel"| Runner
+    Runner <-->|"inputs, outputs, lock"| RunDir
     Runner <-->|"read-only RPCs"| AppServer
     Runner -->|"dispatch"| Workers
     Workers <-->|"work"| Workspace
     Runner <-->|"thread ids"| State
     RunDir -->|"err.log, status.json"| Follower
     Follower -->|"events"| Claude
-    Runner -->|"process exit"| Host
+    Runner -->|"exit, if tracked"| Host
     Host -->|"task notification"| Claude
 
     classDef ours fill:#dbeafe,stroke:#1d4ed8,color:#0f172a

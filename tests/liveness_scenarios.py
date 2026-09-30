@@ -2,9 +2,10 @@
 """Liveness scenarios: the real runner CLI end to end against a fake codex.
 
 Each scenario stages a private run directory, launches the council the way
-SKILL.md does (stdout to out.md, stderr to err.log) with the fake `codex`
-from fake_codex.py first on PATH, follows it with `--follow`, disturbs it,
-and prints one verdict line with the number of lines the follower emitted:
+the tracked fallback does (stdout to out.md, stderr to err.log; S8-S12 use
+--start) with the fake `codex` from fake_codex.py first on PATH, follows it
+with `--follow`, disturbs it, and prints one verdict line with the number
+of lines the follower emitted:
 
   S0  happy path: three roles succeed.
   S1  a descendant of codex holds codex's stdout open after codex exits.
