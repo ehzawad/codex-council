@@ -17,12 +17,6 @@ runs on a model and reasoning effort discovered at runtime for its lens, or
 on your native Codex configuration. Claude itself keeps the host session's
 model and effort; council routing controls only the external Codex workers.
 
-![d00-context: the user, Claude Code with the skill, the council runner, the Codex workers, and the shared workspace, top to bottom](docs/diagrams/d00-context.png)
-
-*d00-context — Council in context. Claude briefs the runner, the runner
-dispatches one Codex worker per role, and Claude reconciles what comes back.
-Source: [d00-context.mmd](docs/diagrams/d00-context.mmd).*
-
 ## Requirements
 
 - [Claude Code](https://claude.ai/code) 2.1.x, signed in (`claude` works in
@@ -95,15 +89,143 @@ references cover
 [context staging](plugins/codex-council/skills/codex-council/references/context-staging.md),
 and [runtime behavior](plugins/codex-council/skills/codex-council/references/runtime-behavior.md).
 
+## Architecture
+
+Claude stages each council in a private run directory with foreground
+calls, `--start` detaches the runner from the host, and Claude follows the
+run from disk until the runner has ended, then reconciles one result. For
+the full design, mechanism by mechanism, read
+[`docs/codex-council.pdf`](docs/codex-council.pdf): this README,
+[DESIGN.md](DESIGN.md), the skill, and its references in one document, with
+these three diagrams drawn as vector graphics.
+
+```mermaid
+flowchart LR
+    subgraph Host["Claude Code + the codex-council skill"]
+        direction TB
+        Panel["Compose the role panel<br/>SKILL.md"] --> Mktemp["mktemp -d<br/>private run dir"]
+        Mktemp --> Discover["--discover, metadata only<br/>model-snapshot.json"]
+        Discover --> Inputs["roles.json: model and<br/>effort per role (pin,<br/>routed, native_effort,<br/>or inherit); context.md"]
+        Inputs --> Check["--check-staging-dir<br/>foreground pre-flight"]
+        Check --> Start["--start, foreground<br/>claims supervisor.lock<br/>+ token, err.log, out.md"]
+    end
+
+    Host -- "detaches" --> Detached
+
+    subgraph Detached["Detached supervisor, outside any host task"]
+        direction TB
+        Runner["Runner holds<br/>supervisor.lock, writes<br/>supervisor.json<br/>and status.json"] --> Fanout["Bounded parallel fan-out<br/>CODEX_COUNCIL_MAX_PARALLEL"]
+        Fanout --> RoleA["Role A<br/>liveness + watchdog"]
+        Fanout --> RoleN["Role N<br/>liveness + watchdog"]
+        RoleA --> ExecA["codex exec<br/>fresh or resumed"]
+        RoleN --> ExecN["codex exec<br/>fresh or resumed"]
+        ExecA --> Replies["replies/<br/>as each role settles"]
+        ExecN --> Replies
+        Replies --> Out["out.md report, then<br/>CODEX_COUNCIL_DONE"]
+    end
+
+    Detached -- "err.log<br/>status.json<br/>supervisor.lock" --> Watch
+
+    subgraph Watch["Claude follows, then reconciles"]
+        direction TB
+        Follow["--follow, read-only<br/>600 s keepalive"] --> Monitor["Monitor wakes Claude<br/>early replies"]
+        Monitor --> Ended["--status: ended?<br/>lock free, pid gone"]
+        Ended --> Reconcile["Read out.md, reconcile<br/>one result for the user"]
+        Ended -. "stuck or gone" .-> Ctl["--cancel if stuck<br/>--reap if gone"]
+    end
+```
+
+## Launch Flow
+
+One launch, from staging to reconciliation. Every command Claude runs is a
+foreground call; only the council runs detached, so no host time limit
+reaches it, and the skill never launches a council as a time-limited
+background task. A start that fails gets one relaunch in a new directory;
+if that fails too, Claude stops and reports the `err.log` diagnosis.
+
+```mermaid
+sequenceDiagram
+    participant C as Claude Code
+    participant S as codex_council.py
+    participant D as Run dir
+    participant R as Detached runner
+    participant X as codex exec
+    participant M as Follower
+
+    C->>D: mktemp -d, new and private
+    C->>S: --discover, metadata only
+    S->>D: model-snapshot.json
+    C->>D: roles.json, context.md
+    C->>S: --check-staging-dir
+    S-->>C: staging OK, or exit 2
+    C->>S: --start, own foreground call
+    S->>D: claim supervisor.lock,<br/>err.log, out.md
+    S->>R: start in its own session
+    R->>D: supervisor.json
+    S-->>C: started line, then the<br/>follow, status, cancel commands
+    Note over C,S: returns once supervisor.json exists<br/>never a time-limited background launch
+    opt --start exits 1, or the runner is gone within a minute
+        C->>S: relaunch once in a NEW dir:<br/>mktemp, discover, pre-flight, --start
+        Note over C,S: if that fails too, stop and report err.log
+    end
+    par dispatch: bounded fan-out
+        R->>X: role A, fresh or resumed
+    and
+        R->>X: role N
+    end
+    C->>M: Monitor runs --follow
+    loop until the terminal line
+        R->>D: reply file, then<br/>completion line
+        M-->>C: completion line, reply=path
+        M-->>C: still running, after 600 s quiet
+    end
+    opt Monitor watch expires
+        C->>S: --status says running
+        C->>M: re-arm the same --follow
+    end
+    R->>D: out.md, then<br/>CODEX_COUNCIL_DONE
+    M-->>C: terminal line, the follower exits 0
+    C->>S: --status
+    S-->>C: done: lock free, pid gone
+    C->>D: only now read out.md
+    Note over C: reconcile one result
+```
+
+## State Scope
+
+How a role finds, locks, and resumes its saved Codex thread (see
+[Saved role threads](#saved-role-threads)).
+
+```mermaid
+flowchart TD
+    Root["Project root: Git top level,<br/>else the launch directory"] --> PHash["project hash<br/>sha256, 16 hex"]
+
+    Explicit["CODEX_COUNCIL_SESSION_KEY"] -->|"set, not blank"| Key["session key"]
+    Explicit -->|"unset or blank"| Auto["first host id set, in order:<br/>CLAUDE_CODE_SESSION_ID<br/>CLAUDE_SESSION_ID<br/>CODEX_THREAD_ID<br/>TERM_SESSION_ID<br/>TMUX_PANE, STY<br/>VSCODE_PID"]
+    Auto -->|"found: NAME=value"| Key
+    Auto -->|"none"| Wide["no session part:<br/>project-wide threads"]
+    Key --> SHash["session hash<br/>sha256, 16 hex"]
+
+    Role["role id"] -->|"32 chars or fewer"| RKey["role key = the id"]
+    Role -->|"longer"| RHash["role key =<br/>role-sha256-HEX"]
+
+    PHash --> Path
+    SHash --> Path
+    Wide --> Path
+    RKey --> Path
+    RHash --> Path
+    Path["codex-council/ under<br/>$XDG_STATE_HOME<br/>or ~/.local/state:<br/>project-session__role.json<br/>or project__role.json"]
+    Path --> Lock["flock PATH.lock<br/>without blocking"]
+    Lock -->|"another council holds it"| Wait["yield the fan-out permit,<br/>retry in 0.1 s, doubling<br/>up to 2 s"]
+    Wait --> Lock
+    Lock -->|"locked, thread saved"| Resume["codex exec resume"]
+    Lock -->|"locked, none saved"| Fresh["codex exec, fresh thread"]
+    Resume -->|"stale: clear the state,<br/>prior continuity lost"| Fresh
+    Resume --> Save["with a reply, save<br/>the thread id, never<br/>a model or effort"]
+    Fresh --> Save
+```
+
 ## How a run works
-
-![d10-components: Claude Code, the runner detached by --start, the follower, the host task tracker (attached runs only), the run directory with its supervisor lock, saved threads, codex app-server, codex exec, and the workspace](docs/diagrams/d10-components.png)
-
-*d10-components — Runtime components and ownership. The runner talks to
-Codex; Claude and the runner hand work to each other through the run
-directory; a released supervisor lock and a vanished runner (or, for an
-attached run, the end of its launch command) say the run is over. Source:
-[d10-components.mmd](docs/diagrams/d10-components.mmd).*
 
 1. **Stage.** Claude creates a private directory with `mktemp -d`, runs
    `--discover` there (it writes `model-snapshot.json`), then writes
@@ -150,8 +272,7 @@ background task an attached launch is stopped at the host's time limit, so
 the skill never uses it (see
 [runtime behavior](plugins/codex-council/skills/codex-council/references/runtime-behavior.md)).
 
-Every mechanism has its own section and diagram in [DESIGN.md](DESIGN.md);
-the [diagram index](#diagrams) below lists them all.
+Every mechanism has its own section in [DESIGN.md](DESIGN.md).
 
 ## Configuration
 
@@ -330,31 +451,6 @@ token, and the app-server's own error output never reaches any file or
 message. Catalog text is treated as data and printed with control
 characters escaped.
 
-## Diagrams
-
-Each diagram's Mermaid source sits next to its PNG in
-[`docs/diagrams/`](docs/diagrams/); [DESIGN.md](DESIGN.md) shows each one
-beside the mechanism it explains, and
-[`docs/codex-council.pdf`](docs/codex-council.pdf) collects these documents
-with every diagram.
-
-| Id | Level | Shows |
-|---|---|---|
-| [d00-context](docs/diagrams/d00-context.png) | 0 | who does what |
-| [d10-components](docs/diagrams/d10-components.png) | 1 | runtime components and who owns each |
-| [d11-modules](docs/diagrams/d11-modules.png) | 1 | the runner's modules and their imports |
-| [d20-discovery](docs/diagrams/d20-discovery.png) | 2 | model discovery |
-| [d21-choose](docs/diagrams/d21-choose.png) | 2 | how Claude chooses a role's model and effort |
-| [d22-resolve](docs/diagrams/d22-resolve.png) | 2 | authoring checks, then what the runner sends |
-| [d23-staging](docs/diagrams/d23-staging.png) | 2 | staging, preflight, and launch gates |
-| [d24-fanout](docs/diagrams/d24-fanout.png) | 2 | bounded fan-out and role locks |
-| [d25-continuity](docs/diagrams/d25-continuity.png) | 2 | saved role threads |
-| [d26-attempt](docs/diagrams/d26-attempt.png) | 2 | one Codex process and its watchdog |
-| [d27-stall](docs/diagrams/d27-stall.png) | 2 | what a stalled attempt becomes |
-| [d28-failures](docs/diagrams/d28-failures.png) | 2 | failure classes, retries, and saved threads |
-| [d29-progress](docs/diagrams/d29-progress.png) | 2 | replies, the follower, and reconciliation |
-| [d30-liveness](docs/diagrams/d30-liveness.png) | 2 | noticing a dead or stuck runner, and recovery |
-
 ## Development
 
 ```bash
@@ -425,12 +521,14 @@ CODEX_COUNCIL_LIVE_TESTS=1 python3 -m unittest tests.test_live_codex -v   # real
 ```
 
 `scripts/build-docs.sh` rebuilds `docs/codex-council.pdf` from this README,
-DESIGN.md, SKILL.md, and its references (it needs `uvx` and Chrome or
-Chromium). In the PDF, links between these documents jump within it, other
+DESIGN.md, SKILL.md, and its references (it needs `uvx`, Chrome or
+Chromium, and network access to mermaid.ink). It renders each `mermaid`
+code block to SVG through mermaid.ink and inlines it into the page Chrome
+prints, so every diagram in the PDF is vector; the build refuses a PDF that
+holds any raster image, and it writes no image file anywhere. The
+repository holds no image files: the three diagrams above are their only
+source. In the PDF, links between these documents jump within it, other
 repository links point at GitHub, and the headings are bookmarks.
-`scripts/build-docs.sh --diagrams` first re-renders every
-`docs/diagrams/<id>.png` from its `.mmd` source through mermaid.ink, on an
-opaque white background.
 
 ## License
 

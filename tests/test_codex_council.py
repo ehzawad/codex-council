@@ -20,6 +20,7 @@ import asyncio
 import contextlib
 import dataclasses
 import hashlib
+import html
 import importlib.util
 import inspect
 import io
@@ -4146,8 +4147,7 @@ class DocsContractTests(unittest.TestCase):
         r"(?:,\s*(?:and\s+|or\s+)?(?:minimal|low|medium|high|xhigh|max)\b)"
         r"{2,})"
     )
-    TEXT_SUFFIXES = (".md", ".py", ".json", ".sh", ".yml", ".yaml", ".toml",
-                     ".mmd")
+    TEXT_SUFFIXES = (".md", ".py", ".json", ".sh", ".yml", ".yaml", ".toml")
 
     # How every documented template invokes the runner; ${CLAUDE_PLUGIN_ROOT}
     # is the directory that holds .claude-plugin/plugin.json.
@@ -4211,7 +4211,7 @@ class DocsContractTests(unittest.TestCase):
 
     def _repo_text_files(self):
         """Repo-relative paths of the text files the repo ships or tests
-        with (root documents, plugin, scripts, diagrams, CI, and tests);
+        with (root documents, plugin, scripts, docs, CI, and tests);
         ignored local directories are never walked."""
         root = self._repo_file()
         paths = [name for name in sorted(os.listdir(root))
@@ -6276,9 +6276,9 @@ class DocsContractTests(unittest.TestCase):
     # ---------- README and DESIGN structure ----------
 
     README_SECTIONS = (
-        "Requirements", "Install", "Usage", "How a run works",
-        "Configuration", "Results and failures", "Security", "Diagrams",
-        "Development", "License",
+        "Requirements", "Install", "Usage", "Architecture", "Launch Flow",
+        "State Scope", "How a run works", "Configuration",
+        "Results and failures", "Security", "Development", "License",
     )
     DESIGN_CONCERNS = (
         "Panel and context contract", "Model discovery",
@@ -6289,10 +6289,20 @@ class DocsContractTests(unittest.TestCase):
         "Progress, replies, and reconciliation",
         "Run liveness and recovery",
     )
-    DIAGRAM_NODE_BUDGET = 9
-    # Mermaid draws 16 px labels. A diagram shrunk below this to fit the
-    # PDF's page box prints them under about 7 pt.
-    DIAGRAM_MIN_PRINT_SCALE = 0.6
+    # README's three diagrams, in order, with the kind each has drawn since
+    # 0.9.0. They are the only diagram source; the PDF build draws them as
+    # vector graphics.
+    README_DIAGRAMS = (
+        ("Architecture", "flowchart LR"),
+        ("Launch Flow", "sequenceDiagram"),
+        ("State Scope", "flowchart TD"),
+    )
+    # Nodes (a flowchart) or messages (the sequence diagram) at most: past
+    # this a diagram stops being readable at print size.
+    DIAGRAM_BUDGET = 25
+    # No tracked file may have one of these suffixes.
+    IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp",
+                      ".bmp", ".ico", ".tif", ".tiff", ".avif", ".mmd")
 
     @staticmethod
     def _top_sections(text):
@@ -6485,124 +6495,369 @@ class DocsContractTests(unittest.TestCase):
 
     # ---------- diagrams and the PDF ----------
 
-    def _diagram_ids(self):
-        folder = self._repo_file("docs", "diagrams")
-        return sorted(name[:-4] for name in os.listdir(folder)
-                      if name.endswith(".mmd"))
+    def _repo_files(self):
+        """Repo-relative paths of every tracked file (every file outside
+        the ignored local directories when Git is unavailable)."""
+        root = self._repo_file()
+        try:
+            listed = subprocess.run(
+                ["git", "-C", root, "ls-files", "-z"], capture_output=True,
+                check=True, timeout=30).stdout.decode("utf-8")
+            return sorted(path for path in listed.split("\0") if path)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        paths = []
+        skip = {".git", "__pycache__", "Agents-docs", ".claude", ".codex",
+                ".in_use"}
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(d for d in dirnames if d not in skip)
+            paths += [os.path.relpath(os.path.join(dirpath, name), root)
+                      for name in filenames]
+        return sorted(paths)
 
-    def test_every_diagram_has_a_source_a_png_and_a_small_budget(self):
-        """Each diagram id has its Mermaid source and a PNG export, and no
-        diagram draws more than DIAGRAM_NODE_BUDGET nodes (details belong
-        in the tables beside it)."""
-        ids = self._diagram_ids()
-        self.assertTrue(ids)
-        folder = self._repo_file("docs", "diagrams")
-        pngs = sorted(name[:-4] for name in os.listdir(folder)
-                      if name.endswith(".png"))
-        self.assertEqual(pngs, ids)
-        for ident in ids:
-            with self.subTest(diagram=ident):
-                self.assertRegex(ident, r"^d\d\d-[a-z0-9-]+$")
-                with open(os.path.join(folder, f"{ident}.png"), "rb") as f:
-                    self.assertEqual(f.read(8), b"\x89PNG\r\n\x1a\n")
-                source = self._read_repo_file("docs", "diagrams",
-                                              f"{ident}.mmd")
-                self.assertRegex(source, r"^flowchart (?:LR|TD)\n")
-                nodes = set()
-                for line in source.splitlines():
-                    line = line.strip()
-                    if line.startswith(("classDef ", "class ")):
-                        continue
-                    nodes.update(re.findall(
-                        r"\b([A-Za-z][A-Za-z0-9_]*)(?=\(|\[|\{)", line))
-                self.assertTrue(nodes)
-                self.assertLessEqual(len(nodes), self.DIAGRAM_NODE_BUDGET)
+    def _mermaid_blocks(self, text):
+        """(heading, source) for each ```mermaid block in `text`, heading
+        being the `## ` section it sits in."""
+        blocks, heading = [], None
+        for match in re.finditer(r"^## ([^\n]+)$|^```mermaid\n(.*?)^```$",
+                                 text, re.M | re.S):
+            if match.group(1) is not None:
+                heading = match.group(1)
+            else:
+                blocks.append((heading, match.group(2)))
+        return blocks
 
-    def test_docs_embed_every_diagram_with_its_source_beside_it(self):
-        """README embeds the level 0 and level 1 views and indexes every
-        diagram; DESIGN embeds every diagram once, each followed by a
-        caption naming its id and linking its Mermaid source."""
-        ids = self._diagram_ids()
-        readme = self._read_repo_file("README.md")
-        design = self._read_repo_file("DESIGN.md")
-        embed = r"!\[[^\]]*\]\(docs/diagrams/({0})\.png\)"
-        for name, text, expected in (
-                ("README.md", readme, {"d00-context", "d10-components"}),
-                ("DESIGN.md", design, set(ids))):
-            embedded = re.findall(embed.format(r"[a-z0-9-]+"), text)
+    def _readme_diagrams(self):
+        """README's mermaid sources by section heading."""
+        blocks = self._mermaid_blocks(self._read_repo_file("README.md"))
+        return {heading: source for heading, source in blocks}
+
+    def test_repository_holds_no_image_files(self):
+        """No image file and no separate diagram source is tracked: the
+        three README diagrams are the only diagram source, and the one
+        binary document is the PDF."""
+        files = self._repo_files()
+        self.assertIn("README.md", files)
+        for path in files:
+            with self.subTest(path=path):
+                self.assertFalse(path.lower().endswith(self.IMAGE_SUFFIXES))
+                self.assertFalse(path.startswith("docs/diagrams/"))
+        self.assertEqual([p for p in files if p.startswith("docs/")],
+                         ["docs/codex-council.pdf"])
+
+    def test_docs_embed_and_link_no_images(self):
+        """No document embeds an image (Markdown or HTML) or links to an
+        image file; where a picture helps, README draws it in Mermaid."""
+        suffixes = "|".join(re.escape(s) for s in self.IMAGE_SUFFIXES)
+        link = re.compile(rf"\]\([^)\s]*(?:{suffixes})(?:#[^)]*)?\)", re.I)
+        for name, text in self._doc_surfaces().items():
             with self.subTest(doc=name):
-                self.assertEqual(set(embedded), expected)
-                self.assertEqual(len(embedded), len(set(embedded)))
-            for ident in embedded:
-                with self.subTest(doc=name, diagram=ident):
-                    after = text.split(f"(docs/diagrams/{ident}.png)", 1)[1]
-                    caption = self._flat(after.split("\n\n", 2)[1])
-                    self.assertTrue(caption.startswith(f"*{ident} — "))
-                    self.assertIn(f"[{ident}.mmd](docs/diagrams/{ident}.mmd)",
-                                  caption)
-        index = self._flat(readme.split("\n## Diagrams\n", 1)[1]
-                           .split("\n## ", 1)[0])
-        for ident in ids:
-            with self.subTest(index=ident):
-                self.assertIn(f"[{ident}](docs/diagrams/{ident}.png)", index)
+                self.assertNotRegex(text, r"!\[")
+                self.assertNotRegex(text, r"(?i)<img\b")
+                self.assertNotRegex(text, link)
+                self.assertNotIn("docs/diagrams", text)
+                if name != "README.md":
+                    self.assertEqual(self._mermaid_blocks(text), [])
+
+    def test_readme_draws_three_mermaid_diagrams_in_place(self):
+        """README holds exactly three mermaid blocks, one under each
+        diagram heading and each of the kind it has drawn since 0.9.0, and
+        points to the PDF for the full design."""
+        readme = self._read_repo_file("README.md")
+        blocks = self._mermaid_blocks(readme)
+        self.assertEqual([heading for heading, _ in blocks],
+                         [heading for heading, _ in self.README_DIAGRAMS])
+        self.assertEqual(readme.count("```mermaid"), 3)
+        for (heading, source), (_, kind) in zip(blocks, self.README_DIAGRAMS):
+            with self.subTest(diagram=heading):
+                self.assertEqual(source.splitlines()[0], kind)
+        # The PDF link sits with the diagrams, in the Architecture section.
+        architecture = readme.split("\n## Architecture\n", 1)[1].split(
+            "\n## ", 1)[0]
+        self.assertIn("[`docs/codex-council.pdf`](docs/codex-council.pdf)",
+                      architecture)
+        self.assertIn("full design", self._flat(architecture))
+
+    def test_readme_diagrams_stay_readable(self):
+        """Each diagram draws at most DIAGRAM_BUDGET nodes (flowcharts) or
+        messages (the sequence diagram); detail belongs in the text."""
+        for heading, source in self._readme_diagrams().items():
+            with self.subTest(diagram=heading):
+                if source.startswith("sequenceDiagram"):
+                    count = len(re.findall(r"^\s*\w+\s*-+>>\s*\w+\s*:",
+                                           source, re.M))
+                else:
+                    nodes = set()
+                    for line in source.splitlines():
+                        line = line.strip()
+                        if line.startswith(("subgraph ", "direction ",
+                                            "classDef ", "class ")):
+                            continue
+                        nodes.update(re.findall(
+                            r"\b([A-Za-z][A-Za-z0-9_]*)(?=\[|\(|\{)", line))
+                    count = len(nodes)
+                self.assertGreater(count, 5)
+                self.assertLessEqual(count, self.DIAGRAM_BUDGET)
+
+    def test_readme_diagrams_draw_the_current_launch_and_state(self):
+        """The diagrams name what the code does today: the detached --start
+        launch that claims supervisor.lock, the read-only follower and its
+        keepalive, the sentinel, the completion rule, and the session-key
+        and state-path rules, taken from the runner's own constants."""
+        diagrams = self._readme_diagrams()
+        combined = "\n".join(diagrams.values())
+        for fact in ("--start", "supervisor.lock", "--follow",
+                     "CODEX_COUNCIL_DONE", "--status"):
+            with self.subTest(fact=fact):
+                self.assertIn(fact, combined)
+        keepalive = f"{council_liveness.FOLLOW_KEEPALIVE_SECS} s"
+        expected = {
+            "Architecture": (
+                "mktemp -d", "--discover", council_discovery.SNAPSHOT_FILENAME,
+                "native_effort", "--check-staging-dir", "+ token",
+                council_common.SUPERVISOR_FILENAME,
+                council_liveness.STATUS_FILENAME, codex_council.MAX_PARALLEL_ENV,
+                "watchdog", "fresh or resumed", "replies/", keepalive,
+                "Monitor", "lock free, pid gone", "--cancel", "--reap"),
+            "Launch Flow": (
+                "mktemp -d", "--discover", "roles.json, context.md",
+                "--check-staging-dir", "own foreground call",
+                "claim supervisor.lock", "own session",
+                "follow, status, cancel", "never a time-limited background launch",
+                "relaunch once in a NEW dir", "report err.log", "par ",
+                "Monitor runs --follow", "reply=path", keepalive,
+                "Monitor watch expires", "--status says running", "re-arm",
+                "the follower exits 0", "done: lock free, pid gone",
+                "only now read out.md",
+                "reconcile"),
+            "State Scope": (
+                "Git top level", "launch directory", "sha256, 16 hex",
+                codex_council.SESSION_KEY_ENV, "NAME=value", "project-wide",
+                "role-sha256-", "$XDG_STATE_HOME", "~/.local/state",
+                "project-session__role.json", "project__role.json", ".lock",
+                f"{codex_council.LOCK_PROBE_INITIAL_BACKOFF_SECS:g} s",
+                f"{codex_council.LOCK_PROBE_MAX_BACKOFF_SECS:g} s",
+                "resume", "fresh", "prior continuity lost",
+                "never a model or effort"),
+        }
+        for heading, facts in expected.items():
+            flat = re.sub(r"\s+", " ", diagrams[heading].replace("<br/>", " "))
+            for fact in facts:
+                with self.subTest(diagram=heading, fact=fact):
+                    self.assertIn(fact, flat)
+        scope = diagrams["State Scope"]
+        # The host ids in the runner's own order, and nothing retired.
+        positions = [scope.find(name)
+                     for name in codex_council.AUTO_SESSION_ENV_VARS]
+        self.assertNotIn(-1, positions)
+        self.assertEqual(positions, sorted(positions))
+        self.assertNotIn("DISABLE_AUTO_SESSION_KEY", scope)
+        # "32 chars or fewer" is the runner's cut-off for a readable key.
+        self.assertIn("32 chars or fewer", scope)
+        self.assertEqual(codex_council._state_role_component("r" * 32),
+                         "r" * 32)
+        self.assertTrue(codex_council._state_role_component(
+            "r" * 33).startswith("role-sha256-"))
+        # The hashes are the runner's: 16 hex digits of sha256.
+        with patch.object(codex_council, "_project_root",
+                          return_value="/p"), \
+                patch.dict(os.environ, {codex_council.SESSION_KEY_ENV: "k"}):
+            self.assertEqual(
+                codex_council._project_key("r"),
+                hashlib.sha256(b"/p").hexdigest()[:16] + "-"
+                + hashlib.sha256(b"k").hexdigest()[:16] + "__r")
 
     def _docs_html(self):
-        """scripts/docs_html.py, which lays out the PDF; its link rules and
-        page box need no Markdown package."""
+        """scripts/docs_html.py, which lays out the PDF; its link, diagram,
+        and layout rules need no Markdown package and no network."""
         spec = importlib.util.spec_from_file_location(
             "docs_html", self._repo_file("scripts", "docs_html.py"))
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return module
 
-    @staticmethod
-    def _png_info(path):
-        """(width, height, colour type, chunk types) of a PNG file."""
-        with open(path, "rb") as f:
-            data = f.read()
-        chunks, pos = set(), 8
-        while pos + 8 <= len(data):
-            chunks.add(data[pos + 4:pos + 8])
-            pos += 12 + int.from_bytes(data[pos:pos + 4], "big")
-        return (int.from_bytes(data[16:20], "big"),
-                int.from_bytes(data[20:24], "big"), data[25], chunks)
+    # A reply shaped like mermaid.ink's: a root id that scopes the
+    # stylesheet and prefixes markers, an external font import, bare ids
+    # that another inline SVG could repeat, and a fixed max-width.
+    FAKE_SVG = (
+        '<svg id="mermaid-svg" width="100%" xmlns="http://www.w3.org/2000/svg"'
+        ' style="max-width: 400px;" viewBox="0 0 400 300">'
+        '<style xmlns="http://www.w3.org/1999/xhtml">@import url('
+        '"https://example.invalid/icons.css");</style>'
+        '<style>#mermaid-svg{font-family:"trebuchet ms";}</style>'
+        '<marker id="mermaid-svg_pointEnd"/><marker id="arrowhead"/>'
+        '<path data-id="L_A_B_0" marker-end="url(#mermaid-svg_pointEnd)"/>'
+        '<path marker-end="url(#arrowhead)"/><use xlink:href="#arrowhead"/>'
+        '<g id="X"><text>label</text></g></svg>')
 
-    def test_diagram_pngs_are_opaque_and_print_legibly(self):
-        """Every diagram PNG is opaque (greyscale or RGB, with no alpha
-        channel and no tRNS chunk), so its dark lines stay visible on a dark
-        page, and it fits the PDF's page box without shrinking below
-        DIAGRAM_MIN_PRINT_SCALE, so an ultra-wide strip or a squeezed tall
-        column fails here."""
+    def test_pdf_build_renders_each_mermaid_block_as_inline_svg(self):
+        """The PDF layout replaces every mermaid block with an inline SVG
+        figure captioned with its heading: rendered through mermaid.ink's
+        SVG endpoint (a stand-in renderer here), every id prefixed so the
+        diagrams cannot collide, and no external import or image left."""
         docs_html = self._docs_html()
-        # The PNGs are rendered at the scale the PDF layout assumes.
-        self.assertIn(f"scale={docs_html.PNG_SCALE}",
-                      self._read_repo_file("scripts", "build-docs.sh"))
-        px_per_mm = 96 / 25.4
-        box = (docs_html.CONTENT_WIDTH_MM * px_per_mm,
-               docs_html.FIGURE_MAX_HEIGHT_MM * px_per_mm)
-        for ident in self._diagram_ids():
-            with self.subTest(diagram=ident):
-                width, height, colour, chunks = self._png_info(
-                    self._repo_file("docs", "diagrams", f"{ident}.png"))
-                self.assertIn(colour, (0, 2))
-                self.assertNotIn(b"tRNS", chunks)
-                natural = (width / docs_html.PNG_SCALE,
-                           height / docs_html.PNG_SCALE)
-                scale = min(1, box[0] / natural[0], box[1] / natural[1])
-                self.assertGreaterEqual(scale, self.DIAGRAM_MIN_PRINT_SCALE)
+        self.assertEqual(docs_html.MERMAID_INK, "https://mermaid.ink/svg/")
+        sources = []
+
+        def render(source):
+            sources.append(source)
+            return self.FAKE_SVG
+
+        docset = docs_html.DocSet(self._repo_file(), ["README.md"],
+                                  render=render)
+        # README's diagram sections as Python-Markdown writes them.
+        body = "".join(
+            f'<h2 id="readme--{docs_html.github_slug(heading)}">{heading}'
+            f'</h2>\n<p>text</p>\n<pre><code class="language-mermaid">'
+            f"{html.escape(source, quote=True)}</code></pre>\n"
+            for heading, source in self._readme_diagrams().items())
+        body = docset.take_diagrams("README.md", body)
+        self.assertNotIn("language-mermaid", body)
+        self.assertEqual(re.findall(r"<!--diagram-(\d+)-->", body),
+                         ["0", "1", "2"])
+        with contextlib.redirect_stderr(io.StringIO()):
+            figures = [docset.figure(i) for i in range(3)]
+        self.assertEqual(sources, list(self._readme_diagrams().values()))
+        ids = []
+        for index, (figure, (heading, _)) in enumerate(
+                zip(figures, self.README_DIAGRAMS)):
+            with self.subTest(diagram=heading):
+                self.assertTrue(figure.startswith('<figure class="diagram'))
+                self.assertIn(f"<figcaption>{heading}</figcaption>", figure)
+                self.assertEqual(figure.count("<svg"), 1)
+                self.assertNotIn("@import", figure)
+                self.assertNotIn("<img", figure)
+                self.assertNotIn("max-width: 400px", figure)
+                self.assertNotIn("mermaid-svg", figure)
+                prefix = f"diagram-{index}"
+                self.assertIn(f"#{prefix}{{", figure)
+                for name in re.findall(r'(?<![\w:-])id="([^"]+)"', figure):
+                    self.assertTrue(name.startswith(prefix), name)
+                    ids.append(name)
+                for ref in re.findall(r"url\(#([^)]+)\)|href=\"#([^\"]+)\"",
+                                      figure):
+                    self.assertTrue("".join(ref).startswith(prefix), ref)
+                self.assertIn('data-id="L_A_B_0"', figure)
+                self.assertRegex(figure, r'<svg style="width: [\d.]+mm; '
+                                         r'height: [\d.]+mm"')
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_pdf_build_refuses_images_and_unreadable_diagrams(self):
+        """An image in a document stops the build, and so does a diagram
+        that would print below MIN_PRINT_SCALE; a wide diagram gets a
+        landscape page when that prints it larger, and a small one keeps
+        its natural size."""
+        docs_html = self._docs_html()
+        docset = docs_html.DocSet(self._repo_file(), ["README.md"])
+        with self.assertRaises(SystemExit):
+            docset.take_diagrams("README.md", '<p><img src="a.png"></p>')
+        mm = 1 / docs_html.MM_PER_PX
+        self.assertEqual(docs_html.layout(300, 200), (False, 1))
+        wide, scale = docs_html.layout(docs_html.WIDE_WIDTH_MM * mm,
+                                       docs_html.WIDE_MAX_HEIGHT_MM * mm)
+        self.assertTrue(wide)
+        self.assertAlmostEqual(scale, 1)
+        wide, scale = docs_html.layout(docs_html.CONTENT_WIDTH_MM * mm,
+                                       docs_html.FIGURE_MAX_HEIGHT_MM * 2 * mm)
+        self.assertFalse(wide)
+        self.assertAlmostEqual(scale, 0.5)
+        huge = self.FAKE_SVG.replace('viewBox="0 0 400 300"',
+                                     'viewBox="0 0 9000 9000"')
+        docset = docs_html.DocSet(self._repo_file(), ["README.md"],
+                                  render=lambda source: huge)
+        docset.take_diagrams(
+            "README.md", '<pre><code class="language-mermaid">flowchart TD\n'
+            "</code></pre>")
+        with contextlib.redirect_stderr(io.StringIO()), \
+                self.assertRaises(SystemExit):
+            docset.figure(0)
+
+    def test_mermaid_ink_retries_server_errors_only(self):
+        """A 5xx answer or a network failure is retried with a pause; a 4xx
+        answer (mermaid.ink's syntax error) stops the build at once."""
+        import urllib.error
+        docs_html = self._docs_html()
+
+        class Reply(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def error(code):
+            return urllib.error.HTTPError(
+                "https://mermaid.ink/svg/x", code, "error", {},
+                io.BytesIO(b"Parse error on line 2"))
+
+        calls = []
+
+        def flaky(request, timeout):
+            calls.append(request.full_url)
+            if len(calls) == 1:
+                raise error(502)
+            if len(calls) == 2:
+                raise urllib.error.URLError("connection reset")
+            return Reply(b"<svg/>")
+
+        with patch.object(docs_html.urllib.request, "urlopen", flaky), \
+                patch.object(docs_html.time, "sleep") as sleep, \
+                contextlib.redirect_stderr(io.StringIO()) as log:
+            self.assertEqual(docs_html.mermaid_ink_svg("flowchart TD"),
+                             "<svg/>")
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(calls[0].startswith(docs_html.MERMAID_INK))
+        self.assertIn("HTTP 502; retrying", log.getvalue())
+        self.assertEqual([c.args[0] for c in sleep.call_args_list],
+                         [docs_html.RENDER_BACKOFF_SECS,
+                          docs_html.RENDER_BACKOFF_SECS * 2])
+        refused = []
+
+        def syntax_error(request, timeout):
+            refused.append(request)
+            raise error(400)
+
+        with patch.object(docs_html.urllib.request, "urlopen", syntax_error), \
+                patch.object(docs_html.time, "sleep"), \
+                self.assertRaises(SystemExit) as stop:
+            docs_html.mermaid_ink_svg("flowchart TD")
+        self.assertEqual(len(refused), 1)
+        self.assertIn("Parse error", str(stop.exception))
+
+    def test_docs_build_renders_svg_and_writes_no_png(self):
+        """The build script has no PNG step and no diagram directory: it
+        renders through docs_html.py's SVG path, prints in a temporary
+        directory, and refuses a PDF holding any raster image."""
+        script = self._read_repo_file("scripts", "build-docs.sh")
+        layout = self._read_repo_file("scripts", "docs_html.py")
+        for text in (script, layout):
+            # No PNG file, no PNG endpoint, no PNG content type.
+            self.assertNotRegex(text, r"(?i)\.png\b|/img/|type=png|image/png")
+            self.assertNotIn("docs/diagrams", text)
+            self.assertNotIn("--diagrams", text)
+        self.assertIn("mermaid.ink", script)
+        self.assertIn("SVG", script)
+        self.assertIn('mktemp -d "${TMPDIR:-/tmp}/codex-council-docs', script)
+        self.assertIn('--print-to-pdf="$printed"', script)
+        self.assertIn(r'images = len(re.findall(rb"/Subtype\s*/Image", data))',
+                      script)
+        self.assertRegex(script, r"if images:\n    sys\.exit\(")
+        self.assertIn('mv -f "$printed" "$pdf"', script)
+        # docs_html.py never writes a file other than the HTML page.
+        self.assertEqual(re.findall(r"\.write_(?:text|bytes)\(", layout),
+                         [".write_text("])
+        self.assertNotRegex(layout, r"\bopen\(")
 
     def test_pdf_links_stay_in_the_pdf_or_point_at_github(self):
         """The PDF build turns a link to a document in the PDF, or to one of
-        its headings, into an in-document link, a link to an embedded
-        diagram into a jump to its figure, and any other repository path
-        into its GitHub URL; a link to a missing path stops the build."""
+        its headings, into an in-document link, and any other repository
+        path into its GitHub URL; a link to a missing path stops the
+        build."""
         docs_html = self._docs_html()
         skill = "/".join(self.SKILL_PARTS)
         runtime = "/".join(self.REF_PARTS + ("runtime-behavior.md",))
         docset = docs_html.DocSet(self._repo_file(),
                                   ["README.md", "DESIGN.md", skill, runtime])
-        # As convert() records the first embed of each diagram.
-        docset.figures["docs/diagrams/d00-context.png"] = "fig-d00-context"
         blob = f"{docs_html.REPO_URL}/blob/{docs_html.BRANCH}"
         for (doc, href), expected in {
             ("README.md", "DESIGN.md"): "#design",
@@ -6610,13 +6865,12 @@ class DocsContractTests(unittest.TestCase):
                 "#design--run-liveness-and-recovery",
             ("README.md", "#model-and-effort-per-role"):
                 "#readme--model-and-effort-per-role",
+            ("DESIGN.md", "README.md#launch-flow"): "#readme--launch-flow",
             (skill, "references/runtime-behavior.md"): "#runtime-behavior",
-            ("README.md", "docs/diagrams/d00-context.png"):
-                "#fig-d00-context",
-            ("README.md", "docs/diagrams/d00-context.mmd"):
-                f"{blob}/docs/diagrams/d00-context.mmd",
-            ("README.md", "docs/diagrams/"):
-                f"{docs_html.REPO_URL}/tree/{docs_html.BRANCH}/docs/diagrams",
+            ("README.md", "docs/codex-council.pdf"):
+                f"{blob}/docs/codex-council.pdf",
+            ("README.md", "docs/"):
+                f"{docs_html.REPO_URL}/tree/{docs_html.BRANCH}/docs",
             ("README.md", "https://claude.ai/code"): "https://claude.ai/code",
         }.items():
             with self.subTest(doc=doc, href=href):
@@ -6634,7 +6888,8 @@ class DocsContractTests(unittest.TestCase):
         """The committed PDF, built by the script from every document it
         promises, links only to the web or within itself (never to a file
         on the machine that built it), has in-document links and a bookmark
-        per document at least, and embeds every diagram."""
+        per document at least, and holds no raster image: its diagrams are
+        vector."""
         script = self._repo_file("scripts", "build-docs.sh")
         self.assertTrue(os.access(script, os.X_OK))
         text = self._read_repo_file("scripts", "build-docs.sh")
@@ -6657,8 +6912,8 @@ class DocsContractTests(unittest.TestCase):
         bookmarks = re.findall(rb"/Title\s*[(<][^\n]*\n/Dest\s*\[", data)
         self.assertGreaterEqual(
             len(bookmarks), 3 + len(os.listdir(self._repo_file(*self.REF_PARTS))))
-        self.assertGreaterEqual(len(re.findall(rb"/Subtype\s*/Image", data)),
-                                len(self._diagram_ids()))
+        self.assertNotRegex(data, rb"/Subtype\s*/Image")
+        self.assertNotRegex(data, rb"/DCTDecode|/JPXDecode")
 
     # ---------- other docs ----------
 

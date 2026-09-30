@@ -9,9 +9,12 @@ complete, compact operating procedure; and its references teach
 [context staging](plugins/codex-council/skills/codex-council/references/context-staging.md),
 and [operation, outputs, and recovery](plugins/codex-council/skills/codex-council/references/runtime-behavior.md).
 
-Every diagram has a stable id used for its Mermaid source
-(`docs/diagrams/<id>.mmd`), its PNG (`docs/diagrams/<id>.png`), and its
-caption here and in `docs/codex-council.pdf`. Each concern below follows
+The diagrams live in README as Mermaid source, the only copy:
+[Architecture](README.md#architecture) (components and who owns what),
+[Launch Flow](README.md#launch-flow) (one launch, from staging to
+reconciliation), and [State Scope](README.md#state-scope) (how a role's
+saved thread is keyed, locked, and resumed). `docs/codex-council.pdf`
+draws them as vector graphics beside this text. Each concern below follows
 the same template: purpose, how it works, key decisions and why, and
 limits.
 
@@ -70,11 +73,6 @@ Supported versions are the current ones only: Claude Code 2.1.x, codex-cli
 
 ### Level 0: the council in context
 
-![d00-context: the user, Claude Code with the skill, the council runner, the Codex workers, and the shared workspace, top to bottom](docs/diagrams/d00-context.png)
-
-*d00-context — Council in context. Source:
-[d00-context.mmd](docs/diagrams/d00-context.mmd).*
-
 The user states an objective; Claude investigates the workspace, briefs the
 runner, and the runner dispatches Codex workers that work in the same
 workspace. Workers return evidence to the runner, the runner returns replies
@@ -82,10 +80,8 @@ and a report to Claude, and Claude reconciles one result for the user.
 
 ### Level 1: runtime components
 
-![d10-components: Claude Code, the runner detached by --start, the follower, the host task tracker (attached runs only), the run directory with its supervisor lock, saved threads, codex app-server, codex exec, and the workspace](docs/diagrams/d10-components.png)
-
-*d10-components — Runtime components and ownership. Source:
-[d10-components.mmd](docs/diagrams/d10-components.mmd).*
+README's [Architecture](README.md#architecture) diagram draws the runtime;
+this table says what each component owns and whom it talks to.
 
 | Component | Owns | Talks to |
 |---|---|---|
@@ -123,13 +119,11 @@ The run directory holds exactly one launch:
 
 ### Level 1: modules
 
-![d11-modules: codex_council imports council_selection, council_discovery, council_failures, council_liveness, and council_common](docs/diagrams/d11-modules.png)
-
-*d11-modules — Module responsibilities and imports, verified from the
-import statements. Source: [d11-modules.mmd](docs/diagrams/d11-modules.mmd).*
-
 The runner is standard-library Python in
-`plugins/codex-council/skills/codex-council/scripts/`.
+`plugins/codex-council/skills/codex-council/scripts/`. `codex_council.py`
+imports all five sibling modules; `council_selection` imports
+`council_discovery` and `council_common`; `council_discovery`,
+`council_failures`, and `council_liveness` import only `council_common`.
 
 | Module | Responsibility |
 |---|---|
@@ -232,11 +226,8 @@ path rather than inlined.
 advertises for this account and how native configuration resolves, without
 starting any Codex work.
 
-![d20-discovery: the caller, the execution context, codex --version, codex app-server, normalization, the snapshot file, and the summary](docs/diagrams/d20-discovery.png)
-
-*d20-discovery — Model discovery. `--discover` writes the snapshot and
-prints the summary; a launch keeps its fresh evidence in memory. Source:
-[d20-discovery.mmd](docs/diagrams/d20-discovery.mmd).*
+`--discover` writes the snapshot and prints the summary; a launch keeps
+its fresh evidence in memory.
 
 **How it works.** Discovery runs in the same execution context as the
 workers: the `codex` that `PATH` resolves, the runner's working directory
@@ -369,10 +360,8 @@ launch from.
 runner guarantees that an automatic choice rests on this run's evidence and
 that a user's pin is never altered.
 
-![d21-choose: what the user asked for decides first (a pin, or native settings kept); otherwise a routed pair, native-model effort, or inheritance, all written to roles.json](docs/diagrams/d21-choose.png)
-
-*d21-choose — Claude chooses one role's model and effort. The runner does
-none of this reasoning. Source: [d21-choose.mmd](docs/diagrams/d21-choose.mmd).*
+Claude chooses each role's model and effort; the runner does none of this
+reasoning.
 
 **How it works.** Claude walks the ladder once per role before launch. A
 user's explicit request wins (and a request to keep native settings means
@@ -397,12 +386,6 @@ or angle brackets, so `-m <model>` stays one argument, the TOML string in
 lines stay single-line. Case is preserved, and `inherit` and `default`, in
 any case, are refused as model values. A `model` or `effort` without
 `selection` is refused before the grammar is checked.
-
-![d22-resolve: only an automatic choice with routing on needs the snapshot; an unsupported one exits 2, rewritten at the preflight or started over at launch; a supported one reaches the pure resolver, through one fresh discovery at launch](docs/diagrams/d22-resolve.png)
-
-*d22-resolve — Validate authoring, then resolve against the newest
-evidence. User pins and inheritance need no snapshot. Source:
-[d22-resolve.mmd](docs/diagrams/d22-resolve.mmd).*
 
 Authoring validation runs at the preflight and again at launch, before any
 worker, and checks only automatic choices, and only while routing is on:
@@ -508,11 +491,10 @@ Every surface reports what was sent:
 **Purpose.** Refuse every bad input before a worker exists, keep reviewed
 content private, and never let a launch damage another launch's files.
 
-![d23-staging: mktemp, discovery, writing inputs, the foreground preflight, the separate foreground --start that claims the directory, and the launch gate](docs/diagrams/d23-staging.png)
-
-*d23-staging — Stage and pass the gates. Inputs exist before the
-preflight; outputs appear only when the separate `--start` call claims the
-directory (or an attached launch's redirects run). Source: [d23-staging.mmd](docs/diagrams/d23-staging.mmd).*
+Inputs exist before the preflight; outputs appear only when the separate
+`--start` call claims the directory (or an attached launch's redirects
+run). README's [Launch Flow](README.md#launch-flow) diagram shows the
+sequence.
 
 **How it works.** Every launch gets its own `mktemp -d` directory. Claude
 runs `--discover` there, writes `roles.json` and `context.md`, and runs
@@ -602,10 +584,8 @@ any number of roles with bounded concurrency, without two councils ever
 driving the same role thread at once, and deliver each result as soon as it
 settles.
 
-![d24-fanout: the resolved panel, one task per role, permits, the nonblocking lock probe, waiting outside the permit, the attempt loop, the completion callback, and gathered results](docs/diagrams/d24-fanout.png)
-
-*d24-fanout — Launch and bounded fan-out. Source:
-[d24-fanout.mmd](docs/diagrams/d24-fanout.mmd).*
+README's [Architecture](README.md#architecture) diagram shows the detached
+supervisor and its bounded fan-out.
 
 **How it works.** `--start RUNDIR` is an ordinary foreground command that
 returns within seconds. After validating and claiming the directory (see
@@ -692,10 +672,8 @@ changed.
 project and host session when Claude deliberately reuses its id, and never
 let two councils race on one thread.
 
-![d25-continuity: project root, session scope, and role id form the state key; the key names the role lock and the state file; the attempt resumes or starts fresh and saves when the outcome allows](docs/diagrams/d25-continuity.png)
-
-*d25-continuity — Thread identity and persistence. Source:
-[d25-continuity.mmd](docs/diagrams/d25-continuity.mmd).*
+README's [State Scope](README.md#state-scope) diagram shows how the state
+key is formed, locked, and resumed.
 
 **How it works.** The state key combines a hash of the project root (the Git
 top level, else the launch directory), an optional hash of the session
@@ -778,12 +756,8 @@ earlier turns is not guaranteed.
 a run-level deadline, and make sure codex's process group does not outlive
 the attempt.
 
-![d26-attempt: the prompt and argv, codex exec in its own process group, the output pumps and activity clock, the watchdog, live process-tree discovery, the termination owner, the post-exit drain, the group-only sweep, and the CodexRun result](docs/diagrams/d26-attempt.png)
-
-*d26-attempt — One subprocess attempt and its watchdog. Terminating a live
-codex reaches its descendants; after codex exits, only its group can be
-reached. Every invocation has its own copy of all of this. Source:
-[d26-attempt.mmd](docs/diagrams/d26-attempt.mmd).*
+Terminating a live codex reaches its descendants; after codex exits, only
+its group can be reached. Every invocation has its own copy of all of this.
 
 **How it works.** The runner starts `codex exec` with
 `start_new_session=True`, so codex leads a process group that belongs to
@@ -832,11 +806,6 @@ cancellation at any point, the drain and the sweep included, still tears the
 group down; SIGINT, SIGTERM, and SIGHUP cancel the whole fan-out and end the
 run without the `CODEX_COUNCIL_DONE` line.
 
-![d27-stall: a stalled attempt becomes ok with a warning, a terminal stall, or a retriable stall](docs/diagrams/d27-stall.png)
-
-*d27-stall — Classify a stalled attempt. Source:
-[d27-stall.mmd](docs/diagrams/d27-stall.mmd).*
-
 A stall is a structured verdict, handled before any text classification, so
 stale- or auth-looking stderr from a killed process can neither classify the
 failure nor clear saved state. If the turn had completed and a final message
@@ -878,11 +847,6 @@ watchdog to 0 permits an indefinitely silent role.
 
 **Purpose.** Name why a role failed, retry only what a retry can fix, and
 never lose a valid saved thread to a misread message.
-
-![d28-failures: the ordered classifier, terminal failures, stale resume and its fresh invocation with a prior continuity lost warning, the retry budget, the 5-second backoff, and exhausted failures](docs/diagrams/d28-failures.png)
-
-*d28-failures — Failure classification and saved-thread action. Source:
-[d28-failures.mmd](docs/diagrams/d28-failures.mmd).*
 
 **How it works.** A failed invocation that is not a stall is classified by
 `_failure_verdict` in one order, identical on the fresh and resume paths:
@@ -979,10 +943,8 @@ limit, so an inheriting re-run can meet the same `[quota]`.
 **Purpose.** Let Claude use finished work early without ever mistaking an
 early signal for the end of the run.
 
-![d29-progress: the runner writes a reply file then logs its completion line; the follower relays it to Claude's provisional work; the final report and a verified runner exit (lock free, pid gone) lead to reconciliation](docs/diagrams/d29-progress.png)
-
-*d29-progress — Progress, replies, follower, and reconciliation. Source:
-[d29-progress.mmd](docs/diagrams/d29-progress.mmd).*
+README's [Launch Flow](README.md#launch-flow) diagram shows replies
+landing, the follower, and the completion rule in order.
 
 **How it works.** stdout carries only the report; everything else is
 best-effort stderr through one diagnostics helper: the dispatch line, the
@@ -1078,12 +1040,8 @@ minutes when it stops responding, with no process beyond the runner itself
 (the detached runner is its own supervisor), and give Claude safe ways to
 stop a run and clean up.
 
-![d30-liveness: the runner writes status.json; the follower checks the runner every 2 seconds; a gone runner leads to --status, --reap, and a re-run in a new directory; a runner that is not responding is cancelled (or its tracked task stopped) first](docs/diagrams/d30-liveness.png)
-
-*d30-liveness — Runner liveness and recovery. A runner that is still
-present is never reaped: it is cancelled (or its tracked task stopped)
-first. Source:
-[d30-liveness.mmd](docs/diagrams/d30-liveness.mmd).*
+A runner that is still present is never reaped: it is cancelled (or its
+tracked task stopped) first.
 
 **How it works.** The launch publishes `RUNDIR/status.json` (mode 0600,
 replaced atomically) on every role transition and at least every 15 s from
@@ -1269,25 +1227,26 @@ check three kinds of thing:
   the absence of product model names and effort ladders. A pin catches a
   deleted or reworded rule, not an inaccurate new sentence, so changed prose
   is still reviewed against the code.
-- *Diagrams and the PDF.* Every `.mmd` has a PNG with the same id and draws
-  at most nine nodes; every PNG is opaque (no alpha channel) and fits the
-  PDF's page box at 60% scale or more; DESIGN embeds every diagram once,
-  captioned with its id and a link to its source, and README embeds d00 and
-  d10 and indexes all of them; the PDF build's link rules send links to
-  in-document anchors or GitHub; and the committed PDF has only web and
-  in-document links, bookmarks for at least each document, and at least
-  one image per diagram.
+- *Diagrams and the PDF.* The repository tracks no image file and no
+  document links or embeds one; README holds exactly three `mermaid` blocks,
+  under Architecture, Launch Flow, and State Scope, each within a node or
+  message budget and naming the launch facts it draws (`--start`,
+  `supervisor.lock`, `--follow`, `CODEX_COUNCIL_DONE`, `--status`); the PDF
+  build turns every `mermaid` block into an inline SVG figure (checked with
+  a stand-in renderer, so the tests need no network), refuses an image,
+  and sends links to in-document anchors or GitHub; and the committed PDF
+  has only web and in-document links, bookmarks for at least each
+  document, and no raster image.
 
-Nothing checks that the committed PNGs and PDF were rebuilt after their
-sources changed: run `scripts/build-docs.sh --diagrams` after editing a
-`.mmd` file and `scripts/build-docs.sh` after editing any document it
-includes.
+Nothing checks that the committed PDF was rebuilt after its sources
+changed: run `scripts/build-docs.sh` after editing any document it
+includes, a diagram included.
 
 CI runs the suite on Python 3.12, 3.13, 3.14, and 3.15 and a pinned ruff.
 `tests/test_live_codex.py` holds opt-in smoke tests against a real, signed-in
 Codex (`CODEX_COUNCIL_LIVE_TESTS=1`). `scripts/build-docs.sh` rebuilds
-`docs/codex-council.pdf` and, with `--diagrams`, re-renders the PNGs from
-their `.mmd` sources.
+`docs/codex-council.pdf`, rendering each diagram to SVG through
+mermaid.ink at build time.
 
 ## Non-goals
 
