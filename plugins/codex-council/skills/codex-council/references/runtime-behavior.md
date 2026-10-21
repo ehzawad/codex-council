@@ -81,8 +81,8 @@ container runtime, and does not promise survival across reboot.
 | auth | Sign in through the user's normal flow; never clear valid continuity as stale. |
 | quota | No automatic retry; a budget/model limit is not a short-lived rate limit. |
 | model-rejected | No automatic substitute; retain explicit pins and follow the reported provenance-specific action. |
-| retriable:rate-limit / retriable:5xx | At most one retry after 5 seconds, only before side-effect-capable work. |
-| retriable:stall | Retry only when the protocol proves no tool-capable item or unreadable output occurred. |
+| retriable:rate-limit / retriable:5xx | At most one retry after 5 seconds, only for a read-only role with external tools denied and before any tool-capable item. |
+| retriable:stall | Retry only for such a role, and only when no tool-capable item or unreadable output occurred. |
 | replay-blocked:rate-limit / replay-blocked:5xx | Tool work may have happened; inspect effects and deliberately recover, never blindly replay. |
 | replay-blocked:stale | A stale-looking resume failure followed possible tool work; preserve the thread and inspect effects before recovery. |
 | stall | Tool work or unknown output makes automatic replay unsafe. |
@@ -90,7 +90,11 @@ container runtime, and does not promise survival across reboot.
 
 A transient provider failure is not an idempotency guarantee. The same replay-safety
 gate applies to fresh and resumed attempts, ordinary HTTP failures and watchdog
-stalls. Completed-turn shutdown stalls can keep a completed reply with a warning.
+stalls. `codex exec --json` is not a complete record of tool calls: on codex-cli
+0.163.0 a sandbox-denied code-mode command emits no `command_execution` item, so
+protocol-reported commands can be incomplete and a missing tool item proves nothing.
+A role with workspace-write, bypass or native external tools is therefore never
+replayed automatically. Completed-turn shutdown stalls can keep a completed reply with a warning.
 
 ## Files and privacy
 

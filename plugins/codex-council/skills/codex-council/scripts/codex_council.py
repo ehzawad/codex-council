@@ -124,7 +124,8 @@ from council_selection import (  # noqa: E402
     _selection_summary_note,
 )
 from council_workspace import WorkspaceError  # noqa: E402
-from council_policy import command_options, parse_policy, policy_dict  # noqa: E402
+from council_policy import (  # noqa: E402
+    command_options, effects_possible, parse_policy, policy_dict)
 from council_evidence import AttemptEvidence, write_result  # noqa: E402
 from council_workflow import (  # noqa: E402
     prepare, load_plan, discover_prepared, resolve_selections, plan_lines,
@@ -664,7 +665,10 @@ class _EventFlagScanner:
     (command executions, MCP tool calls, file changes, web searches, to-do
     lists, collab tool calls, any unknown/future type, and a type that is
     not a string) marks the attempt unsafe to replay — conservative by
-    default, since replaying such a turn could duplicate side effects. A
+    default, since replaying such a turn could duplicate side effects. The
+    stream is not a complete record of tool calls (codex exec --json emits no
+    item for a sandbox-denied code-mode command), so _run_role_once also
+    treats every attempt of a role whose tools can leave effects as unsafe. A
     non-blank line that is not a JSON object (it does not decode, is nested
     too deeply, holds an out-of-range number, or is another JSON value)
     could hide such an item, so it marks the attempt unsafe to replay too,
@@ -1055,6 +1059,10 @@ def _start_line(role, phase, attempt, stall_secs):
 async def _run_role_once(role, prompt, attempt):
     """Observe every invocation, then gate *all* retries on replay safety."""
     runs = []
+    # The JSONL omits some tool calls, so an attempt of a role whose tools can
+    # leave effects is never shown replay-safe by the absence of tool items.
+    effects = effects_possible(
+        parse_policy(role.execution) if role.execution is not None else None)
 
     async def run_codex(cmd):
         observer = (AttemptEvidence(Path(role.evidence_dir), cmd, prompt)
@@ -1066,6 +1074,8 @@ async def _run_role_once(role, prompt, attempt):
             else:
                 run = await _run_codex_subprocess(
                     cmd, prompt, role_id=role.id, evidence=observer, cwd=role.workdir)
+            if effects:
+                run.unsafe_to_replay = True
             runs.append(run)
             return run
         finally:

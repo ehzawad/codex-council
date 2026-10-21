@@ -313,8 +313,18 @@ class WorkflowCliTests(unittest.TestCase):
         self.assertEqual(self.launch(next_run).returncode, 0)
         self.assertEqual(self.execs()[-1]["thread"], thread)
 
+    def test_writable_role_is_never_replayed_on_an_absent_tool_item(self):
+        directory = self.stage("HIDDEN_TOOL_503: exercise failure recovery.")
+        proc = self.launch(directory)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertEqual(len(self.execs()), 1)
+        self.assertIn("[replay-blocked:5xx]", proc.stdout)
+        effects = directory / "workspaces/contribution/effects.txt"
+        self.assertEqual(effects.read_text(), "effect\n")
+
     def test_transient_failure_before_tools_retries_with_separate_evidence(self):
-        directory = self.stage("TRANSIENT_BEFORE_TOOLS: inspect.")
+        directory = self.stage("TRANSIENT_BEFORE_TOOLS: inspect.",
+                               execution={"sandbox": "read-only"})
         proc = self.launch(directory)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(len(self.execs()), 2)

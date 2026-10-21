@@ -221,7 +221,8 @@ not save a model or effort, and a resumed history does not establish current fac
 Saved state has no automatic expiry; do not delete lock files while runs use them.
 
 A transient 429/5xx is retried only before side-effect-capable work, using the same
-scanner as watchdog stalls. Once tool work or unreadable output may have occurred,
+scanner as watchdog stalls, and only for a read-only role with external tools denied:
+the exec JSONL omits some tool calls, so a writable role is never replayed. Once tool work or unreadable output may have occurred,
 `replay-blocked:*` requires deliberate recovery. Quota, authentication and model
 rejection remain terminal; valid continuity is not discarded on those failures.
 

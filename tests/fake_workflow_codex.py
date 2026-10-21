@@ -121,6 +121,16 @@ def execute(argv):
                    else "HTTP 503 Service Unavailable")
         emit({"type": "turn.failed", "error": {"message": message}})
         return 1
+    if "HIDDEN_TOOL_503" in body:
+        # Real codex exec --json emits no item for a sandbox-denied code-mode
+        # command, so its partial effect is invisible in the stream.
+        emit({"type": "item.completed", "item": {"type": "agent_message",
+              "text": "I will run the command once."}})
+        path = cwd / "effects.txt"
+        path.write_text((path.read_text() if path.exists() else "") + "effect\n")
+        emit({"type": "error", "message": "unexpected status 503 Service Unavailable"})
+        emit({"type": "turn.failed", "error": {"message": "HTTP 503 Service Unavailable"}})
+        return 1
     if "TRANSIENT_BEFORE_TOOLS" in body:
         marker = Path(os.environ["CODEX_HOME"]) / "retried"
         if not marker.exists():

@@ -152,7 +152,8 @@ can limit summaries without truncating raw files. The exec reader buffers its
 protocol output in memory, so total runner RAM is not bounded.
 
 Command/exit/output fields in JSONL are **Codex-reported observations**, not an
-independent OS audit. Collaborator prose is stored separately as interpretation.
+independent OS audit, and they can be incomplete: a sandbox-denied code-mode command
+emits no `command_execution` item, although it may already have had effects. Collaborator prose is stored separately as interpretation.
 No parser declares substantive claims true. Required coverage and execution success
 are distinct from applicability to current work and from verified task success.
 

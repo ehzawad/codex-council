@@ -117,7 +117,10 @@ signal. An unattended host must continue observing or cancel before returning.
 ## Replay, evidence and result semantics
 
 Every transient retry, not only a stall retry, passes the replay-safety scanner.
-A 429/5xx after tool-capable or unreadable output is replay-blocked. The error class
+A 429/5xx after tool-capable or unreadable output is replay-blocked. The exec JSONL
+omits some tool calls (a sandbox-denied code-mode command emits no item), so only a
+read-only role with external tools denied, whose unseen calls leave no effects, can
+be replayed; any other role's failed attempt is replay-blocked. The error class
 can be transient without the whole task being safe to repeat. The old thread and
 partial artifacts remain available for deliberate recovery. There is at most one
 automatic retry, after a five-second backoff.

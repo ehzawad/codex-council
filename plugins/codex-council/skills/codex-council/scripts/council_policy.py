@@ -70,6 +70,18 @@ def parse_policy(value: Any = None) -> ExecutionPolicy:
     return policy
 
 
+def effects_possible(policy: ExecutionPolicy | None) -> bool:
+    """Whether a tool call under this policy can leave effects behind.
+
+    codex exec --json does not report every tool call (a sandbox-denied
+    code-mode command emits no item), so the event stream cannot prove that
+    no tool ran. Only a read-only sandbox with external tools denied (and so
+    no network) makes an unseen call harmless to repeat.
+    """
+    return policy is not None and (policy.sandbox != "read-only"
+                                   or policy.external_tools != "deny")
+
+
 def policy_dict(value: Any = None) -> dict[str, Any]:
     return asdict(parse_policy(value))
 
