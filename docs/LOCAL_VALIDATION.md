@@ -42,9 +42,12 @@ CODEX_COUNCIL_LIVE_WORKFLOW=1 python3 -m unittest discover -s tests -p 'test_liv
 ```
 
 Workspace-write should permit its scratch canary while denying the external write
-and command-network connection. Read-only should deny both writes. Both require
-actual command-protocol output from the probe, unchanged probe source, and intact
-external canary. A model declining or failing to execute the probe is **not a pass**.
+and command-network connection. Read-only should deny both writes. Both require the
+exact `python3 probe.py` command to complete with exit 0 in the command protocol, a
+probe marker from no other command, denials reported as EPERM/EACCES (not a refused
+connection or a timeout), no listener acceptance from the sandbox while the
+listener stays reachable, unchanged probe source, and an intact external canary.
+A model declining or failing to execute the probe is **not a pass**.
 A config/read refusal is **not a reason to enable bypass**. Investigate documented
 CLI/API compatibility and retain the failed gate until repaired.
 

@@ -76,17 +76,24 @@ silently truncated. Preflight displays its byte count, not a fabricated token bi
 |---|---|---|
 | sandbox | read-only | Command sandbox: read-only, workspace-write, or explicitly authorized bypass. |
 | network | false | Command-network request. Bypass cannot enforce false and requires true explicitly. |
-| external_tools | deny | Disable apps/plugins/browser/computer/hooks/subagents/web and configured MCP servers, or explicitly authorize native integrations. |
+| external_tools | deny | Disable apps/plugins/browser/computer/hooks/subagents/web, the notify program, installer and remote-plugin features, and configured MCP servers, or explicitly authorize native integrations. |
 | continuity | fresh | Resume only when this task's earlier thread is useful. |
 | required | true | Missing/failed contribution or missing evidence makes required coverage incomplete. |
 | authorization | absent | Required explanation of user permission for bypass/network/native external tools. |
 
 Workspace-write permits experimental writes to that role's scratch cwd; additional
 writable roots and implicit /tmp/TMPDIR grants are removed. Execution is
-non-interactive with approval_policy=never. MCP names are enumerated, safely quoted,
-and explicitly disabled when external_tools=deny. Effective configuration is read
-again with the requested restrictions, and unknown/overridden settings block
-execution. No automatic fallback to bypass exists.
+non-interactive with approval_policy=never. Every sandboxed run passes
+`--ignore-rules`, because a user or project execpolicy rule with `decision="allow"`
+runs its command outside the sandbox. Memories are off for every policy. When
+external_tools=deny, `notify` is emptied (it runs a host program after each turn)
+and MCP names are enumerated and disabled by bare name; a server name outside
+`[A-Za-z0-9_-]` cannot be addressed by a Codex `-c` key and blocks the run. The
+disabled features are the default-on surfaces examined on codex-cli 0.163.0, not a
+promise about tools a later Codex adds. Effective configuration is read again with
+the requested restrictions, and unknown/overridden settings, or managed
+requirements that forbid them, block execution. No automatic fallback to bypass
+exists.
 
 **Limits:** config/read is evidence of configuration, not an OS attestation of a
 later worker. Configuration can change between checking and exec. The command

@@ -60,11 +60,14 @@ privileges, independent of command-network policy.
 
 The adapter reads actual-cwd configuration, enumerates MCP names, then reads again
 with requested restrictions. It removes extra writable roots and implicit temporary
-write grants, sets non-interactive approval, disables supported external-tool
-features and explicitly disables the discovered MCP servers. Wrong/unknown types,
-managed overrides or an altered inventory block execution. Preflight reports the
-policy and launch reobserves it; --start's local revalidation does not repeat slow
-metadata operations before detaching. Prepared setup publishes liveness between
+write grants, sets non-interactive approval, ignores user and project execpolicy
+rules (an allow rule would run its command outside the sandbox), turns memories
+off, and, with external tools denied, empties notify, disables the examined
+external-tool features and explicitly disables the discovered MCP servers by bare
+name. Wrong/unknown types, managed overrides or requirements, an unaddressable MCP
+name or an altered inventory block execution. Preflight reports the policy and
+launch reobserves it; --start's local revalidation does not repeat slow metadata
+operations before detaching. Launch setup publishes liveness between
 bounded metadata operations so long panels do not look like silent dead runners.
 
 There is a remaining check-to-exec window. Config observations are not a serving
@@ -133,7 +136,8 @@ are convenience artifacts; exact bytes remain in scratch. No artifact is applied
 committed or published automatically. Reconciliation checks evidence and current
 requirements, not vote counts or a clean transport exit.
 
-Prepared exit 0 requires a delivered report and complete required contributions.
+Exit 0 requires a delivered report and complete required contributions, each with
+an observed completed turn.
 A failed optional role does not make a completed required contribution disappear.
 Stale captured inputs are a separate applicability verdict, not a retroactive claim
 that the old experiment never happened. --freshness covers only selected inputs:

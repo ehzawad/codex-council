@@ -81,7 +81,7 @@ for complete JSON examples and fields. Permissions are separate from role labels
 |---|---|---|
 | Command sandbox | read-only | Choose workspace-write for scratch experiments; bypass requires explicit authorization. |
 | Command network | false | Explicitly authorize when necessary. Bypass cannot enforce network denial. |
-| External tools | deny | Apps/plugins/browser/computer/hooks/subagents/web and configured MCP servers disabled; native integrations require authorization. |
+| External tools | deny | Apps/plugins/browser/computer/hooks/subagents/web, notify, installer/remote-plugin features and configured MCP servers disabled; native integrations require authorization. |
 | Thread continuity | fresh | Explicit resume within logical project, task, host session and role. |
 | Required contribution | true | Missing execution/evidence leaves required coverage incomplete. |
 
@@ -140,11 +140,11 @@ in scratch with artifact metadata. **Nothing automatically applies, commits, or
 publishes a candidate change to the live source.** Claude checks current intent,
 freshness, evidence and integration results before accepting it.
 
-Prepared exit 0 requires delivered output and complete required contributions;
-exit 1 includes required-coverage/evidence failure, and exit 2 is invalid input or
-refused policy. `--freshness` exits 0 unchanged, 1 stale/unknown, 2 invalid contract.
-Legacy direct CLI without preparation remains read-only and keeps “some role
-responded” exit semantics, without the captured-evidence guarantees.
+Exit 0 requires delivered output and complete required contributions; exit 1
+includes required-coverage/evidence failure, and exit 2 is invalid input or refused
+policy. `--freshness` exits 0 unchanged, 1 stale/unknown, 2 invalid contract.
+Workers start only from `--start` on a completed capture, once per run directory;
+there is no direct launch.
 
 ## Continuity and failures
 
@@ -161,8 +161,9 @@ flowchart TD
 ```
 
 Saved threads are scoped by `CODEX_COUNCIL_SESSION_KEY`, then detected host ids,
-then project scope. Integrated terminals in the same VS Code window share
-`VSCODE_PID`; set `CODEX_COUNCIL_SESSION_KEY` to separate them. Thread state does
+then project scope. `CODEX_COUNCIL_SESSION_KEY` is the reliable scope: a detected
+`CLAUDE_CODE_SESSION_ID` can keep the startup id after `--resume` or `--continue`,
+and integrated terminals in the same VS Code window share `VSCODE_PID`. Thread state does
 not save a model or effort, and a resumed history does not establish current facts.
 Saved state has no automatic expiry; do not delete lock files while runs use them.
 

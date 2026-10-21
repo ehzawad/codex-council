@@ -16,7 +16,7 @@ never passes the lock to Codex children. The detached launch is for explicit pro
 ownership and recovery, not a claim that all Claude Code hosts impose one universal
 background timeout. Local interactive and unattended hosts have different limits.
 
-Prepared invocations publish a `preparing` activity line and status ticks between
+A launch publishes a `preparing` activity line and status ticks between
 bounded metadata checks. This is not a claim that workers have started. Permissions
 are reobserved before inference; a failed or overridden restriction blocks dispatch.
 One role's cwd is its private captured copy. The fan-out, same-thread locks, stall
@@ -46,12 +46,12 @@ alone or a line in a log is not sufficient.
 | 4 | Runner gone/not responding; follow the liveness triage below. |
 | 5 | Follower's parent ended; determine runner state before any rerun. |
 
-Prepared exit 0 requires a delivered report and complete required contributions.
-Optional failed roles can remain coverage gaps. A role reply is not a substantive
-verification verdict. Exit 1 means runtime/evidence/required-coverage failure; exit
-2 means invalid inputs or refused execution policy. Legacy direct CLI without
---prepare retains “some role responded” exit semantics and no captured evidence
-contract; its command sandbox is now read-only. The skill uses the prepared path.
+Exit 0 requires a delivered report, complete required contributions, and an
+observed completed turn for each of them. Optional failed roles can remain coverage
+gaps. A role reply is not a substantive verification verdict. Exit 1 means
+runtime/evidence/required-coverage failure; exit 2 means invalid inputs or refused
+execution policy. Workers run only through `--start` on a completed `--prepare`,
+once per run directory; there is no direct launch.
 
 ## Liveness triage, before any retry
 
@@ -59,8 +59,7 @@ contract; its command sandbox is now read-only. The skill uses the prepared path
    alone does not prove a stuck model. The default output watchdog is 1800 seconds,
    0 disables it. There is intentionally no run-level deadline.
 2. If not responding, inspect publishing errors first. --cancel stops a verified
-   detached runner; for an attached legacy run, stop its owning command. Do not
-   use --reap while the runner is present.
+   detached runner. Do not use --reap while the runner is present.
 3. If gone and live recorded Codex groups remain, --reap signals only verified
    identities/groups. A held/replaced lock, conflicting identity or unreadable
    process table means unknown: do not signal by guessed PID.
@@ -102,7 +101,8 @@ All runner-owned directories/files are private. Raw logs can contain sensitive
 tool output; do not publish or attach them indiscriminately. Cleanup is deliberate:
 never delete a directory or role lock while its processes may still use it.
 
-Saved role threads have explicit fresh/resume selection in prepared runs and are
-scoped by logical project, task, host session and role id. VSCODE_PID is window-wide;
-use CODEX_COUNCIL_SESSION_KEY to separate integrated terminals. Thread history is
+Saved role threads have explicit fresh/resume selection and are scoped by logical
+project, task, host session and role id. CODEX_COUNCIL_SESSION_KEY is the reliable
+session scope: a detected CLAUDE_CODE_SESSION_ID can keep the startup id after
+--resume or --continue, and VSCODE_PID is window-wide. Thread history is
 context, not current evidence, and a stale thread restarts fresh with a warning.
