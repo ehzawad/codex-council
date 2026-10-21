@@ -1233,8 +1233,9 @@ async def _run_role_invocation(role, attempt, run_codex):
         # substring fallback sits after the stale check so a stale error that
         # merely contains a bare digit run (e.g. "...thread id stale-429-sid")
         # still restarts fresh. The verdict is computed once and formatted
-        # as-is, so the tag always matches the branch taken here, and the
-        # retry decision is the verdict's, never the tag text's.
+        # as-is, so the tag always matches the branch taken here; the verdict
+        # marks a transient class, and replay safety and the attempt budget
+        # decide the retry.
         records = _failure_records(run.stdout)
         verdict = _failure_verdict(failure_text, records, model, resume=True)
         if verdict.kind != "stale":

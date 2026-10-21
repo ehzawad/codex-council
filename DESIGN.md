@@ -279,6 +279,7 @@ flowchart TD
     Workflow --> Policy
     Workflow --> Selection
     Workflow --> Workspace
+    Workflow --> Discovery
     Policy --> Discovery
     Policy --> Workspace
     Selection --> Discovery
@@ -288,20 +289,22 @@ flowchart TD
     Liveness --> Common
     Selection --> Common
 
-    classDef host fill:#dbeafe,stroke:#1d4ed8,color:#0b1b3f
     classDef runner fill:#ede9fe,stroke:#6d28d9,color:#1e1037
-    classDef worker fill:#dcfce7,stroke:#15803d,color:#052e16
     classDef evidence fill:#fef3c7,stroke:#b45309,color:#3b1d02
     classDef observer fill:#cffafe,stroke:#0e7490,color:#062a33
-    class Entry host
-    class Workflow,Selection,Discovery,Policy runner
+    classDef failure fill:#fee2e2,stroke:#b91c1c,color:#3f0a0a
+    class Entry,Workflow,Selection,Discovery,Policy,Common runner
     class Workspace,Evidence evidence
-    class Liveness,Failures observer
-    class Common worker
+    class Liveness observer
+    class Failures failure
 ```
 
-The entrypoint also imports the discovery, selection, policy and workspace modules
-directly; those edges are left out above for legibility.
+All of these modules run inside the runner process, so they share the runner
+colour; evidence-owning modules, the observer and failure classification keep
+their own. The entrypoint also imports the discovery, selection, policy and
+workspace modules directly; those edges are left out above for legibility. The
+workflow-to-discovery and policy-to-discovery edges are lazy, function-level
+imports.
 
 Imports form a DAG; production siblings do not import the entrypoint. The runner
 owns mutable run state. Runtime has no third-party Python dependency. Tests and

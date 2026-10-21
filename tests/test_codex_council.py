@@ -2205,9 +2205,9 @@ class UnknownRoleKeyTests(unittest.TestCase):
         )
 
     def test_unknown_key_reported_before_missing_field(self):
-        """Freeze diagnostic precedence: a corrupted object with both a
-        filler key and a missing required field reports the filler key,
-        because the recovery (full rewrite) covers both defects."""
+        """Freeze diagnostic precedence: an object with both an unknown key
+        and a missing required field reports the unknown key, because the
+        recovery (full rewrite) covers both defects."""
         raw = json.dumps([{"id": "x", "instruction": _valid_instruction("i"),
                            "_": ""}])
         _assert_usage_exit(

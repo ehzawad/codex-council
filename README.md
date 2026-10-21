@@ -116,8 +116,10 @@ flowchart TD
     Prepare --> Discover["--discover: per-role metadata probe<br/>in that role's scratch cwd"]
     Discover --> Select["Claude: optionally fill model,<br/>effort and selection from the snapshots"]
     Select --> Check["--check-staging-dir: contract, capture,<br/>selection authoring, execution policy"]
-    Check -- "exit 2" --> Repair["Fix selection fields, or<br/>recapture in a new directory"]
+    Check -- "exit 2: selection" --> Repair["Fix model, effort or<br/>selection fields"]
     Repair -.-> Check
+    Check -- "exit 2: needs recapture" --> Recapture["Recapture in a<br/>new directory"]
+    Recapture -.-> Brief
     Check -- "exit 0" --> Start["--start: claim supervisor.lock, err.log,<br/>out.md; spawn the detached supervisor"]
     Start --> Follow["--follow under Monitor; read<br/>settled replies as they arrive"]
     Follow --> Status["--status: lock free and recorded<br/>runner identity gone"]
@@ -133,7 +135,7 @@ flowchart TD
     class Brief,Select,Reconcile host
     class Prepare,Discover,Check,Start runner
     class Follow,Status,Fresh observer
-    class Repair,Cancel,Reap failure
+    class Repair,Recapture,Cancel,Reap failure
 ```
 
 Claude stages a fresh, decision-complete brief whenever a council is useful, whether
@@ -341,8 +343,9 @@ allows a scratch write but denies an external write and a command-network
 connection, and that read-only denies both writes, using temporary canaries and a
 host-local listener. A model that declines the probe is not a pass, and a refused
 policy is never a reason to enable bypass. The workflow gate prints the private
-evidence directories it keeps; inspect them, then remove them once the runner has
-exited. Smoke-test threads stay in Codex history.
+evidence directories it keeps; inspect them, then, once the runner has exited,
+remove each with `chmod -R u+w DIR && rm -rf DIR` (the captured baseline is
+read-only, so a plain `rm -rf` fails). Smoke-test threads stay in Codex history.
 
 For a host smoke check, start one fresh session from this checkout, which changes
 nothing installed:
