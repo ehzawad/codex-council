@@ -18,7 +18,8 @@ from typing import Any
 
 from council_policy import inspect_policy, parse_policy, policy_dict
 from council_workspace import (WorkspaceError, atomic_json, capture, copy_workspace,
-                               digest, freshness, private_dir, read_json,
+                               digest, freshness, private_dir, private_mkdirs,
+                               read_json,
                                relative_path, snapshot_digest, verify_tree)
 
 REQUEST_SCHEMA = "codex-council/request@1"
@@ -92,14 +93,14 @@ def prepare(run_dir: str, roles: list[Any], body: str) -> dict[str, Any]:
     snapshot = capture(source, directory / "baseline", include=request["include"],
                        exclude=request["exclude"])
     for name in ("workspaces", "evidence", "catalogs"):
-        (directory / name).mkdir(mode=0o700)
+        private_mkdirs(directory / name)
     bindings = {}
     for role in roles:
         key = role_key(role.id)
         relative = f"workspaces/{key}"
         copy_workspace(directory / "baseline", directory / relative, snapshot)
-        (directory / "evidence" / key).mkdir(mode=0o700)
-        (directory / "catalogs" / key).mkdir(mode=0o700)
+        private_mkdirs(directory / "evidence" / key)
+        private_mkdirs(directory / "catalogs" / key)
         bindings[role.id] = {
             "workspace": relative, "evidence": f"evidence/{key}",
             "catalog": f"catalogs/{key}", "contract_sha256": digest(contracts[role.id]),

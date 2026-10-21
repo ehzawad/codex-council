@@ -594,6 +594,21 @@ class WorkflowTests(WorkspaceCase):
         self.assertEqual(b.read_text(), "value = 1\n")
         self.assertEqual(self.file.read_text(), "value = 1\n")
 
+    def test_run_control_directories_are_private_whatever_the_umask(self):
+        """workspaces/, evidence/, catalogs/ and each role's subdirectories
+        are 0700 even when the umask clears owner bits of a requested mode;
+        a plain mkdir(mode=0o700) left them unwritable under umask 0o200."""
+        roles, body = self.stage(roles=[RoleFixture(id="a")])
+        previous = os.umask(0o200)
+        try:
+            workflow.prepare(str(self.run), roles, body)
+        finally:
+            os.umask(previous)
+        for relative in ("workspaces", "evidence", "catalogs",
+                         "evidence/a", "catalogs/a"):
+            mode = stat.S_IMODE(os.lstat(self.run / relative).st_mode)
+            self.assertEqual(mode, 0o700, relative)
+
     def test_agent_instruction_files_are_omitted_and_the_plan_says_so(self):
         names = ("AGENTS.md", "AGENTS.override.md", "CLAUDE.md", "CLAUDE.local.md",
                  "pkg/AGENTS.md", "pkg/claude.md")
