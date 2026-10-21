@@ -18,8 +18,13 @@ from council_workspace import WorkspaceError
 
 POLICY_KEYS = frozenset({"sandbox", "network", "external_tools", "continuity",
                          "required", "authorization"})
+# The default-on external surfaces examined on codex-cli 0.163.0 that reach
+# outside the command sandbox or install things. This is not a promise about
+# tool classes a later Codex adds; a new surface needs its own review.
 DISABLED_FEATURES = ("apps", "plugins", "browser_use", "browser_use_external",
-                     "computer_use", "hooks", "multi_agent")
+                     "computer_use", "hooks", "multi_agent", "image_generation",
+                     "tool_suggest", "skill_mcp_dependency_install", "remote_plugin",
+                     "workspace_dependencies")
 # Codex splits a -c key on every "." and has no quoted-key syntax there, so only
 # these names can be addressed; any other configured server blocks the run.
 MCP_NAME = re.compile(r"[A-Za-z0-9_-]+")
@@ -76,10 +81,14 @@ def config_overrides(policy: ExecutionPolicy, mcp_names: tuple[str, ...] = ()
                  "sandbox_workspace_write.writable_roots=[]",
                  "sandbox_workspace_write.exclude_slash_tmp=true",
                  "sandbox_workspace_write.exclude_tmpdir_env_var=true",
-                 f"sandbox_workspace_write.network_access={str(policy.network).lower()}"]
+                 f"sandbox_workspace_write.network_access={str(policy.network).lower()}",
+                 # Memories carry earlier sessions into a fresh contribution.
+                 "features.memories=false"]
     if policy.external_tools == "deny":
         overrides.extend(f"features.{name}=false" for name in DISABLED_FEATURES)
         overrides.append('web_search="disabled"')
+        # notify runs a host program after every turn, outside the sandbox.
+        overrides.append("notify=[]")
         for name in mcp_names:
             if not MCP_NAME.fullmatch(name):
                 raise WorkspaceError(
@@ -95,7 +104,9 @@ def command_options(policy: ExecutionPolicy, overrides: tuple[str, ...] = ()
     if policy.sandbox == "bypass":
         result = ["--dangerously-bypass-approvals-and-sandbox"]
     else:
-        result = ["--sandbox", policy.sandbox]
+        # A user or project execpolicy rule with decision="allow" runs the
+        # matching command outside the sandbox; never load those rules.
+        result = ["--sandbox", policy.sandbox, "--ignore-rules"]
     for setting in overrides or config_overrides(policy):
         result.extend(("-c", setting))
     return result
@@ -117,6 +128,7 @@ def validate_observed(config: Any, policy: ExecutionPolicy,
     expected: dict[str, Any] = {
         "sandbox_mode": "danger-full-access" if policy.sandbox == "bypass" else policy.sandbox,
         "approval_policy": "never",
+        "features.memories": False,
     }
     if policy.sandbox == "workspace-write":
         expected.update({
@@ -128,6 +140,7 @@ def validate_observed(config: Any, policy: ExecutionPolicy,
     if policy.external_tools == "deny":
         expected.update({f"features.{name}": False for name in DISABLED_FEATURES})
         expected["web_search"] = "disabled"
+        expected["notify"] = []
     for key, wanted in expected.items():
         actual = _at(config, key)
         if type(actual) is not type(wanted) or actual != wanted:
@@ -141,17 +154,44 @@ def validate_observed(config: Any, policy: ExecutionPolicy,
             raise WorkspaceError("an MCP server is not explicitly disabled")
 
 
+def validate_requirements(requirements: Any, policy: ExecutionPolicy) -> None:
+    """Refuse when managed requirements forbid what this policy sends."""
+    if requirements is None:
+        return
+    if not isinstance(requirements, dict):
+        raise WorkspaceError("Codex returned unusable managed requirements")
+    mode = "danger-full-access" if policy.sandbox == "bypass" else policy.sandbox
+    wanted = [("allowedSandboxModes", mode), ("allowedApprovalPolicies", "never")]
+    if policy.external_tools == "deny":
+        wanted.append(("allowedWebSearchModes", "disabled"))
+    for key, value in wanted:
+        allowed = requirements.get(key)
+        if allowed is not None and (not isinstance(allowed, list) or value not in allowed):
+            raise WorkspaceError(f"managed requirements forbid the requested policy: {key}")
+    features = requirements.get("featureRequirements")
+    if features is None:
+        return
+    if not isinstance(features, dict):
+        raise WorkspaceError("managed requirements: unusable featureRequirements")
+    disabled = ("memories", *(DISABLED_FEATURES if policy.external_tools == "deny" else ()))
+    for name in disabled:
+        if features.get(name) is True:
+            raise WorkspaceError(f"managed requirements force a disabled feature on: {name}")
+
+
 def inspect_policy(root: str, policy: ExecutionPolicy, *,
-                   reader: Callable[[str, tuple[str, ...]], dict[str, Any]] | None = None
-                   ) -> dict[str, Any]:
+                   reader: Callable[[str, tuple[str, ...]], tuple[dict[str, Any], Any]]
+                   | None = None) -> dict[str, Any]:
     """Read -> enumerate MCP names -> reread with all requested restrictions.
 
-    No credentials, endpoint values, or raw config leave this function. Metadata
-    unavailability blocks a restricted execution instead of enabling bypass.
+    The reader returns (effective config, managed requirements). No credentials,
+    endpoint values, or raw config leave this function. Metadata unavailability
+    blocks a restricted execution instead of enabling bypass.
     """
     if reader is None:
         reader = _read_config
-    first = reader(root, config_overrides(policy))
+    first, requirements = reader(root, config_overrides(policy))
+    validate_requirements(requirements, policy)
     servers = first.get("mcp_servers")
     if policy.external_tools == "deny" and not isinstance(servers, dict):
         raise WorkspaceError("Codex did not expose an MCP inventory; isolation unverified")
@@ -160,7 +200,8 @@ def inspect_policy(root: str, policy: ExecutionPolicy, *,
         raise WorkspaceError("invalid MCP inventory")
     names = tuple(sorted(names))
     overrides = config_overrides(policy, names)
-    observed = reader(root, overrides)
+    observed, requirements = reader(root, overrides)
+    validate_requirements(requirements, policy)
     validate_observed(observed, policy, names)
     return {"requested": asdict(policy), "overrides": list(overrides),
             "attestation": "configuration-observed-not-exec-attested",
@@ -168,7 +209,7 @@ def inspect_policy(root: str, policy: ExecutionPolicy, *,
             "cwd": root, "checked_at": time.time()}
 
 
-def _read_config(root: str, overrides: tuple[str, ...]) -> dict[str, Any]:
+def _read_config(root: str, overrides: tuple[str, ...]) -> tuple[dict[str, Any], Any]:
     # Imported lazily so pure policy/workspace tests need no runner installation.
     from council_discovery import _app_server_session
 
@@ -184,12 +225,15 @@ def _read_config(root: str, overrides: tuple[str, ...]) -> dict[str, Any]:
             })
             session.notify("initialized")
             result = session.request("config/read", {"cwd": root, "includeLayers": False})
+            managed = session.request("configRequirements/read", None)
             if session.server_requests:
                 raise WorkspaceError("unexpected server request during policy inspection")
             config = result.get("config") if isinstance(result, dict) else None
             if not isinstance(config, dict):
                 raise WorkspaceError("config/read did not return an object")
-            return config
+            if not isinstance(managed, dict) or "requirements" not in managed:
+                raise WorkspaceError("configRequirements/read did not return an object")
+            return config, managed["requirements"]
     except WorkspaceError:
         raise
     except Exception as exc:

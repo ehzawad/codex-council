@@ -144,6 +144,8 @@ class WorkflowCliTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         argv = self.execs()[0]["argv"]
         self.assertEqual(argv[argv.index("--sandbox") + 1], "read-only")
+        # An execpolicy allow rule would run its command outside the sandbox.
+        self.assertIn("--ignore-rules", argv)
         self.assertIn('approval_policy="never"', argv)
         self.assertIn("mcp_servers.fixture-server.enabled=false", argv)
         self.assertFalse(any('"' in arg for arg in argv if arg.startswith("mcp_servers.")))
@@ -156,6 +158,14 @@ class WorkflowCliTests(unittest.TestCase):
         proc = self.cli("--check-staging-dir", directory)
         self.assertEqual(proc.returncode, 2, proc.stderr)
         self.assertIn("cannot be disabled with a Codex -c override", proc.stderr)
+        self.assertFalse(self.execs())
+
+    def test_managed_requirements_block_before_inference(self):
+        directory = self.stage()
+        self.env["FAKE_WORKFLOW_REQUIREMENTS"] = json.dumps({"allowedSandboxModes": ["read-only"]})
+        proc = self.cli("--check-staging-dir", directory)
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn("managed requirements forbid the requested policy", proc.stderr)
         self.assertFalse(self.execs())
 
     def test_policy_mismatch_fails_before_inference_without_fallback(self):
@@ -236,6 +246,8 @@ class WorkflowCliTests(unittest.TestCase):
         second = self.stage(execution={"continuity": "resume"})
         self.assertEqual(self.launch(second).returncode, 0)
         self.assertEqual(self.execs()[-1]["thread"], old)
+        resumed = self.execs()[-1]["argv"]
+        self.assertLess(resumed.index("--ignore-rules"), resumed.index("resume"))
         self.assertNotEqual(self.execs()[-1]["cwd"], self.execs()[0]["cwd"])
         third = self.stage(execution={"continuity": "fresh"})
         self.assertEqual(self.launch(third).returncode, 0)

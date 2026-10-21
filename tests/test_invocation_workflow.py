@@ -306,6 +306,12 @@ class PolicyTests(unittest.TestCase):
         self.assertIs(config["mcp_servers"]["node_repl"]["enabled"], False)
         self.assertIs(config["features"]["apps"], False)
 
+    def test_every_sandboxed_policy_ignores_execpolicy_rules(self):
+        for sandbox in ("read-only", "workspace-write"):
+            with self.subTest(sandbox=sandbox):
+                options = policy.command_options(policy.parse_policy({"sandbox": sandbox}))
+                self.assertEqual(options[:3], ["--sandbox", sandbox, "--ignore-rules"])
+
     def test_quoted_mcp_key_would_create_a_different_server(self):
         # Why quoting is wrong: Codex keeps the quotes as part of the name.
         config = apply_overrides({"mcp_servers": {"node_repl": {}}},
@@ -338,7 +344,7 @@ class PolicyTests(unittest.TestCase):
 
         def read(root, settings):
             seen.append((root, settings))
-            return apply_overrides(config, settings)
+            return apply_overrides(config, settings), None
 
         result = policy.inspect_policy("/scratch", policy.parse_policy(), reader=read)
         self.assertEqual(len(seen), 2)
@@ -352,12 +358,48 @@ class PolicyTests(unittest.TestCase):
         def managed(root, settings):
             result = apply_overrides({"mcp_servers": {}}, settings)
             result["sandbox_mode"] = "danger-full-access"
-            return result
+            return result, None
 
         with self.assertRaisesRegex(workspace.WorkspaceError, "sandbox_mode"):
             policy.inspect_policy("/scratch", p, reader=managed)
         with self.assertRaisesRegex(workspace.WorkspaceError, "MCP inventory"):
-            policy.inspect_policy("/scratch", p, reader=lambda root, settings: {})
+            policy.inspect_policy("/scratch", p, reader=lambda root, settings: ({}, None))
+
+    def test_managed_requirements_that_forbid_the_request_fail_closed(self):
+        p = policy.parse_policy({"sandbox": "workspace-write"})
+        refused = ({"allowedSandboxModes": ["read-only"]},
+                   {"allowedApprovalPolicies": ["on-request"]},
+                   {"allowedWebSearchModes": ["live"]},
+                   {"featureRequirements": {"memories": True}},
+                   {"featureRequirements": {"tool_suggest": True}},
+                   {"allowedSandboxModes": "workspace-write"}, ["unexpected"])
+        for requirements in refused:
+            with self.subTest(requirements=requirements), self.assertRaisesRegex(
+                    workspace.WorkspaceError, "managed requirements"):
+                policy.inspect_policy("/scratch", p, reader=lambda root, settings: (
+                    apply_overrides({"mcp_servers": {}}, settings), requirements))
+        allowed = {"allowedSandboxModes": ["read-only", "workspace-write"],
+                   "allowedApprovalPolicies": ["never"], "featureRequirements": {"apps": False}}
+        policy.inspect_policy("/scratch", p, reader=lambda root, settings: (
+            apply_overrides({"mcp_servers": {}}, settings), allowed))
+
+    def test_notify_memories_and_installers_are_disabled_and_observed(self):
+        p = policy.parse_policy()
+        settings = policy.config_overrides(p)
+        for setting in ("notify=[]", "features.memories=false", "features.tool_suggest=false",
+                        "features.skill_mcp_dependency_install=false",
+                        "features.remote_plugin=false", "features.workspace_dependencies=false",
+                        "features.image_generation=false"):
+            self.assertIn(setting, settings)
+        host = {"mcp_servers": {}, "notify": ["host-program", "--flag"],
+                "features": {"memories": True}}
+        config = apply_overrides(host, settings)
+        policy.validate_observed(config, p, ())
+        config["notify"] = ["host-program"]
+        with self.assertRaisesRegex(workspace.WorkspaceError, "notify"):
+            policy.validate_observed(config, p, ())
+        native = policy.parse_policy({"external_tools": "native", "authorization": "user asked"})
+        self.assertIn("features.memories=false", policy.config_overrides(native))
 
     def test_unknown_future_mcp_server_between_reads_is_refused(self):
         calls = 0
@@ -368,7 +410,7 @@ class PolicyTests(unittest.TestCase):
             config = apply_overrides({"mcp_servers": {}}, settings)
             if calls == 2:
                 config["mcp_servers"]["new"] = {"enabled": True}
-            return config
+            return config, None
 
         with self.assertRaisesRegex(workspace.WorkspaceError, "inventory changed"):
             policy.inspect_policy("/scratch", policy.parse_policy(), reader=read)

@@ -73,7 +73,7 @@ def app_server(argv):
         elif method == "config/read":
             result = {"config": config(argv), "origins": {}}
         elif method == "configRequirements/read":
-            result = {"requirements": None}
+            result = {"requirements": json.loads(os.environ.get("FAKE_WORKFLOW_REQUIREMENTS", "null"))}
         elif method == "model/list":
             result = {"data": [{"id": "fixture-collaborator", "model": "fixture-collaborator",
                 "displayName": "Fixture", "description": "A synthetic collaborator.",
