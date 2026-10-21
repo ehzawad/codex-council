@@ -7,6 +7,7 @@ permissions:
   contents: write
 jobs:
   assemble:
+    if: startsWith(github.event.head_commit.message, 'chore: assemble captured collaboration')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -19,6 +20,8 @@ jobs:
           python-version: '3.13'
       - name: Integrate against the checked base
         run: python .council-integrate.py
+      - name: Remove only obsolete unused imports
+        run: pipx run --spec 'ruff==0.15.21' ruff check --fix --select F401 .
       - name: Check source and focused tests
         run: |
           python -m compileall -q plugins tests
@@ -30,11 +33,11 @@ jobs:
         run: |
           set -eu
           branch=codex/adaptive-collaboration-20261021
-          rm .council-integrate.py .github/workflows/council-feature-assembly.yml
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          rm .council-integrate.py
           git config user.name 'Codex'
           git config user.email 'noreply@openai.com'
           git add -A
-          tree=$(git write-tree)
-          commit=$(printf '%s\n' 'feat: adaptive collaboration with captured experiments and evidence' | git commit-tree "$tree" -p c933a0b0d278972a35d1482203f9cbdb14d33e31)
-          git push --force-with-lease="refs/heads/$branch:$EXPECTED_SHA" origin "$commit:refs/heads/$branch"
-          printf 'Integrated feature commit: %s\n' "$commit"
+          git commit -m 'feat: integrate captured collaboration and evidence with the existing runner'
+          git push origin "HEAD:refs/heads/$branch"
+          printf 'Integrated feature commit: %s\n' "$(git rev-parse HEAD)"

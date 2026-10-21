@@ -1,0 +1,158 @@
+# Captured invocation contract
+
+This is a versioned filesystem protocol, not a role catalog. Claude owns task
+interpretation, invocation timing, panel composition, and reconciliation. The
+runner owns paths, input identity, process lifetime, permissions sent, and records.
+
+## Files before preparation
+
+`request.json` describes the logical task and capture scope:
+
+```json
+{
+  "schema": "codex-council/request@1",
+  "task_id": "parser-boundary-investigation",
+  "reason": "A reproduction can distinguish the two current explanations.",
+  "source_root": "/absolute/project",
+  "include": ["src", "tests", "pyproject.toml"],
+  "exclude": ["tests/large-fixtures/*"]
+}
+```
+
+Use a stable task id for a continuing investigation, not a turn number. A new
+question/objective gets a new id. `reason` explains the marginal value of this
+invocation. It is not a runner-scored confidence or a model ranking.
+
+`source_root` and the run directory must be separate, non-overlapping trees.
+Paths are relative, with no `..`, absolute names, or traversed symbolic links.
+With `include` omitted, Git supplies tracked and non-ignored untracked filenames;
+the runner reads their **current working bytes**, including staged/unstaged edits
+and deletions. A non-Git project requires `include`. `include: []` supports a
+pure question without filesystem inputs. Exclusions use case-sensitive shell-style
+patterns against relative paths. Explicit includes may select ignored fixtures.
+
+Capture excludes common credential files, agent/VCS configuration directories,
+and dependency caches. This is a conservative omission policy, not a complete
+secret detector. Inspect `run.json.snapshot.omitted`; sanitize unusual sensitive
+inputs yourself and narrow the scope before capture. Submodules, symlinks, special
+files, and case/Unicode-colliding selected paths are refused or recorded as gaps,
+not silently flattened. File contents and executable bits are captured; ownership,
+ACLs, extended attributes, sparse layout and external services are not reproduced.
+
+`roles.json` is a nonempty array. This is an example, not a predefined role:
+
+```json
+[
+  {
+    "id": "boundary-experiment",
+    "label": "Boundary experiment",
+    "instruction": [
+      "Determine which explanation fits the captured parser behavior.",
+      "Reproduce the baseline, try the smallest discriminating experiment, and retain evidence."
+    ],
+    "execution": {
+      "sandbox": "workspace-write",
+      "network": false,
+      "external_tools": "deny",
+      "continuity": "fresh",
+      "required": true
+    }
+  }
+]
+```
+
+Ids match `^[a-z0-9_-]+$`; long ids are hashed for filenames. Labels are single-line.
+Instructions are arrays of nonempty strings. The runner supplies common framing;
+Claude need not reproduce a literal phrase or closing sentence. Unknown/duplicate
+JSON keys and non-finite numbers remain errors. Context is nonempty UTF-8, never
+silently truncated. Preflight displays its byte count, not a fabricated token bill.
+
+## Capabilities and trust
+
+`execution` is independent of the role's label or instructions:
+
+| Field | Default | Meaning |
+|---|---|---|
+| sandbox | read-only | Command sandbox: read-only, workspace-write, or explicitly authorized bypass. |
+| network | false | Command-network request. Bypass cannot enforce false and requires true explicitly. |
+| external_tools | deny | Disable apps/plugins/browser/computer/hooks/subagents/web and configured MCP servers, or explicitly authorize native integrations. |
+| continuity | fresh | Resume only when this task's earlier thread is useful. |
+| required | true | Missing/failed contribution or missing evidence makes required coverage incomplete. |
+| authorization | absent | Required explanation of user permission for bypass/network/native external tools. |
+
+Workspace-write permits experimental writes to that role's scratch cwd; additional
+writable roots and implicit /tmp/TMPDIR grants are removed. Execution is
+non-interactive with approval_policy=never. MCP names are enumerated, safely quoted,
+and explicitly disabled when external_tools=deny. Effective configuration is read
+again with the requested restrictions, and unknown/overridden settings block
+execution. No automatic fallback to bypass exists.
+
+**Limits:** config/read is evidence of configuration, not an OS attestation of a
+later worker. Configuration can change between checking and exec. The command
+sandbox is not a sandbox around the entire Codex process, does not promise to
+hide the rest of HOME, and cannot authenticate the user's permission from an
+orchestrator-written `authorization` string. Native external tools have their own
+privileges and may use network independently of the command sandbox. Bypass grants
+unrestricted local capability. Run trusted inputs only, and validate actual denial
+behavior with the opt-in live tests before relying on a particular host setup.
+
+## Prepare, discover, then resolve
+
+`--prepare RUNDIR` exclusively claims preparation, copies current inputs into an
+owner-read-only baseline, creates independent writable per-role copies and writes
+`run.json`. It checks content and metadata before/after copying and refuses observed
+change. Pause overlapping writers for this interval. This is **observed stable**,
+not an atomic snapshot in the presence of arbitrary concurrent writers. A failed
+capture consumes its run directory; never repair/reuse it.
+
+The backend is copy-based for Git and non-Git projects. No shared Git metadata,
+hardlinks, automatic commits, or worktree/resume incompatibility. A clean-HEAD
+worktree alone would omit precisely the dirty edits under investigation. Git-dependent
+build/version commands can fail without .git; record this as an environment gap,
+not proof of a source-code bug. Dependencies and external state need explicit,
+authorized setup and must be identified in the evidence.
+
+Each role's discovery runs in its actual scratch cwd. Source project agent config
+is intentionally not copied or flattened into global settings. Native inheritance
+therefore means **the configuration Codex resolves in the execution cwd**, which
+may differ from the live project's configuration. Inspect the discovery summary;
+use a supported explicit pin when the user's intended model must be preserved.
+The host Claude session's settings and user Codex configuration are never edited.
+
+Each role gets its own `catalogs/<role>/model-snapshot.json`. Existing selection
+modes stay valid: explicit user pin, routed model+effort, native_effort, or omission
+for native inheritance. Automatic choices name that role's snapshot_id. Model and
+effort descriptions guide Claude; the runner validates membership and provenance,
+never ranks. Fresh launch discovery revalidates automatic choices in the same cwd.
+Reports describe values **sent**, not an attestation of a serving model.
+
+Only model/effort/selection may change after prepare. Changes to context, task,
+panel, instructions or execution policy require a fresh run directory. The logical
+source root and task id scope saved threads, not the scratch path. Session scope
+still follows CODEX_COUNCIL_SESSION_KEY, then host ids, then project scope.
+
+## Evidence and reconciliation
+
+`result.json` schema `codex-council/result@1` identifies run, task, snapshot, context
+hash, role completeness, baseline integrity, applicability, attempts and artifacts.
+Each attempt streams exact stdout/stderr bytes to private files while running;
+metadata records argv, process identity, transport outcome, observed command events,
+usage when supplied, hashes and coverage gaps. Incomplete/oversized protocol records
+can limit summaries without truncating raw files. The original exec reader still
+buffers its protocol output; this release does not claim bounded total runner RAM.
+
+Command/exit/output fields in JSONL are **Codex-reported observations**, not an
+independent OS audit. Collaborator prose is stored separately as interpretation.
+No parser declares substantive claims true. Required coverage and execution success
+are distinct from applicability to current work and from verified task success.
+
+Changes are recorded in artifact manifests. Small text changes also produce a
+human-inspectable `candidate.diff`; binary/large/mode-only changes retain metadata
+and exact bytes in scratch. Nothing applies patches to the live source. Treat all
+artifacts as untrusted. Frozen-directory modes and digests detect mistakes, not
+malicious same-user/bypass tampering.
+
+`--freshness RUNDIR` returns 0 for unchanged captured scope, 1 for stale/unknown,
+and 2 for an invalid contract. It cannot detect changed user intent or unrecorded
+external dependencies. Claude must compare the current goal as well. A failed
+baseline due to unavailable dependencies is a blocked check, not a discovered bug.

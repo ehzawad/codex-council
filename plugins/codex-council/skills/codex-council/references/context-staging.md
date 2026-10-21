@@ -1,311 +1,37 @@
-# Context staging
+# Context at an invocation boundary
 
-Read this reference when assembling `context.md`: what belongs in it, how to
-order it so roles can verify rather than inherit your conclusions, and
-fail-closed recipes for extracting files, diffs, or diagnostic output from
-disk. The launch itself stays in `SKILL.md`; these recipes only create
-`ABS_RUNDIR/context.md`.
+A fresh invocation may occur after one turn, ten turns, or a material tool result.
+No turn counter determines usefulness. Capture the current decision and relevant
+artifacts, not an arbitrary number of recent messages.
 
-## Contents
+Write context.md with the current objective, acceptance criteria and authorization
+first. Then describe the contribution that could change the next decision, the
+claims to challenge, strongest contrary evidence, relevant artifacts and setup,
+in-flight work, and unknowns. Keep source facts, inference and proposals distinct.
+Previous council conclusions retain their original snapshot and limitations.
 
-- What goes into context.md
-- Extraction is evidence, not the brief
-- Extraction rules
-- The fail-closed skeleton
-- Tracked changes
-- Verification brief plus tracked changes
-- Changes plus relevant untracked files
-- Artifact plus a question
-- Diagnostic transcript
+A Codex thread does not inherit the host conversation. After host compaction,
+reread durable decisions and relevant live artifacts; acknowledge missing history.
+Provide file-relative locations within the captured input scope rather than asking
+a worker to follow historical absolute paths back into the changing live tree.
 
-## What goes into context.md
+Choose capture scope from the question, including the tests, configurations and
+fixtures needed to decide it. Git tracked/untracked selection is a convenience,
+not proof that all dependencies were included. Non-Git capture uses explicit paths.
+Omitted credentials/configuration/caches are recorded. A missing dependency is a
+coverage gap; do not fabricate a passing or failing empirical result.
 
-Context comes from one or both sources:
+Pause overlapping managed writers only during preparation. Capture refuses observed
+changes, but cannot make arbitrary external writers atomic. After preparation,
+Claude can continue independent live work while roles experiment in their copies.
+The baseline and role contracts are frozen; changing the context or authorization
+requires another invocation. Model selection fields alone can be filled after
+actual-cwd discovery.
 
-- **Claude-composed context** — prose written with the Write tool when you
-  already understand the situation and Codex does not need raw source.
-  Preserve every materially relevant fact, decision, uncertainty, and artifact
-  reference; remove only irrelevant or duplicated material.
-- **Shell-extracted context** — raw artifacts from disk, using the recipes
-  below.
+At reconciliation, --freshness checks captured filesystem scope, not the user's
+current intention or external service state. Compare both the current objective
+and artifacts. Recheck affected findings after changes; if the dependency scope is
+uncertain, recapture rather than claiming an old result proves current correctness.
 
-Build a decision-complete working set, not a transcript dump. The script has
-no byte ceiling on `context.md`, stdin, role fields, or the composed prompt,
-and it never truncates them; relevance selection is your job.
-
-The roles are an independent check on your work, so write the context the
-way a verifier needs it. The user's goal, requirements, and constraints are
-authoritative. Your account of the state, your conclusions, and what has
-already been tried are claims to check, and the runner's collaboration brief
-tells every role to treat them that way. Put what must be true before your
-explanation of why it is, label your conclusions and hypotheses as claims,
-and include the strongest evidence against them as well as the evidence for
-them. For a long session, assemble context in this order:
-
-1. **Problem, project, trajectory, and immediate objective:** what the user
-   is solving or implementing, the result needed now, the acceptance
-   criteria and constraints that decide it, and whether the work is
-   goal-directed, blocked, or exploratory.
-2. **Verification question and reviewed state:** the specific claims,
-   changes, or results to check and what would count as done; the repository
-   or artifact location, revision, branch/worktree, relevant working-tree
-   changes, material runtime versions, and commands already run with their
-   outcomes. Separate what you observed from checks the roles must perform
-   themselves.
-3. **In-flight work:** files, modules, features, drafts, datasets, queries,
-   experiments, deployments, tests, and research being changed or validated.
-4. **Active problems and hypotheses:** bugs, errors, symptoms, regressions,
-   security or performance failures, failing commands, attempted fixes,
-   working theories, and the evidence for or against them, each labeled as a
-   claim with its current support.
-5. **Recent working context at high fidelity:** recent user constraints,
-   decisions, actions, outputs, and artifacts that led to the current state.
-   Keep exact wording or raw material when details matter.
-6. **Current primary evidence:** files, diffs, diagnostics, data, sources, or
-   command output verified live rather than recalled.
-7. **Older durable context as a faithful summary:** decisions, rejected
-   approaches and why, invariants, preferences, earlier evidence, and
-   dependencies that still constrain the work. Include an old fact whenever
-   removing it could change the recommendation; age alone is never a reason
-   to drop it.
-8. **Unknowns, assumptions, and provenance:** separate verified current state
-   from summaries and inference; name known unknowns, likely blind spots,
-   missing evidence, possibly wrong assumptions, and what observation would
-   resolve each.
-
-Leave out superseded state, conversational repetition, stale intermediate
-output, and unrelated history. If the host conversation was compacted, treat
-the compaction summary as an index, re-check live state, and carry forward
-the older details that still matter. Do not compress merely to fit this
-plugin; there is no plugin size budget. The model, provider, OS, and memory
-still have real limits: if one is hit, keep the staged material and surface
-the actual downstream error.
-
-**Earlier councils.** A new council starts only from what you stage.
-Earlier replies and your reconciliation are optional history: stage the part
-that bears on this turn (a finding still open, a decision the work depends
-on, or a rejected finding with the evidence that decided it) and leave the
-rest out, whatever its age. A reused role still remembers what it said
-before, so say what changed since then and, where it matters now, how you
-disposed of that role's earlier findings. Earlier run directories keep
-`out.md` and `replies/`; after compaction, read the ones the summary points
-to, and only when they bear on the current work.
-
-Common scopes:
-
-- **Project context** — what the codebase is: purpose, architecture, key
-  modules, conventions, direction, and constraints. For evaluating the
-  project as a whole.
-- **Live problem-solving and implementation map** — what the user is doing
-  now, in-flight artifacts, observed bugs and hypotheses, what has been
-  tried, unknowns, blockers, ownership, and the next decision.
-- **Session retrospective** — what this session did: goal, files touched,
-  decisions, open questions, and branch state.
-
-Mark uncertainty explicitly, and verify state live (for example
-`git status --short --branch`) instead of recalling it. Never write an empty
-context file; when there is nothing to extract, write a self-contained
-question to `ABS_RUNDIR/context.md` instead. If the reviewed artifacts change
-while a council runs, name the affected checks before carrying their
-conclusions forward.
-
-## Extraction is evidence, not the brief
-
-The recipes below produce evidence: a diff, a file, a transcript. A
-successful, non-empty extraction proves only that the evidence was captured.
-It does not make the context decision-complete, because a raw diff carries
-no objective, acceptance criteria, verification question, or account of what
-was already tried. Pair extracted evidence with a brief. Write the brief
-with the Write tool (for example to `ABS_RUNDIR/brief.md`) and combine the
-two with the "Verification brief plus tracked changes" recipe, or use the
-"Artifact plus a question" and "Diagnostic transcript" shapes, which carry
-their question inline. Mention material non-text inputs by path even when
-their content cannot be staged.
-
-## Extraction rules
-
-Use the exact private `ABS_RUNDIR` printed by this launch's `mktemp -d` call
-(`SKILL.md` Step 3; every launch gets its own). Each recipe must run inside
-one Bash invocation: shell options and variables do not persist across Claude
-Code Bash calls, so every recipe re-assigns its own paths. Placeholder
-discipline: paste concrete values for every `<angle-bracket>` placeholder and
-for the literal `ABS_RUNDIR` prefix before running — never leave an undefined
-`$file`-style variable from an earlier tool call in the command.
-
-## The fail-closed skeleton
-
-Every extraction uses this exact shape. It pre-cleans both the final file and
-the temp file, extracts into the temp file, refuses to publish empty output,
-publishes atomically with `mv`, and removes both files if anything fails — so
-a failed, partial, or empty extraction can never leave stale or previously
-accepted context behind for the launch to pick up:
-
-```bash
-set -euo pipefail
-out='ABS_RUNDIR/context.md'
-tmp='ABS_RUNDIR/context.md.tmp'
-rm -f "$out" "$tmp"
-trap 'rc=$?; if [ "$rc" -ne 0 ]; then rm -f "$out" "$tmp"; fi; exit "$rc"' EXIT
-{
-  git diff HEAD
-} >"$tmp"
-[ -s "$tmp" ]
-mv -f "$tmp" "$out"
-trap - EXIT
-```
-
-Do not add `|| true` anywhere: a failed extractor must fail the recipe so the
-trap removes both files. The `[ -s "$tmp" ]` guard fails the recipe when the
-extractor produced nothing, so an empty success publishes nothing — write a
-self-contained question to `context.md` instead (see above). A bare
-`tmp`-then-`mv` without the leading `rm -f` would leave an older accepted
-`context.md` behind when extraction fails; the pre-clean plus the trap make
-failure leave no file at all.
-
-`git diff HEAD` includes staged and unstaged tracked changes. Use `git diff
---cached` for staged-only work or `git diff` for unstaged-only work. None of
-those commands include untracked files.
-
-## Tracked changes
-
-The skeleton above already extracts `git diff HEAD`. Staged only — same
-skeleton, different extractor:
-
-```bash
-set -euo pipefail
-out='ABS_RUNDIR/context.md'
-tmp='ABS_RUNDIR/context.md.tmp'
-rm -f "$out" "$tmp"
-trap 'rc=$?; if [ "$rc" -ne 0 ]; then rm -f "$out" "$tmp"; fi; exit "$rc"' EXIT
-{
-  git diff --cached
-} >"$tmp"
-[ -s "$tmp" ]
-mv -f "$tmp" "$out"
-trap - EXIT
-```
-
-## Verification brief plus tracked changes
-
-Write the brief first with the Write tool: the objective, acceptance
-criteria, verification question, reviewed state, and your claims with the
-evidence for and against them. Then combine it with the diff. The diff guard
-reads `git diff HEAD --quiet`'s status explicitly: 1 (tracked changes exist)
-publishes; 0 (no tracked changes to review) fails the recipe instead of
-publishing a brief that points at an empty diff; anything else is a Git
-failure and fails the recipe with that status. Every failure removes both
-files. Never write the guard as `git diff HEAD --quiet && exit 1`: `set -e`
-ignores a command that fails before `&&`, so a Git error would publish the
-context:
-
-```bash
-set -euo pipefail
-out='ABS_RUNDIR/context.md'
-tmp='ABS_RUNDIR/context.md.tmp'
-rm -f "$out" "$tmp"
-trap 'rc=$?; if [ "$rc" -ne 0 ]; then rm -f "$out" "$tmp"; fi; exit "$rc"' EXIT
-{
-  cat <'ABS_RUNDIR/brief.md'
-  printf '\n## Tracked changes under review (git diff HEAD)\n\n'
-  git diff HEAD
-} >"$tmp"
-[ -s "$tmp" ]
-diff_rc=0
-git diff HEAD --quiet || diff_rc=$?
-case "$diff_rc" in
-  1) ;;
-  0) exit 1 ;;
-  *) exit "$diff_rc" ;;
-esac
-mv -f "$tmp" "$out"
-trap - EXIT
-```
-
-## Changes plus relevant untracked files
-
-Keep binary, symlink, and encoding guards while preserving filenames safely:
-
-```bash
-set -euo pipefail
-out='ABS_RUNDIR/context.md'
-tmp='ABS_RUNDIR/context.md.tmp'
-rm -f "$out" "$tmp"
-trap 'rc=$?; if [ "$rc" -ne 0 ]; then rm -f "$out" "$tmp"; fi; exit "$rc"' EXIT
-{
-  git diff HEAD
-  git ls-files -z --others --exclude-standard -- |
-    while IFS= read -r -d '' f; do
-      [ -f "$f" ] && [ ! -L "$f" ] || continue
-      mime=$(file --brief --mime -- "$f")
-      case "$mime" in
-        *charset=binary*)
-          printf '\n=== non-text untracked artifact: %q (%s); inspect from disk if relevant ===\n' "$f" "$mime"
-          continue
-          ;;
-        *charset=utf-8*|*charset=us-ascii*) ;;
-        *)
-          printf '\n=== non-UTF-8 untracked artifact: %q (%s); inspect from disk if relevant ===\n' "$f" "$mime"
-          continue
-          ;;
-      esac
-      printf '\n=== untracked file: %q ===\n' "$f"
-      cat <"$f"
-    done
-} >"$tmp"
-[ -s "$tmp" ]
-mv -f "$tmp" "$out"
-trap - EXIT
-```
-
-## Artifact plus a question
-
-Write the complete relevant artifact and the decision the council should make.
-Paste the artifact's literal absolute path (for example
-`/Users/you/project/src/parser.py`) where the recipe shows one — never a
-`$file` variable from an earlier Bash call:
-
-```bash
-set -euo pipefail
-out='ABS_RUNDIR/context.md'
-tmp='ABS_RUNDIR/context.md.tmp'
-rm -f "$out" "$tmp"
-trap 'rc=$?; if [ "$rc" -ne 0 ]; then rm -f "$out" "$tmp"; fi; exit "$rc"' EXIT
-{
-  printf 'Question: %s\n\n' '<what should the council decide or produce?>'
-  cat <'/abs/path/to/artifact'
-} >"$tmp"
-[ -s "$tmp" ]
-mv -f "$tmp" "$out"
-trap - EXIT
-```
-
-## Diagnostic transcript
-
-Preserve the failing command, status, and complete output. Paste the literal
-exit status (for example `1`) and the literal absolute log path (for example
-`ABS_RUNDIR/build.log`) — never `$exit_status` or `$log_file` variables from
-earlier tool calls:
-
-```bash
-set -euo pipefail
-out='ABS_RUNDIR/context.md'
-tmp='ABS_RUNDIR/context.md.tmp'
-rm -f "$out" "$tmp"
-trap 'rc=$?; if [ "$rc" -ne 0 ]; then rm -f "$out" "$tmp"; fi; exit "$rc"' EXIT
-{
-  printf 'Question: %s\n\n' '<what should the council diagnose?>'
-  printf 'Command: %s\n' '<the failing command>'
-  printf 'Exit status: %s\n\n' '<pasted exit status, e.g. 1>'
-  echo 'Output:'
-  cat <'/abs/path/to/command.log'
-} >"$tmp"
-[ -s "$tmp" ]
-mv -f "$tmp" "$out"
-trap - EXIT
-```
-
-`context.md` is UTF-8 text because it is sent to `codex exec` on stdin. For a
-material binary, image, archive, or non-UTF-8 artifact, include its project
-path, type, relevance, and any available textual diagnostics. Do not silently
-exclude or blindly transcode it; roles can inspect the original from disk with
-the tools supported by the active Codex installation.
+Exact input shapes and capture limitations are in
+[invocation-contract.md](invocation-contract.md).

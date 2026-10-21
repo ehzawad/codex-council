@@ -1,0 +1,100 @@
+"""Mechanical docs/packaging contracts, not frozen explanatory prose."""
+import json
+import re
+import shlex
+import sys
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+PLUGIN = ROOT / "plugins/codex-council"
+SKILL = PLUGIN / "skills/codex-council/SKILL.md"
+REFERENCES = SKILL.parent / "references"
+SCRIPTS = SKILL.parent / "scripts"
+sys.path.insert(0, str(SCRIPTS))
+HAS_RUNNER = (SCRIPTS / "codex_council.py").exists()
+if HAS_RUNNER:
+    import codex_council  # noqa: E402
+
+
+@unittest.skipUnless(HAS_RUNNER, "requires full checkout")
+class DocumentationContractTests(unittest.TestCase):
+    def test_skill_has_room_to_evolve_and_does_not_pin_the_host_model(self):
+        text = SKILL.read_text()
+        self.assertLess(len(text), 10000)
+        self.assertLess(len(text.splitlines()), 180)
+        frontmatter = text.split("---", 2)[1]
+        self.assertFalse(re.search(r"(?m)^(model|effort|context):", frontmatter))
+        self.assertNotIn("disable-model-invocation: true", frontmatter)
+
+    def test_every_skill_python_command_parses_with_the_real_parser(self):
+        commands = []
+        for block in re.findall(r"```bash\n(.*?)```", SKILL.read_text(), re.S):
+            for line in block.splitlines():
+                if line.startswith("python3 "):
+                    argv = shlex.split(line)[2:]
+                    parsed = codex_council._parse_args(argv)
+                    self.assertEqual(parsed.skill_contract, codex_council.SKILL_CONTRACT_EPOCH)
+                    commands.append(argv[0])
+        self.assertEqual(commands, ["--prepare", "--discover", "--check-staging-dir",
+                                    "--start", "--freshness"])
+
+    def test_new_modes_are_exclusive_and_accept_the_current_epoch(self):
+        import contextlib
+        import io
+        for command in ("--prepare", "--freshness"):
+            parsed = codex_council._parse_args([command, "/private/run", "--skill-contract",
+                                               str(codex_council.SKILL_CONTRACT_EPOCH)])
+            self.assertEqual(getattr(parsed, command[2:]), "/private/run")
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+                codex_council._parse_args([command, "/run", "--start", "/other"])
+            self.assertEqual(caught.exception.code, 2)
+
+    def test_role_example_uses_the_actual_parser_without_magic_prose(self):
+        blocks = re.findall(r"```json\n(.*?)```", (REFERENCES / "invocation-contract.md").read_text(), re.S)
+        panels = [json.loads(block) for block in blocks if isinstance(json.loads(block), list)]
+        self.assertEqual(len(panels), 1)
+        roles = codex_council._parse_roles_json(json.dumps(panels[0]))
+        self.assertEqual(roles[0].execution["sandbox"], "workspace-write")
+        self.assertNotIn(codex_council.REQUIRED_CADENCE_SENTENCE, roles[0].instruction)
+
+    def test_relative_markdown_links_point_at_existing_files(self):
+        documents = [SKILL, ROOT / "README.md", ROOT / "DESIGN.md", *REFERENCES.glob("*.md")]
+        for document in documents:
+            for target in re.findall(r"\]\(([^)]+)\)", document.read_text()):
+                if "://" in target or target.startswith("#"):
+                    continue
+                with self.subTest(document=document.name, target=target):
+                    self.assertTrue((document.parent / target.split("#", 1)[0]).exists())
+
+    def test_marketplace_installs_only_the_plugin_subtree(self):
+        marketplace = json.loads((ROOT / ".claude-plugin/marketplace.json").read_text())
+        self.assertEqual(marketplace["plugins"][0]["source"], "./plugins/codex-council")
+        self.assertFalse((PLUGIN / "tests").exists())
+        self.assertFalse(any(PLUGIN.rglob("*.pdf")))
+        self.assertFalse(any(PLUGIN.rglob("*.png")))
+
+    def test_version_and_license_are_publishable(self):
+        meta = json.loads((PLUGIN / ".claude-plugin/plugin.json").read_text())
+        self.assertIn(meta["version"], (ROOT / "CHANGELOG.md").read_text())
+        self.assertEqual(meta["license"], "MIT")
+        self.assertIn("Permission is hereby granted", (ROOT / "LICENSE").read_text())
+
+    def test_bare_command_defaults_do_not_grant_bypass(self):
+        for command in (codex_council._fresh_cmd("/workspace"),
+                        codex_council._resume_cmd("/workspace", "thread-id")):
+            self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", command)
+            self.assertEqual(command[command.index("--sandbox") + 1], "read-only")
+            self.assertIn('approval_policy="never"', command)
+
+    def test_behavioral_cases_cover_non_invocation_and_context_drift(self):
+        cases = json.loads((ROOT / "tests/fixtures/invocation_cases.json").read_text())
+        ids = {case["id"] for case in cases["cases"]}
+        self.assertLessEqual({"simple-no-council", "after-ten-turns", "changed-during-run",
+                             "after-compaction", "context-only", "no-redundant-invocation"}, ids)
+        self.assertEqual(len(ids), len(cases["cases"]))
+        self.assertTrue(all(case["steps"] and case["expected"] for case in cases["cases"]))
+
+
+if __name__ == "__main__":
+    unittest.main()
