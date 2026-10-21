@@ -162,6 +162,20 @@ def _resolve(role, planning=None, launch=None, routing_mode="auto", now=NOW):
         role, planning, launch, routing_mode, now)
 
 
+def _native_retiring_entries(retirement=PAST_RETIREMENT):
+    """The default wire catalog with the native model's advertised
+    retirement at `retirement` (ISO UTC); its efforts are unchanged."""
+    epoch = calendar.timegm(time.strptime(retirement, "%Y-%m-%dT%H:%M:%SZ"))
+    catalog = fake_codex.default_catalog()
+    for entry in catalog:
+        if entry["model"] == NATIVE:
+            entry["upgradeInfo"] = {
+                "model": VEGA, "retirementAt": epoch,
+                "migrationMarkdown": None, "modelLink": None,
+                "upgradeCopy": None}
+    return catalog
+
+
 # ---------- the value grammar (model and effort) ----------
 
 class SelectionValueGrammarTests(unittest.TestCase):
@@ -786,6 +800,24 @@ class ResolverTests(unittest.TestCase):
                           _snapshot(), _snapshot(), now=BEFORE_LYRA_RETIRES)
         self.assertEqual(before.provenance, "routed")
 
+    def test_a_native_retirement_only_the_launch_catalog_shows_falls_back(self):
+        role = _role(effort="adaptive-v2", mode="native_effort")
+        launch = _snapshot(snapshot_id="fedcba9876543210",
+                           entries=_native_retiring_entries())
+        decision = _resolve(role, _snapshot(), launch)
+        self.assertEqual(decision.provenance, "fallback")
+        self.assertIsNone(decision.dispatch_model)
+        self.assertIsNone(decision.dispatch_effort)
+        self.assertEqual(
+            decision.note,
+            "selection evidence changed since discovery: native model "
+            f"'{NATIVE}' advertised retirement passed ({PAST_RETIREMENT})")
+        # Without a retirement the same choice still pins the native model.
+        kept = _resolve(role, _snapshot(),
+                        _snapshot(snapshot_id="fedcba9876543210"))
+        self.assertEqual((kept.provenance, kept.dispatch_model),
+                         ("native_effort", NATIVE))
+
     def test_native_effort_evidence_change_falls_back(self):
         prefix = "selection evidence changed since discovery: "
         role = _role(effort="adaptive-v2", mode="native_effort")
@@ -1025,6 +1057,22 @@ class AuthoringValidationTests(unittest.TestCase):
         for now in (NOW, BEFORE_LYRA_RETIRES):
             self._validate([_role(model=LYRA, effort="brisk", mode="routed")],
                            planning=_snapshot(), now=now)
+
+    def test_native_effort_rejects_a_retired_native_model(self):
+        """As for a routed choice: retired when retirement_at <= now (the
+        boundary is retired), the same one-line exit-2 authoring error."""
+        role = _role(effort="adaptive-v2", mode="native_effort")
+        for retirement in ("2026-09-27T11:59:59Z", NOW):
+            with self.subTest(retirement=retirement):
+                self._rejects(
+                    [role],
+                    f"--roles-file entry 0 (id 'architect'): native model "
+                    f"'{NATIVE}' advertised retirement passed ({retirement}).",
+                    planning=_snapshot(
+                        entries=_native_retiring_entries(retirement)))
+        # One second after `now` the native model is not yet retired.
+        self._validate([role], planning=_snapshot(
+            entries=_native_retiring_entries("2026-09-27T12:00:01Z")))
 
     def test_effort_must_be_advertised_for_that_model_exactly(self):
         for effort in ("adaptive-v2", "Brisk", "BRISK"):
@@ -2888,6 +2936,37 @@ class LaunchEndToEndTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         (argv,) = self.argvs()
         self.assertIn(LYRA, argv)
+
+    def test_a_retired_native_model_refuses_native_effort_everywhere(self):
+        """The summary says native effort adjustment is unavailable, and a
+        native_effort choice on the retired native model exits 2 at
+        preflight and launch, like a retired routed model."""
+        self.scenario(self._retired_scenario(NATIVE))
+        self.stage([_entry()])
+        proc = self.run_script("--discover", self.run_dir,
+                               "--skill-contract", EPOCH)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(
+            "native-model effort adjustment: unavailable — native model "
+            f"{NATIVE} advertised retirement passed ({PAST_RETIREMENT})\n",
+            proc.stdout)
+        self.forget_discovery()
+        snapshot_id = self.discover()
+        self.stage([_native_effort(effort="adaptive-v2",
+                                   snapshot_id=snapshot_id)])
+        expected = (f"--roles-file entry 0 (id 'architect'): native model "
+                    f"'{NATIVE}' advertised retirement passed "
+                    f"({PAST_RETIREMENT}).")
+        preflight = self.run_script("--check-staging-dir", self.run_dir,
+                                    "--skill-contract", EPOCH)
+        self.assertEqual(preflight.returncode, 2, preflight.stdout)
+        self.assertIn(expected, preflight.stderr)
+        self.assertNotIn("staging OK", preflight.stdout)
+        proc = self.launch()
+        self.assertEqual(proc.returncode, 2, proc.stdout)
+        self.assertIn(expected, proc.stderr)
+        self.assertNotIn("dispatching", proc.stderr)
+        self.assertEqual(self.argvs(), [])
 
     def test_a_retirement_only_the_launch_catalog_shows_falls_back(self):
         snapshot_id = self.discover()

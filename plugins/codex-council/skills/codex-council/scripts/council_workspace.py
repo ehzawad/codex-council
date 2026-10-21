@@ -1,8 +1,10 @@
 """Content-addressed, copy-backed experiment inputs; no agent or Git writes.
 
 A capture is observed-stable, not an atomic snapshot of arbitrary external
-writers. Pause overlapping writers during capture. Symlinks and special files
-in the selected inputs are refused. Copies never share writable inodes with the
+writers. Pause overlapping writers during capture. Symlinks, special files, and
+case/Unicode collisions among selected files, empty directories, and directory
+components are refused. Every directory a capture or copy creates is 0700
+whatever the process umask. Copies never share writable inodes with the
 source, and Git metadata/configuration is never borrowed by an experiment.
 """
 
@@ -58,6 +60,40 @@ def private_dir(path: str | Path) -> Path:
             or st.st_mode & 0o077):
         raise WorkspaceError(f"not an owned private directory: {path}")
     return path.resolve(strict=True)
+
+
+def private_mkdirs(path: Path) -> None:
+    """Create `path` and any missing ancestors as 0700 directories whatever
+    the process umask. Only directories created here are chmodded; an
+    existing component is left as it is and must be a real directory."""
+    missing: list[Path] = []
+    current = Path(os.path.abspath(path))
+    while not os.path.lexists(current):
+        missing.append(current)
+        current = current.parent
+    if not stat.S_ISDIR(current.lstat().st_mode):
+        raise WorkspaceError(f"not a directory: {current}")
+    for directory in reversed(missing):
+        os.mkdir(directory, 0o700)
+        os.chmod(directory, 0o700)
+
+
+def portable_collision(names: Any, dirs: Any = ()) -> tuple[str, str] | None:
+    """The first pair of distinct selected paths that are equal after NFC
+    normalization and case folding, or None. Compared over complete file
+    paths, empty directories, and every directory component of both, so
+    Foo/ and foo/, or Foo/a.txt and foo/b.txt, collide; a file and a
+    directory with folded-equal names collide too."""
+    seen: dict[str, str] = {}
+    for name in sorted({*names, *dirs}):
+        parts = PurePosixPath(name).parts
+        for depth in range(1, len(parts) + 1):
+            path = "/".join(parts[:depth])
+            folded = unicodedata.normalize("NFC", path).casefold()
+            other = seen.setdefault(folded, path)
+            if other != path:
+                return other, path
+    return None
 
 
 def atomic_json(path: Path, value: Any) -> None:
@@ -174,7 +210,7 @@ def _hash_file(root: Path, name: str, destination: Path | None = None
         output = None
         try:
             if destination is not None:
-                destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                private_mkdirs(destination.parent)
                 fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL
                              | os.O_NOFOLLOW, 0o600)
                 output = os.fdopen(fd, "wb")
@@ -317,15 +353,12 @@ def inventory(root: Path, include: list[str] | None, exclude: list[str]
         for value in include:
             names.update(_walk(root, relative_path(value, allow_dot=True),
                                exclude, omitted, empty))
-    # Collisions are checked over complete selected file paths only, not
-    # over empty-directory names or colliding directory components.
-    portable: dict[str, str] = {}
+    collision = portable_collision(names, empty)
+    if collision is not None:
+        raise WorkspaceError("non-portable case/Unicode collision: "
+                             f"{collision[0]} and {collision[1]}")
     files, stamps = {}, {}
     for name in sorted(names):
-        folded = unicodedata.normalize("NFC", name).casefold()
-        if folded in portable and portable[folded] != name:
-            raise WorkspaceError(f"non-portable case/Unicode collision: {name}")
-        portable[folded] = name
         files[name], stamps[name] = _hash_file(root, name)
     return files, stamps, omitted, sorted(empty)
 
@@ -345,8 +378,9 @@ def capture(source: Path, baseline: Path, *, include: list[str] | None = None,
     before_git = git_state(source, include, exclude)
     before, stamps, omitted, dirs = inventory(source, include, exclude)
     baseline.mkdir(mode=0o700)
+    os.chmod(baseline, 0o700)
     for name in dirs:
-        (baseline / name).mkdir(mode=0o700, parents=True, exist_ok=True)
+        private_mkdirs(baseline / name)
     copied = {}
     for name, entry in before.items():
         copy, stamp = _hash_file(source, name, baseline / name)
@@ -417,8 +451,9 @@ def verify_tree(root: Path, expected: dict[str, Any], dirs: list[str]) -> None:
 def copy_workspace(baseline: Path, target: Path, snapshot: dict[str, Any]) -> None:
     verify_tree(baseline, snapshot["files"], snapshot["dirs"])
     target.mkdir(mode=0o700)
+    os.chmod(target, 0o700)
     for name in snapshot["dirs"]:
-        (target / name).mkdir(mode=0o700, parents=True, exist_ok=True)
+        private_mkdirs(target / name)
     for name, value in snapshot["files"].items():
         if _hash_file(baseline, name, target / name)[0] != value:
             raise WorkspaceError(f"baseline changed while copying: {name}")

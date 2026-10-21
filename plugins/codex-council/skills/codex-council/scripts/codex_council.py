@@ -454,11 +454,84 @@ def _state_lock_path(role_id):
     return _state_path(role_id) + ".lock"
 
 
+class StateDirError(PermissionError):
+    """The saved-thread state directory or a lock file is not private and
+    cannot safely be made so; nothing there is chmodded or used."""
+
+
+def _ensure_state_dir():
+    """Return STATE_DIR as a private (0700) directory, whatever the umask.
+
+    Missing components are created 0700 (as the XDG base-directory
+    specification asks of a missing $XDG_STATE_HOME); existing ancestors are
+    never touched. An existing state directory must be a real directory
+    (not a symlink) owned by the effective uid; when it is group- or
+    other-accessible, as one created under an earlier umask-dependent
+    release can be, it is tightened to 0700 through a descriptor opened
+    without following links and re-checked to be the same owned directory.
+    Anything else raises StateDirError and nothing is chmodded.
+    """
+    path = os.path.normpath(os.path.abspath(STATE_DIR))
+    missing = []
+    current = path
+    while not os.path.lexists(current):
+        missing.append(current)
+        current = os.path.dirname(current)
+    for directory in reversed(missing):
+        try:
+            os.mkdir(directory, 0o700)
+        except FileExistsError:
+            continue  # a concurrent council created it; checked below
+        os.chmod(directory, 0o700)
+    st = os.lstat(path)
+    problem = _private_stat_problem(st, directory=True)
+    if problem is None:
+        return path
+    kind, fragment = problem
+    if kind != "mode":
+        raise StateDirError(
+            f"saved-thread state directory {path!r} {fragment}; it is not "
+            "changed or used. Move it aside or point XDG_STATE_HOME at an "
+            "owned private directory, then start over in a new run directory")
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                 | os.O_CLOEXEC)
+    try:
+        opened = os.fstat(fd)
+        if ((opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino)
+                or opened.st_uid != os.geteuid()):
+            raise StateDirError(
+                f"saved-thread state directory {path!r} changed while being "
+                "checked; it is not changed or used")
+        os.fchmod(fd, 0o700)
+    finally:
+        os.close(fd)
+    return path
+
+
+def _open_private_lock(lock_path):
+    """Open (creating 0600) one owned regular lock file without following a
+    link; an existing owned lock file with group/other bits is tightened to
+    0600 through its descriptor. Anything else raises StateDirError."""
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
+                 | os.O_CLOEXEC | os.O_NONBLOCK, 0o600)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
+            raise StateDirError(
+                f"role lock {lock_path!r} is not an owned regular file; it is "
+                "not changed or used")
+        if stat.S_IMODE(st.st_mode) != 0o600:
+            os.fchmod(fd, 0o600)
+        return os.fdopen(fd, "r+")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def _try_role_state_lock(role_id):
     """Return a held role-state lock, or None without waiting."""
-    os.makedirs(STATE_DIR, exist_ok=True)
-    lock_path = _state_lock_path(role_id)
-    lock_file = open(lock_path, "a+")
+    _ensure_state_dir()
+    lock_file = _open_private_lock(_state_lock_path(role_id))
     try:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return lock_file
@@ -502,9 +575,9 @@ def save_session(role_id, session_id):
     parent directory is not fsynced, so the replacement itself is not
     guaranteed to survive power loss. An OSError propagates
     (the temp file already removed) so each caller keeps its own
-    reply-first warning.
+    reply-first warning (StateDirError is an OSError).
     """
-    os.makedirs(STATE_DIR, exist_ok=True)
+    _ensure_state_dir()
     meta = {
         "session_id": session_id,
         "role_id": role_id,
@@ -2868,6 +2941,9 @@ def main():
         if preparing is None:
             raise WorkspaceError("this directory has no completed capture; "
                                  "run --prepare in a new directory")
+        # Every role takes its continuity lock there: refuse an unsafe
+        # state directory before any worker, not role by role.
+        _ensure_state_dir()
         _claim_execution(run_dir)
     except (OSError, ValueError) as exc:
         _usage_exit("invocation contract: " + _report_inline(exc))

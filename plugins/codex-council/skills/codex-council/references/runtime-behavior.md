@@ -112,9 +112,12 @@ Inputs: request.json, roles.json, context.md. Capture: run.json, baseline/,
 `workspaces/<key>/`, `catalogs/<key>/`. Lifecycle: supervisor.lock, supervisor.json,
 status.json, err.log, out.md, replies/. Evidence: `evidence/<key>/` and result.json.
 Each `<key>` is the role key `run.json` records (a hashed key for ids over 32
-characters). Run roots and control/evidence files are private; the saved-thread
-state directory and its lock files under `$XDG_STATE_HOME/codex-council` follow
-the process umask. Raw logs can contain sensitive
+characters). Run roots, control/evidence files, and every scratch directory the
+capture creates are private whatever the umask. The saved-thread state directory
+under `$XDG_STATE_HOME/codex-council` is created 0700 and its lock files 0600; an
+owned, too-open state directory or lock file from an earlier release is tightened,
+while a symlinked, foreign-owned or non-directory state path refuses the launch
+before dispatch and is never changed. Raw logs can contain sensitive
 tool output; do not publish or attach them indiscriminately. Cleanup is deliberate:
 never delete a directory or role lock while its processes may still use it.
 

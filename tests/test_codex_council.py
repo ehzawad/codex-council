@@ -311,6 +311,108 @@ class StatePathTests(unittest.TestCase):
         self.assertTrue(s.endswith("__security.json"))
 
 
+class StatePrivacyTests(unittest.TestCase):
+    """The saved-thread state directory and lock files are private whatever
+    the umask; an unsafe existing directory is refused, never chmodded."""
+
+    def setUp(self):
+        self.project_patcher = patch.object(
+            codex_council, "_project_root", return_value=FIXED_PROJECT_ROOT
+        )
+        self.project_patcher.start()
+        self.addCleanup(self.project_patcher.stop)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.env = patch.dict(os.environ, _env_without_session_key(),
+                              clear=True)
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def _state(self, path):
+        patcher = patch.object(codex_council, "STATE_DIR", path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return path
+
+    def _umask(self, mask):
+        previous = os.umask(mask)
+        self.addCleanup(os.umask, previous)
+
+    def _mode(self, path):
+        return stat.S_IMODE(os.lstat(path).st_mode)
+
+    def test_new_state_dir_lock_and_state_are_private_under_any_umask(self):
+        for mask in (0o022, 0o000):
+            with self.subTest(umask=f"{mask:03o}"):
+                xdg = os.path.join(self.tmp.name, f"xdg-{mask:03o}", "state")
+                state = self._state(os.path.join(xdg, "codex-council"))
+                self._umask(mask)
+                lock = codex_council._try_role_state_lock("architect")
+                self.assertIsNotNone(lock)
+                codex_council._release_role_state_lock(lock)
+                codex_council.save_session("architect", "sid-private")
+                self.assertEqual(self._mode(state), 0o700)
+                # Missing ancestors are created 0700 as well (XDG asks it).
+                self.assertEqual(self._mode(xdg), 0o700)
+                self.assertEqual(
+                    self._mode(codex_council._state_lock_path("architect")),
+                    0o600)
+                self.assertEqual(
+                    self._mode(codex_council._state_path("architect")), 0o600)
+
+    def test_an_owned_too_open_state_dir_and_lock_are_tightened(self):
+        parent = os.path.join(self.tmp.name, "xdg")
+        os.mkdir(parent)
+        os.chmod(parent, 0o755)
+        state = self._state(os.path.join(parent, "codex-council"))
+        os.mkdir(state)
+        os.chmod(state, 0o755)
+        lock_path = codex_council._state_lock_path("architect")
+        with open(lock_path, "w"):
+            pass
+        os.chmod(lock_path, 0o644)
+        lock = codex_council._try_role_state_lock("architect")
+        codex_council._release_role_state_lock(lock)
+        self.assertEqual(self._mode(state), 0o700)
+        self.assertEqual(self._mode(lock_path), 0o600)
+        # An existing ancestor is never the runner's to change.
+        self.assertEqual(self._mode(parent), 0o755)
+
+    def test_a_symlinked_state_dir_is_refused_and_left_alone(self):
+        target = os.path.join(self.tmp.name, "elsewhere")
+        os.mkdir(target)
+        os.chmod(target, 0o755)
+        state = self._state(os.path.join(self.tmp.name, "codex-council"))
+        os.symlink(target, state)
+        for call in (lambda: codex_council._try_role_state_lock("architect"),
+                     lambda: codex_council.save_session("architect", "sid")):
+            with self.assertRaisesRegex(codex_council.StateDirError,
+                                        "is a symlink"):
+                call()
+        self.assertEqual(self._mode(target), 0o755)
+        self.assertEqual(os.listdir(target), [])
+
+    def test_a_foreign_owned_state_dir_is_refused_and_left_alone(self):
+        state = self._state(os.path.join(self.tmp.name, "codex-council"))
+        os.mkdir(state)
+        os.chmod(state, 0o755)
+        foreign = os.geteuid() + 1
+        with patch("os.geteuid", return_value=foreign):
+            with self.assertRaisesRegex(codex_council.StateDirError,
+                                        "is owned by uid"):
+                codex_council._ensure_state_dir()
+        self.assertEqual(self._mode(state), 0o755)
+
+    def test_a_non_regular_lock_file_is_refused(self):
+        state = self._state(os.path.join(self.tmp.name, "codex-council"))
+        codex_council._ensure_state_dir()
+        os.mkfifo(codex_council._state_lock_path("architect"), 0o600)
+        with self.assertRaisesRegex(codex_council.StateDirError,
+                                    "not an owned regular file"):
+            codex_council._try_role_state_lock("architect")
+        self.assertEqual(self._mode(state), 0o700)
+
+
 class StateIOTests(unittest.TestCase):
     def setUp(self):
         self.project_patcher = patch.object(
@@ -1549,7 +1651,8 @@ class RunCouncilAsyncTests(unittest.IsolatedAsyncioTestCase):
                 self.closed = True
 
         fake_file = FakeLockFile()
-        with patch("builtins.open", return_value=fake_file):
+        with patch.object(codex_council, "_open_private_lock",
+                          return_value=fake_file):
             with patch.object(
                 codex_council.fcntl, "flock", side_effect=BlockingIOError
             ):

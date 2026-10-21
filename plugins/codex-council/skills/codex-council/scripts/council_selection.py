@@ -376,15 +376,16 @@ def _native_model_gap(snapshot):
     return f"cannot adjust effort on the native model: {reason}"
 
 
-def _native_effort_gap(snapshot, effort, planned_model=None):
+def _native_effort_gap(snapshot, effort, now, planned_model=None):
     """Why `snapshot` does not support `effort` on its proven native model.
 
     `planned_model` (launch only) is the native model of the planning
     snapshot, whose effort descriptions the choice was made from. An effort
     is never carried onto another model, even one that advertises the same
-    spelling: the same name need not mean the same behavior. There is no
-    retirement check here: only routed selections reject an advertised
-    retirement.
+    spelling: the same name need not mean the same behavior. As for a
+    routed choice, the native model's advertised retirement (if any) must
+    not have passed at `now` (retired when retirement_at <= now; None
+    skips the check): the runner would otherwise send that model with -m.
     """
     gap = _native_model_gap(snapshot)
     if gap:
@@ -393,6 +394,11 @@ def _native_effort_gap(snapshot, effort, planned_model=None):
     if planned_model is not None and model != planned_model:
         return f"native model changed from '{planned_model}' to '{model}'"
     entry = _catalog_entry(snapshot, model)
+    if entry is not None:
+        retirement = _retirement_passed(entry, now)
+        if retirement:
+            return (f"native model '{model}' advertised retirement passed "
+                    f"({retirement})")
     if entry is None or not _effort_advertised(entry, effort):
         return f"effort '{effort}' is not advertised for model '{model}'"
     return None
@@ -531,7 +537,7 @@ def _resolve_selection(role, planning, launch, routing_mode, now):
         planned = None
         if launch is not None and planning is not None:
             planned = planning["native"]["model"]
-        gap = _native_effort_gap(evidence, role.effort, planned)
+        gap = _native_effort_gap(evidence, role.effort, now, planned)
         model = evidence["native"]["model"]
     if gap:
         if launch is not None:
@@ -561,7 +567,7 @@ def _authoring_problem(role, planning, planning_problem, now):
         gap = _native_model_gap(planning)
         if gap:
             return f"{gap}; omit effort and selection to inherit"
-        return _native_effort_gap(planning, role.effort)
+        return _native_effort_gap(planning, role.effort, now)
     if not planning["routing"]["eligible"]:
         return (
             "discovery reported routing unavailable "
@@ -662,8 +668,9 @@ def _resolve_run_selections(roles, run_dir, routing_mode, at_launch, project_roo
     snapshot, so its decisions are the plan.
 
     The preflight judges authoring, and resolves, at the current time. The
-    launch judges authoring as of the planning snapshot's creation, so a
-    routed choice already retired at discovery stays an exit-2 defect, while a
+    launch judges authoring as of the planning snapshot's creation, so an
+    automatic choice (a routed model, or the native model of a native_effort
+    choice) already retired at discovery stays an exit-2 defect, while a
     retirement that passes after discovery is changed evidence: the
     resolver falls back to inheritance. Its clock is read only after launch
     discovery has finished, so a retirement that passes while discovery

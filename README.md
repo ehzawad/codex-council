@@ -148,7 +148,9 @@ staged/unstaged edits, deletions, and non-ignored untracked files. A partially s
 file is captured as its working version. Non-Git capture uses explicit include paths
 and keeps empty directories; a context-only question may select no files. Pause
 overlapping writers during capture: the runner refuses observed changes but does
-not claim an atomic snapshot of arbitrary external writers.
+not claim an atomic snapshot of arbitrary external writers. Paths that collide
+after case folding or Unicode normalization, whether files, empty directories or
+directory components such as `Foo/` and `foo/`, refuse the capture.
 
 Every contribution receives an independent copy of the same baseline, so Claude may
 continue live work afterward. Copies share no Git control metadata or hardlinks and
@@ -291,7 +293,9 @@ authentication and model rejection are terminal and keep valid continuity.
 Settings: `CODEX_COUNCIL_MAX_PARALLEL` defaults to 6,
 `CODEX_COUNCIL_STALL_SECS` to 1800 (0 disables), `CODEX_COUNCIL_MODEL_ROUTING` to
 auto (off disables automatic choices), and state under
-`$XDG_STATE_HOME/codex-council` or `~/.local/state/codex-council`. There is no
+`$XDG_STATE_HOME/codex-council` or `~/.local/state/codex-council` (a 0700
+directory with 0600 lock files whatever the umask; an unsafe existing state path
+refuses the launch). There is no
 run-level deadline. Detached work keeps running and spending until completion or
 cancellation; do not abandon observation. See
 [runtime recovery](plugins/codex-council/skills/codex-council/references/runtime-behavior.md).

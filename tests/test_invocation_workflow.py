@@ -4,6 +4,7 @@ No paid inference or network. The fake CLI checks integration/argv, NOT the real
 Codex sandbox. tests/test_live_workflow.py is the opt-in actual-sandbox gate.
 """
 
+import contextlib
 import copy
 import dataclasses
 import hashlib
@@ -227,6 +228,104 @@ class CaptureTests(WorkspaceCase):
             self.skipTest("case-insensitive filesystem")
         with self.assertRaisesRegex(workspace.WorkspaceError, "collision"):
             self.capture()
+
+    def test_collision_checker_covers_directories_and_components(self):
+        """Pure check, independent of the host filesystem's case rules."""
+        nfd = "cafe\u0301"
+        refused = (
+            ((), ("Foo", "foo")),                       # empty directories
+            (("Foo/a.txt", "foo/b.txt"), ()),           # directory components
+            (("Foo/a.txt",), ("foo",)),                 # component vs empty dir
+            (("Foo",), ("foo",)),                       # file vs directory
+            (("x/Foo/a", "x/FOO/b"), ()),               # deeper component
+            ((f"{nfd}/a.txt", "caf\u00e9/b.txt"), ()),   # NFC vs NFD component
+            (("Same.txt", "same.txt"), ()),             # complete file paths
+        )
+        for names, dirs in refused:
+            with self.subTest(names=names, dirs=dirs):
+                pair = workspace.portable_collision(names, dirs)
+                self.assertIsNotNone(pair)
+                self.assertNotEqual(pair[0], pair[1])
+        for names, dirs in ((("Foo/a.txt", "Foo/b.txt"), ("Foo/empty",)),
+                            (("a/b.txt", "ab/b.txt"), ("a/b",))):
+            with self.subTest(names=names, dirs=dirs):
+                self.assertIsNone(workspace.portable_collision(names, dirs))
+
+    def test_inventory_refuses_directory_and_component_collisions(self):
+        """The capture path refuses what the checker reports; _walk is
+        stubbed so case-insensitive hosts exercise it too."""
+        def walk(names, dirs):
+            def fake(root, start, exclude, omitted, empty=None):
+                if empty is not None:
+                    empty.update(dirs)
+                return set(names)
+            return fake
+
+        for names, dirs in (((), ("Foo", "foo")),
+                            (("Foo/a.txt", "foo/b.txt"), ())):
+            with self.subTest(names=names, dirs=dirs), \
+                    patch.object(workspace, "_walk", walk(names, dirs)), \
+                    patch.object(workspace, "_hash_file") as hashed:
+                with self.assertRaisesRegex(
+                        workspace.WorkspaceError,
+                        "non-portable case/Unicode collision: "):
+                    workspace.inventory(self.source, ["."], [])
+                hashed.assert_not_called()
+
+    def test_git_scope_component_collision_is_refused_on_any_filesystem(self):
+        """The index can hold Foo/a.txt and foo/b.txt even where the
+        filesystem folds case; the capture is refused either way."""
+        self.init_git()
+        (self.source / "Foo").mkdir()
+        (self.source / "Foo/a.txt").write_text("a")
+        with contextlib.suppress(FileExistsError):
+            (self.source / "foo").mkdir()
+        (self.source / "foo/b.txt").write_text("b")
+        # Add Foo/a.txt first: with core.ignorecase, a later add would adopt
+        # the case of a directory already in the index.
+        self.git("add", "Foo/a.txt")
+        blob = self.git("hash-object", "-w", str(self.source / "foo/b.txt"))
+        self.git("update-index", "--add", "--cacheinfo",
+                 f"100644,{blob.decode().strip()},foo/b.txt")
+        self.assertIn(b"\tfoo/b.txt", self.git("ls-files", "--stage"))
+        self.assertIn(b"\tFoo/a.txt", self.git("ls-files", "--stage"))
+        with self.assertRaisesRegex(workspace.WorkspaceError,
+                                    "non-portable case/Unicode collision: "):
+            workspace.capture(self.source, self.baseline)
+        self.assertFalse(self.baseline.exists())
+
+    def test_created_directories_are_private_under_a_permissive_umask(self):
+        (self.source / "a/b").mkdir(parents=True)
+        (self.source / "a/b/c.txt").write_text("c")
+        (self.source / "x/y/z").mkdir(parents=True)
+        for mask in (0o022, 0o000):
+            with self.subTest(umask=f"{mask:03o}"):
+                run = self.base / f"run-{mask:03o}"
+                run.mkdir(mode=0o700)
+                previous = os.umask(mask)
+                try:
+                    # Before freeze, the baseline's own modes are visible.
+                    with patch.object(workspace, "freeze"):
+                        snap = workspace.capture(self.source, run / "baseline",
+                                                 include=["."])
+                    workspace.freeze(run / "baseline")
+                    unfrozen = run / "unfrozen"
+                    with patch.object(workspace, "freeze"):
+                        workspace.capture(self.source, unfrozen, include=["."])
+                    target = run / "scratch"
+                    workspace.copy_workspace(run / "baseline", target, snap)
+                finally:
+                    os.umask(previous)
+                for root in (unfrozen, target):
+                    for directory, dirs, files in os.walk(root):
+                        self.assertEqual(
+                            stat.S_IMODE(os.lstat(directory).st_mode), 0o700,
+                            directory)
+                        for name in files:
+                            path = Path(directory) / name
+                            self.assertEqual(
+                                stat.S_IMODE(path.lstat().st_mode), 0o600, path)
+                self.assertEqual(sorted(snap["dirs"]), ["x/y/z"])
 
     def test_empty_directories_are_captured_copied_and_compared(self):
         (self.source / "output").mkdir()
