@@ -31,10 +31,10 @@ claude plugins marketplace add ehzawad/codex-council
 claude plugins install codex-council@codex-council
 ```
 
-Invoke `/codex-council:codex-council`, ask “codex council,” or let Claude choose it
-when an independent contribution could materially improve the next decision.
-A new turn alone is not a reason to invoke. Requests for Claude's own subagents
-remain a separate workflow; genuinely unresolved intent gets a brief clarification.
+Invoke `/codex-council:codex-council` or ask for a “codex council.” Claude may also
+offer one, or use it, when an independent contribution could clearly change the
+next decision; nothing triggers it automatically, and a new turn alone is never a
+reason. Requests for Claude's own subagents remain a separate workflow.
 
 For the turn that invokes it, the skill pre-approves `mktemp -d` and the runner
 commands exactly as SKILL.md writes them. That pre-approval does not carry into

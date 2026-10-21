@@ -3,12 +3,12 @@ name: codex-council
 description: >-
   On-demand collaboration with OpenAI Codex to materially advance the current
   task, resolve a consequential uncertainty, test competing explanations, or
-  produce a useful artifact. Use when explicitly requested (codex council,
-  coterie, or team), or when an independent contribution could change the next
-  decision, including a consequential call (a release, a root cause, a risky
-  change) where the user wants an independent check rather than a single
-  reading, even if Codex is not named. Shape the contribution from current goals, evidence, permissions,
-  and unfinished work; do not invoke merely because a turn ended.
+  produce a useful artifact. Use when the user asks for it (codex council,
+  coterie, or team). Claude may also offer it, or use it, when an independent
+  contribution could clearly change the next decision, such as a release, a
+  root cause, or a risky change. Shape the contribution from current goals,
+  evidence, permissions, and unfinished work; never invoke merely because a
+  turn ended.
 argument-hint: "[current objective or useful contribution]"
 allowed-tools:
   - Bash(mktemp -d *)
@@ -25,8 +25,9 @@ mandatory debate, turn counter, or automatic per-turn hook.
 
 ## Decide and frame
 
-Invoke when the user asks, or identify a contribution that could materially
-change the next decision or improve the deliverable. Do not repeat an unchanged
+Invoke when the user asks. Otherwise you may offer a council, or run one, when a
+contribution could clearly change the next decision or improve the deliverable;
+nothing invokes this skill automatically. Do not repeat an unchanged
 investigation or launch just because another turn/tool call ended. Use the fewest
 independent contributions that cover the actual uncertainty. Resolve ambiguous
 workflow intent only when the surrounding conversation cannot resolve it.
