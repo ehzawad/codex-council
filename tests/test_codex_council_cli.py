@@ -646,11 +646,11 @@ class SkillContractTests(CouncilCLITestCase):
         self.assertNotIn("[codex-council] dispatching", proc.stderr)
         self.assertEqual(proc.stdout, "")
 
-    def test_the_previous_epoch_3_is_a_stale_pair_on_every_path(self):
+    def test_the_previous_epoch_4_is_a_stale_pair_on_every_path(self):
         """Epoch 4 only: a SKILL.md written for epoch 3 (the tracked
         launch as the default) is refused with the stale-pair recovery on
         the pre-flight, the launch, and every run command alike."""
-        self.assertEqual(council_testlib.EPOCH, "4")
+        self.assertEqual(council_testlib.EPOCH, "5")
         self._staged()
         run_dir = self.workdir.name
         for args in (
@@ -663,10 +663,10 @@ class SkillContractTests(CouncilCLITestCase):
         ):
             with self.subTest(command=args[0]):
                 proc = self._run(input="", args=(*args, "--skill-contract",
-                                                  "3"))
+                                                  "4"))
                 self.assertEqual(proc.returncode, 2, proc.stderr)
-                self.assertIn("--skill-contract 3 does not match this "
-                              "script's contract epoch 4: stale SKILL/script "
+                self.assertIn("--skill-contract 4 does not match this "
+                              "script's contract epoch 5: stale SKILL/script "
                               "pair", proc.stderr)
                 self.assertEqual(proc.stdout, "")
         self.assertEqual(sorted(os.listdir(run_dir)),

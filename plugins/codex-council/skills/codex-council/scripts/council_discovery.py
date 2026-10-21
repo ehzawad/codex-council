@@ -121,7 +121,7 @@ def _model_routing_mode():
     _usage_exit(f"{MODEL_ROUTING_ENV} must be 'auto' or 'off'; got {raw!r}.")
 
 
-def _execution_context(deadline=None):
+def _execution_context(deadline=None, project_root=None):
     """The process context discovery shares with every worker.
 
     Workers run the PATH-resolved `codex` with this process's cwd and
@@ -136,8 +136,8 @@ def _execution_context(deadline=None):
     """
     executable = shutil.which("codex")
     return {
-        "project_root": _project_root(deadline),
-        "launch_cwd": os.getcwd(),
+        "project_root": _project_root(deadline) if project_root is None else project_root,
+        "launch_cwd": os.getcwd() if project_root is None else project_root,
         "codex_executable": os.path.abspath(executable) if executable else None,
         "codex_cli_version": None,
         "codex_home": None,
@@ -519,7 +519,7 @@ class _AppServerTransport:
 
 
 @contextlib.contextmanager
-def _app_server_session(executable, deadline):
+def _app_server_session(executable, deadline, cwd=None, config_overrides=()):
     """Spawn `codex app-server --listen stdio://` and yield its transport.
 
     Launched like a worker — the same PATH-resolved binary, the inherited
@@ -528,9 +528,11 @@ def _app_server_session(executable, deadline):
     """
     try:
         proc = subprocess.Popen(
-            [executable, "app-server", "--listen", "stdio://"],
+            [executable, "app-server", "--listen", "stdio://",
+             *(arg for setting in config_overrides for arg in ("-c", setting))],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, start_new_session=True,
+            **({"cwd": cwd} if cwd is not None else {}),
         )
     except (OSError, ValueError) as e:
         name = errno.errorcode.get(getattr(e, "errno", None), type(e).__name__)
@@ -924,7 +926,7 @@ def _request_source(session, method, params, normalize, problems):
     return value
 
 
-def _observe_codex(deadline):
+def _observe_codex(deadline, project_root=None):
     """Run the discovery I/O; return raw observations for _build_snapshot.
 
     Sends only initialize/initialized, account/read, config/read,
@@ -935,7 +937,8 @@ def _observe_codex(deadline):
     ends discovery before Codex starts (`timeout:project_root`): config/read
     would otherwise describe a root workers may not get.
     """
-    context = _execution_context(deadline)
+    context = (_execution_context(deadline) if project_root is None else
+               _execution_context(deadline, project_root=project_root))
     observed = {
         "context": context, "problems": [], "conclusive": False,
         "account": None, "configured": None, "managed": None, "catalog": None,
@@ -953,7 +956,8 @@ def _observe_codex(deadline):
         problems.append("codex_version_unavailable")
     session = None
     try:
-        with _app_server_session(executable, deadline) as session:
+        with _app_server_session(executable, deadline,
+                                 **({"cwd": project_root} if project_root is not None else {})) as session:
             codex_home, problem = _normalize_initialize(session.request(
                 "initialize", {
                     "clientInfo": {
@@ -1171,7 +1175,7 @@ def _build_snapshot(*, snapshot_id, created_at, plugin_version, routing_mode,
     }
 
 
-def _discover(routing_mode):
+def _discover(routing_mode, project_root=None):
     """Run bounded, metadata-only model discovery; return the snapshot dict.
 
     Never raises (KeyboardInterrupt, and the termination signal the entry
@@ -1188,7 +1192,8 @@ def _discover(routing_mode):
     """
     deadline = time.monotonic() + DISCOVERY_TIMEOUT_SECS
     try:
-        observed = _observe_codex(deadline)
+        observed = (_observe_codex(deadline) if project_root is None else
+                    _observe_codex(deadline, project_root=project_root))
     except Exception as e:  # a discovery bug must never cost a council
         observed = {
             "context": dict(_EMPTY_DISCOVERY_CONTEXT),
@@ -1536,7 +1541,7 @@ def _discovery_summary(snapshot):
     return [_report_inline(line) for line in lines]
 
 
-def _discover_command(run_dir):
+def _discover_command(run_dir, project_root=None):
     """--discover RUNDIR: discover, write the snapshot, print the summary.
 
     Exits 0 whenever RUNDIR is a valid private directory that has not
@@ -1556,7 +1561,8 @@ def _discover_command(run_dir):
     )
     # A launched directory's planning snapshot is that council's evidence.
     _usage_exit_if_launched(run_dir, "--discover: ")
-    snapshot = _discover(_model_routing_mode())
+    snapshot = (_discover(_model_routing_mode()) if project_root is None else
+                _discover(_model_routing_mode(), project_root=project_root))
     try:
         path = _write_snapshot(os.path.abspath(run_dir), snapshot)
     except Exception as e:

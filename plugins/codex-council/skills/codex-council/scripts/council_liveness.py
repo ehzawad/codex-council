@@ -855,7 +855,7 @@ class _Follower:
         if not _reply_path_ok(line, self.replies_dir):
             return False
         if self.dispatched_at is None and line.startswith(
-                FOLLOW_DISPATCH_PREFIX):
+                (FOLLOW_DISPATCH_PREFIX, "[codex-council] preparing ")):
             self.dispatched_at = time.monotonic()
         if not self.verbose and FOLLOW_ROUTINE_PATTERN.match(line):
             return False

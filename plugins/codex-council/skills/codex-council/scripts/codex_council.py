@@ -1,137 +1,26 @@
 #!/usr/bin/env python3
-"""Coordinate an adaptive, context-driven council of Codex agents.
+"""Adaptive Codex collaboration with captured inputs and explicit execution policy.
 
-Each role runs in its own `codex exec` subprocess with a distinct
-framing instruction. Sessions are isolated per (project, host session,
-role) when a terminal/session identifier is available, and persist
-across calls from that host session: a role id used again resumes its
-thread, a new id starts fresh, and a saved thread Codex no longer has
-restarts the role fresh with a warning in its result.
+Claude decides when a task-shaped contribution is useful. This runner captures
+current inputs into independent copies, resolves per-role model choices in the
+actual execution cwd, launches the existing detached supervisor, and records
+raw protocol evidence separately from collaborator interpretation. It neither
+judges substantive claims nor applies candidate changes to the live project.
 
-Results are aggregated into one structured markdown report on stdout
-for Claude to reconcile.
+Prepared flow: --prepare, --discover, --check-staging-dir, --start; then
+--follow/--status and --freshness before reconciliation. --cancel and --reap
+retain their verified process-identity and supervisor-lock guarantees.
+Legacy direct --roles-file/--context-file remains available with read-only
+command defaults and without a captured-evidence contract.
 
-This script is a pure runner — there is no built-in role catalog and no
-default council or role count; one role is as valid as many. Claude
-reconstructs the user's live problem and project state, then composes the
-roles the work actually needs. Roles arrive via `--roles-file` (a path to a
-JSON file holding the panel), which keeps a large role array out of the shell
-entirely. Each role object has `id`, `label`, and `instruction`, plus the
-optional `model`, `effort`, and `selection` keys.
+All retry paths require both a transient failure and replay safety. A role
+that may have performed tool work is never automatically replayed, including
+a stale-looking resume failure. Replies survive state-persistence failures.
 
-Model and effort: a role that omits all three inherits Codex's native
-configuration in the worker's execution context, and the runner sends no
-model or effort override at all. Codex resolves that configuration itself
-from its layers (CLI flags, a trusted project `.codex/config.toml` found
-from the project root, the user's `$CODEX_HOME/config.toml`, cloud, system,
-and managed layers, and any managed new-thread defaults). The runner
-forwards no profile, runs every worker as `codex exec -C <git toplevel of
-the launch directory, else the launch directory>`, and lets workers inherit
-its own cwd and environment. A role's `selection` object declares where its
-values came from: "user" is an explicit pin, forwarded unchanged and never
-replaced; "routed" (a model and effort pair) and "native_effort" (an effort
-on the proven native model, which the runner pins) are runtime-grounded
-choices validated against this run's discovery snapshot and revalidated by
-one fresh discovery at launch; evidence that no longer supports them
-resolves the role to native inheritance with a recorded reason. The values
-actually sent are passed as `-m <model>` and
-`-c model_reasoning_effort="<effort>"` on every invocation of that role
-(fresh and resume alike; they are not sticky across calls). codex exec does
-not report which model or effort served a turn, so reports describe what
-the council sent. A model Codex rejects fails the role as [model-rejected]
-(no substitute is tried and the saved thread is kept), and a usage or
-credit limit fails it as [quota]; neither is retried.
-
-`--discover RUNDIR` runs bounded, metadata-only discovery against
-`codex app-server` (no thread or turn is started), writes
-RUNDIR/model-snapshot.json, and prints a compact summary Claude reads
-before writing roles.json. CODEX_COUNCIL_MODEL_ROUTING=off disables
-automatic selection; explicit user pins still apply.
-
-The orchestrator imposes no size or count ceiling on role panels, role
-fields, context, stdin, or composed prompts, and never truncates them.
-Downstream model/provider limits and physical memory remain external.
-
-Early results: as each role settles (ok, FAILED, or crashed) the launch
-path writes that role's report section atomically to
-`<RUNDIR>/replies/<key>.md` (RUNDIR = the private directory holding the
-staged inputs; <key> = the role id, or a fixed-size hash for long ids) and
-only then emits its completion progress line, which ends in
-` reply=<absolute path>` when the file was written. Reply files already on
-disk survive an interruption. The launch also publishes RUNDIR/status.json
-(runner identity and state, a tick at least every 15s, per-role state and
-codex process group). `--follow RUNDIR` is a read-only follower for a
-Claude Code Monitor: it relays the actionable `[codex-council` lines of
-RUNDIR/err.log and reports a runner that is gone or stopped ticking;
-`--status RUNDIR` prints a short snapshot and `--reap RUNDIR` ends the codex
-process groups of a runner that is gone (see council_liveness.py).
-
-Detached launch: `--start RUNDIR` validates the staged directory exactly as
-`--check-staging-dir` does, claims it atomically (RUNDIR/supervisor.lock,
-err.log, and out.md, each created exclusively and 0600), and starts the
-unchanged staged launch as a supervisor in its own session, with stdout on
-out.md and stderr on err.log. That supervisor holds the lock for its whole
-life and writes RUNDIR/supervisor.json about itself before any other work;
-`--start` returns once it has, so the council runs outside any host
-background task. `--cancel RUNDIR` stops a verified supervisor.
-
-One launch per RUNDIR: `--discover`, `--check-staging-dir`, and `--start`
-refuse a directory that already holds out.md, err.log, replies/, or a
-supervisor file, because a tracked launch command's own redirections would
-truncate a running council's files before this script could object.
-
-Usage:
-    python3 codex_council.py --discover RUNDIR
-    python3 codex_council.py --check-staging-dir RUNDIR
-    python3 codex_council.py --start RUNDIR
-    python3 codex_council.py --roles-file roles.json --context-file context.md
-    python3 codex_council.py --follow RUNDIR [--verbose]
-    python3 codex_council.py --status RUNDIR
-    python3 codex_council.py --cancel RUNDIR
-    python3 codex_council.py --reap RUNDIR
-
-Env vars:
-    CODEX_COUNCIL_SESSION_KEY     explicit council thread scope override
-    CODEX_COUNCIL_MAX_PARALLEL    positive active-role concurrency limit
-                                   (default 6)
-    CODEX_COUNCIL_STALL_SECS      output-inactivity watchdog threshold in
-                                   seconds (default 1800; 0 disables)
-    CODEX_COUNCIL_MODEL_ROUTING   auto (default when unset or empty) or off;
-                                   off disables automatic per-role model and
-                                   effort selection (explicit pins still apply)
-
-The council has no total elapsed-time or run-level deadline. A role may run
-indefinitely while its codex subprocess continues producing output bytes.
-Separately, each codex subprocess has an OUTPUT-INACTIVITY watchdog based
-only on time since its most recent stdout/stderr byte. After
-CODEX_COUNCIL_STALL_SECS of council-visible silence the runner terminates
-that attempt and applies the stall policy: retriable only when no
-side-effect-capable work had begun, success-with-warning when the turn had
-already completed, terminal otherwise. Setting 0 permits an indefinitely
-silent role. Ctrl+C tears down every in-flight codex process group. Each
-codex process group belongs to one attempt: after codex exits its pipes get
-a bounded drain, and whatever is left in the group is then terminated. The
-group signals reach codex and any child that stays in its group; current
-codex starts each tool command in its own session and each MCP server in
-its own process group, so a tool command still running when codex is
-terminated keeps running until it ends.
-
-The optional `--skill-contract <int>` flag pins the SKILL/script contract
-epoch: absent it is ignored; present it must equal this script's epoch or
-the launch is refused as a stale SKILL/script pair. A model or effort
-without a `selection` object is refused on every path. The --discover
-summary's first line and the staging-OK, dispatch, heartbeat, and
-CODEX_COUNCIL_DONE lines carry `version=<plugin version>` for postmortem
-visibility (it does not prevent skew; the contract epoch does).
-
-This file is the only entry point. It imports the sibling modules in
-its directory: council_common.py (shared primitives),
-council_discovery.py (--discover and the model snapshot),
-council_selection.py (Role, the `selection` contract, and its resolver),
-council_failures.py (failure classification), and council_liveness.py
-(status.json, process identity, --follow, --status, and --reap).
-
-POSIX-only: uses start_new_session and process-group signals.
+POSIX/Python 3.12+; standard-library only. A copied workspace is not a whole
+process sandbox, configuration inspection is not runtime attestation, and
+observed-stable capture is not atomic against arbitrary external writers.
+See DESIGN.md and references/invocation-contract.md for limits and protocol.
 """
 
 import argparse
@@ -151,6 +40,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 # python3 -P and PYTHONSAFEPATH=1 leave this script's directory off
 # sys.path; put it first (once) so the sibling modules below resolve.
@@ -230,11 +120,17 @@ from council_selection import (  # noqa: E402
     _launch_discovery_state,
     _model_selection_lines,
     _parse_role_selection,
-    _resolve_run_selections,
     _role_decision,
     _selection_plan_text,
     _selection_section_text,
     _selection_summary_note,
+)
+from council_workspace import WorkspaceError  # noqa: E402
+from council_policy import command_options, parse_policy, policy_dict  # noqa: E402
+from council_evidence import AttemptEvidence, write_result  # noqa: E402
+from council_workflow import (  # noqa: E402
+    prepare, load_plan, discover_prepared, resolve_selections, plan_lines,
+    freshness_command,
 )
 sys.dont_write_bytecode = _DONT_WRITE_BYTECODE
 
@@ -296,7 +192,7 @@ PROGRESS_HEARTBEAT_SECS = 300
 # `selection` object and --discover; 4: the detached --start launch with
 # --cancel, and the completion rule that a detached run has ended only once
 # its supervisor lock is free and its runner identity is gone).
-SKILL_CONTRACT_EPOCH = 4
+SKILL_CONTRACT_EPOCH = 5
 # --start waits at most this long for its supervisor to write
 # supervisor.json (or exit early). It bounds the start command only, never
 # a running council.
@@ -313,7 +209,7 @@ REQUIRED_CADENCE_SENTENCE = "Thoroughness beats speed."
 # lens-specific instruction is the last thing the model reads.
 COLLABORATION_BRIEF = (
     "You are working as one role in a Claude-orchestrated Codex council, an "
-    "independent cross-model check on Claude Code's work; you may be the "
+    "independent cross-model collaborator advancing the current task; you may be the "
     "only role, or one of several covering other lenses in parallel. In the "
     "shared working context below, the user's goal, requirements, and "
     "constraints are authoritative; Claude's account of the project state, "
@@ -331,7 +227,8 @@ COLLABORATION_BRIEF = (
     "checked and what remains unverified. Size any testing to the change. "
     "Finish with plain paragraphs Claude can reconcile: the result first, "
     "then the evidence, dependencies on other work, risks, and open "
-    "questions."
+    "questions. If nothing material falls in your lens, say so clearly. "
+    "Thoroughness beats speed."
 )
 STAGING_PATH_HINT = (
     "Staging hint: use the exact directory printed by `mktemp -d` for "
@@ -446,6 +343,46 @@ _RUN = RunStatus()
 # held open, and so locked, for the runner's whole life, and never
 # inherited by a codex worker.
 _SUPERVISOR = {"lock_fd": None}
+# One owner, as for _RUN. CLI invocations are separate processes. Captured task
+# identity is not the temporary execution cwd, and settled evidence survives an
+# interruption without implying that unfinished contributions completed.
+_WORKFLOW = {"plan": None, "run_dir": None, "settled": {}, "result": None}
+
+
+def _logical_project_root():
+    plan = _WORKFLOW["plan"]
+    return plan["snapshot"]["source_root"] if plan else _project_root()
+
+
+def _workflow_selection(roles, run_dir, routing_mode, at_launch, body, probe_policy=True):
+    try:
+        return resolve_selections(
+            roles, run_dir, routing_mode, at_launch, body,
+            probe_policy=probe_policy,
+            on_progress=_RUN.publish if at_launch and _WORKFLOW["plan"] else None)
+    except (OSError, ValueError) as exc:
+        if at_launch and _WORKFLOW["plan"] is not None:
+            _finish_evidence(state="refused")
+            _RUN.finish("aborted", 2)
+            _diag("[codex-council] runner aborted exit=2: captured invocation refused before workers")
+        _usage_exit("invocation contract: " + _report_inline(exc)
+                    + "; prepare a fresh run directory; never enable bypass to recover.")
+
+
+def _finish_evidence(results=None, state="done"):
+    if _WORKFLOW["plan"] is None:
+        return None
+    if results is None:
+        results = list(_WORKFLOW["settled"].values())
+    try:
+        value = write_result(Path(_WORKFLOW["run_dir"]), _WORKFLOW["plan"],
+                             results, execution_state=state)
+        _WORKFLOW["result"] = value
+        return value
+    except (OSError, ValueError, TypeError) as exc:
+        _diag("[codex-council] evidence incomplete: result.json could not be "
+              "finalized (" + type(exc).__name__ + "); inspect per-attempt logs")
+        return None
 
 
 # \Z, not $: in Python `$` also matches just before a trailing "\n", so
@@ -508,7 +445,9 @@ def _max_parallel_roles():
 
 def _project_key(role_id):
     """Stable state key for (project, role, optional session-key)."""
-    base = hashlib.sha256(_project_root().encode()).hexdigest()[:16]
+    base = hashlib.sha256(_logical_project_root().encode()).hexdigest()[:16]
+    if _WORKFLOW["plan"] is not None:
+        base += "-" + hashlib.sha256(_WORKFLOW["plan"]["task_id"].encode()).hexdigest()[:16]
     role_component = _state_role_component(role_id)
     session_key = _session_key()
     if session_key:
@@ -580,9 +519,12 @@ def save_session(role_id, session_id):
     meta = {
         "session_id": session_id,
         "role_id": role_id,
-        "project_path": _project_root(),
+        "project_path": _logical_project_root(),
         "updated_at": _utc_iso(time.time()),
     }
+    if _WORKFLOW["plan"] is not None:
+        meta["task_id"] = _WORKFLOW["plan"]["task_id"]
+        meta["input_snapshot"] = _WORKFLOW["plan"]["snapshot"]["snapshot_id"]
     session_key = _session_key()
     if session_key:
         meta["session_key"] = session_key
@@ -660,13 +602,27 @@ def _with_item_error_warning(warning, jsonl_output):
 # ---------- prompt composition ----------
 
 def _compose_prompt(role, body):
-    """Frame intact shared context for one role and reinforce its lens."""
-    return (
-        f"{role.instruction}\n\n"
-        f"{COLLABORATION_BRIEF}\n\n"
-        f"## Shared working context\n\n{body}\n\n"
-        f"{role.instruction}"
-    )
+    """Current context wins over thread history; permissions are enforced in argv.
+
+    A task-shaped collaborator can investigate, test, compare, or contribute an
+    implementation. No fixed persona, debate round, or task-specific grader.
+    """
+    workspace = ""
+    if role.workdir:
+        workspace = (
+            f"\nCaptured task: {role.task_id}; input snapshot: {role.input_snapshot}.\n"
+            f"Your execution workspace is {role.workdir}. Use its relative paths. "
+            "Historical absolute paths may identify the live project: do not use "
+            "them as substitutes for captured inputs. Changes belong only in "
+            "this experimental workspace. Do not edit another role's workspace "
+            "or council control files. Never apply or publish changes to the live "
+            "project. When empirical work would decide the question, establish "
+            "a baseline, run a discriminating check, inspect its actual output, "
+            "and report commands, results, changed artifacts and limitations. "
+            "Never claim execution when a check was only proposed.\n"
+        )
+    return (f"{role.instruction}\n\n{COLLABORATION_BRIEF}\n{workspace}\n"
+            f"## Shared working context\n\n{body}\n\n{role.instruction}")
 
 
 # ---------- async codex invocation ----------
@@ -696,25 +652,20 @@ def _model_overrides(model=None, effort=None):
     return opts
 
 
-def _resume_cmd(root, session_id, model=None, effort=None):
-    # `-C` is a parent option of `codex exec` and must precede `resume`; the
-    # dispatched model/effort overrides (none when the role inherits) sit
-    # with it on the parent, so they apply to the resumed turn.
-    return [
-        "codex", "exec", "-C", root, *_model_overrides(model, effort),
-        "resume", session_id,
-        "--dangerously-bypass-approvals-and-sandbox",
-        "--skip-git-repo-check",
-        "--json", "-",
-    ]
+def _resume_cmd(root, session_id, model=None, effort=None, execution_options=None):
+    options = (["--sandbox", "read-only", "-c", 'approval_policy="never"']
+               if execution_options is None else execution_options)
+    return ["codex", "exec", "-C", root, *_model_overrides(model, effort),
+            *options, "resume", session_id, "--skip-git-repo-check", "--json", "-"]
 
 
-def _fresh_cmd(root, model=None, effort=None):
-    return [
-        "codex", "exec", "-C", root, *_model_overrides(model, effort),
-        "--dangerously-bypass-approvals-and-sandbox",
-        "--json", "--skip-git-repo-check", "-",
-    ]
+def _fresh_cmd(root, model=None, effort=None, execution_options=None):
+    # Policy switches are on the parent exec command, as are model overrides.
+    # Bare direct CLI is now read-only, never implicitly unrestricted.
+    options = (["--sandbox", "read-only", "-c", 'approval_policy="never"']
+               if execution_options is None else execution_options)
+    return ["codex", "exec", "-C", root, *_model_overrides(model, effort),
+            *options, "--json", "--skip-git-repo-check", "-"]
 
 
 class _EventFlagScanner:
@@ -782,7 +733,7 @@ class _EventFlagScanner:
         return isinstance(item_type, str) and item_type in self._SAFE_ITEM_TYPES
 
 
-async def _run_codex_subprocess(cmd, prompt, role_id=""):
+async def _run_codex_subprocess(cmd, prompt, role_id="", *, evidence=None, cwd=None):
     """Run codex exec async with incremental readers and a stall watchdog.
 
     start_new_session=True puts codex in its own process group, which
@@ -812,6 +763,7 @@ async def _run_codex_subprocess(cmd, prompt, role_id=""):
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
+        **({"cwd": cwd} if cwd is not None else {}),
     )
     try:
         pgid = os.getpgid(proc.pid)
@@ -819,6 +771,8 @@ async def _run_codex_subprocess(cmd, prompt, role_id=""):
         # start_new_session=True makes the child process leader's pid the pgid.
         pgid = proc.pid
     _RUN.spawned(role_id, proc.pid, pgid)
+    if evidence is not None:
+        evidence.spawned(proc.pid, pgid)
 
     scanner = _EventFlagScanner()
     stdout_buf = bytearray()
@@ -841,6 +795,8 @@ async def _run_codex_subprocess(cmd, prompt, role_id=""):
                 return
             _record_activity()
             buf.extend(chunk)
+            if evidence is not None:
+                evidence.feed("stdout" if feed_scanner else "stderr", chunk)
             if feed_scanner:
                 scanner.feed(chunk)
 
@@ -1113,20 +1069,47 @@ def _start_line(role, phase, attempt, stall_secs):
 
 
 async def _run_role_once(role, prompt, attempt):
-    """One attempt for one role (see _run_role_invocation).
-
-    A warning any of its codex runs reports (POST_EXIT_DRAIN_WARNING,
-    IO_FAILED_WARNING) is added to the role's result.
-    """
+    """Observe every invocation, then gate *all* retries on replay safety."""
     runs = []
 
     async def run_codex(cmd):
-        runs.append(await _run_codex_subprocess(cmd, prompt, role_id=role.id))
-        return runs[-1]
+        observer = (AttemptEvidence(Path(role.evidence_dir), cmd, prompt)
+                    if role.evidence_dir else None)
+        run = None
+        try:
+            if observer is None:
+                run = await _run_codex_subprocess(cmd, prompt, role_id=role.id)
+            else:
+                run = await _run_codex_subprocess(
+                    cmd, prompt, role_id=role.id, evidence=observer, cwd=role.workdir)
+            runs.append(run)
+            return run
+        finally:
+            if observer is not None:
+                try:
+                    observed = observer.finish(
+                        returncode=run.returncode if run else None,
+                        state="exited" if run else "interrupted-or-failed",
+                        stalled=run.stalled if run else False,
+                        unsafe_to_replay=run.unsafe_to_replay if run else True)
+                    if run is not None and not observed.get("evidence_complete"):
+                        run.warning = _append_warning(run.warning, "attempt evidence incomplete")
+                        run.unsafe_to_replay = True
+                except (OSError, ValueError):
+                    if run is not None:
+                        run.warning = _append_warning(run.warning, "attempt evidence not finalized")
+                        run.unsafe_to_replay = True
 
     result = await _run_role_invocation(role, attempt, run_codex)
     for run in runs:
         result.warning = _append_warning(result.warning, run.warning)
+    if result.retriable and any(run.unsafe_to_replay for run in runs):
+        result.retriable = False
+        if result.error and result.error.startswith("[retriable:"):
+            result.error = result.error.replace("[retriable:", "[replay-blocked:", 1)
+        result.error = (result.error or "transient failure") + (
+            "; not replayed because tool work may already have happened; "
+            "inspect partial effects before a deliberate recovery")
     return result
 
 
@@ -1140,16 +1123,20 @@ async def _run_role_invocation(role, attempt, run_codex):
     `run_codex(cmd)` runs one codex subprocess and returns its CodexRun.
     """
     started = time.monotonic()
-    root = _project_root()
+    root = role.workdir or _project_root()
     stall_secs = _stall_secs()
     decision = _role_decision(role)
     model, effort = decision.dispatch_model, decision.dispatch_effort
-    session_id, meta = load_session(role.id)
+    policy = parse_policy(role.execution) if role.execution is not None else None
+    session_id, meta = ((None, None) if policy and policy.continuity == "fresh"
+                        else load_session(role.id))
+    execution = ({"execution_options": command_options(policy, role.execution_overrides)}
+                 if policy is not None else {})
     warning = None
 
     if session_id:
         _diag(_start_line(role, "resume", attempt, stall_secs))
-        run = await run_codex(_resume_cmd(root, session_id, model, effort))
+        run = await run_codex(_resume_cmd(root, session_id, model, effort, **execution))
         # The structured stall verdict is handled BEFORE any text
         # classification: a killed run's partial stderr could look stale or
         # auth-shaped, and must not clear resume state.
@@ -1255,6 +1242,15 @@ async def _run_role_invocation(role, attempt, run_codex):
                 retriable=verdict.retriable,
             )
 
+        # A stale-looking transport failure after tool work is not evidence that
+        # replay is safe. Preserve the saved thread and all partial effects.
+        if run.unsafe_to_replay:
+            return RoleResult(
+                role=role, ok=False,
+                error="[replay-blocked:stale] saved thread could not be resumed after "
+                      "possible tool work; inspect partial effects before recovery",
+                elapsed_seconds=time.monotonic() - started, attempts=attempt,
+            )
         # Stale: log, warn, clear, fall through to fresh. The warning rides
         # every outcome of the fresh run, so the report and the reply file
         # show that the role lost its prior continuity. A failed clear is
@@ -1290,7 +1286,7 @@ async def _run_role_invocation(role, attempt, run_codex):
 
     # Fresh path.
     _diag(_start_line(role, "fresh", attempt, stall_secs))
-    run = await run_codex(_fresh_cmd(root, model, effort))
+    run = await run_codex(_fresh_cmd(root, model, effort, **execution))
     if run.stalled:
         return _stalled_role_result(
             role, run, None, attempt, started,
@@ -1356,6 +1352,7 @@ async def _run_role_attempts(role, prompt):
     earlier attempt stays lost, so every later result keeps
     STALE_RESUME_WARNING.
     """
+    role_started = time.monotonic()
     attempt = 1
     lost = False
     while True:
@@ -1368,6 +1365,7 @@ async def _run_role_attempts(role, prompt):
                 STALE_RESUME_WARNING, result.warning,
             )
         if result.ok or not result.retriable or attempt >= MAX_RETRY_ATTEMPTS:
+            result.elapsed_seconds = time.monotonic() - role_started
             return result
         _diag(
             f"[codex-council:{role.id}] retriable error on attempt "
@@ -1467,6 +1465,8 @@ async def run_council(roles, body, max_parallel, replies_dir=None):
             )
 
     def _reply_suffix(result):
+        if _WORKFLOW["plan"] is not None:
+            _WORKFLOW["settled"][result.role.id] = result
         # The reply file is written BEFORE the completion line, so a reader
         # that reacts to the line always finds the finished file.
         if replies_dir is None:
@@ -1902,6 +1902,10 @@ def _parse_args(argv):
             "pair."
         ),
     )
+    parser.add_argument("--prepare", metavar="RUNDIR",
+                        help="Capture request.json inputs and create independent experiment workspaces.")
+    parser.add_argument("--freshness", metavar="RUNDIR",
+                        help="Compare captured inputs with current source state (0 unchanged, 1 stale/unknown).")
     args = parser.parse_args(argv)
     if args.roles_file == "":
         parser.error("--roles-file must be non-empty")
@@ -1921,6 +1925,8 @@ def _parse_args(argv):
         ("--check-staging-dir", args.check_staging_dir),
     )
     commands = (
+        ("--prepare", args.prepare),
+        ("--freshness", args.freshness),
         ("--discover", args.discover),
         ("--start", args.start),
         ("--follow", args.follow),
@@ -2097,7 +2103,7 @@ def _validate_role_label(label, ctx):
 ROLE_FIELDS = ("id", "label", "instruction")
 # Optional per-role selection keys; omitting all three inherits Codex's
 # native configuration.
-OPTIONAL_ROLE_FIELDS = ("model", "effort", "selection")
+OPTIONAL_ROLE_FIELDS = ("model", "effort", "selection", "execution")
 
 
 def _normalize_instruction_list(value, ctx):
@@ -2129,22 +2135,13 @@ def _normalize_instruction_list(value, ctx):
 
 
 def _validate_role_instruction(instruction, ctx):
-    """Validate the joined instruction paragraph against the role contract.
-
-    Runs on the output of _normalize_instruction_list, which is
-    single-line by construction, so no linebreak check is needed here.
-    """
-    lowered = instruction.lower()
-    if REQUIRED_SCOPE_PHRASE not in lowered:
-        _roles_usage_exit(
-            f"--roles-file {ctx}: instruction must include "
-            f"{REQUIRED_SCOPE_PHRASE!r}."
-        )
-    if not instruction.rstrip().endswith(REQUIRED_CADENCE_SENTENCE):
-        _roles_usage_exit(
-            f"--roles-file {ctx}: instruction must end with "
-            f"{REQUIRED_CADENCE_SENTENCE!r}."
-        )
+    """Validate content, not magic prose; shared cadence is runner-generated."""
+    if not instruction.strip():
+        _roles_usage_exit(f"--roles-file {ctx}: instruction must be non-empty.")
+    try:
+        instruction.encode("utf-8")
+    except UnicodeEncodeError:
+        _roles_usage_exit(f"--roles-file {ctx}: instruction must be encodable UTF-8.")
 
 
 def _parse_roles_json(raw):
@@ -2220,7 +2217,14 @@ def _parse_roles_json(raw):
                 f"--roles-file {ctx}: duplicate id {rid!r} within JSON payload."
             )
         seen.add(rid)
-        roles.append(Role(rid, label, instruction, model, effort, selection))
+        try:
+            if "execution" in entry and not isinstance(entry["execution"], dict):
+                raise WorkspaceError("execution must be an object when present")
+            execution = policy_dict(entry["execution"]) if "execution" in entry else None
+        except WorkspaceError as exc:
+            _roles_usage_exit(f"--roles-file {ctx}: {exc}.")
+        roles.append(Role(rid, label, instruction, model, effort, selection,
+                          execution=execution))
     return roles
 
 
@@ -2343,7 +2347,7 @@ def _validate_staging_dir(path, prefix="--check-staging-dir: ",
         ("--context-file", context_path),
     )
     roles = _parse_roles_json(_read_roles_file(roles_path))
-    _read_context_file(context_path)
+    body = _read_context_file(context_path)
     # The codex binary is the one hard external dependency; a preflight
     # that says "staging OK" while codex is missing defers the failure to
     # a background launch whose error lands only in err.log.
@@ -2351,8 +2355,9 @@ def _validate_staging_dir(path, prefix="--check-staging-dir: ",
     max_parallel = _max_parallel_roles()
     _stall_secs()  # the launch refuses an invalid watchdog override (exit 2)
     routing_mode = _model_routing_mode()
-    roles, _ = _resolve_run_selections(
-        roles, path, routing_mode, at_launch=False
+    roles, _, _ = _workflow_selection(
+        roles, path, routing_mode, at_launch=False, body=body,
+        probe_policy=prefix != "--start: "
     )
     return path, roles, max_parallel
 
@@ -2377,6 +2382,11 @@ def _check_staging_dir(path):
             f"[codex-council] selection plan: {role.id}: "
             f"{_selection_plan_text(role.decision)}"
         ))
+
+    plan = load_plan(path)
+    if plan is not None:
+        for line in plan_lines(plan, roles, _stall_secs()):
+            print(_report_inline(line))
 
 
 class _TerminationSignal(BaseException):
@@ -2687,6 +2697,10 @@ def _become_supervisor(run_dir, lock_fd):
     record = supervisor_record(os.getpid(), held, _plugin_version(),
                                SKILL_CONTRACT_EPOCH, _utc_iso(time.time()),
                                lock_token=read_lock_token(lock_fd))
+    if not record.get("start_identity"):
+        _diag("[codex-council] cannot establish supervisor process identity; "
+              "stopped before any worker; inspect ps support on this host")
+        sys.exit(2)
     try:
         _atomic_write_private(sup_path, json.dumps(record).encode("utf-8"))
     except OSError as e:
@@ -2719,6 +2733,31 @@ def _force_utf8_streams():
 def main():
     _force_utf8_streams()
     args = _parse_args(sys.argv[1:])
+    # Preserve relative CODEX_HOME semantics when execution moves to a scratch
+    # cwd. No config file is edited and credentials are never copied.
+    home = os.environ.get("CODEX_HOME")
+    if home and not os.path.isabs(home):
+        os.environ["CODEX_HOME"] = os.path.abspath(home)
+    if args.prepare is not None:
+        try:
+            directory = _check_private_dir(args.prepare, prefix="--prepare: ")
+            _usage_exit_if_launched(directory, "--prepare: ")
+            roles = _parse_roles_json(_read_roles_file(os.path.join(directory, "roles.json")))
+            body = _read_context_file(os.path.join(directory, "context.md"))
+            plan = prepare(directory, roles, body)
+        except (OSError, ValueError) as exc:
+            _usage_exit("--prepare: " + _report_inline(exc)
+                        + "; pause overlapping writers and start over in a new private directory.")
+        print(f"[codex-council] captured snapshot={plan['snapshot']['snapshot_id']} "
+              f"files={len(plan['snapshot']['files'])} roles={len(roles)} "
+              f"omitted={len(plan['snapshot']['omitted'])} version={_plugin_version()}")
+        return
+    if args.freshness is not None:
+        try:
+            code = freshness_command(args.freshness)
+        except (OSError, ValueError) as exc:
+            _usage_exit("--freshness: " + _report_inline(exc))
+        sys.exit(code)
 
     if args.check_staging_dir is not None:
         _check_staging_dir(args.check_staging_dir)
@@ -2727,7 +2766,17 @@ def main():
     if args.discover is not None:
         try:
             with _termination_raises():
-                _discover_command(args.discover)
+                directory = _check_private_dir(args.discover, prefix="--discover: ")
+                _usage_exit_if_launched(directory, "--discover: ")
+                if os.path.lexists(os.path.join(directory, "prepare.lock")):
+                    try:
+                        roles = _parse_roles_json(_read_roles_file(os.path.join(directory, "roles.json")))
+                        body = _read_context_file(os.path.join(directory, "context.md"))
+                        discover_prepared(directory, roles, body)
+                    except (OSError, ValueError) as exc:
+                        _usage_exit("--discover: " + _report_inline(exc))
+                else:
+                    _discover_command(args.discover)
         except KeyboardInterrupt:
             # The app-server group was already torn down by its session's
             # finally; no new snapshot was written.
@@ -2831,19 +2880,35 @@ def main():
     run_dir = os.path.dirname(os.path.abspath(
         args.context_file if args.context_file is not None else args.roles_file
     ))
+    try:
+        preparing = load_plan(run_dir, roles, body)
+    except (OSError, ValueError) as exc:
+        _usage_exit("invocation contract: " + _report_inline(exc))
+    if preparing is not None:
+        _WORKFLOW.update(plan=preparing, run_dir=run_dir, settled={}, result=None)
+        _RUN.attach(os.path.join(run_dir, STATUS_FILENAME),
+                    mode="detached" if _SUPERVISOR["lock_fd"] is not None else None)
+        _RUN.begin([role.id for role in roles])
+        _diag(f"[codex-council] preparing {len(roles)} captured contributions; "
+              "no worker dispatched yet")
     # Authoring defects exit 2 here, before any worker; automatic
     # selections are then revalidated by one fresh discovery, and every
     # role gets the decision its commands are built from. A termination
     # signal during that discovery unwinds through its teardown.
     try:
         with _roles_recovery(roles_recovery), _termination_raises():
-            roles, launch = _resolve_run_selections(
-                roles, run_dir, routing_mode, at_launch=True
+            roles, launch, plan = _workflow_selection(
+                roles, run_dir, routing_mode, at_launch=True, body=body
             )
+            _WORKFLOW.update(plan=plan, run_dir=run_dir, settled={}, result=None)
     except KeyboardInterrupt:
+        _finish_evidence(state="interrupted")
+        _RUN.finish("interrupted", 130)
         _diag("\n[codex-council] interrupted by user")
         sys.exit(130)
     except _TerminationSignal as stop:
+        _finish_evidence(state="interrupted")
+        _RUN.finish("interrupted", 128 + int(stop.signum))
         _exit_interrupted(stop.signum, "\n[codex-council] interrupted by")
     state, reason = _launch_discovery_state(
         routing_mode, any(_is_automatic(r) for r in roles), launch
@@ -2872,12 +2937,14 @@ def main():
             )
         )
     except KeyboardInterrupt:
+        _finish_evidence(state="interrupted")
         _RUN.finish("interrupted", 130)
         _diag("\n[codex-council] interrupted by user")
         sys.exit(130)
     except Exception as e:
         # Leave a terminal line so --follow stops at once; the traceback
         # follows on stderr.
+        _finish_evidence(state="aborted")
         _RUN.finish("aborted", 1)
         _diag(
             "\n[codex-council] runner aborted exit=1: unhandled "
@@ -2885,14 +2952,20 @@ def main():
         )
         raise
     if signum is not None:
+        _finish_evidence(state="interrupted")
         _RUN.finish("interrupted", 128 + int(signum))
         _exit_interrupted(signum, "\n[codex-council] interrupted by")
 
     elapsed = time.monotonic() - started
+    evidence_result = _finish_evidence(results)
     try:
         print(_format_report(
             results, elapsed, _discovery_sentence(state, reason, launch)
         ), end="")
+        if plan is not None:
+            print("\n## Captured evidence\n\nRead `result.json` and per-attempt logs before "
+                  "reconciliation. Run `--freshness` before applying any candidate change. "
+                  "Execution success is not a substantive verification verdict.")
         sys.stdout.flush()
     except (OSError, ValueError):
         # stdout is dead: the report was not delivered, so no sentinel may
@@ -2910,6 +2983,9 @@ def main():
     successes = sum(1 for r in results if r.ok)
     total = len(results)
     exit_code = 0 if successes else 1
+    if plan is not None and (evidence_result is None
+                             or not evidence_result["required_contributions_complete"]):
+        exit_code = 1
 
     # Final, uniquely-shaped, LAST stderr line. Its presence means the stdout
     # report is fully written; it carries the exit status so a lost/orphaned but
