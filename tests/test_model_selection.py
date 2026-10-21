@@ -3212,7 +3212,7 @@ class LaunchEndToEndTests(unittest.TestCase):
         # The captured run records its interruption; no role was dispatched.
         self.assertTrue(status.stdout.startswith(
             "runner: interrupted (exit 143)"), status.stdout)
-        self.assertIn("architect: queued", status.stdout)
+        self.assertIn("architect: interrupted (was queued)", status.stdout)
 
     def test_launch_discovery_stderr_reaches_no_output(self):
         """An app-server that prints account data to stderr and exits:
