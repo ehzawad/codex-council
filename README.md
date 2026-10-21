@@ -9,19 +9,25 @@ A contribution can investigate, reproduce, test, research, compare alternatives,
 build an authorized candidate. One is often enough. There is no role catalog,
 model ranking, fixed panel size, peer-debate loop, or automatic per-turn hook.
 
-## Release candidate
+## Requirements
 
-**1.3.0-rc.1, skill contract 5.** This changes permissions and the skill's launch
-protocol. Validate on your signed-in macOS/Ubuntu hosts before merging/releasing.
-See [local validation](docs/LOCAL_VALIDATION.md) and [changes](CHANGELOG.md).
-No claim of real-model quality or real-host sandbox enforcement comes from the
-fake-Codex test suite.
+| Component | Supported |
+|---|---|
+| Claude Code | 2.1.x, with plugin skills |
+| Codex CLI | codex-cli 0.163 or later, signed in; behavior verified on 0.163.0 |
+| Python | 3.12 or later, on macOS or Linux |
 
-Requirements: Claude Code with plugin skills, a signed-in Codex CLI exposing
-app-server metadata and the documented sandbox configuration, and Python 3.12+
-on macOS or Linux. The runner uses only the standard library and POSIX process
-controls. Missing policy metadata blocks restricted execution rather than granting
-bypass. Neither native user configuration nor the host Claude model/effort is edited.
+The skill speaks contract epoch 5. The runner uses only the standard library and
+POSIX process controls. Missing policy metadata blocks restricted execution rather
+than granting bypass. Neither native user configuration nor the host Claude
+model/effort is edited. The fake-Codex test suite makes no claim about real-model
+quality or real-host sandbox enforcement; [local validation](docs/LOCAL_VALIDATION.md)
+covers the signed-in host checks.
+
+The full documentation (this README, [DESIGN.md](DESIGN.md), the skill, its
+references and the local validation guide) is also one PDF,
+[docs/codex-council.pdf](docs/codex-council.pdf), with every diagram drawn as
+vector graphics.
 
 ## Install and invoke
 
@@ -35,14 +41,61 @@ when an independent contribution could materially improve the next decision.
 A new turn alone is not a reason to invoke. Requests for Claude's own subagents
 remain a separate workflow; genuinely unresolved intent gets a brief clarification.
 
+For the turn that invokes it, the skill pre-approves `mktemp -d` and the runner
+commands exactly as SKILL.md writes them. Claude Code asks before Claude itself
+invokes a skill that pre-approves tools, so in a `dontAsk` or other unattended
+session invoke `/codex-council:codex-council` directly or allow
+`Skill(codex-council:codex-council)`. Writing the staging files into the run
+directory, which is outside the project, still needs Write permission there.
+
 The main skill is deliberately small. It reads focused references when needed,
 not all documentation on every invocation. Tests, build scripts, and project docs
 are outside the installed plugin source (`plugins/codex-council`).
 
-## One invocation
+## Architecture
 
 ```mermaid
 flowchart LR
+    subgraph Host["Claude Code + the codex-council skill"]
+        direction TB
+        Stage["mktemp -d; request.json,<br/>roles.json, context.md"] --> Prepare["--prepare<br/>baseline + per-role copies"]
+        Prepare --> Disc["--discover<br/>per-role model snapshot"]
+        Disc --> Check["--check-staging-dir<br/>selection + execution plan"]
+        Check --> Start["--start, foreground<br/>claims supervisor.lock,<br/>err.log, out.md"]
+    end
+
+    Host -- "detaches" --> Detached
+
+    subgraph Detached["Detached supervisor, its own session"]
+        direction TB
+        Runner["Runner holds supervisor.lock,<br/>writes supervisor.json<br/>and status.json"] --> Policy["Reobserve execution policy<br/>in each role's scratch cwd"]
+        Policy --> Fanout["Bounded fan-out<br/>CODEX_COUNCIL_MAX_PARALLEL"]
+    end
+
+    Fanout --> Roles
+
+    subgraph Roles["Roles, one scratch copy each"]
+        direction TB
+        RoleA["Role A: codex exec<br/>sandbox, watchdog,<br/>raw attempt evidence"]
+        RoleN["Role N: codex exec<br/>sandbox, watchdog,<br/>raw attempt evidence"]
+        RoleA ~~~ RoleN
+    end
+
+    Roles -- "replies/, evidence/,<br/>result.json, out.md" --> Watch
+
+    subgraph Watch["Claude observes, then reconciles"]
+        direction TB
+        Follow["--follow, read-only"] --> Status["--status: lock released,<br/>runner identity gone"]
+        Status --> Fresh["--freshness:<br/>captured scope unchanged?"]
+        Fresh --> Reconcile["Reconcile evidence<br/>into one result"]
+        Status -. "stuck or gone" .-> Ctl["--cancel if stuck<br/>--reap if gone"]
+    end
+```
+
+## One invocation
+
+```mermaid
+flowchart TD
     Goal[Current goal and useful contribution] --> Inputs[request + roles + context]
     Inputs --> Capture[Prepare captured baseline]
     Capture --> Copies[Independent copy per role]
@@ -118,8 +171,8 @@ sequenceDiagram
     C->>R: freshness before applying results
 ```
 
-The existing detached supervisor, private-directory gates, lock token, process
-identities, liveness ticks, bounded concurrency and conservative cleanup remain.
+The detached supervisor relies on private-directory gates, a lock token, process
+identities, liveness ticks, bounded concurrency and conservative cleanup.
 `preparing` means bounded metadata work, not worker dispatch. `--follow` is read-only.
 The final line alone does not prove completion: `--status` requires released lock
 and vanished recorded identity. `--cancel` stops a verified detached runner;
@@ -150,7 +203,7 @@ there is no direct launch.
 
 ```mermaid
 flowchart TD
-    Identity[Logical source + task + host session + role] --> Lock[Existing continuity lock]
+    Identity[Logical source + task + host session + role] --> Lock[Continuity lock]
     Lock --> Choice{Explicit continuity}
     Choice -->|fresh| New[New Codex thread]
     Choice -->|resume| Old[Resume saved thread]
@@ -172,7 +225,7 @@ scanner as watchdog stalls. Once tool work or unreadable output may have occurre
 `replay-blocked:*` requires deliberate recovery. Quota, authentication and model
 rejection remain terminal; valid continuity is not discarded on those failures.
 
-Settings retained: `CODEX_COUNCIL_MAX_PARALLEL` defaults to 6,
+Settings: `CODEX_COUNCIL_MAX_PARALLEL` defaults to 6,
 `CODEX_COUNCIL_STALL_SECS` to 1800 (0 disables), model routing to auto (off disables
 automatic choices), and state under `$XDG_STATE_HOME/codex-council` or
 `~/.local/state/codex-council`. There is no run-level deadline. Detached work keeps
@@ -191,29 +244,38 @@ trusted inputs and verify actual sandbox denials on the target host.
 Excluded data, dependency state, Git metadata, ACLs/xattrs and remote services are
 not recreated. Freshness only covers the selected filesystem state; changed user
 intent must be checked by Claude. Raw logs may hold sensitive tool output. Keep
-them private. The existing exec reader still retains protocol output in memory;
-this release does not claim fully bounded RAM for arbitrarily chatty workers.
+them private. The exec reader holds each attempt's protocol output in memory, so
+runner RAM is not bounded for arbitrarily chatty workers.
 
 ## Development
 
 ```zsh
 python3 -m unittest discover -s tests -p 'test_*.py' -v
 uvx --from 'ruff==0.15.21' ruff check .
+claude plugin validate plugins/codex-council
+claude plugin validate .
 ```
 
 CI runs the full fake/protocol/process suite on Ubuntu and macOS. No real model
 credentials or inference are used by default. Opt-in real-host checks and a
 copy-pastable validation prompt are in [LOCAL_VALIDATION.md](docs/LOCAL_VALIDATION.md).
-Existing module-DAG tests include the new workspace, policy, evidence and workflow
-modules. Documentation tests check parseable commands, JSON shapes and packaging,
+Module-DAG tests cover every runner module. Documentation tests check parseable commands, JSON shapes and packaging,
 not hundreds of exact prose phrases.
 
-`./scripts/dev-link.sh` remains the development-link helper. Alternatively load
-this checkout with Claude Code's `--plugin-dir ./plugins/codex-council` option in a
-fresh session. Do not modify global model settings to test the plugin.
+Load this checkout in a fresh session with Claude Code's
+`--plugin-dir ./plugins/codex-council` option; it changes nothing installed.
+`./scripts/dev-link.sh` instead points the installed plugin cache and registry at
+this checkout. Do not modify global model settings to test the plugin.
 
-`scripts/build-docs.sh` can generate a PDF locally. Generated PDFs are not committed;
-Markdown is authoritative and release builds may attach generated documentation.
+`scripts/build-docs.sh` rebuilds [docs/codex-council.pdf](docs/codex-council.pdf)
+from this README, DESIGN.md, SKILL.md, every reference and
+docs/LOCAL_VALIDATION.md. It needs `uvx`, Chrome or Chromium, and network access
+to mermaid.ink, which renders each `mermaid` block to SVG; the SVG is inlined so
+every diagram prints as vector graphics, and the build refuses a PDF that holds a
+raster image. The repository holds no image files: the diagrams above are their
+only source. In the PDF, links between these documents jump within it, other
+repository links point at GitHub, and the headings are bookmarks. Rebuild and
+commit the PDF whenever one of those documents changes.
 
 ## License
 

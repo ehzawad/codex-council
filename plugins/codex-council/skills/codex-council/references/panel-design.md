@@ -25,7 +25,7 @@ capability from product names, id spelling, version numbers, catalog order,
 recommended markers or remembered reputations. The runner validates evidence,
 not the semantic quality of Claude's choice.
 
-The existing selection JSON shapes remain:
+The selection JSON shapes are:
 
 ```json
 {"mode": "user"}

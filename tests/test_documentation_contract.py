@@ -73,11 +73,59 @@ class DocumentationContractTests(unittest.TestCase):
         self.assertFalse(any(PLUGIN.rglob("*.pdf")))
         self.assertFalse(any(PLUGIN.rglob("*.png")))
 
-    def test_version_and_license_are_publishable(self):
+    def test_license_is_publishable(self):
         meta = json.loads((PLUGIN / ".claude-plugin/plugin.json").read_text())
-        self.assertIn(meta["version"], (ROOT / "CHANGELOG.md").read_text())
         self.assertEqual(meta["license"], "MIT")
         self.assertIn("Permission is hereby granted", (ROOT / "LICENSE").read_text())
+
+    def test_allowed_tools_pre_approve_every_runner_command_as_written(self):
+        """Bash rules match the command text as written, quotes included, so
+        each runner command the skill body gives must start with a rule's
+        text before its trailing ' *'; nothing broader is pre-approved."""
+        text = SKILL.read_text()
+        frontmatter = text.split("---", 2)[1]
+        rules = re.findall(r"(?m)^  - Bash\((.*) \*\)$", frontmatter)
+        runner = ('python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/'
+                  'scripts/codex_council.py"')
+        self.assertEqual(rules, ["mktemp -d", runner])
+        self.assertEqual(len(re.findall(r"(?m)^  - ", frontmatter)), len(rules))
+        body = text.split("---", 2)[2]
+        commands = re.findall(r"(?m)^(python3 .*)$", body)
+        commands += re.findall(r"`(python3 [^`]*)`", body)
+        self.assertGreaterEqual(len(commands), 6)
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertTrue(command.startswith(runner + " "))
+                argv = shlex.split(command)[2:]
+                parsed = codex_council._parse_args(argv)
+                self.assertEqual(parsed.skill_contract, codex_council.SKILL_CONTRACT_EPOCH)
+
+    def test_the_pdf_is_built_from_every_current_document_and_committed(self):
+        script = (ROOT / "scripts/build-docs.sh").read_text()
+        listed = re.search(r"(?ms)^docs=\(\n(.*?)^\)", script).group(1).split()
+        skill = "plugins/codex-council/skills/codex-council"
+        built = [entry.strip('"').replace("$skill", skill) for entry in listed]
+        current = {"README.md", "DESIGN.md", f"{skill}/SKILL.md",
+                   *(str(p.relative_to(ROOT)) for p in REFERENCES.glob("*.md")),
+                   *(str(p.relative_to(ROOT)) for p in (ROOT / "docs").glob("*.md"))}
+        self.assertEqual(sorted(built), sorted(current))
+        self.assertEqual(len(built), len(set(built)))
+        self.assertTrue((ROOT / "docs/codex-council.pdf").is_file())
+        self.assertIn("](docs/codex-council.pdf)", (ROOT / "README.md").read_text())
+        ignored = (ROOT / ".gitignore").read_text().split()
+        self.assertFalse([line for line in ignored if "pdf" in line])
+        self.assertFalse((ROOT / "CHANGELOG.md").exists())
+
+    def test_ci_job_names_match_the_required_checks(self):
+        ci = (ROOT / ".github/workflows/ci.yml").read_text()
+        self.assertIn("    name: test (${{ matrix.label }})\n", ci)
+        labels = re.findall(r"label: '([^']+)'", ci)
+        self.assertEqual(labels, ["3.12", "3.13", "3.14", "3.15", "macos, 3.13"])
+        rows = re.findall(r"\{os: (\S+), python: '([^']+)', label: '([^']+)'\}", ci)
+        self.assertEqual(len(rows), len(labels))
+        for os_name, python, label in rows:
+            expected = python if os_name == "ubuntu-latest" else f"macos, {python}"
+            self.assertEqual(label, expected)
 
     def test_bare_command_defaults_do_not_grant_bypass(self):
         for command in (codex_council._fresh_cmd("/workspace"),

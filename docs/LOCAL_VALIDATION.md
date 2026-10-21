@@ -1,7 +1,7 @@
 # Local acceptance gate
 
-The release candidate must remain unmerged until the actual installed Claude Code,
-Codex, native configuration and OS behavior have been checked. Fake-protocol tests
+Do not merge a change until the actual installed Claude Code, Codex, native
+configuration and OS behavior have been checked. Fake-protocol tests
 prove the runner integration, not model quality or real sandbox enforcement.
 
 ## Checkout and offline verification
@@ -16,6 +16,8 @@ claude --version
 codex --version
 python3 -m unittest discover -s tests -p 'test_*.py' -v
 uvx --from 'ruff==0.15.21' ruff check .
+claude plugin validate plugins/codex-council
+claude plugin validate .
 ```
 
 Record the OS version, actual host model/effort, CLI versions, plugin version,
@@ -26,7 +28,7 @@ remain unverified; one OS pass is not evidence for another.
 Tests cover Git dirty/unstaged/untracked/deleted inputs, non-Git explicit scope,
 source/scratch independence, symlinks/hardlinks/special files, context mutation,
 actual-cwd model routing, explicit continuity, partial coverage, raw evidence,
-transient failure after a side effect and detached cancellation. Existing process
+transient failure after a side effect and detached cancellation. The process
 liveness scenarios are included through unittest discovery.
 
 ## Real command boundaries (explicit inference opt-in)
@@ -46,7 +48,8 @@ and command-network connection. Read-only should deny both writes. Both require 
 exact `python3 probe.py` command to complete with exit 0 in the command protocol, a
 probe marker from no other command, denials reported as EPERM/EACCES (not a refused
 connection or a timeout), no listener acceptance from the sandbox while the
-listener stays reachable, unchanged probe source, and an intact external canary.
+listener stays reachable, unchanged probe source, an intact external canary, and
+no MCP tool call.
 A model declining or failing to execute the probe is **not a pass**.
 A config/read refusal is **not a reason to enable bypass**. Investigate documented
 CLI/API compatibility and retain the failed gate until repaired.
@@ -87,7 +90,7 @@ counting roles or praising a particular model name.
 ## Copy-pastable validation prompt
 
 ```text
-Validate this Codex Council PR as a release candidate. Do not merge it, push to
+Validate this Codex Council PR. Do not merge it, push to
 main, change my native Claude/Codex configuration, or enable unrestricted bypass.
 Record the exact commit, OS, CLI versions, host model/effort and plugin epoch.
 

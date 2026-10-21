@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Build docs/codex-council.pdf: README, DESIGN, the skill (SKILL.md), and
-# its references in one PDF, with every diagram drawn as vector graphics.
+# Build docs/codex-council.pdf: README, DESIGN, the skill (SKILL.md), every
+# reference and the local validation guide in one PDF, with every diagram
+# drawn as vector graphics.
 #
 #   scripts/build-docs.sh
 #
@@ -25,9 +26,11 @@ docs=(
   README.md
   DESIGN.md
   "$skill/SKILL.md"
+  "$skill/references/invocation-contract.md"
   "$skill/references/panel-design.md"
   "$skill/references/context-staging.md"
   "$skill/references/runtime-behavior.md"
+  docs/LOCAL_VALIDATION.md
 )
 
 if [ "$#" -ne 0 ]; then

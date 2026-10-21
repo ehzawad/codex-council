@@ -10,7 +10,7 @@ task to start the supervisor. Every command in the current skill uses
 `--skill-contract 5`; an epoch mismatch requires update/reload, never argument repair.
 
 `--start` repeats local staging validation and claims supervisor.lock, err.log and
-out.md exclusively. It starts the existing runner in its own session, passing only
+out.md exclusively. It starts the runner in its own session, passing only
 the locked descriptor. The child records supervisor.json before doing work and
 never passes the lock to Codex children. The detached launch is for explicit process
 ownership and recovery, not a claim that all Claude Code hosts impose one universal
@@ -20,7 +20,7 @@ A launch publishes a `preparing` activity line and status ticks between
 bounded metadata checks. This is not a claim that workers have started. Permissions
 are reobserved before inference; a failed or overridden restriction blocks dispatch.
 One role's cwd is its private captured copy. The fan-out, same-thread locks, stall
-watchdog, and process-group cleanup remain owned by the existing runner.
+watchdog, and process-group cleanup are owned by the runner.
 
 ## Follow and completion
 
@@ -68,7 +68,7 @@ once per run directory; there is no direct launch.
    new run directory, recapture current context and inputs, and rerun only what is
    still useful. Never relaunch into the consumed directory.
 
---cancel uses the existing signal latch and verified identity checks. SIGKILL or
+--cancel uses the signal latch and verified identity checks. SIGKILL or
 reboot cannot execute cleanup; verified --reap is the recovery for surviving
 recorded workers. Detached tool sessions that already left the observed process
 hierarchy remain a documented process-cleanup limit. This is not a cluster OS or a
@@ -95,8 +95,8 @@ stalls. Completed-turn shutdown stalls can keep a completed reply with a warning
 ## Files and privacy
 
 Inputs: request.json, roles.json, context.md. Capture: run.json, baseline/,
-workspaces/<role>/, catalogs/<role>/. Lifecycle: supervisor.lock, supervisor.json,
-status.json, err.log, out.md, replies/. Evidence: evidence/<role>/ and result.json.
+`workspaces/<role>/`, `catalogs/<role>/`. Lifecycle: supervisor.lock, supervisor.json,
+status.json, err.log, out.md, replies/. Evidence: `evidence/<role>/` and result.json.
 All runner-owned directories/files are private. Raw logs can contain sensitive
 tool output; do not publish or attach them indiscriminately. Cleanup is deliberate:
 never delete a directory or role lock while its processes may still use it.

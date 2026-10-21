@@ -129,8 +129,8 @@ may differ from the live project's configuration. Inspect the discovery summary;
 use a supported explicit pin when the user's intended model must be preserved.
 The host Claude session's settings and user Codex configuration are never edited.
 
-Each role gets its own `catalogs/<role>/model-snapshot.json`. Existing selection
-modes stay valid: explicit user pin, routed model+effort, native_effort, or omission
+Each role gets its own `catalogs/<role>/model-snapshot.json`. Selection
+modes are: explicit user pin, routed model+effort, native_effort, or omission
 for native inheritance. Automatic choices name that role's snapshot_id. Model and
 effort descriptions guide Claude; the runner validates membership and provenance,
 never ranks. Fresh launch discovery revalidates automatic choices in the same cwd.
@@ -148,8 +148,8 @@ hash, role completeness, baseline integrity, applicability, attempts and artifac
 Each attempt streams exact stdout/stderr bytes to private files while running;
 metadata records argv, process identity, transport outcome, observed command events,
 usage when supplied, hashes and coverage gaps. Incomplete/oversized protocol records
-can limit summaries without truncating raw files. The original exec reader still
-buffers its protocol output; this release does not claim bounded total runner RAM.
+can limit summaries without truncating raw files. The exec reader buffers its
+protocol output in memory, so total runner RAM is not bounded.
 
 Command/exit/output fields in JSONL are **Codex-reported observations**, not an
 independent OS audit. Collaborator prose is stored separately as interpretation.

@@ -17,20 +17,20 @@ a promise that unavailable tools/data or unobservable outcomes can be verified.
 
 ## Identity and state
 
-Four identities remain distinct: logical source project, task/investigation,
+Four identities are distinct: logical source project, task/investigation,
 captured inputs, and optional Codex thread. The source root and task id join the
-existing host-session and role key for continuity. A new scratch directory does
+host-session and role key for continuity. A new scratch directory does
 not accidentally create a new logical project. Fresh is the prepared default;
 resume is explicit and history is subordinate to the complete current brief.
 
 The staged request, context and role capability/lens contracts are frozen by
-preparation. Model/effort/selection remain fillable after discovery. Context changes,
+preparation. Model/effort/selection stay fillable after discovery. Context changes,
 new requirements or a different contribution require recapture rather than quietly
 reusing stale input identity. Hashes bind artifacts, not semantic correctness.
 
 ## Capture backend
 
-The initial backend is independent copies for Git and non-Git projects. Git is a
+The capture backend makes independent copies for Git and non-Git projects. Git is a
 read-only filename/index/HEAD source, never an instruction to verify only committed
 HEAD. Current tracked and selected untracked bytes, deletions and executable bits
 are captured. Before/after inventories and file identity stamps reject observed
@@ -48,7 +48,7 @@ Each role gets a separate writable copy and runs tests/experiments only accordin
 to its explicit capabilities. Missing Git metadata or dependencies can block a
 baseline; blocked setup is not evidence of an implementation defect. Worktrees are
 not required for isolation here, and Codex's worktree/resume incompatibility is
-avoided rather than hidden. A future backend must preserve the same invariants.
+avoided rather than hidden.
 
 ## Execution policy
 
@@ -86,27 +86,27 @@ and CLAUDE.md are ordinary selected inputs and are copied. Source-layer defaults
 differ from scratch-native defaults and preflight says so.
 No silent claim of source configuration parity is made.
 
-The existing account/config/managed-requirements/catalog adapter, strict value
-grammar, authoring validation, launch-time revalidation, explicit pins, native
-fallback and per-role provenance remain. Each role owns its planning snapshot;
+Discovery reads account, configuration, managed requirements and the model catalog
+through one adapter, with strict value grammar, authoring validation, launch-time
+revalidation, explicit pins, native fallback and per-role provenance. Each role owns its planning snapshot;
 launch observations are retained separately. No thread or turn starts during model
 or policy discovery. Nothing ranks ids, versions, recommended markers, or reputation.
 Report values describe what was sent, not an attestation of what served a turn.
 
 ## Execution and lifecycle
 
-The existing POSIX supervisor remains authoritative. --start exclusively claims a
+The POSIX supervisor is authoritative. --start exclusively claims a
 private directory, passes its held lock into a new session, and returns once the
 child publishes its record. Only the supervisor holds that lock; Codex children do
 not inherit it. Both lock identity/token and process-start identity are checked.
-One-use directories, conservative unknown states and safe signal targeting remain.
+Directories are one-use; unknown states are conservative; signal targeting is safe.
 
 Bounded fan-out and per-thread nonblocking locks prevent simultaneous turns in one
 saved thread. Every child has its own process group. Byte-inactivity watchdogs,
 bounded post-exit drain, descendant cleanup, signal latching, reply-first persistence,
-and orphan reaping remain. The supervisor is not a reboot-persistent job scheduler.
+and orphan reaping complete the lifecycle. The supervisor is not a reboot-persistent job scheduler.
 Same-user tampering, reparented descendants and a SIGKILL before child recording are
-not solved by a new workspace abstraction.
+not solved by the workspace copies.
 
 `preparing` is an activity signal for metadata work, not worker dispatch. --follow
 is read-only and notices lost status/identity. Terminal text is advisory: --status
@@ -116,17 +116,17 @@ signal. An unattended host must continue observing or cancel before returning.
 
 ## Replay, evidence and result semantics
 
-All transient retries now pass the existing replay-safety scanner, not only stalls.
+Every transient retry, not only a stall retry, passes the replay-safety scanner.
 A 429/5xx after tool-capable or unreadable output is replay-blocked. The error class
 can be transient without the whole task being safe to repeat. The old thread and
 partial artifacts remain available for deliberate recovery. There is at most one
-automatic retry with the existing five-second backoff.
+automatic retry, after a five-second backoff.
 
 Raw protocol stdout and stderr are written per attempt as the worker runs. Metadata
 records argv, identity, prompt hash, transport outcome, protocol-reported commands,
 usage, hashes and gaps. A loss of raw storage or unreadable protocol is not disguised
 as complete evidence. Interrupted attempts retain their records, and settled roles'
-contributions survive cancellation. The old exec reader still buffers its streams;
+contributions survive cancellation. The exec reader buffers its streams in memory;
 raw spooling alone does not make total runner memory bounded.
 
 The result envelope separates runner observations, Codex-reported protocol data,
@@ -149,12 +149,12 @@ checks changed intent and external conditions separately.
 
 | Module | Owns |
 |---|---|
-| codex_council | CLI, existing supervisor/fan-out/continuity, runner observation wiring. |
-| council_common | Existing private paths, atomic writes, diagnostics and shared primitives. |
+| codex_council | CLI, supervisor/fan-out/continuity, runner observation wiring. |
+| council_common | Private paths, atomic writes, diagnostics and shared primitives. |
 | council_discovery | Bounded metadata transport, catalog/config normalization and snapshots. |
 | council_selection | Role/selection data, pure model resolver and authoring validation. |
-| council_failures | Existing structured failure classification and recovery wording. |
-| council_liveness | Existing status/identity/lock handling, follow/status/cancel/reap. |
+| council_failures | Structured failure classification and recovery wording. |
+| council_liveness | Status/identity/lock handling, follow/status/cancel/reap. |
 | council_workspace | Read-only source capture, independent copies, integrity and freshness. |
 | council_policy | Capability validation and fail-closed effective-config observation. |
 | council_evidence | Raw attempts, protocol summaries, candidate artifacts and result envelope. |
@@ -169,8 +169,8 @@ project documentation are not installed as skill prompt content.
 Unit tests exercise strict contracts, copies, links, freshness, policy observations
 and evidence gaps. CLI tests use real subprocesses and a fake Codex protocol for
 red/green experiments, task-scoped fresh/resume, transient retry safety, required
-coverage, actual-cwd routing and cancellation. Existing liveness scenarios remain
-in the full suite. CI adds macOS coverage alongside Ubuntu/Python versions.
+coverage, actual-cwd routing and cancellation. The liveness scenarios run in the
+full suite. CI runs it on Ubuntu with Python 3.12 to 3.15 and on macOS with 3.13.
 
 The fake does not implement Codex sandbox security or evaluate model quality.
 Opt-in signed-in host tests check real inside/outside write denials; behavioral
@@ -179,10 +179,15 @@ host model, Claude Code version, Codex version and effective configuration. Unkn
 or failed gates remain explicit; do not merge automatically on fake-suite success.
 
 Documentation tests validate executable command/schema contracts and packaging.
-They do not freeze hundreds of prose phrases. The committed PDF is removed in
-favor of Markdown sources and an optional generated release artifact.
+They do not freeze hundreds of prose phrases. Markdown is the source; the committed
+docs/codex-council.pdf is built from every current document by scripts/build-docs.sh.
 
-Non-goals remain predefined roles, hardcoded model rankings, peer debate, automatic
-per-turn invocation, automatic patch integration, and a second agent loop replacing
-Codex exec. New experimental workspaces are a deliberate revision of the former
-no-isolation policy, not a conversion into a generic cluster scheduler.
+Non-goals are predefined roles, hardcoded model rankings, peer debate, automatic
+per-turn invocation, automatic patch integration, a second agent loop replacing
+Codex exec, and a generic cluster scheduler. Per-role experimental workspaces give
+each contribution its own copy; they do not make the runner a job scheduler.
+
+## Supported versions
+
+Claude Code 2.1.x, codex-cli 0.163 or later (behavior verified on 0.163.0), and
+Python 3.12 or later on macOS or Linux. The skill and runner share contract epoch 5.

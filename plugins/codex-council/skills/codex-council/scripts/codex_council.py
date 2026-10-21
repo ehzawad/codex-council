@@ -1755,9 +1755,8 @@ def _parse_args(argv):
             "completed --prepare is refused. A DIR that already holds a launch (out.md, "
             "err.log, or replies/) is refused: every launch needs its own "
             "directory. Use this after writing the per-run staging files, "
-            "as its own call, and launch the background council in a "
-            "separate call only after it exits 0 (the launch itself does "
-            "not check for an earlier launch)."
+            "as its own call, and run --start in a separate call only "
+            "after it exits 0."
         ),
     )
     parser.add_argument("--context-file", default=None, help=argparse.SUPPRESS)
@@ -1861,7 +1860,7 @@ def _parse_args(argv):
         "--skill-contract", default=None, type=int, metavar="EPOCH",
         help=(
             "Contract epoch the invoking SKILL text was written against. "
-            "Optional (bare/direct invocations stay valid); when present it "
+            "Optional; when present it "
             f"must equal this script's epoch ({SKILL_CONTRACT_EPOCH}), "
             "otherwise the invocation is refused as a stale SKILL/script "
             "pair."
@@ -1870,7 +1869,8 @@ def _parse_args(argv):
     parser.add_argument("--prepare", metavar="RUNDIR",
                         help="Capture request.json inputs and create independent experiment workspaces.")
     parser.add_argument("--freshness", metavar="RUNDIR",
-                        help="Compare captured inputs with current source state (0 unchanged, 1 stale/unknown).")
+                        help=("Compare captured inputs with current source state (0 unchanged, "
+                              "1 stale/unknown, 2 invalid run directory)."))
     args = parser.parse_args(argv)
     if args.roles_file == "":
         parser.error("--roles-file must be non-empty")
