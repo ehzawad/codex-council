@@ -59,8 +59,10 @@ identity are separate from the captured input hash and optional Codex thread.
 Previous conclusions are context, not automatically current evidence.
 
 Preparation captures **working bytes**, not just Git HEAD: dirty tracked files,
-staged/unstaged edits, deletions, and non-ignored untracked files. Non-Git capture
-uses explicit include paths; a context-only question may select no files. Pause
+staged/unstaged edits, deletions, and non-ignored untracked files. A partially staged
+file is captured as its working version, not its staged version. Non-Git capture
+uses explicit include paths and keeps empty directories; a context-only question
+may select no files. Pause
 overlapping writers during capture. The runner detects observed changes but does
 not claim an atomic snapshot of arbitrary external writers.
 

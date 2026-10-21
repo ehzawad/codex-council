@@ -278,6 +278,27 @@ class CaptureTests(WorkspaceCase):
         self.git("rm", "--cached", "subject.py")
         self.assertTrue(workspace.freshness(snap)["git_metadata_changed"])
 
+    def test_freshness_binds_selected_index_entries_not_the_whole_index(self):
+        self.init_git()
+        (self.source / "other.txt").write_text("unrelated")
+        self.git("add", "other.txt")
+        self.git("commit", "-qm", "other")
+        narrow = workspace.capture(self.source, self.baseline, include=["subject.py"])
+        context_only = workspace.capture(self.source, self.run / "context-only", include=[])
+        (self.source / "other.txt").write_text("unrelated staged edit")
+        self.git("add", "other.txt")
+        for snap in (narrow, context_only):
+            fresh = workspace.freshness(snap)
+            self.assertEqual(fresh["state"], "unchanged", fresh)
+        # Staging the captured path itself still changes its binding.
+        self.file.write_text("value = 2\n")
+        self.git("add", "subject.py")
+        self.file.write_text("value = 1\n")
+        fresh = workspace.freshness(narrow)
+        self.assertEqual((fresh["state"], fresh["changed_paths"]), ("stale", []))
+        self.assertTrue(fresh["git_metadata_changed"])
+        self.assertEqual(workspace.freshness(context_only)["state"], "unchanged")
+
     def test_invalid_paths(self):
         for value in ("../escape", "/absolute", "a/../b", "a\\b", "a//b", "", "./a"):
             with self.subTest(value=value), self.assertRaises(workspace.WorkspaceError):

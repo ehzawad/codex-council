@@ -134,8 +134,10 @@ requirements, not vote counts or a clean transport exit.
 Prepared exit 0 requires a delivered report and complete required contributions.
 A failed optional role does not make a completed required contribution disappear.
 Stale captured inputs are a separate applicability verdict, not a retroactive claim
-that the old experiment never happened. --freshness covers only selected inputs;
-Claude checks changed intent and external conditions separately.
+that the old experiment never happened. --freshness covers only selected inputs:
+their bytes, empty directories, Git HEAD and the index entries of selected paths.
+Staging an unrelated file leaves a capture fresh; a new commit does not. Claude
+checks changed intent and external conditions separately.
 
 ## Module boundaries
 

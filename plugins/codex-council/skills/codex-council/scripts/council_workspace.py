@@ -197,17 +197,31 @@ def _git(root: Path, *args: str) -> bytes | None:
     return proc.stdout if proc.returncode == 0 else None
 
 
-def git_state(root: Path) -> dict[str, Any] | None:
+def _in_scope(name: str, include: list[str] | None, exclude: list[str]) -> bool:
+    if _omission(name, exclude):
+        return False
+    return include is None or any(
+        item == "." or name == item or name.startswith(item + "/") for item in include)
+
+
+def git_state(root: Path, include: list[str] | None, exclude: list[str]
+              ) -> dict[str, Any] | None:
+    """HEAD plus the index entries of selected paths only. Staging an
+    unrelated file does not make a capture stale. Captured bytes are the
+    working files; a partially staged file is captured as its working version."""
     top = _git(root, "rev-parse", "--show-toplevel")
     if top is None:
         return None
     index = _git(root, "ls-files", "--stage", "-z")
     if index is None:
         raise WorkspaceError("Git index could not be read")
+    selected = b"\0".join(
+        entry for entry in index.split(b"\0")
+        if entry and _in_scope(os.fsdecode(entry.split(b"\t", 1)[-1]), include, exclude))
     head = _git(root, "rev-parse", "--verify", "HEAD")
     return {"root": os.fsdecode(top.rstrip(b"\n")),
             "head": head.decode("ascii").strip() if head is not None else None,
-            "index_sha256": hashlib.sha256(index).hexdigest()}
+            "selected_index_sha256": hashlib.sha256(selected).hexdigest()}
 
 
 def _walk(root: Path, start: str, exclude: list[str],
@@ -310,7 +324,7 @@ def capture(source: Path, baseline: Path, *, include: list[str] | None = None,
         raise WorkspaceError("run directory must be outside the source tree")
     private_dir(baseline.parent)
     exclude = [] if exclude is None else exclude
-    before_git = git_state(source)
+    before_git = git_state(source, include, exclude)
     before, stamps, omitted, dirs = inventory(source, include, exclude)
     baseline.mkdir(mode=0o700)
     for name in dirs:
@@ -322,7 +336,7 @@ def capture(source: Path, baseline: Path, *, include: list[str] | None = None,
             raise WorkspaceError(f"input changed during capture: {name}")
         copied[name] = copy
     after, after_stamps, after_omitted, after_dirs = inventory(source, include, exclude)
-    after_git = git_state(source)
+    after_git = git_state(source, include, exclude)
     if (after != before or stamps != after_stamps or before_git != after_git
             or omitted != after_omitted or dirs != after_dirs):
         raise WorkspaceError("source changed during capture; pause writers and retry")
@@ -401,7 +415,7 @@ def freshness(snapshot: dict[str, Any]) -> dict[str, Any]:
         changed = sorted(name for name in set(files) | set(snapshot["files"])
                          if files.get(name) != snapshot["files"].get(name))
         changed += sorted(f"{name}/" for name in set(dirs) ^ set(snapshot["dirs"]))
-        metadata_changed = git_state(root) != snapshot["git"]
+        metadata_changed = git_state(root, snapshot["include"], snapshot["exclude"]) != snapshot["git"]
         omissions_changed = omitted != snapshot["omitted"]
         return {"state": "stale" if changed or metadata_changed or omissions_changed
                 else "unchanged", "changed_paths": changed,

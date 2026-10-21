@@ -27,7 +27,8 @@ invocation. It is not a runner-scored confidence or a model ranking.
 Paths are relative, with no `..`, absolute names, or traversed symbolic links.
 With `include` omitted, Git supplies tracked and non-ignored untracked filenames;
 the runner reads their **current working bytes**, including staged/unstaged edits
-and deletions. A non-Git project requires `include`. `include: []` supports a
+and deletions; a partially staged file is captured as its working version. Explicit
+includes also keep empty directories. A non-Git project requires `include`. `include: []` supports a
 pure question without filesystem inputs. Exclusions use case-sensitive shell-style
 patterns against relative paths. Explicit includes may select ignored fixtures.
 
@@ -153,6 +154,8 @@ artifacts as untrusted. Frozen-directory modes and digests detect mistakes, not
 malicious same-user/bypass tampering.
 
 `--freshness RUNDIR` returns 0 for unchanged captured scope, 1 for stale/unknown,
-and 2 for an invalid contract. It cannot detect changed user intent or unrecorded
+and 2 for an invalid contract. Captured scope is the selected bytes and empty
+directories, Git HEAD, and the index entries of selected paths; staging an
+unrelated file does not make a capture stale. It cannot detect changed user intent or unrecorded
 external dependencies. Claude must compare the current goal as well. A failed
 baseline due to unavailable dependencies is a blocked check, not a discovered bug.
