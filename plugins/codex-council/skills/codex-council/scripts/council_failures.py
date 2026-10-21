@@ -5,8 +5,9 @@ JSONL stdout (never agent messages, reasoning, or tool output), decides one
 verdict in a fixed order (auth, quota, anchored 429/5xx, model rejected,
 stale on resume only, substring retriable fallback, untagged), and formats
 the tagged error text a role reports. The verdict, not that text, carries
-whether the attempt may be retried (FailureVerdict.retriable): provider text
-that happens to begin with a tag never decides a retry. A model rejection,
+whether the failure class is transient (FailureVerdict.retriable): provider
+text that happens to begin with a tag never decides a retry. Replay safety
+and the remaining attempt budget then decide whether it is retried. A model rejection,
 and a usage limit Codex names for one model, end with one action for the
 model that was sent. The stall verdict is structured and decided by the
 runner before any of this runs.
@@ -65,8 +66,8 @@ RATE_LIMIT_MARKERS = (
     "request was throttled",
     # NB: "quota exceeded" / usage caps are deliberately NOT retriable markers —
     # a plan/usage cap does not clear within a 5s backoff, so it is surfaced
-    # terminal (see "Retries and long runs" in references/runtime-behavior.md
-    # and "Failure classification and recovery" in DESIGN.md); the
+    # terminal (see "Failures and safe replay" in references/runtime-behavior.md
+    # and "Replay, evidence and result semantics" in DESIGN.md); the
     # recognized quota forms are tagged [quota] ahead of the anchored parser
     # (QUOTA_ERROR_CODES).
     # Genuine transient 429s are caught by the anchored parser or the
@@ -156,7 +157,7 @@ _EXCLUDED_PARAM_RE = re.compile(
     r"|service_tier)(?![A-Za-z0-9_-])",
     re.IGNORECASE,
 )
-# The verdict kinds the runner retries (see FailureVerdict.retriable).
+# The transient verdict kinds (see FailureVerdict.retriable).
 RETRIABLE_KINDS = ("rate-limit", "5xx")
 
 
@@ -221,8 +222,9 @@ def _failure_text(stdout, stderr):
 class FailureRecord:
     """One structured failure from a codex `error` / `turn.failed` event.
 
-    Fields are None when absent; `status` is the HTTP status of the nearest
-    enclosing level that carried one.
+    Fields are None when absent; `status` is taken from the payload wrapper
+    being read (or an enclosing one); a nested error object's own status is
+    not inspected.
     """
     status: int | None = None
     type: str | None = None
@@ -552,9 +554,10 @@ class FailureVerdict:
 
     @property
     def retriable(self):
-        """Whether the runner may retry this attempt: the one retry
-        decision, carried as data and never read back from the formatted
-        tag (an untagged failure's text is Codex's and may look like one)."""
+        """Whether this is a transient failure class, carried as data and
+        never read back from the formatted tag (an untagged failure's text
+        is Codex's and may look like one). Replay safety and the remaining
+        attempt budget decide whether it is retried."""
         return self.kind in RETRIABLE_KINDS
 
 
@@ -565,8 +568,9 @@ def _failure_verdict(failure_text, records, requested_model, resume=False):
     401 or authentication code, or auth prose) -> quota -> anchored
     429/5xx -> model rejected -> stale (resume only) -> substring retriable
     fallback -> None (untagged). Returns a FailureVerdict, whose rejection
-    message is parsed here, once per attempt, and whose `retriable` is the
-    runner's retry decision.
+    message is parsed here, once per attempt, and whose `retriable` marks a
+    transient failure class (replay safety and the attempt budget decide
+    the retry).
     """
     # Status scans never see the model id: its text is the user's or the
     # catalog's, and an id like `future-status:429` must not name a status.
@@ -669,7 +673,8 @@ def _classify_failure(failure_text, rc, phase, decision, verdict):
     `decision` is the role's SelectionDecision and `verdict` the attempt's
     FailureVerdict, the one the caller already branched on, so the tag
     always matches that branch. A stale resume is never formatted: the
-    resume path restarts fresh instead. A [quota] whose text is Codex's
+    resume path restarts fresh when the failed resume is replay-safe, and
+    reports replay-blocked:stale otherwise. A [quota] whose text is Codex's
     usage limit for one model ends with the action for the model that was
     sent; any other [quota] keeps Codex's text alone.
     """

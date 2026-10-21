@@ -2,7 +2,10 @@
 
 The runner publishes RUNDIR/status.json through RunStatus: its own pid and
 OS start identity, its state, a tick that advances on every role transition
-and at least every STATUS_TICK_SECS, and per role the scheduling state, the
+and, during the asynchronous fan-out, about every STATUS_TICK_SECS
+(preparation publishes between bounded metadata operations; synchronous
+filesystem work and finalization can leave longer gaps), and per role the
+scheduling state, the
 attempt, the live codex process group, and the outcome. A detached run
 (launched with --start) also has RUNDIR/supervisor.lock, which its runner
 holds locked (flock) for its whole life, and RUNDIR/supervisor.json, which
@@ -61,12 +64,15 @@ from council_common import (
 
 STATUS_FILENAME = "status.json"
 STATUS_SCHEMA = 1
-# The runner republishes status.json at least this often while it runs.
+# During the asynchronous fan-out the runner republishes status.json about
+# this often.
 STATUS_TICK_SECS = 15
 ROLE_STATES = ("queued", "active", "retry-wait", "settled")
 TERMINAL_STATES = ("done", "interrupted", "aborted")
-# runner.mode in status.json (optional): "detached" for a --start runner.
-RUNNER_MODES = ("tracked", "detached")
+# runner.mode values read from status.json (optional): "detached" for a
+# --start runner. Any other value reads as none: a run without supervisor
+# records, reported from status.json alone.
+RUNNER_MODES = ("detached",)
 SUPERVISOR_SCHEMA = 1
 # Every ps call is bounded; a timeout reads as "cannot tell", never "gone".
 PS_TIMEOUT_SECS = 2
@@ -75,8 +81,8 @@ PS_TIMEOUT_SECS = 2
 _PS_ENV = {"LC_ALL": "C", "TZ": "UTC0"}
 
 # --follow timing: read err.log every FOLLOW_POLL_SECS, look at the runner
-# and the follower's own parent every FOLLOW_CHECK_SECS; no dispatch line
-# within FOLLOW_START_SECS means no council activity. No usable status.json
+# and the follower's own parent every FOLLOW_CHECK_SECS; neither a preparing
+# nor a dispatch line within FOLLOW_START_SECS means no council activity. No usable status.json
 # for STATUS_UNUSABLE_WARN_SECS after dispatch (or after its last usable
 # read) is reported once. A tick older than TICK_WARN_SECS while the runner
 # is present is reported once; at TICK_GIVE_UP_SECS the follower stops
@@ -317,8 +323,10 @@ class RunStatus:
     """The runner's live state, published as RUNDIR/status.json.
 
     Roles and their last-output stamps live in memory for the heartbeat;
-    once attach() names a file, every transition and every tick of the
-    event loop republishes it atomically (0600). Each publish is a tick:
+    once attach() names a file, every transition and, during the
+    asynchronous fan-out, the periodic heartbeat republish it atomically
+    (0600); preparation publishes between bounded metadata operations.
+    Each publish is a tick:
     tick.seq grows and tick.at is its wall time, so a fresh tick shows the
     runner's event loop is turning. A failed write is reported once, removes
     the file an earlier write left (so no stale tick remains), and never
@@ -337,7 +345,7 @@ class RunStatus:
         """Publish to `path` from now on (the launch path only).
 
         `mode` "detached" (a --start supervisor) is recorded as runner.mode,
-        an optional schema-1 field; a tracked launch records none.
+        an optional schema-1 field.
         """
         pid = os.getpid()
         self.path = path
@@ -1032,14 +1040,14 @@ def follow(run_dir, verbose=False):
     complete lines that begin with "[codex-council". Per-attempt start lines
     and the heartbeat stay in err.log unless `verbose`. Reply text never
     reaches err.log and runner diagnostics escape codex-controlled text, so
-    role output cannot forge a line through the runner; but roles run
-    unsandboxed as the same user and can append to err.log directly, which
-    no same-uid check can authenticate. The follower therefore drops any
-    completion line whose reply= path is not directly inside this run's
-    replies/ directory, and SKILL.md bases the final verdict on a verified
-    runner exit (the tracked task's completion, or for a detached run a
-    released lock and a vanished runner identity). A new follower reads err.log from the
-    start.
+    role output cannot forge a line through the runner; but roles with
+    native or bypass privileges, or other same-user processes with enough
+    access, can append to err.log directly, which no same-uid check can
+    authenticate. The follower therefore drops any completion line whose
+    reply= path is not directly inside this run's replies/ directory, and
+    SKILL.md bases the final verdict on a verified runner exit (a released
+    supervisor lock and a vanished runner identity). A new follower reads
+    err.log from the start.
 
     Every FOLLOW_CHECK_SECS it also checks its own parent (exit 5 once
     reparented), its stdout reader (exit 1 once gone), and, after dispatch,
@@ -1050,8 +1058,8 @@ def follow(run_dir, verbose=False):
     usable status.json for STATUS_UNUSABLE_WARN_SECS is one `runner
     liveness unavailable` line, and err.log is still relayed. Exit 0
     after the CODEX_COUNCIL_DONE sentinel, an interruption line, or a
-    `runner aborted` line; exit 3 when no dispatch line appears within
-    FOLLOW_START_SECS. A Python traceback in err.log is one advisory line.
+    `runner aborted` line; exit 3 when neither a preparing nor a dispatch
+    line appears within FOLLOW_START_SECS. A Python traceback in err.log is one advisory line.
     For a detached run the supervisor lock decides the runner's liveness
     (supervisor_state), and a free lock with no dispatch line is one
     `runner ended before dispatch` line and exit 3 at once. After dispatch,
@@ -1147,7 +1155,7 @@ def _status_lines(view, now, table, detached=None):
     """The --status report (at most about ten lines).
 
     `detached` is a detached run's combined liveness (supervisor_state);
-    None reports a tracked run from status.json alone.
+    None reports a run without supervisor records from status.json alone.
     """
     if detached is not None:
         unfinished = _unfinished(view) if view is not None else []
@@ -1184,9 +1192,8 @@ def _status_lines(view, now, table, detached=None):
         label = f"gone (pid {view.pid} is no longer this run's runner)"
         groups = _codex_groups(view, table)
         if groups[0]:
-            action = ("confirm the council's background task has ended, run "
-                      "--reap on this directory, then re-run unfinished roles "
-                      "in a new directory")
+            action = ("run --reap on this directory, then re-run unfinished "
+                      "roles in a new directory")
         elif unfinished:
             action = ("re-run unfinished roles in a new directory; replies/ "
                       "keeps the settled ones")
@@ -1200,8 +1207,8 @@ def _status_lines(view, now, table, detached=None):
         age = "never" if tick_age is None else f"{tick_age:.0f}s ago"
         label = f"not responding (pid {view.pid} present; last status tick {age})"
         action = (f"unless err.log says {STATUS_FILENAME} not written, stop "
-                  "the council's background task, confirm with --status that "
-                  "the runner is gone, then --reap if live codex groups remain")
+                  f"the runner (pid {view.pid}), confirm with --status that "
+                  "it is gone, then --reap if live codex groups remain")
     else:
         label = f"running (pid {view.pid}; status tick {tick_age:.0f}s ago)"
         action = "keep following; do not relaunch"
@@ -1235,7 +1242,10 @@ def _group_lines(groups):
 
 
 def status_command(run_dir):
-    """--status RUNDIR: print the run's snapshot; always exit 0.
+    """--status RUNDIR: print the run's snapshot; exit 0 once it is printed.
+
+    Unknown liveness is still exit 0. An invalid run directory exits 2, and
+    an unavailable stdout exits 1.
 
     A detached run (see is_detached) is reported from its combined
     liveness: starting, running, not responding, a terminal state once the
@@ -1267,7 +1277,8 @@ def status_command(run_dir):
 
 
 def reap_command(run_dir):
-    """--reap RUNDIR: end a gone runner's live codex groups; 0 or 1.
+    """--reap RUNDIR: end a gone runner's live codex groups; 0 or 1, and 2
+    for an invalid private run directory.
 
     Refused (exit 1) unless status.json shows a runner that is gone and,
     for a detached run, its supervisor lock is free (a held lock refuses
@@ -1355,10 +1366,14 @@ def _verified_supervisor(run_dir, supervisor, view):
 
 
 def _wait_lock_released(run_dir, supervisor, seconds):
-    """True once the lock is no longer held (polls up to `seconds`)."""
+    """True once the recorded lock is observed free (polls up to `seconds`).
+
+    Only "free" counts: an absent, replaced or unreadable lock ("absent" or
+    "unknown") never confirms that the runner ended.
+    """
     deadline = time.monotonic() + seconds
     while True:
-        if lock_state(run_dir, supervisor) != "held":
+        if lock_state(run_dir, supervisor) == "free":
             return True
         if time.monotonic() >= deadline:
             return False
@@ -1366,7 +1381,9 @@ def _wait_lock_released(run_dir, supervisor, seconds):
 
 
 def cancel_command(run_dir):
-    """--cancel RUNDIR: stop a detached run's runner; 0 once it has ended.
+    """--cancel RUNDIR: stop a detached run's runner; 0 once its lock is
+    observed free, 1 when refused or not observed free, 2 for an invalid
+    private run directory.
 
     Refused (exit 1, nothing signalled) unless the run was launched with
     --start, its supervisor lock is held, and the recorded runner is

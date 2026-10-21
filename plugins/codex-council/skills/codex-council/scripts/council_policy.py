@@ -18,7 +18,7 @@ from council_workspace import WorkspaceError
 
 POLICY_KEYS = frozenset({"sandbox", "network", "external_tools", "continuity",
                          "required", "authorization"})
-# The default-on external surfaces examined on codex-cli 0.163.0 that reach
+# The default-on external surfaces of codex-cli 0.163 that reach
 # outside the command sandbox or install things. This is not a promise about
 # tool classes a later Codex adds; a new surface needs its own review.
 DISABLED_FEATURES = ("apps", "plugins", "browser_use", "browser_use_external",

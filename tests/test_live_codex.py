@@ -851,7 +851,8 @@ class LiveDiscoveryTests(LiveCouncilCase):
 
 
 class LiveInheritanceTests(LiveCouncilCase):
-    """A role without model, effort, or selection sends no override."""
+    """A role without model, effort, or selection sends no model or effort
+    override; execution-policy overrides remain."""
 
     def test_inherited_role_sends_no_override_fresh_then_resume(self):
         role_id = "live-inherit"

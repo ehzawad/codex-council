@@ -425,7 +425,7 @@ class SelectionObjectParsingTests(unittest.TestCase):
                 self.assertIn(REWRITE, err)
 
     def test_non_finite_numbers_are_rejected(self):
-        for constant in ("NaN", "Infinity", "-Infinity"):
+        for constant in ("NaN", "Infinity", "-Infinity", "1e999", "-1e999"):
             raw = ('[{"id": "a", "label": "A", "instruction": ["x"], '
                    '"selection": {"mode": %s}}]' % constant)
             with self.subTest(constant=constant):
@@ -694,7 +694,8 @@ class ResolverTests(unittest.TestCase):
                 self.assertEqual(decision.requested_effort, "brisk")
 
     def test_unavailable_launch_discovery_falls_back_to_inheritance(self):
-        """A failed launch discovery never blocks; it inherits."""
+        """Unusable launch catalog evidence makes a valid automatic choice
+        inherit; it does not block the role."""
         for role in (_role(model=VEGA, effort="brisk", mode="routed"),
                      _role(effort="brisk", mode="native_effort")):
             decision = _resolve(role, _snapshot(),
@@ -752,8 +753,9 @@ class ResolverTests(unittest.TestCase):
             {"reasoningEffort": "deliberate", "description": "d"}],
             defaultReasoningEffort="deliberate")] + without_vega
         cases = (
-            # The launch snapshot is never written anywhere, so the note
-            # names the stage, not an id no reader could look up.
+            # The launch snapshot is retained as launch-model-snapshot.json
+            # evidence, not a planning snapshot id, so the note names the
+            # stage.
             (without_vega, VEGA, NOW,
              f"model '{VEGA}' is not an advertised execution id in launch "
              "discovery"),
@@ -2193,7 +2195,8 @@ class RunRoleSelectionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_fallback_role_resumes_its_saved_thread_bare(self):
         """A routed role that fell back resumes the thread an earlier council
-        saved: same UUID, no -m/-c, and the thread is never reset."""
+        saved: same UUID, no model or effort override (execution-policy
+        overrides remain), and the thread is never reset."""
         codex_council.save_session("architect", "live-sid")
         ok = codex_council.CodexRun(returncode=0, stdout="\n".join([
             json.dumps({"type": "thread.started", "thread_id": "live-sid"}),
@@ -2290,7 +2293,8 @@ class ReportingTests(unittest.TestCase):
     def test_model_selection_paragraph_follows_the_summary(self):
         caveat = ("codex exec does not report the model or effort that "
                   "served a turn; values above are what the council sent, "
-                  "and \"native inheritance\" means no override was sent.")
+                  "and \"native inheritance\" means no model or effort "
+                  "override was sent.")
         for sentence, expected in (
             (None, "launch discovery not run (no runtime-grounded selections)"),
             ("launch discovery ok (codex-cli 9.9.9)",
@@ -2530,7 +2534,8 @@ class LaunchEndToEndTests(unittest.TestCase):
                 os.remove(path)
 
     def launch_discovered(self):
-        """True when the app-server was spawned since forget_discovery."""
+        """True when the model-discovery app-server was spawned since
+        forget_discovery (execution-policy probes are not counted)."""
         return os.path.exists(os.path.join(self.pid_dir, "server.pid"))
 
     def catalog(self, role_id="architect"):
@@ -2653,7 +2658,8 @@ class LaunchEndToEndTests(unittest.TestCase):
                              for a in argv))
 
     def test_inherited_roles_send_nothing_and_never_discover(self):
-        """Fresh and resume carry no -m/-c; no launch discovery."""
+        """Fresh and resume carry no model or effort override (execution-
+        policy overrides remain); no launch model-catalog discovery."""
         self.stage([_entry("architect")])
         for phase in ("fresh", "resume"):
             with self.subTest(phase=phase):
@@ -2740,7 +2746,8 @@ class LaunchEndToEndTests(unittest.TestCase):
         self.assertIn("(native inheritance; routing fell back)", proc.stdout)
 
     def test_launch_discovery_failure_inherits_and_the_run_succeeds(self):
-        """An unavailable launch discovery never blocks the council."""
+        """Unusable launch catalog evidence makes the automatic choices
+        inherit; with valid authoring and policy evidence the council runs."""
         snapshot_id = self.discover()
         self.stage([_routed(snapshot_id=snapshot_id),
                     _native_effort("tuner", snapshot_id=snapshot_id)])
@@ -2778,7 +2785,8 @@ class LaunchEndToEndTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         (argv,) = self.argvs()
         self.assert_no_overrides(argv)
-        # The launch snapshot is in memory only: the note names the stage.
+        # The launch snapshot is launch-model-snapshot.json evidence, not a
+        # planning snapshot id: the note names the stage.
         self.assertIn(
             "[codex-council:architect] routing fell back to native "
             "inheritance: selection evidence changed since discovery: "
@@ -3068,8 +3076,7 @@ class LaunchEndToEndTests(unittest.TestCase):
         self.assertEqual(self.saved_thread("architect"), thread)
 
     def test_a_rejected_model_id_naming_a_setting_keeps_the_thread(self):
-        """The runtime review's reproduction: explicit pins whose ids
-        contain service_tier, model_reasoning_effort, or reasoning.effort,
+        """Explicit pins whose ids contain service_tier, model_reasoning_effort, or reasoning.effort,
         refused with a structured model_not_found that also looks stale,
         fail once as [model-rejected] and never replace the saved state."""
         self.stage([_entry()])
@@ -3320,7 +3327,8 @@ class LaunchEndToEndTests(unittest.TestCase):
             "user to update the Codex configuration (model) or to name a "
             "model to pin._", proc.stdout)
         self.assertNotIn("Re-run this role", proc.stdout)
-        # The inherit re-run the old advice asked for sends the same model.
+        # An inheriting re-run sends the same native model, so inheriting
+        # cannot repair a rejected native model.
         self.reset_argvs()
         self.run_dir = self._mkdir("inherit-rerun")
         self.stage([_entry(text=text)])
@@ -3372,7 +3380,8 @@ class LaunchEndToEndTests(unittest.TestCase):
     def test_resume_after_a_native_default_change_warns_on_the_same_thread(self):
         """The thread was recorded on the native model LYRA. The native
         default then moves to NATIVE and LYRA retires. The inherited role
-        resumes the same UUID with no overrides and no launch discovery,
+        resumes the same UUID with no model or effort override and no
+        launch model-catalog discovery,
         and Codex's own advisory is relayed verbatim."""
         self.scenario(self._native_scenario(LYRA))
         self.stage([_entry()])
@@ -3395,7 +3404,8 @@ class LaunchEndToEndTests(unittest.TestCase):
     def test_a_routed_thread_resumes_natively_after_its_model_retires(self):
         """A routed role's model retires between councils. The next
         council plans the same route, the launch falls back, and the role
-        resumes the same thread with no overrides: the fallback is noted,
+        resumes the same thread with no model or effort override: the
+        fallback is noted,
         Codex's advisory names the model change, and the thread is kept."""
         snapshot_id = self.discover()
         self.stage([_routed(model=VEGA, effort="deliberate",
@@ -3625,8 +3635,7 @@ class LaunchEndToEndTests(unittest.TestCase):
                     council_common.STAGED_LAUNCH_RESTART), 1, logged)
                 self.assertNotIn("re-run --check-staging-dir", logged)
                 self.assertNotIn("re-run the pre-flight", logged)
-                # What the old hint alone led to: a pre-flight re-run in
-                # the same directory, which is refused.
+                # A consumed directory cannot be preflighted again.
                 rerun = self.run_script(
                     "--check-staging-dir", self.run_dir,
                     "--skill-contract", EPOCH)

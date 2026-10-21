@@ -1,4 +1,4 @@
-"""Versioned invocation contracts on top of the existing council supervisor.
+"""Versioned invocation contracts for the council supervisor.
 
 The orchestrator owns task interpretation and whether to invoke. This module
 owns capture, task identity, per-role workspace bindings and metadata discovery.
@@ -213,8 +213,9 @@ def bind_roles(run_dir: str, roles: list[Any], body: str, *, at_launch: bool,
 
 def discover_prepared(run_dir: str, roles: list[Any], body: str) -> None:
     """Each role of a prepared run owns its model snapshot, discovered in the
-    same resolved workspace path it executes in. Each summary ends with its
-    role's catalogs/<role>/model-snapshot.json path."""
+    same resolved workspace path it executes in. Each summary ends with the
+    snapshot path under the role's catalog directory recorded in run.json
+    (a hashed role key for ids longer than 32 characters)."""
     plan = _require_plan(run_dir, roles, body)
     directory = private_dir(run_dir)
     from council_discovery import _discover_command
@@ -246,7 +247,7 @@ def resolve_selections(roles: list[Any], run_dir: str, routing_mode: str,
         if snapshot is not None:
             snapshots.append(snapshot)
             atomic_json(Path(role.evidence_dir) / "launch-model-snapshot.json", snapshot)
-    # The existing renderer accepts one discovery summary. Never imply a single
+    # The report renderer takes one discovery summary. Never imply a single
     # catalog governed all workers: per-role evidence stays in each directory.
     launch = None
     if snapshots:

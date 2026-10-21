@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Liveness scenarios: the real runner CLI end to end against a fake codex.
 
-Each scenario stages a private run directory, launches the council attached,
-as direct CLI use does (stdout to out.md, stderr to err.log; S8-S12 use
---start) with the fake `codex` from fake_codex.py first on PATH, follows it
+Each scenario stages a private run directory and launches the council with
+the fake `codex` from fake_codex.py first on PATH: S0-S7 run the supervised
+child through the test harness (stdout to out.md, stderr to err.log), and
+S8-S12 use the public --start. Each follows it
 with `--follow`, disturbs it, and prints one verdict line with the number
 of lines the follower emitted:
 
@@ -13,7 +14,7 @@ of lines the follower emitted:
   S3  the runner is alive but its event loop is blocked (SIGSTOP).
   S4  the follower's parent process dies.
   S5  a role is byte-silent for a while, then succeeds.
-  S6  a role writes stdout lines no JSON parser accepts while its stderr
+  S6  a role writes stdout lines the Python decoder rejects while its stderr
       keeps printing, then succeeds.
   S7  the runner's process group gets SIGTERM while a role is silent: the
       interruption is clean and settled replies stay.
@@ -660,7 +661,7 @@ def _fake_survivors(c, timeout=10):
     return [pid for pid in pids if _wait_gone(pid, timeout) is None]
 
 
-def s7_tracked_stop(runner, fake_bin):
+def s7_group_sigterm(runner, fake_bin):
     roles = [_role("quick", "Review the quick lens."),
              _role("silent", f"{SENTINELS['sleep_secs']}300.")]
     with Council(runner, fake_bin, roles) as c:
@@ -668,8 +669,8 @@ def s7_tracked_stop(runner, fake_bin):
         follower = c.follow()
         settled = follower.wait_for(r"^\[codex-council\] \d/2 quick: ok ", 30)
         active = c.wait_status(_role_active("silent"), 15) is not None
-        # What the host does at its background time limit: SIGTERM to the
-        # tracked task's process group (the runner leads it).
+        # Send SIGTERM to the harness-launched supervisor's process group
+        # (the runner leads it).
         os.killpg(c.proc.pid, signal.SIGTERM)
         runner_code = c.wait_runner(30)
         code = follower.wait_exit(15)
@@ -910,7 +911,7 @@ SCENARIOS = {
     "S4": s4_follower_orphaned,
     "S5": s5_silent_role,
     "S6": s6_malformed_lines,
-    "S7": s7_tracked_stop,
+    "S7": s7_group_sigterm,
     "S8": s8_parent_death,
     "S9": s9_start_killed,
     "S10": s10_concurrent_starts,

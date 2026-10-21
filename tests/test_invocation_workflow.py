@@ -310,6 +310,11 @@ class CaptureTests(WorkspaceCase):
         path.chmod(0o600)
         with self.assertRaisesRegex(workspace.WorkspaceError, "duplicate"):
             workspace.read_json(path)
+        for number in ("NaN", "1e999"):
+            path.write_text('{"a": %s}' % number)
+            with self.subTest(number=number), self.assertRaisesRegex(
+                    workspace.WorkspaceError, "non-finite"):
+                workspace.read_json(path)
         write_json(path, {"a": 1})
         path.chmod(0o644)
         with self.assertRaises(workspace.WorkspaceError):
@@ -537,7 +542,7 @@ class WorkflowTests(WorkspaceCase):
             workflow.prepare(str(self.run), roles, body)
         self.assertEqual(before, (self.run / "run.json").read_bytes())
 
-    def test_failed_capture_cannot_be_treated_as_legacy_run(self):
+    def test_an_incomplete_capture_is_refused(self):
         roles, body = self.stage()
         (self.run / "prepare.lock").touch(mode=0o600)
         with self.assertRaisesRegex(workspace.WorkspaceError, "capture did not finish"):

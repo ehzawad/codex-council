@@ -424,9 +424,9 @@ class RunCouncilReplyFilesTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(body, report)
 
     async def test_stale_resume_warning_reaches_reply_file_and_report(self):
-        """A saved thread Codex no longer has: the role reruns fresh, and its
-        result, reply file, and report section all say continuity was
-        lost."""
+        """A saved thread Codex no longer has, under a replay-safe policy: the
+        role reruns fresh, and its result, reply file, and report section
+        all say continuity was lost."""
         codex_council.save_session("architect", "stale-sid")
 
         async def fake_subproc(cmd, prompt, role_id=None):
@@ -570,7 +570,8 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(lines[0], "[codex-council] preparing 2 captured "
                                    "contributions; no worker dispatched yet")
         self.assertTrue(lines[1].startswith("[codex-council] dispatching 2 roles"))
-        # No runtime-grounded selection: the launch ran no discovery.
+        # No runtime-grounded selection: the launch ran no model-catalog
+        # discovery (execution-policy probes still ran).
         self.assertEqual(
             lines[2],
             "[codex-council] model selection: routing=auto; "

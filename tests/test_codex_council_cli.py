@@ -41,7 +41,7 @@ from fake_codex import EXEC_SENTINELS  # noqa: E402
 # retriable), replies with a body embedding a forged CODEX_COUNCIL_DONE
 # line, fails with a 503 on its first invocation only, makes the council
 # state directory read-only before replying, hangs byte-silent, or writes
-# stdout lines no JSON parser accepts (then, with a sleep, goes silent).
+# stdout lines the Python decoder rejects (then, with a sleep, goes silent).
 FAIL_SENTINEL = EXEC_SENTINELS["fail"]
 STDOUT_ERROR_SENTINEL = EXEC_SENTINELS["stdout_error"]
 STATUS400_429_SENTINEL = EXEC_SENTINELS["status400_429"]
@@ -727,9 +727,9 @@ class StallWatchdogCliTests(CouncilCLITestCase):
         self.assertEqual(proc.stdout, "")
 
     def test_silent_hang_is_stall_killed_retried_then_terminal(self):
-        """End-to-end reproduction of the silent-wedge incident: a codex that
-        emits no bytes is terminated at the threshold, retried once (replay
-        safe — no tool work began), then reported terminally."""
+        """A codex that emits no bytes reaches the watchdog: it is terminated
+        at the threshold, retried once (no side-effect-capable work was
+        observed under a read-only policy), then reported terminally."""
         env = dict(self.env)
         env["CODEX_COUNCIL_STALL_SECS"] = "1"
         proc = self._launch(
@@ -739,8 +739,8 @@ class StallWatchdogCliTests(CouncilCLITestCase):
         self.assertIn("stall threshold reached", proc.stderr)
         self.assertIn("retriable error on attempt 1/2", proc.stderr)
         self.assertIn("[retriable:stall]", proc.stdout)
-        self.assertIn("no tool work had begun, so replay is safe",
-                      proc.stdout)
+        self.assertIn("no side-effect-capable work was observed and the "
+                      "role's policy permits replay", proc.stdout)
         self.assertNotIn("retrying", proc.stdout)
         self.assertRegex(
             self._last_nonempty_stderr_line(proc.stderr),

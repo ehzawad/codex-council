@@ -3,8 +3,8 @@
 Runs without the Codex CLI installed. Covers helper behavior:
 key/state per role, JSONL parsing, error classifiers, prompt
 composition, command shape, the resume-thread-id mismatch footgun,
-retry-on-retriable, fan-out aggregation, and (DocsContractTests) the
-documentation contract of SKILL.md, its references, README, and DESIGN.
+retry-on-retriable, and fan-out aggregation. Documentation contracts are
+tested in tests/test_documentation_contract.py by DocumentationContractTests.
 Reply files and per-role overrides are covered in
 tests/test_replies_and_overrides.py; --follow, --status, and --reap in
 tests/test_liveness.py; model discovery and the selection contract in
@@ -2165,9 +2165,9 @@ class ParseRolesJsonTests(unittest.TestCase):
 
 
 class UnknownRoleKeyTests(unittest.TestCase):
-    """Stray filler keys ('"_": ""', '"instruction_note": ""') are the
-    corruption signature of a glitched LLM write; they must be rejected
-    with a rewrite-the-whole-file recovery message, never silently
+    """Unknown keys ('"_": ""', '"instruction_note": ""') expose schema
+    mistakes; they must be rejected with a rewrite-the-whole-file recovery
+    message, never silently
     accepted."""
 
     def _entry_with(self, extra_keys):
@@ -2175,7 +2175,7 @@ class UnknownRoleKeyTests(unittest.TestCase):
         entry.update(extra_keys)
         return json.dumps([entry])
 
-    def test_issue2_filler_key_rejected(self):
+    def test_an_unknown_underscore_key_is_rejected(self):
         _assert_usage_exit(
             self,
             lambda: codex_council._parse_roles_json(self._entry_with({"_": ""})),
@@ -2221,10 +2221,8 @@ class UnknownRoleKeyTests(unittest.TestCase):
 
 
 class InstructionListFormTests(unittest.TestCase):
-    """List-form instruction: sentence-sized items the script joins into
-    the single paragraph Codex sees. Exists so the LLM writer never has
-    to emit a multi-KB single-line JSON string literal, the shape where
-    file-Write corruption concentrates."""
+    """List-form instruction: nonempty sentence-sized strings the script
+    joins into the single paragraph Codex sees."""
 
     def _roles(self, items):
         return codex_council._parse_roles_json(
@@ -2495,7 +2493,7 @@ class CheckStagingDirTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         os.chmod(self.tmp.name, 0o700)
-        # Preflight now requires codex on PATH; keep these tests hermetic
+        # Preflight requires codex on PATH; keep these tests hermetic
         # so they pass on codex-less machines.
         which_patcher = patch("shutil.which", return_value="/fake/bin/codex")
         which_patcher.start()
@@ -2529,8 +2527,9 @@ class CheckStagingDirTests(unittest.TestCase):
         )
 
     def test_empty_context_is_rejected_as_usage_error(self):
-        """Exit 2 like every other staging defect — exit 1 stays reserved
-        for 'every role failed at runtime'."""
+        """Exit 2 like every other staging defect; exit 1 stays for runtime
+        outcomes (no successful role, undelivered output, or incomplete
+        required coverage or evidence)."""
         self._write_valid_roles()
         self._write_context("   \n")
         _assert_usage_exit(
@@ -2765,8 +2764,9 @@ class ReadContextFileTests(unittest.TestCase):
         )
 
     def test_empty_context_file_is_usage_error(self):
-        """Exit 2 like every other staging defect; exit 1 stays reserved
-        for runtime failures (stdin defects, all-roles-failed)."""
+        """Exit 2 like every other staging defect; exit 1 stays for runtime
+        outcomes (no successful role, undelivered output, or incomplete
+        required coverage or evidence)."""
         path = self._path()
         with open(path, "w", encoding="utf-8") as f:
             f.write("   \n")
@@ -3095,10 +3095,9 @@ class NoRunLevelDeadlineTests(unittest.TestCase):
         The output-inactivity watchdog must stay hand-rolled (an
         asyncio.sleep loop over time.monotonic): the named APIs below would
         impose a deadline on the subprocess await itself, which is exactly
-        what the design forbids. The one allowed exception is not a role's
-        deadline: the project root's `git rev-parse` in
-        council_common._project_root is capped, so a hung git can stall
-        neither discovery nor dispatch."""
+        what the design forbids. Bounded metadata, process-table,
+        post-exit-drain and teardown operations are allowed (the table
+        below); none of them imposes a run-level deadline."""
         import io as _io
         import re as _re
         import tokenize as _tokenize
@@ -3342,9 +3341,9 @@ class EventFlagScannerTests(unittest.TestCase):
                 self.assertTrue(s.unsafe_to_replay)
 
     def test_an_item_type_that_is_not_a_string_is_unknown_work(self):
-        """A list or object type once raised TypeError out of feed(), which
-        ended the stdout pump before the attempt was marked unsafe; the
-        lines after it are still scanned."""
+        """A list, object or other non-string item type marks the attempt
+        unsafe without raising out of feed(), and the lines after it are
+        still scanned."""
         for item_type in ([], {}, 5, None, True):
             with self.subTest(item_type=item_type):
                 event = {"type": "item.started", "item": {"type": item_type}}
@@ -3432,7 +3431,7 @@ class StallPolicyTests(unittest.IsolatedAsyncioTestCase):
             result = await codex_council._run_role_attempts(role, "prompt")
         self.assertFalse(result.ok)
         self.assertTrue(result.error.startswith("[retriable:stall]"))
-        self.assertIn("no tool work had begun", result.error)
+        self.assertIn("no side-effect-capable work was observed", result.error)
         # The budget is spent: the final error never promises a retry.
         self.assertNotIn("retrying", result.error)
         self.assertEqual(result.attempts, codex_council.MAX_RETRY_ATTEMPTS)

@@ -225,11 +225,11 @@ class StartCommandTests(StartCase):
         self.assertEqual(os.listdir(self.pid_dir), [])
 
     def test_a_launched_or_claimed_directory_is_refused(self):
-        """A tracked launch's files, a planted lock, or a symlinked lock:
+        """Another launch's files, a planted lock, or a symlinked lock:
         exit 2, and nothing is created, truncated, or followed."""
-        tracked = self.stage("tracked")
+        launched = self.stage("launched")
         for name in ("out.md", "err.log"):
-            with open(os.path.join(tracked, name), "w",
+            with open(os.path.join(launched, name), "w",
                       encoding="utf-8") as f:
                 f.write("a running council's output\n")
         planted = self.stage("planted")
@@ -238,7 +238,7 @@ class StartCommandTests(StartCase):
         linked = self.stage("linked")
         target = os.path.join(self.base, "target")
         os.symlink(target, os.path.join(linked, "supervisor.lock"))
-        for run_dir, present in ((tracked, "out.md, err.log"),
+        for run_dir, present in ((launched, "out.md, err.log"),
                                  (planted, "supervisor.lock"),
                                  (linked, "supervisor.lock")):
             with self.subTest(run_dir=os.path.basename(run_dir)):

@@ -10,9 +10,10 @@ check is exact membership in the discovered data, which is untrusted text
 and reaches output only through _report_inline (_log_inline in err.log).
 
 This module also owns the Role object the resolver works on, the
-`selection` object grammar of roles.json, the orchestration shared by the
-preflight and the launch (_resolve_run_selections: authoring validation,
-then at most one fresh discovery per council, at launch only), and the
+`selection` object grammar of roles.json, the per-role orchestration shared
+by the preflight and the launch (_resolve_run_selections: authoring
+validation, then, at launch only, a fresh discovery in the role's own
+scratch cwd for an automatically selected role), and the
 text that reports each decision in err.log, out.md, reply files, and the
 preflight plan.
 """
@@ -79,7 +80,7 @@ NO_AUTOMATIC_SELECTIONS = "no runtime-grounded selections"
 MODEL_SELECTION_CAVEAT = (
     "codex exec does not report the model or effort that served a turn; "
     "values above are what the council sent, and \"native inheritance\" "
-    "means no override was sent."
+    "means no model or effort override was sent."
 )
 
 
@@ -105,9 +106,11 @@ class SelectionDecision:
     dispatch_effort (None = that override is not sent); the requested
     values are kept for reporting. `note` is a fallback reason or a user-pin
     advisory. `native_model` is the native model the resolving evidence
-    proves (None when unproven or absent): it is never sent, and only tells
-    a refusal of a sent model that equals it (a routed or pinned model that
-    is the native one) that an inheriting re-run would send it again.
+    proves (None when unproven or absent). The field is advisory and is not
+    independently dispatched (native_effort resolution can place the same
+    value in dispatch_model); it tells a refusal of a sent model that equals
+    it (a routed or pinned model that is the native one) that an inheriting
+    re-run would send it again.
     """
     provenance: str
     requested_model: str | None = None
@@ -379,7 +382,9 @@ def _native_effort_gap(snapshot, effort, planned_model=None):
     `planned_model` (launch only) is the native model of the planning
     snapshot, whose effort descriptions the choice was made from. An effort
     is never carried onto another model, even one that advertises the same
-    spelling: the same name need not mean the same behavior.
+    spelling: the same name need not mean the same behavior. There is no
+    retirement check here: only routed selections reject an advertised
+    retirement.
     """
     gap = _native_model_gap(snapshot)
     if gap:
@@ -515,7 +520,8 @@ def _resolve_selection(role, planning, launch, routing_mode, now):
                 role, "fallback",
                 note=f"{stage} reports routing unavailable: {reasons}",
             )
-        # At launch the snapshot id is in memory only: name the stage.
+        # The launch snapshot is retained as launch-model-snapshot.json
+        # evidence, not as a planning snapshot id: name the stage.
         gap = _routed_evidence_gap(evidence, role.model, role.effort, now,
                                    stage if launch is not None else None)
         model = role.model
@@ -645,16 +651,19 @@ def _resolve_run_selections(roles, run_dir, routing_mode, at_launch, project_roo
 
     Reads this run's planning snapshot from `run_dir`; an authoring defect
     exits 2 before any discovery. Returns (roles with `decision` set, the
-    launch snapshot or None). Only the launch (`at_launch`) discovers, and
-    only when a role carries an automatic selection and routing is on —
-    councils of inherited and explicit roles pay no discovery latency. The
-    launch snapshot is frozen for the whole council and never written over
-    the planning snapshot. The preflight passes the resolver no launch
+    launch snapshot or None). The caller passes one role and that role's
+    catalog directory. Only the launch (`at_launch`) discovers, in the
+    role's own scratch cwd (`project_root`), and only when the role carries
+    an automatic selection and routing is on: inherited and explicit-pin
+    roles skip launch model-catalog discovery (execution-policy metadata
+    probes still run). The caller retains the launch snapshot separately as
+    evidence/<key>/launch-model-snapshot.json; it never overwrites the
+    planning snapshot. The preflight passes the resolver no launch
     snapshot, so its decisions are the plan.
 
     The preflight judges authoring, and resolves, at the current time. The
     launch judges authoring as of the planning snapshot's creation, so a
-    choice already retired at discovery stays an exit-2 defect, while a
+    routed choice already retired at discovery stays an exit-2 defect, while a
     retirement that passes after discovery is changed evidence: the
     resolver falls back to inheritance. Its clock is read only after launch
     discovery has finished, so a retirement that passes while discovery

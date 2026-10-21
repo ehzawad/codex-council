@@ -3,19 +3,20 @@
 
 Claude decides when a task-shaped contribution is useful. This runner captures
 current inputs into independent copies, resolves per-role model choices in the
-actual execution cwd, launches the existing detached supervisor, and records
+actual execution cwd, launches a detached supervisor, and records
 raw protocol evidence separately from collaborator interpretation. It neither
 judges substantive claims nor applies candidate changes to the live project.
 
 The only flow: --prepare, --discover, --check-staging-dir, --start; then
 --follow/--status and --freshness before reconciliation. --cancel and --reap
-retain their verified process-identity and supervisor-lock guarantees.
+act only on verified process identities and the supervisor lock.
 Workers run only in --start's supervised child, only for a completed capture,
 and at most once per run directory.
 
-All retry paths require both a transient failure and replay safety. A role
-that may have performed tool work is never automatically replayed, including
-a stale-looking resume failure. Replies survive state-persistence failures.
+Transient retries and stale-resume recovery both require replay safety;
+stale-resume recovery starts fresh within the current logical attempt. A role
+that may have performed tool work is never automatically replayed. Replies
+survive state-persistence failures.
 
 POSIX/Python 3.12+; standard-library only. A copied workspace is not a whole
 process sandbox, configuration inspection is not runtime attestation, and
@@ -166,8 +167,9 @@ IO_FAILED_WARNING = (
     "an output reader or the prompt writer failed ({}); the output may be "
     "incomplete, so a stall is not retried"
 )
-# A resume whose saved thread Codex no longer has reruns the role fresh
-# with the same prompt; the role's result says its earlier turns are gone.
+# A replay-safe resume whose saved thread Codex no longer has reruns the
+# role fresh with the same prompt; the role's result says its earlier turns
+# are gone. An unsafe one is replay-blocked:stale instead.
 STALE_RESUME_WARNING = (
     "saved Codex thread unavailable; started fresh with the current context "
     "(prior continuity lost)"
@@ -429,7 +431,7 @@ def _max_parallel_roles():
 
 
 def _project_key(role_id):
-    """Stable state key for (project, role, optional session-key)."""
+    """State key for (logical source, task id, optional session key, role)."""
     base = hashlib.sha256(_logical_project_root().encode()).hexdigest()[:16]
     if _WORKFLOW["plan"] is not None:
         base += "-" + hashlib.sha256(_WORKFLOW["plan"]["task_id"].encode()).hexdigest()[:16]
@@ -442,7 +444,8 @@ def _project_key(role_id):
 
 
 def _state_path(role_id):
-    """State path for (project, session key, role); see _project_key."""
+    """State path for (logical source, task id, session key, role); see
+    _project_key."""
     return os.path.join(STATE_DIR, f"{_project_key(role_id)}.json")
 
 
@@ -495,8 +498,9 @@ def save_session(role_id, session_id):
     """Persist session metadata through the shared atomic writer.
 
     _atomic_write_private: a 0600 temp file in STATE_DIR, fsync, then
-    os.replace, so a crash or power loss never leaves a truncated state
-    file that load_session would read as no thread. An OSError propagates
+    os.replace, so a reader never sees a partially written state file. The
+    parent directory is not fsynced, so the replacement itself is not
+    guaranteed to survive power loss. An OSError propagates
     (the temp file already removed) so each caller keeps its own
     reply-first warning.
     """
@@ -669,11 +673,13 @@ class _EventFlagScanner:
     stream is not a complete record of tool calls (codex exec --json emits no
     item for a sandbox-denied code-mode command), so _run_role_once also
     treats every attempt of a role whose tools can leave effects as unsafe. A
-    non-blank line that is not a JSON object (it does not decode, is nested
-    too deeply, holds an out-of-range number, or is another JSON value)
-    could hide such an item, so it marks the attempt unsafe to replay too,
-    and so does anything else scanning a line raises: feed() and finish()
-    never raise, so scanning never stops the stdout pump.
+    non-blank line that is not a JSON object (Python's decoder rejects it,
+    for example for excessive nesting or the integer-digit limit, or it is
+    another JSON value) could hide such an item, so it marks the attempt
+    unsafe to replay too, and so does anything else scanning a line raises:
+    feed() and finish() never raise, so scanning never stops the stdout
+    pump. Only item.started and item.completed events are checked against
+    the safe-item allowlist; other top-level event types are accepted.
     """
 
     _SAFE_ITEM_TYPES = frozenset({"agent_message", "reasoning", "error"})
@@ -708,7 +714,8 @@ class _EventFlagScanner:
             self.unsafe_to_replay = True
 
     def _replay_safe(self, event):
-        """False when `event` is, or could hide, side-effect-capable work."""
+        """False for a non-object, or an item event whose item type is not
+        in the safe-item allowlist; other top-level event types are True."""
         if not isinstance(event, dict):
             return False
         event_type = event.get("type")
@@ -1002,8 +1009,10 @@ def _stalled_role_result(role, run, stored_id, attempt, started, warning=None):
       * turn.completed AND a final agent_message buffered: the reply is
         definitively complete — the kill hit a wedged shutdown. Success with
         a warning; state saved best-effort; no retry.
-      * no side-effect-capable item started: replay is safe — retriable
-        through the ordinary shared retry budget. The text says why, not
+      * no side-effect-capable item was observed (the caller's policy gate
+        has already marked every attempt of a role whose tools can leave
+        effects unsafe): retriable through the ordinary shared retry
+        budget. The text says why, not
         that a retry follows: the same text is the final error once the
         budget is spent (the retry itself is logged by _run_role_attempts).
       * otherwise: terminal — replaying could duplicate tool side effects.
@@ -1030,7 +1039,8 @@ def _stalled_role_result(role, run, stored_id, attempt, started, warning=None):
             role=role, ok=False,
             error=(
                 f"[retriable:stall] no output for {stall}s (watchdog "
-                f"{stall}s); no tool work had begun, so replay is safe"
+                f"{stall}s); no side-effect-capable work was observed and "
+                "the role's policy permits replay"
             ),
             elapsed_seconds=elapsed, attempts=attempt, warning=warning,
             retriable=True,
@@ -1109,7 +1119,8 @@ async def _run_role_once(role, prompt, attempt):
 
 async def _run_role_invocation(role, attempt, run_codex):
     """One attempt for one role: a fresh run, or a resume that restarts
-    fresh, with STALE_RESUME_WARNING, when its saved thread is stale. No
+    fresh, with STALE_RESUME_WARNING, when its saved thread is stale and
+    the failed resume is replay-safe (otherwise replay-blocked:stale). No
     retry logic here.
 
     The command carries only the role's resolved dispatch values; the
@@ -1745,7 +1756,7 @@ def _parse_args(argv):
             "council's actionable err.log progress, --status RUNDIR prints "
             "a snapshot, and --reap RUNDIR ends the codex process groups of "
             "a runner that is gone. --start RUNDIR launches the staged "
-            "council detached (outside any host background task), and "
+            "council detached in its own session, and "
             "--cancel RUNDIR stops it."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1757,8 +1768,9 @@ def _parse_args(argv):
         "--check-staging-dir", default=None, metavar="DIR",
         help=(
             "Validate a prepared DIR (its capture, roles.json, context.md, "
-            "and each role's observed execution policy), then exit without "
-            "launching Codex, printing one selection-plan line per role and "
+            "and each role's observed execution policy, read through Codex "
+            "metadata probes), then exit without starting any worker or "
+            "turn, printing one selection-plan line per role and "
             "the execution plan. Automatic selections are checked against "
             f"each role's catalogs/<role>/{SNAPSHOT_FILENAME} here and "
             "revalidated at launch; no model discovery runs. A DIR without a "
@@ -1779,8 +1791,9 @@ def _parse_args(argv):
             "one flushed line per event) and exit 0 after the "
             "CODEX_COUNCIL_DONE sentinel, an interruption line, or a "
             "'runner aborted' line. Per-attempt start lines and the "
-            "heartbeat stay in err.log unless --verbose. Exits 3 if no "
-            f"dispatch line appears within {FOLLOW_START_SECS}s, 4 with one "
+            "heartbeat stay in err.log unless --verbose. Exits 3 if "
+            "neither a preparing nor a dispatch line appears within "
+            f"{FOLLOW_START_SECS}s, 4 with one "
             f"line when the runner recorded in RUNDIR/{STATUS_FILENAME} is "
             f"gone or has not ticked for {TICK_GIVE_UP_SECS}s (one warning "
             f"at {TICK_WARN_SECS}s), 5 when the "
@@ -1801,23 +1814,31 @@ def _parse_args(argv):
             "responding, gone, done, interrupted, aborted), up to five "
             "unfinished roles (state, attempt, quiet seconds, and codex pid) "
             "and a count of the rest, live codex process groups when the "
-            "runner is gone, and one next action. Always exits 0."
+            "runner is gone, and one next action. Exits 0 once the report "
+            "is printed (unknown liveness included), 2 for invalid "
+            "arguments or run directory, and 1 when stdout is unavailable."
         ),
     )
     parser.add_argument(
         "--start", default=None, metavar="RUNDIR",
         help=(
             "Detached launch of the staged council in RUNDIR (roles.json and "
-            "context.md): validate it exactly as --check-staging-dir does "
-            "(a refusal exits 2 and leaves RUNDIR untouched), claim it "
+            "context.md): repeat --check-staging-dir's local contract, "
+            "capture and selection-authoring checks (a refusal exits 2 and "
+            "leaves RUNDIR untouched; the detached child reobserves "
+            "execution policy and revalidates automatic choices before "
+            "dispatch), claim it "
             f"atomically ({SUPERVISOR_LOCK_FILENAME}, err.log, and out.md, "
             "each created exclusively and 0600; a directory that already "
             "launched exits 2), and start the council as a supervisor in "
             "its own session that holds the lock for its whole life and "
-            f"writes {SUPERVISOR_FILENAME}. Exits 0 with one 'started' line "
-            "and the --follow, --status, and --cancel commands once the "
-            "supervisor is running, or 1 when it exited at once (read "
-            "err.log; the directory is used up). Run it as an ordinary "
+            f"writes {SUPERVISOR_FILENAME}. Waits a bounded few seconds "
+            "for that record, then exits 0 with one "
+            "'started' line, a note when the record is not written yet or "
+            "the runner already ended, and the --follow, --status, and "
+            "--cancel commands; exits 1 when the supervisor could not be "
+            "spawned or exited before writing its record (read err.log; "
+            "the directory is used up). Run it as an ordinary "
             "foreground command, never in a background task and never "
             "with &, nohup, or setsid. Never retry it in the same RUNDIR."
         ),
@@ -1830,8 +1851,9 @@ def _parse_args(argv):
             f"{STATUS_FILENAME}) name the same live runner, SIGTERM that "
             "runner, which tears down its codex process groups; after a "
             "grace, SIGKILL it if it is still the same process (then run "
-            "--reap). Exits 0 once the runner has ended, 1 when refused "
-            "(nothing is signalled) or when it did not end."
+            "--reap). Exits 0 once the lock is observed free, 1 when "
+            "refused (nothing is signalled) or when it was not observed "
+            "free, and 2 for invalid arguments or run directory."
         ),
     )
     parser.add_argument(
@@ -1845,8 +1867,8 @@ def _parse_args(argv):
             "gone: SIGTERM, then SIGKILL, each recorded codex process group "
             "whose leader is still this run's codex, and the process groups "
             "and processes that codex started, then print what was done "
-            "(exit 0). Refused with exit 1 otherwise. Never touches saved "
-            "threads or files."
+            "(exit 0). Refused with exit 1 otherwise; invalid arguments or "
+            "run directory exit 2. Never touches saved threads or files."
         ),
     )
     parser.add_argument(
@@ -2081,19 +2103,17 @@ def _validate_role_label(label, ctx):
 
 
 ROLE_FIELDS = ("id", "label", "instruction")
-# Optional per-role selection keys; omitting all three inherits Codex's
-# native configuration.
+# Optional per-role keys: omitting model, effort, and selection inherits
+# Codex's native model settings; omitting execution uses the default policy.
 OPTIONAL_ROLE_FIELDS = ("model", "effort", "selection", "execution")
 
 
 def _normalize_instruction_list(value, ctx):
     """Join a list-form instruction into one whitespace-normalized paragraph.
 
-    The list form exists because the only production writer of roles.json
-    is an LLM using a file-Write tool: multi-kilobyte single-line JSON
-    string literals are exactly where such writes corrupt. Sentence-sized
-    items on separate physical lines remove that failure surface; the
-    script reassembles the paragraph Codex actually sees.
+    The instruction is a nonempty array of nonempty strings, kept as
+    sentence-sized items on separate lines of roles.json; the script
+    reassembles the paragraph Codex actually sees.
     """
     if not value:
         _roles_usage_exit(
@@ -2128,17 +2148,15 @@ def _parse_roles_json(raw):
     """Parse the --roles-file blob into a list of Role objects.
 
     Validates each entry has exactly the id/label/instruction fields plus
-    the optional model/effort/selection keys (instruction is a list of
+    the optional model/effort/selection/execution keys (instruction is a list of
     sentence-sized strings, normalized and joined to one paragraph), id is
     well-formed, model/effort (when present) match SELECTION_VALUE_PATTERN,
     the selection object is well-formed for its mode and present whenever
     model or effort is (see _parse_role_selection), instructions follow the
     documented contract, and ids are unique within the JSON. A key repeated
     at any object level is rejected too: it would hide one value behind
-    another. Unknown keys are rejected, not ignored: stray filler fields
-    like '"_": ""' are the signature of a corrupted LLM write, so surfacing
-    them forces a clean rewrite instead of silently launching from a file
-    that already glitched once. Every validation defect carries the same
+    another. Unknown keys are rejected, not ignored, to expose schema
+    mistakes. Every validation defect carries the same
     full-rewrite recovery (ROLES_REWRITE_RECOVERY, or the staged launch's
     new-directory form it scopes in with _roles_recovery). Whether an automatic
     selection is supported by discovery evidence is checked separately
@@ -2166,8 +2184,8 @@ def _parse_roles_json(raw):
                 f"--roles-file {ctx}: unknown field(s) "
                 f"{', '.join(repr(k) for k in unknown)}. Each role object "
                 "must have exactly 'id', 'label', and 'instruction', plus "
-                "optionally 'model', 'effort', and 'selection' — no filler "
-                "keys."
+                "optionally 'model', 'effort', 'selection', and "
+                "'execution' — no other keys."
             )
         for field in ROLE_FIELDS:
             if field not in entry:
@@ -2234,7 +2252,8 @@ def _read_context_file(path, staged_launch=False):
 
     Empty and non-UTF-8 staged context files exit 2 like every other staging
     defect, so 'exit 2 = fix the staged inputs' holds uniformly; exit 1
-    stays for runtime failures (every role failing). The
+    stays for runtime outcomes (no successful role, undelivered output, or
+    incomplete required coverage or evidence). The
     preflight's recovery re-runs it; the launch passes `staged_launch`,
     whose recovery starts over in a new directory, since --start already
     claimed this one and the preflight refuses it; the same holds for a
@@ -2288,8 +2307,10 @@ def _usage_exit_unless_parent_private(arg_name, path, recovery):
 
 def _validate_staging_dir(path, prefix="--check-staging-dir: ",
                           next_step="re-run --check-staging-dir and launch."):
-    """Every check the launch makes before dispatch; (path, roles, max
-    parallel) or a usage exit (2) that leaves the directory untouched.
+    """Validate the current inputs and observed configuration; (path,
+    roles, max parallel) or a usage exit (2) that leaves the directory
+    untouched. The launch repeats the applicable checks and can refuse
+    changed or newly unavailable evidence.
 
     A directory that already holds a launch (out.md, err.log, replies/, or
     a supervisor file) is refused first: its council may still be running.
@@ -2332,8 +2353,8 @@ def _validate_staging_dir(path, prefix="--check-staging-dir: ",
 def _check_staging_dir(path):
     """Validate the per-run staging dir before launching Codex.
 
-    Runs _validate_staging_dir, so a directory the launch would refuse
-    never reports "staging OK", then prints the staging-OK line and one
+    Runs _validate_staging_dir (a point-in-time check of the current inputs
+    and observed configuration), then prints the staging-OK line and one
     selection-plan line per role.
     """
     if path == "":
@@ -2484,8 +2505,11 @@ def _fill_closed_standard_fds():
 def _start_command(run_dir):
     """--start RUNDIR: launch the staged council detached; exit 0, 1, or 2.
 
-    1. Validate exactly as the pre-flight does; a refusal exits 2 before
-       anything is created, so the directory stays untouched.
+    1. Repeat the pre-flight's local contract, capture and selection-
+       authoring checks (execution-policy probes are left to the child,
+       which reobserves policy and revalidates automatic choices before
+       dispatch); a refusal exits 2 before anything is created, so the
+       directory stays untouched.
     2. Claim the directory, in this order and each exclusively (O_EXCL,
        O_NOFOLLOW, 0600): supervisor.lock, locked with flock(LOCK_EX), then
        err.log and out.md. A concurrent --start that got there first makes
@@ -2501,8 +2525,10 @@ def _start_command(run_dir):
     4. Close this process's copies (the lock stays held by the child) and
        wait up to START_WAIT_SECS for the child to write supervisor.json.
        A child that wrote it is a start (exit 0) even if it has already
-       ended; one that exits without writing it is exit 1 (read err.log;
-       the directory is used up).
+       ended; one that exits without writing it, or a spawn failure, is
+       exit 1 (read err.log; the directory is used up). When the wait
+       runs out with the child still running and no record, it is also
+       exit 0, with a note to run --status.
     """
     prefix = "--start: "
     _fill_closed_standard_fds()
@@ -2849,8 +2875,9 @@ def main():
     _RUN.begin([role.id for role in roles])
     _diag(f"[codex-council] preparing {len(roles)} captured contributions; "
           "no worker dispatched yet")
-    # Authoring defects exit 2 here, before any worker; automatic
-    # selections are then revalidated by one fresh discovery, and every
+    # Authoring defects exit 2 here, before any worker; each automatic
+    # selection is then revalidated by a fresh discovery in its role's own
+    # scratch cwd, and every
     # role gets the decision its commands are built from. A termination
     # signal during that discovery unwinds through its teardown.
     try:
@@ -2873,8 +2900,8 @@ def main():
     )
     # A problem here only disables reply files.
     replies_dir = _prepare_replies_dir(run_dir)
-    # From here on the run publishes status.json (a failed write only costs
-    # the liveness view, never the council).
+    # Re-attach for the dispatch phase (a failed status.json write only
+    # costs the liveness view, never the council).
     _RUN.attach(os.path.join(run_dir, STATUS_FILENAME), mode="detached")
 
     _diag(
@@ -2941,9 +2968,9 @@ def main():
     if evidence_result is None or not evidence_result["required_contributions_complete"]:
         exit_code = 1
 
-    # Final, uniquely-shaped, LAST stderr line. Its presence means the stdout
-    # report is fully written; it carries the exit status so a lost/orphaned but
-    # redirected run is fully recoverable from `err.log` (tail until this line).
+    # Final, uniquely-shaped, LAST stderr line. It records that the stdout
+    # report was delivered and the runner's exit status; confirm process exit
+    # with --status and inspect evidence and freshness before reconciliation.
     # Best-effort by design: a dead stderr loses the sentinel but must not
     # change the exit code (status.json still records the end).
     _RUN.finish("done", exit_code)
