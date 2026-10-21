@@ -24,7 +24,8 @@ not accidentally create a new logical project. Fresh is the prepared default;
 resume is explicit and history is subordinate to the complete current brief.
 Saved-thread state lives in a 0700 directory with 0600 lock and state files
 whatever the umask; an owned, too-open state directory is tightened, while a
-symlinked or foreign-owned one refuses the launch and is never changed.
+symlinked or foreign-owned one is refused by the pre-flight and again at
+launch, and is never changed.
 
 The staged request, context and role capability/lens contracts are frozen by
 preparation. Model/effort/selection stay fillable after discovery. Context changes,

@@ -279,6 +279,26 @@ class HappyPathTests(CouncilCLITestCase):
         self.assertEqual(os.listdir(elsewhere), [])
         self.assertEqual(stat.S_IMODE(os.stat(elsewhere).st_mode), 0o755)
 
+    def test_the_preflight_refuses_an_unsafe_state_directory(self):
+        elsewhere = os.path.join(self.statedir.name, "elsewhere")
+        os.mkdir(elsewhere)
+        os.chmod(elsewhere, 0o755)
+        os.symlink(elsewhere, os.path.join(self.statedir.name, "codex-council"))
+        self._write_roles([
+            _role("architect", "Architect", _instruction("Review architecture")),
+        ])
+        self._write_context("please review this change\n")
+        self._prepare()
+        proc = self._run(input="",
+                         args=("--check-staging-dir", self.workdir.name))
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn("--check-staging-dir: saved-thread state directory",
+                      proc.stderr)
+        self.assertIn("is a symlink", proc.stderr)
+        self.assertNotIn("staging OK", proc.stdout)
+        self.assertEqual(os.listdir(elsewhere), [])
+        self.assertEqual(stat.S_IMODE(os.stat(elsewhere).st_mode), 0o755)
+
     def test_a_launch_under_a_permissive_umask_keeps_state_private(self):
         state_root = os.path.join(self.statedir.name, "codex-council")
         os.mkdir(state_root)

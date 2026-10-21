@@ -1766,6 +1766,7 @@ def _prepare_replies_dir(run_dir):
         return None
     try:
         os.mkdir(path, 0o700)
+        os.chmod(path, 0o700)  # the umask can only clear bits of the mode
     except FileExistsError:
         pass
     except OSError as e:
@@ -2388,8 +2389,9 @@ def _validate_staging_dir(path, prefix="--check-staging-dir: ",
 
     A directory that already holds a launch (out.md, err.log, replies/, or
     a supervisor file) is refused first: its council may still be running.
-    A directory without a completed capture is refused. A directory, roles
-    file, context, missing codex
+    A directory without a completed capture is refused, and so is an unsafe
+    saved-thread state directory (see _ensure_state_dir), which is created
+    private when missing. A directory, roles file, context, missing codex
     binary, or environment override (CODEX_COUNCIL_MAX_PARALLEL,
     CODEX_COUNCIL_STALL_SECS, CODEX_COUNCIL_MODEL_ROUTING) the launch would
     refuse is refused here too. No discovery runs: automatic selections are
@@ -2414,6 +2416,12 @@ def _validate_staging_dir(path, prefix="--check-staging-dir: ",
     # that says "staging OK" while codex is missing defers the failure to
     # a background launch whose error lands only in err.log.
     _usage_exit_if_codex_missing(prefix, next_step)
+    # Every role takes its continuity lock in the state directory, so an
+    # unsafe one is refused here, before a launch claims this directory.
+    try:
+        _ensure_state_dir()
+    except OSError as exc:
+        _usage_exit(f"{prefix}{_report_inline(exc)}")
     max_parallel = _max_parallel_roles()
     _stall_secs()  # the launch refuses an invalid watchdog override (exit 2)
     routing_mode = _model_routing_mode()
