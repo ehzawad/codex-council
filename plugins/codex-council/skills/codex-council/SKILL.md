@@ -8,6 +8,9 @@ description: >-
   decision. Shape the contribution from current goals, evidence, permissions,
   and unfinished work; do not invoke merely because a turn ended.
 argument-hint: "[current objective or useful contribution]"
+allowed-tools:
+  - Bash(mktemp -d *)
+  - Bash(python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" *)
 ---
 
 # Codex Council
@@ -103,7 +106,9 @@ Only after exit 0, launch in a separate foreground call, without redirects,
 python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" --start 'ABS_RUNDIR' --skill-contract 5
 ```
 
-Follow the printed `--follow` command using Monitor when available. A detached
+Follow with Monitor when available, running the printed `--follow` command or
+its skill form, `python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" --follow 'ABS_RUNDIR' --skill-contract 5`
+(`--status` and `--cancel` take the same form). A detached
 runner keeps running and spending until completion or `--cancel`. In unattended
 hosts, keep watching or cancel before ending your turn. Re-arm only after watch
 expiry and only while `--status` says running. For exit 3/4, unknown liveness,
