@@ -490,6 +490,23 @@ class WorkflowTests(WorkspaceCase):
         self.assertEqual(b.read_text(), "value = 1\n")
         self.assertEqual(self.file.read_text(), "value = 1\n")
 
+    def test_project_instructions_are_copied_and_the_plan_says_so(self):
+        (self.source / "AGENTS.md").write_text("Project instructions.\n")
+        (self.source / "CLAUDE.md").write_text("Host instructions.\n")
+        (self.source / ".codex").mkdir()
+        (self.source / ".codex/config.toml").write_text('model = "pinned"\n')
+        roles, body = self.stage()
+        plan = workflow.prepare(str(self.run), roles, body)
+        work = self.run / plan["roles"]["experiment"]["workspace"]
+        self.assertTrue((work / "AGENTS.md").exists())
+        self.assertTrue((work / "CLAUDE.md").exists())
+        self.assertFalse((work / ".codex").exists())
+        self.assertIn(".codex", plan["snapshot"]["omitted"])
+        self.assertTrue(any("AGENTS.md and CLAUDE.md are copied" in item
+                            for item in plan["limitations"]), plan["limitations"])
+        lines = workflow.plan_lines(plan, roles, 0)
+        self.assertIn("selected AGENTS.md/CLAUDE.md are", lines[1])
+
     def test_context_lens_or_permission_changes_require_new_capture(self):
         roles, body = self.stage()
         workflow.prepare(str(self.run), roles, body)

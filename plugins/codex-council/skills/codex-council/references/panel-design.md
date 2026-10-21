@@ -42,8 +42,8 @@ The existing selection JSON shapes remain:
 User mode needs model and/or effort. Routed mode needs both; native_effort needs
 only effort and the runner pins the proven native model. These examples illustrate
 shapes; copy the actual role-specific snapshot_id and advertised values at runtime.
-Inheritance is omission, never literal inherit/default placeholders. Source project
-agent configuration is not copied into scratch, so inspect the actual native
+Inheritance is omission, never literal inherit/default placeholders. Source `.codex`
+configuration is not copied into scratch, so inspect the actual native
 configuration rather than assuming source-layer defaults survived relocation.
 
 See [invocation-contract.md](invocation-contract.md) for full input/capability fields

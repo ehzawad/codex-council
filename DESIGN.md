@@ -77,8 +77,10 @@ Failure never silently grants bypass or edits user configuration.
 
 Discovery and execution use each role's actual scratch cwd and the same Codex
 binary/environment. Relative CODEX_HOME is normalized before relocation, without
-copying credentials. Source project agent configuration is deliberately not copied;
-source-layer defaults may differ from scratch-native defaults and preflight says so.
+copying credentials. Source agent configuration directories (`.codex`, `.claude`,
+`.agents`) are deliberately not copied; project instruction files such as AGENTS.md
+and CLAUDE.md are ordinary selected inputs and are copied. Source-layer defaults may
+differ from scratch-native defaults and preflight says so.
 No silent claim of source configuration parity is made.
 
 The existing account/config/managed-requirements/catalog adapter, strict value

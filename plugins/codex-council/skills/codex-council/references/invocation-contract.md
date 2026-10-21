@@ -113,8 +113,10 @@ build/version commands can fail without .git; record this as an environment gap,
 not proof of a source-code bug. Dependencies and external state need explicit,
 authorized setup and must be identified in the evidence.
 
-Each role's discovery runs in its actual scratch cwd. Source project agent config
-is intentionally not copied or flattened into global settings. Native inheritance
+Each role's discovery runs in its actual scratch cwd. Source `.codex`, `.claude` and
+`.agents` directories are intentionally not copied or flattened into global settings;
+project instruction files such as AGENTS.md and CLAUDE.md are selected inputs and are
+copied, so they can shape a collaborator like any project file. Native inheritance
 therefore means **the configuration Codex resolves in the execution cwd**, which
 may differ from the live project's configuration. Inspect the discovery summary;
 use a supported explicit pin when the user's intended model must be preserved.
