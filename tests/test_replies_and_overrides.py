@@ -104,7 +104,8 @@ class CommandOverrideTests(unittest.TestCase):
 
     def test_model_only_or_effort_only(self):
         self.assertNotIn(
-            "-c", codex_council._fresh_cmd("/r", "future-vega-2033", None))
+            "model_reasoning_effort", council_testlib.config_values(
+                codex_council._fresh_cmd("/r", "future-vega-2033", None)))
         self.assertNotIn("-m", codex_council._fresh_cmd("/r", None, "brisk"))
 
 
@@ -604,7 +605,11 @@ class EndToEndTests(unittest.TestCase):
             ["exec", "-C", with_model[0][2], "-m", "future-vega-2033",
              "-c", 'model_reasoning_effort="brisk"'])
         without = [a for a in argvs if "-m" not in a]
-        self.assertTrue(without and all("-c" not in a for a in without))
+        self.assertTrue(without)
+        for argv in without:
+            council_testlib.assert_no_model_overrides(self, argv)
+            self.assertEqual(council_testlib.config_values(argv)["approval_policy"],
+                             "never")
 
     def test_dead_stdout_logs_runner_aborted_and_follow_exits(self):
         self._stage([_role_json("architect", "Architect")])

@@ -160,14 +160,44 @@ class WorkflowCliTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 2, proc.stderr)
         self.assertFalse(self.execs())
 
-    def test_transient_failure_after_tool_work_does_not_repeat_side_effect(self):
-        directory = self.stage("SIDE_EFFECT_503: exercise failure recovery.")
+    def test_transient_failures_after_tool_work_are_not_replayed_fresh_or_resumed(self):
+        for resume in (False, True):
+            for status, tag in ((503, "5xx"), (429, "rate-limit")):
+                with self.subTest(resume=resume, status=status):
+                    task = f"retry-proof-{resume}-{status}"
+                    if resume:
+                        seed = self.stage(task=task)
+                        self.assertEqual(self.launch(seed).returncode, 0)
+                    count = len(self.execs())
+                    directory = self.stage(
+                        f"SIDE_EFFECT_{status}: exercise failure recovery.", task=task,
+                        execution={"sandbox": "workspace-write",
+                                   "continuity": "resume" if resume else "fresh"})
+                    proc = self.launch(directory)
+                    self.assertEqual(proc.returncode, 1, proc.stderr)
+                    calls = self.execs()[count:]
+                    self.assertEqual(len(calls), 1)
+                    self.assertEqual("resume" in calls[0]["argv"], resume)
+                    self.assertIn(f"[replay-blocked:{tag}]", proc.stdout)
+                    effects = directory / "workspaces/contribution/effects.txt"
+                    self.assertEqual(effects.read_text(), "effect\n")
+                    self.assertFalse(self.result(directory)["required_contributions_complete"])
+
+    def test_stale_looking_failure_after_tool_work_keeps_thread_and_never_restarts(self):
+        first = self.stage()
+        self.assertEqual(self.launch(first).returncode, 0)
+        thread = self.execs()[-1]["thread"]
+        count = len(self.execs())
+        directory = self.stage("SIDE_EFFECT_STALE: exercise resume recovery.",
+                               execution={"sandbox": "workspace-write", "continuity": "resume"})
         proc = self.launch(directory)
         self.assertEqual(proc.returncode, 1, proc.stderr)
-        self.assertEqual(len(self.execs()), 1)
-        self.assertIn("[replay-blocked:5xx]", proc.stdout)
+        self.assertIn("[replay-blocked:stale]", proc.stdout)
+        self.assertEqual(len(self.execs()[count:]), 1)
         self.assertEqual((directory / "workspaces/contribution/effects.txt").read_text(), "effect\n")
-        self.assertFalse(self.result(directory)["required_contributions_complete"])
+        next_run = self.stage(execution={"continuity": "resume"})
+        self.assertEqual(self.launch(next_run).returncode, 0)
+        self.assertEqual(self.execs()[-1]["thread"], thread)
 
     def test_transient_failure_before_tools_retries_with_separate_evidence(self):
         directory = self.stage("TRANSIENT_BEFORE_TOOLS: inspect.")
@@ -238,6 +268,17 @@ class WorkflowCliTests(unittest.TestCase):
         self.assertTrue(all(call["cwd"] == workspace for call in self.calls()))
         self.assertIn("fixture-collaborator", self.execs()[0]["argv"])
         self.assertTrue((directory / "evidence/contribution/launch-model-snapshot.json").exists())
+
+    def test_recorded_permission_mutation_is_refused_before_policy_probe_or_worker(self):
+        directory = self.stage(execution={"sandbox": "read-only"})
+        plan = json.loads((directory / "run.json").read_text())
+        plan["roles"]["contribution"]["execution"].update(
+            sandbox="bypass", network=True, authorization="changed manifest only")
+        write(directory / "run.json", plan)
+        proc = self.launch(directory)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("permissions changed", proc.stderr)
+        self.assertFalse(self.calls())
 
     def test_context_mutation_is_refused_before_any_worker(self):
         directory = self.stage()

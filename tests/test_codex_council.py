@@ -895,7 +895,7 @@ class ComposePromptTests(unittest.TestCase):
         # evidence-first.
         for concept in (
             "you may be the only role, or one of several",
-            "an independent cross-model check on Claude Code's work",
+            "an independent cross-model collaborator advancing the current task",
             "the user's goal, requirements, and constraints are authoritative",
             "claims to verify against the workspace, not facts to accept",
             "non-interactive",
@@ -2099,19 +2099,21 @@ class ParseRolesJsonTests(unittest.TestCase):
         roles = codex_council._parse_roles_json(raw)
         self.assertEqual(roles[0].instruction, instruction)
 
-    def test_instruction_requires_scope_phrase(self):
-        raw = json.dumps([_role_json("x", "L", "Review only. Thoroughness beats speed.")])
-        _assert_usage_exit(
-            self, lambda: codex_council._parse_roles_json(raw),
-            expect_in_stderr="nothing material",
-        )
+    def test_instruction_without_scope_boilerplate_is_preserved(self):
+        instruction = "Reproduce the reported data mismatch."
+        raw = json.dumps([_role_json("x", "L", instruction)])
+        role = codex_council._parse_roles_json(raw)[0]
+        self.assertEqual(role.instruction, instruction)
+        prompt = codex_council._compose_prompt(role, "Current evidence")
+        self.assertIn("If nothing material falls in your lens", prompt)
+        self.assertEqual(prompt.count(instruction), 2)
 
-    def test_instruction_requires_cadence_sentence(self):
-        raw = json.dumps([_role_json("x", "L", "Review; if nothing material, say so clearly.")])
-        _assert_usage_exit(
-            self, lambda: codex_council._parse_roles_json(raw),
-            expect_in_stderr="Thoroughness beats speed.",
-        )
+    def test_runner_supplies_cadence_without_requiring_authored_prose(self):
+        raw = json.dumps([_role_json("x", "L", "Compare the alternatives.")])
+        role = codex_council._parse_roles_json(raw)[0]
+        self.assertNotIn("Thoroughness beats speed.", role.instruction)
+        prompt = codex_council._compose_prompt(role, "Current evidence")
+        self.assertEqual(prompt.count("Thoroughness beats speed."), 1)
 
     def test_bad_id_regex_uppercase_raises(self):
         raw = json.dumps([_role_json("BadID", "L")])
@@ -2275,22 +2277,15 @@ class InstructionListFormTests(unittest.TestCase):
             expect_in_stderr="instruction list item 1",
         )
 
-    def test_scope_phrase_checked_on_joined_paragraph(self):
-        _assert_usage_exit(
-            self,
-            lambda: self._roles(["Review only.", "Thoroughness beats speed."]),
-            expect_in_stderr="nothing material",
-        )
+    def test_task_sentences_need_no_scope_boilerplate(self):
+        items = ["Investigate the data.", "Explain the uncertainty."]
+        roles = self._roles(items)
+        self.assertEqual(roles[0].instruction, " ".join(items))
 
-    def test_cadence_sentence_must_end_joined_paragraph(self):
-        _assert_usage_exit(
-            self,
-            lambda: self._roles([
-                "Thoroughness beats speed.",
-                "If nothing material, say so clearly.",
-            ]),
-            expect_in_stderr="Thoroughness beats speed.",
-        )
+    def test_legacy_cadence_position_does_not_restrict_task_instructions(self):
+        items = ["Thoroughness beats speed.", "If nothing material, say so clearly."]
+        roles = self._roles(items)
+        self.assertEqual(roles[0].instruction, " ".join(items))
 
     def test_large_joined_paragraph_is_accepted(self):
         items = ["a" * 5000, "b" * 5000,
@@ -3105,10 +3100,13 @@ class NoRunLevelDeadlineTests(unittest.TestCase):
     timeout/retry config overrides (those live in the user's
     provider-scoped codex config)."""
 
-    def test_commands_have_no_config_overrides(self):
+    def test_commands_have_safety_but_no_model_or_deadline_overrides(self):
         for cmd in (codex_council._fresh_cmd("/r"),
                     codex_council._resume_cmd("/r", "sid")):
-            self.assertNotIn("-c", cmd)
+            council_testlib.assert_no_model_overrides(self, cmd)
+            self.assertEqual(council_testlib.config_values(cmd),
+                             {"approval_policy": "never"})
+            self.assertEqual(cmd[cmd.index("--sandbox") + 1], "read-only")
             self.assertFalse(any("timeout" in a or "retries" in a for a in cmd))
 
     def test_source_uses_no_run_level_timeout_primitive(self):
@@ -3143,7 +3141,8 @@ class NoRunLevelDeadlineTests(unittest.TestCase):
         # killed), and council_liveness's bounded ps call.
         allowed = {("council_common.py", "timeout="): 1,
                    ("codex_council.py", "timeout="): 4,
-                   ("council_liveness.py", "timeout="): 1}
+                   ("council_liveness.py", "timeout="): 1,
+                   ("council_workspace.py", "timeout="): 1}
         modules = sorted(name for name in os.listdir(SCRIPTS_DIR)
                          if name.endswith(".py"))
         self.assertIn("codex_council.py", modules)
@@ -3156,7 +3155,7 @@ class NoRunLevelDeadlineTests(unittest.TestCase):
             # these APIs.
             masked = list(src)
             offsets = [0]
-            for line in src.splitlines(keepends=True):
+            for line in _io.StringIO(src).readlines():
                 offsets.append(offsets[-1] + len(line))
             for tok in _tokenize.generate_tokens(_io.StringIO(src).readline):
                 if tok.type in (_tokenize.COMMENT, _tokenize.STRING):
@@ -3173,6 +3172,20 @@ class NoRunLevelDeadlineTests(unittest.TestCase):
             with self.subTest(module=module):
                 self.assertEqual(
                     found, [], f"unexpected timeout primitive(s): {found}")
+        # The new timeout belongs only to metadata collection, not role work.
+        import ast as _ast
+        with open(os.path.join(SCRIPTS_DIR, "council_workspace.py"),
+                  encoding="utf-8") as f:
+            tree = _ast.parse(f.read())
+        timeout_owners = []
+        for node in tree.body:
+            if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                for call in _ast.walk(node):
+                    if isinstance(call, _ast.Call):
+                        for kw in call.keywords:
+                            if kw.arg == "timeout":
+                                timeout_owners.append((node.name, _ast.literal_eval(kw.value)))
+        self.assertEqual(timeout_owners, [("_git", 15)])
         self.assertIn("timeout=timeout",
                       inspect.getsource(council_common._project_root))
 
@@ -4047,10 +4060,10 @@ class RolesRewriteRecoveryTests(unittest.TestCase):
                 [{"id": "a", "label": "A", "instruction": []}]),
             "blank-instruction-item": json.dumps(
                 [{"id": "a", "label": "A", "instruction": ["   "]}]),
-            "missing-scope-phrase": json.dumps([_role_json(
-                "a", "A", ["Review only.", "Thoroughness beats speed."])]),
-            "missing-cadence-sentence": json.dumps([_role_json(
-                "a", "A", ["Review; if nothing material, say so clearly."])]),
+            "bad-execution-type": json.dumps([
+                {**_role_json("a", "A"), "execution": "bypass"}]),
+            "unauthorized-execution": json.dumps([
+                {**_role_json("a", "A"), "execution": {"sandbox": "bypass"}}]),
             "duplicate-id": json.dumps(
                 [_role_json("a", "A"), _role_json("a", "A2")]),
         }

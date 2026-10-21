@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import difflib
 import hashlib
+import io
 import json
 import os
 import platform
@@ -80,7 +81,12 @@ class AttemptEvidence:
         stream = self.streams.get(name)
         if stream is not None:
             try:
-                stream.write(block)
+                remaining = memoryview(block)
+                while remaining:
+                    written = stream.write(remaining)
+                    if written is None or written <= 0:
+                        raise OSError("evidence stream made no write progress")
+                    remaining = remaining[written:]
             except OSError:
                 self.errors.append(f"{name}-write-failed")
                 with contextlib.suppress(OSError):
@@ -222,7 +228,7 @@ def collect_artifacts(baseline: Path, workspace: Path, snapshot: dict[str, Any],
             continue
         if a != b:
             for line in difflib.unified_diff(
-                    a.splitlines(keepends=True), b.splitlines(keepends=True),
+                    io.StringIO(a).readlines(), io.StringIO(b).readlines(),
                     fromfile=f"a/{name}" if before else "/dev/null",
                     tofile=f"b/{name}" if after else "/dev/null"):
                 patches.append(line)
@@ -265,7 +271,10 @@ def write_result(run_dir: Path, plan: dict[str, Any], results: list[Any],
         attempts = []
         for path in sorted(directory.glob("attempt-*.json")):
             try:
-                attempts.append(read_json(path))
+                attempt = read_json(path)
+                if not isinstance(attempt, dict) or attempt.get("schema") != "codex-council/attempt@1":
+                    raise ValueError("invalid attempt evidence")
+                attempts.append(attempt)
             except (OSError, ValueError):
                 gaps.append(f"{role_id}:attempt-metadata-unreadable")
         role_gaps = []

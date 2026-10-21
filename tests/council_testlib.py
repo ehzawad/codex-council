@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS_DIR = os.path.abspath(os.path.join(
@@ -212,3 +213,20 @@ def assert_only_discovery_methods(test, methods):
         test.assertNotIn("login", method.lower())
         if not method.startswith("response:"):
             test.assertIn(method, fake_codex.DISCOVERY_METHODS)
+
+
+def config_values(argv):
+    """Decode explicit CLI configuration without confusing safety and model flags."""
+    result = {}
+    for index, arg in enumerate(argv):
+        if arg in ("-c", "--config"):
+            result.update(tomllib.loads(argv[index + 1]))
+    return result
+
+
+def assert_no_model_overrides(test, argv):
+    """Native model inheritance still permits explicit command-safety settings."""
+    test.assertNotIn("-m", argv)
+    test.assertNotIn("--model", argv)
+    for key in ("model", "model_reasoning_effort", "model_provider"):
+        test.assertNotIn(key, config_values(argv))

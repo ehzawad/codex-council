@@ -130,11 +130,17 @@ def load_plan(run_dir: str | Path, roles: list[Any] | None = None,
     plan = read_json(path)
     if not isinstance(plan, dict) or plan.get("schema") != PLAN_SCHEMA:
         raise WorkspaceError("unsupported or invalid run.json")
-    if plan.get("request_sha256") != digest(_request(directory)):
+    request = _request(directory)
+    if plan.get("request_sha256") != digest(request):
         raise WorkspaceError("request changed after capture; prepare a fresh invocation")
     snapshot, bindings = plan.get("snapshot"), plan.get("roles")
     if not isinstance(snapshot, dict) or not isinstance(bindings, dict):
         raise WorkspaceError("invalid captured inputs or role bindings")
+    if (plan.get("task_id") != request["task_id"]
+            or plan.get("reason") != request["reason"]
+            or any(snapshot.get(key) != request[key]
+                   for key in ("source_root", "include", "exclude"))):
+        raise WorkspaceError("captured task or source binding differs from request.json")
     if snapshot.get("snapshot_id") != digest({"files": snapshot.get("files"),
                                               "git": snapshot.get("git")}):
         raise WorkspaceError("captured input manifest checksum does not match")
@@ -153,7 +159,10 @@ def load_plan(run_dir: str | Path, roles: list[Any] | None = None,
         if set(bindings) != {role.id for role in roles}:
             raise WorkspaceError("panel changed after capture; prepare a new invocation")
         for role in roles:
-            if bindings[role.id]["contract_sha256"] != digest(role_contract(role)):
+            contract = role_contract(role)
+            binding = bindings[role.id]
+            if (binding.get("contract_sha256") != digest(contract)
+                    or binding.get("execution") != contract["execution"]):
                 raise WorkspaceError(f"{role.id}: task or permissions changed after capture")
     if body is not None and plan.get("context_sha256") != _context_hash(body):
         raise WorkspaceError("context changed after capture; prepare a fresh invocation")

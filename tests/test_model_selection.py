@@ -2187,7 +2187,7 @@ class RunRoleSelectionTests(unittest.IsolatedAsyncioTestCase):
         (cmd,) = self.calls
         self.assertEqual(cmd[cmd.index("resume") + 1], "live-sid")
         self.assertNotIn("-m", cmd)
-        self.assertNotIn("-c", cmd)
+        council_testlib.assert_no_model_overrides(self, cmd)
         self.assertEqual(codex_council.load_session("architect")[0],
                          "live-sid")
 
@@ -2207,7 +2207,7 @@ class RunRoleSelectionTests(unittest.IsolatedAsyncioTestCase):
             codex_council.clear_session("architect")
             await self._attempts(pinned_native)
         self.assertNotIn("-m", self.calls[0])
-        self.assertNotIn("-c", self.calls[0])
+        council_testlib.assert_no_model_overrides(self, self.calls[0])
         self.assertEqual(self.calls[1][4:8], [
             "-m", NATIVE, "-c", 'model_reasoning_effort="adaptive-v2"'])
 
@@ -2539,7 +2539,7 @@ class LaunchEndToEndTests(unittest.TestCase):
 
     def assert_no_overrides(self, argv):
         self.assertNotIn("-m", argv)
-        self.assertNotIn("-c", argv)
+        council_testlib.assert_no_model_overrides(self, argv)
         self.assertFalse(any("model_reasoning_effort" in a for a in argv))
         self.assertFalse(any(a.lower() in ("inherit", "default")
                              for a in argv))

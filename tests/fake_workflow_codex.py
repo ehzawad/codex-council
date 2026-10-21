@@ -89,10 +89,13 @@ def execute(argv):
         time.sleep(120)
     if "SLOW_FIXTURE" in body:
         time.sleep(1)
-    if "SIDE_EFFECT_503" in body:
+    if any(marker in body for marker in ("SIDE_EFFECT_503", "SIDE_EFFECT_429", "SIDE_EFFECT_STALE")):
         command("from pathlib import Path; p=Path('effects.txt'); "
                 "p.write_text((p.read_text() if p.exists() else '')+'effect\\n')", cwd)
-        emit({"type": "turn.failed", "error": {"message": "HTTP 503 Service Unavailable"}})
+        message = ("HTTP 429 Too Many Requests" if "SIDE_EFFECT_429" in body else
+                   "Error: no rollout found for thread id " + sid if "SIDE_EFFECT_STALE" in body
+                   else "HTTP 503 Service Unavailable")
+        emit({"type": "turn.failed", "error": {"message": message}})
         return 1
     if "TRANSIENT_BEFORE_TOOLS" in body:
         marker = Path(os.environ["CODEX_HOME"]) / "retried"
