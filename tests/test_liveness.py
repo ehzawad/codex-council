@@ -1173,6 +1173,16 @@ class StatusCommandTests(unittest.TestCase):
         self.assertIn(f"live codex groups: {sleeper.pid} (architect)", lines)
         self.assertIn("--reap", lines[-1])
 
+    def test_unfinished_roles_of_an_ended_runner_read_interrupted(self):
+        _status(self.run_dir, pid=_dead_pid(), state="interrupted", exit_code=143,
+                roles={"sleeper": {"state": "active", "attempt": 1,
+                                   "output_at": time.time() - 9},
+                       "done": {"state": "settled", "outcome": "ok"}})
+        lines = self._lines()
+        self.assertEqual(lines[0], "runner: interrupted (exit 143)")
+        self.assertEqual(lines[1], "roles: 1 of 2 settled")
+        self.assertEqual(lines[2], "  sleeper: interrupted (was active), attempt 1")
+
     def test_terminal_states(self):
         for state, code, action in (("done", 0, "read out.md"),
                                     ("interrupted", 143, "err.log")):

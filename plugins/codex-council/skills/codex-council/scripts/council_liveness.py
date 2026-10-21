@@ -1066,11 +1066,13 @@ def follow(run_dir, verbose=False):
 
 # ---------- --status and --reap ----------
 
-def _role_line(role_id, role, now, table):
-    parts = [role["state"]]
+def _role_line(role_id, role, now, table, ended=False):
+    # Once the runner has published a terminal state, an unfinished role was
+    # cut off; its last published state is history, not activity.
+    parts = [f"interrupted (was {role['state']})" if ended else role["state"]]
     if role["attempt"]:
         parts.append(f"attempt {role['attempt']}")
-    if role["state"] == "active" and role["output_at"] is not None:
+    if not ended and role["state"] == "active" and role["output_at"] is not None:
         parts.append(f"quiet {max(0.0, now - role['output_at']):.0f}s")
     if role["pid"] is not None:
         alive = _identity_state(table, role["pid"], role["start_identity"])
@@ -1213,8 +1215,9 @@ def _status_lines(view, now, table, detached=None):
 def _role_lines(view, now, table, unfinished):
     lines = [f"roles: {len(view.roles) - len(unfinished)} of "
              f"{len(view.roles)} settled"]
+    ended = view.state in TERMINAL_STATES
     for role_id in unfinished[:STATUS_ROLE_LINES]:
-        lines.append(_role_line(role_id, view.roles[role_id], now, table))
+        lines.append(_role_line(role_id, view.roles[role_id], now, table, ended))
     if len(unfinished) > STATUS_ROLE_LINES:
         lines.append(f"  ... and {len(unfinished) - STATUS_ROLE_LINES} more "
                      "unfinished")
