@@ -14,20 +14,41 @@ def emit(value):
     print(json.dumps(value), flush=True)
 
 
-def merge(destination, source):
-    for key, value in source.items():
-        if isinstance(value, dict):
-            merge(destination.setdefault(key, {}), value)
-        else:
-            destination[key] = value
+def apply_codex_override(config, setting):
+    """Codex's -c semantics (config_override.rs, overrides.rs): split once on
+    '=', trim, parse the value as TOML or fall back to the raw string, then
+    split the key on EVERY '.' with no quote handling. Not Python TOML keys."""
+    key, separator, raw = setting.partition("=")
+    key, raw = key.strip(), raw.strip()
+    if not separator or not key:
+        raise ValueError(f"invalid override: {setting}")
+    try:
+        value = tomllib.loads(f"_x_ = {raw}")["_x_"]
+    except tomllib.TOMLDecodeError:
+        value = raw.strip("\"'")
+    current = config
+    segments = key.split(".")
+    for segment in segments[:-1]:
+        if not isinstance(current.get(segment), dict):
+            current[segment] = {}
+        current = current[segment]
+    current[segments[-1]] = value
+    return config
 
 
 def config(argv):
     value = {"model": "fixture-collaborator", "model_reasoning_effort": "brisk",
-             "model_provider": None, "mcp_servers": {"fixture.server": {"enabled": True}}}
+             "model_provider": None,
+             "mcp_servers": {os.environ.get("FAKE_WORKFLOW_MCP", "fixture-server"):
+                             {"enabled": True}}}
+    configured = set(value["mcp_servers"])
     for index, arg in enumerate(argv[:-1]):
         if arg == "-c":
-            merge(value, tomllib.loads(argv[index + 1]))
+            apply_codex_override(value, argv[index + 1])
+    if set(value["mcp_servers"]) - configured:
+        # Real Codex: an override-created server has no transport.
+        print("Error: invalid transport", file=sys.stderr)
+        sys.exit(1)
     if os.environ.get("FAKE_WORKFLOW_POLICY_REFUSE"):
         value["sandbox_mode"] = "danger-full-access"
     return value

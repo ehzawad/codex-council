@@ -145,9 +145,18 @@ class WorkflowCliTests(unittest.TestCase):
         argv = self.execs()[0]["argv"]
         self.assertEqual(argv[argv.index("--sandbox") + 1], "read-only")
         self.assertIn('approval_policy="never"', argv)
-        self.assertIn('mcp_servers."fixture.server".enabled=false', argv)
+        self.assertIn("mcp_servers.fixture-server.enabled=false", argv)
+        self.assertFalse(any('"' in arg for arg in argv if arg.startswith("mcp_servers.")))
         self.assertIn('web_search="disabled"', argv)
         self.assertIn('features.apps=false', argv)
+
+    def test_unaddressable_mcp_name_blocks_before_inference(self):
+        directory = self.stage()
+        self.env["FAKE_WORKFLOW_MCP"] = "fixture.server"
+        proc = self.cli("--check-staging-dir", directory)
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn("cannot be disabled with a Codex -c override", proc.stderr)
+        self.assertFalse(self.execs())
 
     def test_policy_mismatch_fails_before_inference_without_fallback(self):
         directory = self.stage()

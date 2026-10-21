@@ -8,7 +8,7 @@ boundary. In particular, read-only does not mean the rest of HOME is unreadable.
 
 from __future__ import annotations
 
-import json
+import re
 import shutil
 import time
 from dataclasses import asdict, dataclass
@@ -20,6 +20,9 @@ POLICY_KEYS = frozenset({"sandbox", "network", "external_tools", "continuity",
                          "required", "authorization"})
 DISABLED_FEATURES = ("apps", "plugins", "browser_use", "browser_use_external",
                      "computer_use", "hooks", "multi_agent")
+# Codex splits a -c key on every "." and has no quoted-key syntax there, so only
+# these names can be addressed; any other configured server blocks the run.
+MCP_NAME = re.compile(r"[A-Za-z0-9_-]+")
 
 
 @dataclass(frozen=True)
@@ -78,11 +81,12 @@ def config_overrides(policy: ExecutionPolicy, mcp_names: tuple[str, ...] = ()
         overrides.extend(f"features.{name}=false" for name in DISABLED_FEATURES)
         overrides.append('web_search="disabled"')
         for name in mcp_names:
-            # JSON-quoted ASCII names form TOML basic quoted keys, including
-            # dots and quotes; never interpolate an unquoted dotted key.
-            if not name or not name.isascii() or not name.isprintable():
-                raise WorkspaceError("MCP server name cannot be safely represented")
-            overrides.append(f"mcp_servers.{json.dumps(name)}.enabled=false")
+            if not MCP_NAME.fullmatch(name):
+                raise WorkspaceError(
+                    "a configured MCP server name cannot be disabled with a Codex -c "
+                    "override (only letters, digits, '_' and '-' are addressable); "
+                    "external-tool isolation cannot be established")
+            overrides.append(f"mcp_servers.{name}.enabled=false")
     return tuple(overrides)
 
 
@@ -189,6 +193,9 @@ def _read_config(root: str, overrides: tuple[str, ...]) -> dict[str, Any]:
     except WorkspaceError:
         raise
     except Exception as exc:
-        # App-server errors may carry credentials. Expose an exception category,
-        # never the raw RPC body, stderr, or merged configuration.
-        raise WorkspaceError(f"execution policy inspection failed ({type(exc).__name__})") from None
+        # App-server errors may carry credentials. Expose only discovery's
+        # machine-safe problem/stderr categories, never raw bodies or stderr.
+        problem = getattr(exc, "problem", None)
+        detail = getattr(exc, "detail", None)
+        category = ":".join(str(part) for part in (problem, detail) if part) or type(exc).__name__
+        raise WorkspaceError(f"execution policy inspection failed ({category})") from None

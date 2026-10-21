@@ -14,18 +14,19 @@ import subprocess
 import sys
 import tempfile
 import time
-import tomllib
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "plugins/codex-council/skills/codex-council/scripts"
 sys.path.insert(0, str(SCRIPTS))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import council_evidence as evidence  # noqa: E402
 import council_policy as policy  # noqa: E402
 import council_workflow as workflow  # noqa: E402
 import council_workspace as workspace  # noqa: E402
+from fake_workflow_codex import apply_codex_override  # noqa: E402
 
 
 @dataclasses.dataclass(frozen=True)
@@ -47,18 +48,10 @@ def write_json(path, value):
 
 
 def apply_overrides(config, values):
+    """Apply -c settings the way Codex does, not as Python TOML documents."""
     result = copy.deepcopy(config)
-
-    def merge(dst, src):
-        for key, value in src.items():
-            if isinstance(value, dict):
-                child = dst.setdefault(key, {})
-                merge(child, value)
-            else:
-                dst[key] = value
-
     for setting in values:
-        merge(result, tomllib.loads(setting))
+        apply_codex_override(result, setting)
     return result
 
 
@@ -303,13 +296,41 @@ class PolicyTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(workspace.WorkspaceError):
                 policy.parse_policy(value)
 
-    def test_mcp_keys_are_toml_quoted_and_not_interpolated(self):
+    def test_mcp_keys_are_bare_codex_dotted_paths(self):
         p = policy.parse_policy()
-        settings = policy.config_overrides(p, ('server.name', 'quote"name'))
-        config = apply_overrides({"mcp_servers": {"server.name": {}, 'quote"name': {}}}, settings)
-        self.assertIs(config["mcp_servers"]["server.name"]["enabled"], False)
-        self.assertIs(config["mcp_servers"]['quote"name']["enabled"], False)
+        settings = policy.config_overrides(p, ("node_repl", "fixture-2"))
+        self.assertIn("mcp_servers.node_repl.enabled=false", settings)
+        self.assertFalse(any('"' in s for s in settings if s.startswith("mcp_servers.")))
+        config = apply_overrides({"mcp_servers": {"node_repl": {}, "fixture-2": {}}}, settings)
+        self.assertEqual(set(config["mcp_servers"]), {"node_repl", "fixture-2"})
+        self.assertIs(config["mcp_servers"]["node_repl"]["enabled"], False)
         self.assertIs(config["features"]["apps"], False)
+
+    def test_quoted_mcp_key_would_create_a_different_server(self):
+        # Why quoting is wrong: Codex keeps the quotes as part of the name.
+        config = apply_overrides({"mcp_servers": {"node_repl": {}}},
+                                 ['mcp_servers."node_repl".enabled=false'])
+        self.assertEqual(set(config["mcp_servers"]), {"node_repl", '"node_repl"'})
+        self.assertNotIn("enabled", config["mcp_servers"]["node_repl"])
+
+    def test_unaddressable_mcp_names_fail_closed(self):
+        p = policy.parse_policy()
+        for name in ("server.name", 'quote"name', "a:b", "x@y", "a/b", "", "sp ace", "é"):
+            with self.subTest(name=name), self.assertRaisesRegex(
+                    workspace.WorkspaceError, "cannot be disabled"):
+                policy.config_overrides(p, (name,))
+
+    def test_policy_read_failure_keeps_the_sanitized_category(self):
+        import council_discovery
+
+        def failing(*_args, **_kwargs):
+            raise council_discovery._DiscoveryFailure("server_exited:initialize", "other")
+
+        with patch("shutil.which", return_value="/bin/codex"), \
+                patch.object(council_discovery, "_app_server_session", failing):
+            with self.assertRaisesRegex(workspace.WorkspaceError,
+                                        r"\(server_exited:initialize:other\)"):
+                policy._read_config("/scratch", ())
 
     def test_metadata_inspection_checks_effective_settings_twice(self):
         seen = []
@@ -322,7 +343,7 @@ class PolicyTests(unittest.TestCase):
         result = policy.inspect_policy("/scratch", policy.parse_policy(), reader=read)
         self.assertEqual(len(seen), 2)
         self.assertNotIn("SECRET-SENTINEL", json.dumps(result))
-        self.assertIn('mcp_servers."fixture".enabled=false', result["overrides"])
+        self.assertIn("mcp_servers.fixture.enabled=false", result["overrides"])
         self.assertEqual(result["attestation"], "configuration-observed-not-exec-attested")
 
     def test_managed_override_and_unknown_mcp_fail_closed(self):
