@@ -1,13 +1,13 @@
-name: Assemble collaboration feature
+name: Finalize collaboration implementation
 on:
   push:
     branches: [codex/adaptive-collaboration-20261021]
-    paths: [.council-integrate.py, .github/workflows/council-feature-assembly.yml]
+    paths: ['.council-finalize-*.patch', '.github/workflows/council-feature-assembly.yml']
 permissions:
   contents: write
 jobs:
-  assemble:
-    if: "startsWith(github.event.head_commit.message, 'chore: assemble captured collaboration')"
+  finalize:
+    if: "startsWith(github.event.head_commit.message, 'chore: finalize captured collaboration')"
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -18,54 +18,33 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.13'
-      - name: Integrate against the checked base
+      - name: Apply checked patches against the inspected head
         run: |
-          python - <<'PY'
-          from pathlib import Path
-          p = Path('.council-integrate.py')
-          text = p.read_text().replace('import ast\n', 'import ast\nimport io\n')
-          for name in ('self.text', 's.text', 'text'):
-              text = text.replace(name + '.splitlines(keepends=True)', 'io.StringIO(' + name + ').readlines()')
-          p.write_text(text)
-          PY
-          python .council-integrate.py
-      - name: Remove only obsolete unused imports
-        run: pipx run --spec 'ruff==0.15.21' ruff check --fix --select F401 .
-      - name: Check source and focused tests
-        run: |
+          set -eu
+          test "$(git rev-parse HEAD^)" = '4eacb61bc68bb5dd724dc9a9df937c078038120b'
+          for patch in .council-finalize-*.patch; do
+            git apply --check "$patch"
+            git apply "$patch"
+          done
+          git diff --check
           python -m compileall -q plugins tests
-          python -m unittest discover -s tests -p 'test_invocation_workflow.py' -v
+      - name: Pinned lint
+        run: pipx run --spec 'ruff==0.15.21' ruff check .
+      - name: Verify changed behavior and compatibility contracts
+        run: |
+          PYTHONPATH=tests python -m unittest test_invocation_workflow test_documentation_contract test_codex_council.ComposePromptTests test_codex_council.ParseRolesJsonTests test_codex_council.InstructionListFormTests test_codex_council.RolesRewriteRecoveryTests test_codex_council.NoRunLevelDeadlineTests test_replies_and_overrides.CommandOverrideTests -v
           python -m unittest discover -s tests -p 'test_workflow_cli.py' -v
-      - name: Publish ordinary source changes on the feature branch only
+      - name: Publish source changes and remove temporary assembly files
         env:
           EXPECTED_SHA: ${{ github.sha }}
         run: |
           set -eu
-          branch=codex/adaptive-collaboration-20261021
           test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
-          rm .council-integrate.py
+          git rm -- .council-finalize-*.patch .github/workflows/council-feature-assembly.yml
+          git add plugins tests
+          git diff --cached --check
           git config user.name 'Codex'
           git config user.email 'noreply@openai.com'
-          git add -A
-          git commit -m 'feat: integrate captured collaboration and evidence with the existing runner'
-          git push origin "HEAD:refs/heads/$branch"
-          printf 'Integrated feature commit: %s\n' "$(git rev-parse HEAD)"
-      - name: Package source for offline verification (no Git credentials)
-        if: always()
-        run: |
-          python - <<'PY'
-          import os, pathlib, subprocess, zipfile
-          paths = subprocess.check_output(['git', 'ls-files', '-z']).split(b'\0')
-          with zipfile.ZipFile(os.path.join(os.environ['RUNNER_TEMP'], 'council-source.zip'), 'w', zipfile.ZIP_DEFLATED) as archive:
-              for raw in paths:
-                  if raw:
-                      path = pathlib.Path(os.fsdecode(raw))
-                      if path.is_file() and not path.is_symlink():
-                          archive.write(path, path.as_posix())
-          PY
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: council-source-checkout
-          path: ${{ runner.temp }}/council-source.zip
-          retention-days: 1
+          git commit -m 'fix: bind captured permissions and finalize evidence and regression contracts'
+          git push origin HEAD:refs/heads/codex/adaptive-collaboration-20261021
+          printf 'Finalized source commit: %s\n' "$(git rev-parse HEAD)"

@@ -1,0 +1,108 @@
+diff --git a/tests/test_invocation_workflow.py b/tests/test_invocation_workflow.py
+index 855d2c3..20a5a6e 100644
+--- a/tests/test_invocation_workflow.py
++++ b/tests/test_invocation_workflow.py
+@@ -422,6 +422,32 @@ class WorkflowTests(WorkspaceCase):
+         with self.assertRaisesRegex(workspace.WorkspaceError, "deterministic private path"):
+             workflow.load_plan(self.run, roles, body)
+ 
++    def test_recorded_execution_cannot_change_while_author_contract_hash_stays(self):
++        roles, body = self.stage()
++        plan = workflow.prepare(str(self.run), roles, body)
++        plan["roles"][roles[0].id]["execution"] = policy.policy_dict({
++            "sandbox": "bypass", "network": True,
++            "authorization": "a changed record, not the authored policy"})
++        write_json(self.run / "run.json", plan)
++        with patch.object(workflow, "inspect_policy") as inspect:
++            with self.assertRaisesRegex(workspace.WorkspaceError, "permissions changed"):
++                workflow.bind_roles(str(self.run), roles, body, at_launch=True)
++        inspect.assert_not_called()
++
++    def test_task_and_source_scope_stay_bound_to_the_request(self):
++        roles, body = self.stage()
++        original = workflow.prepare(str(self.run), roles, body)
++        for field, value in (("task_id", "different-task"),
++                             ("source_root", str(self.run)),
++                             ("include", []), ("exclude", ["*"])):
++            plan = copy.deepcopy(original)
++            target = plan if field == "task_id" else plan["snapshot"]
++            target[field] = value
++            write_json(self.run / "run.json", plan)
++            with self.subTest(field=field):
++                with self.assertRaisesRegex(workspace.WorkspaceError, "binding differs"):
++                    workflow.load_plan(self.run, roles, body)
++
+     def test_native_external_tool_permission_is_not_an_agent_label(self):
+         roles, body = self.stage(roles=[RoleFixture(label="Security reviewer",
+                                                    execution={"sandbox": "bypass"})])
+@@ -468,6 +494,30 @@ class EvidenceTests(WorkspaceCase):
+         self.assertNotIn("Everything verified", json.dumps(result))
+         self.assertTrue(result["evidence_complete"])
+ 
++    def test_partial_raw_writes_are_completed_before_claiming_complete_evidence(self):
++        directory = self.run / "evidence"
++        directory.mkdir(mode=0o700)
++        recorder = evidence.AttemptEvidence(directory, ["codex"], "goal")
++        stream = recorder.streams["stdout"]
++        original_write = stream.write
++        raw = b'{"type":"turn.completed"}\n'
++        with patch.object(stream, "write", side_effect=lambda data: original_write(data[:3])):
++            recorder.feed("stdout", raw)
++        result = recorder.finish(returncode=0, state="exited")
++        self.assertEqual((directory / result["stdout_file"]).read_bytes(), raw)
++        self.assertTrue(result["evidence_complete"])
++
++    def test_raw_stream_no_progress_is_an_explicit_coverage_gap(self):
++        directory = self.run / "evidence"
++        directory.mkdir(mode=0o700)
++        recorder = evidence.AttemptEvidence(directory, ["codex"], "goal")
++        stream = recorder.streams["stdout"]
++        with patch.object(stream, "write", return_value=0):
++            recorder.feed("stdout", b'{"type":"turn.completed"}\n')
++        result = recorder.finish(returncode=0, state="exited")
++        self.assertFalse(result["evidence_complete"])
++        self.assertIn("stdout-write-failed", result["coverage_gaps"])
++
+     def test_oversized_summary_records_keep_raw_logs_and_mark_gap(self):
+         directory = self.run / "evidence"
+         directory.mkdir(mode=0o700)
+@@ -502,6 +552,39 @@ class EvidenceTests(WorkspaceCase):
+         self.assertIn("+value = 2", (directory / "candidate.diff").read_text())
+         self.assertEqual(self.file.read_text(), "value = 1\n")
+ 
++    def test_candidate_diff_preserves_embedded_unicode_line_separators(self):
++        old = 'value = "first\u2028second\x85third"\n'
++        new = 'value = "first\u2028changed\x85third"\n'
++        self.file.write_text(old, encoding="utf-8")
++        snap = self.capture()
++        target, directory = self.run / "scratch", self.run / "evidence"
++        directory.mkdir(mode=0o700)
++        workspace.copy_workspace(self.baseline, target, snap)
++        (target / "subject.py").write_text(new, encoding="utf-8")
++        evidence.collect_artifacts(self.baseline, target, snap, directory)
++        apply_dir = self.run / "apply"
++        apply_dir.mkdir(mode=0o700)
++        (apply_dir / "subject.py").write_text(old, encoding="utf-8")
++        subprocess.run(["git", "apply", str(directory / "candidate.diff")],
++                       cwd=apply_dir, check=True, capture_output=True)
++        self.assertEqual((apply_dir / "subject.py").read_text(encoding="utf-8"), new)
++        self.assertEqual(self.file.read_text(encoding="utf-8"), old)
++
++    def test_invalid_attempt_metadata_blocks_completeness_not_the_report(self):
++        roles = [RoleFixture()]
++        write_json(self.run / "request.json", {
++            "schema": workflow.REQUEST_SCHEMA, "task_id": "metadata-test",
++            "reason": "Check evidence integrity", "source_root": str(self.source),
++            "include": ["."]})
++        plan = workflow.prepare(str(self.run), roles, "Current evidence")
++        (self.run / "context.md").write_text("Current evidence")
++        directory = self.run / plan["roles"][roles[0].id]["evidence"]
++        write_json(directory / "attempt-corrupt.json", [])
++        result = evidence.write_result(self.run, plan, [])
++        self.assertFalse(result["required_contributions_complete"])
++        self.assertIn("experiment:attempt-metadata-unreadable", result["coverage_gaps"])
++        self.assertTrue((self.run / "result.json").exists())
++
+     def test_artifact_symlink_cannot_read_host_file(self):
+         snap = self.capture()
+         target, directory = self.run / "scratch", self.run / "evidence"

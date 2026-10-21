@@ -1,0 +1,135 @@
+diff --git a/plugins/codex-council/skills/codex-council/scripts/council_evidence.py b/plugins/codex-council/skills/codex-council/scripts/council_evidence.py
+index 45517a4..291d517 100644
+--- a/plugins/codex-council/skills/codex-council/scripts/council_evidence.py
++++ b/plugins/codex-council/skills/codex-council/scripts/council_evidence.py
+@@ -11,6 +11,7 @@ from __future__ import annotations
+ import contextlib
+ import difflib
+ import hashlib
++import io
+ import json
+ import os
+ import platform
+@@ -80,7 +81,12 @@ class AttemptEvidence:
+         stream = self.streams.get(name)
+         if stream is not None:
+             try:
+-                stream.write(block)
++                remaining = memoryview(block)
++                while remaining:
++                    written = stream.write(remaining)
++                    if written is None or written <= 0:
++                        raise OSError("evidence stream made no write progress")
++                    remaining = remaining[written:]
+             except OSError:
+                 self.errors.append(f"{name}-write-failed")
+                 with contextlib.suppress(OSError):
+@@ -222,7 +228,7 @@ def collect_artifacts(baseline: Path, workspace: Path, snapshot: dict[str, Any],
+             continue
+         if a != b:
+             for line in difflib.unified_diff(
+-                    a.splitlines(keepends=True), b.splitlines(keepends=True),
++                    io.StringIO(a).readlines(), io.StringIO(b).readlines(),
+                     fromfile=f"a/{name}" if before else "/dev/null",
+                     tofile=f"b/{name}" if after else "/dev/null"):
+                 patches.append(line)
+@@ -265,7 +271,10 @@ def write_result(run_dir: Path, plan: dict[str, Any], results: list[Any],
+         attempts = []
+         for path in sorted(directory.glob("attempt-*.json")):
+             try:
+-                attempts.append(read_json(path))
++                attempt = read_json(path)
++                if not isinstance(attempt, dict) or attempt.get("schema") != "codex-council/attempt@1":
++                    raise ValueError("invalid attempt evidence")
++                attempts.append(attempt)
+             except (OSError, ValueError):
+                 gaps.append(f"{role_id}:attempt-metadata-unreadable")
+         role_gaps = []
+diff --git a/plugins/codex-council/skills/codex-council/scripts/council_workflow.py b/plugins/codex-council/skills/codex-council/scripts/council_workflow.py
+index b96df0a..12498bd 100644
+--- a/plugins/codex-council/skills/codex-council/scripts/council_workflow.py
++++ b/plugins/codex-council/skills/codex-council/scripts/council_workflow.py
+@@ -130,11 +130,17 @@ def load_plan(run_dir: str | Path, roles: list[Any] | None = None,
+     plan = read_json(path)
+     if not isinstance(plan, dict) or plan.get("schema") != PLAN_SCHEMA:
+         raise WorkspaceError("unsupported or invalid run.json")
+-    if plan.get("request_sha256") != digest(_request(directory)):
++    request = _request(directory)
++    if plan.get("request_sha256") != digest(request):
+         raise WorkspaceError("request changed after capture; prepare a fresh invocation")
+     snapshot, bindings = plan.get("snapshot"), plan.get("roles")
+     if not isinstance(snapshot, dict) or not isinstance(bindings, dict):
+         raise WorkspaceError("invalid captured inputs or role bindings")
++    if (plan.get("task_id") != request["task_id"]
++            or plan.get("reason") != request["reason"]
++            or any(snapshot.get(key) != request[key]
++                   for key in ("source_root", "include", "exclude"))):
++        raise WorkspaceError("captured task or source binding differs from request.json")
+     if snapshot.get("snapshot_id") != digest({"files": snapshot.get("files"),
+                                               "git": snapshot.get("git")}):
+         raise WorkspaceError("captured input manifest checksum does not match")
+@@ -153,7 +159,10 @@ def load_plan(run_dir: str | Path, roles: list[Any] | None = None,
+         if set(bindings) != {role.id for role in roles}:
+             raise WorkspaceError("panel changed after capture; prepare a new invocation")
+         for role in roles:
+-            if bindings[role.id]["contract_sha256"] != digest(role_contract(role)):
++            contract = role_contract(role)
++            binding = bindings[role.id]
++            if (binding.get("contract_sha256") != digest(contract)
++                    or binding.get("execution") != contract["execution"]):
+                 raise WorkspaceError(f"{role.id}: task or permissions changed after capture")
+     if body is not None and plan.get("context_sha256") != _context_hash(body):
+         raise WorkspaceError("context changed after capture; prepare a fresh invocation")
+diff --git a/tests/council_testlib.py b/tests/council_testlib.py
+index ba74a7f..28c36be 100644
+--- a/tests/council_testlib.py
++++ b/tests/council_testlib.py
+@@ -18,6 +18,7 @@ import subprocess
+ import sys
+ import tempfile
+ import time
++import tomllib
+ 
+ TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+ SCRIPTS_DIR = os.path.abspath(os.path.join(
+@@ -212,3 +213,20 @@ def assert_only_discovery_methods(test, methods):
+         test.assertNotIn("login", method.lower())
+         if not method.startswith("response:"):
+             test.assertIn(method, fake_codex.DISCOVERY_METHODS)
++
++
++def config_values(argv):
++    """Decode explicit CLI configuration without confusing safety and model flags."""
++    result = {}
++    for index, arg in enumerate(argv):
++        if arg in ("-c", "--config"):
++            result.update(tomllib.loads(argv[index + 1]))
++    return result
++
++
++def assert_no_model_overrides(test, argv):
++    """Native model inheritance still permits explicit command-safety settings."""
++    test.assertNotIn("-m", argv)
++    test.assertNotIn("--model", argv)
++    for key in ("model", "model_reasoning_effort", "model_provider"):
++        test.assertNotIn(key, config_values(argv))
+diff --git a/tests/fake_workflow_codex.py b/tests/fake_workflow_codex.py
+index b76a13c..b04b180 100644
+--- a/tests/fake_workflow_codex.py
++++ b/tests/fake_workflow_codex.py
+@@ -89,10 +89,13 @@ def execute(argv):
+         time.sleep(120)
+     if "SLOW_FIXTURE" in body:
+         time.sleep(1)
+-    if "SIDE_EFFECT_503" in body:
++    if any(marker in body for marker in ("SIDE_EFFECT_503", "SIDE_EFFECT_429", "SIDE_EFFECT_STALE")):
+         command("from pathlib import Path; p=Path('effects.txt'); "
+                 "p.write_text((p.read_text() if p.exists() else '')+'effect\\n')", cwd)
+-        emit({"type": "turn.failed", "error": {"message": "HTTP 503 Service Unavailable"}})
++        message = ("HTTP 429 Too Many Requests" if "SIDE_EFFECT_429" in body else
++                   "Error: no rollout found for thread id " + sid if "SIDE_EFFECT_STALE" in body
++                   else "HTTP 503 Service Unavailable")
++        emit({"type": "turn.failed", "error": {"message": message}})
+         return 1
+     if "TRANSIENT_BEFORE_TOOLS" in body:
+         marker = Path(os.environ["CODEX_HOME"]) / "retried"
