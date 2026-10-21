@@ -1242,13 +1242,22 @@ def status_command(run_dir):
     run_dir = _check_private_dir(
         run_dir, prefix="--status: ", recovery=RUN_DIR_RECOVERY
     )
-    view = read_status(os.path.join(run_dir, STATUS_FILENAME))
+    status_path = os.path.join(run_dir, STATUS_FILENAME)
+    view = read_status(status_path)
     detached = None
     if is_detached(run_dir, view):
         table = _process_table()
         detached = supervisor_state(run_dir, view, table)
     else:
         table = _process_table() if view is not None else None
+    if view is not None and view.state not in TERMINAL_STATES:
+        # The runner may have published its terminal state and exited
+        # between the read above and the liveness reads; that state wins.
+        final = read_status(status_path)
+        if final is not None and final.state in TERMINAL_STATES:
+            view = final
+            if detached is not None:
+                detached = supervisor_state(run_dir, view, table)
     for line in _status_lines(view, time.time(), table, detached):
         _print_stdout(line)
     return 0

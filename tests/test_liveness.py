@@ -1351,6 +1351,30 @@ class DetachedStatusTests(unittest.TestCase):
         self.assertEqual(lines[-1], "next: read out.md; the run has ended")
 
 
+    def test_a_terminal_state_published_during_the_liveness_reads_wins(self):
+        holder, identity = _lock_holder(self, self.run_dir)
+        _supervisor(self.run_dir, holder.pid, identity)
+        _status(self.run_dir, pid=holder.pid, identity=identity, roles={
+            "architect": {"state": "settled", "outcome": "ok"}})
+        real = council_liveness._process_table
+
+        def runner_finishes_then_ps(pid=None):
+            # The runner's last publish and exit land after status.json was read.
+            if holder.poll() is None:
+                _status(self.run_dir, pid=holder.pid, identity=identity,
+                        state="done", exit_code=0, roles={
+                            "architect": {"state": "settled", "outcome": "ok"}})
+                holder.kill()
+                holder.wait()
+            return real(pid)
+
+        with patch.object(council_liveness, "_process_table",
+                          runner_finishes_then_ps):
+            lines = self._lines()
+        self.assertEqual(lines[0], "runner: done (exit 0)")
+        self.assertEqual(lines[-1], "next: read out.md; the run has ended")
+
+
 class DetachedReapTests(unittest.TestCase):
     def setUp(self):
         self.run_dir = _private_dir(self)
