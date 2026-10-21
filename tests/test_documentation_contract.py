@@ -56,7 +56,6 @@ class DocumentationContractTests(unittest.TestCase):
         self.assertEqual(len(panels), 1)
         roles = codex_council._parse_roles_json(json.dumps(panels[0]))
         self.assertEqual(roles[0].execution["sandbox"], "workspace-write")
-        self.assertNotIn(codex_council.REQUIRED_CADENCE_SENTENCE, roles[0].instruction)
 
     def test_relative_markdown_links_point_at_existing_files(self):
         documents = [SKILL, ROOT / "README.md", ROOT / "DESIGN.md", *REFERENCES.glob("*.md")]

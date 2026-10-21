@@ -2282,11 +2282,6 @@ class InstructionListFormTests(unittest.TestCase):
         roles = self._roles(items)
         self.assertEqual(roles[0].instruction, " ".join(items))
 
-    def test_legacy_cadence_position_does_not_restrict_task_instructions(self):
-        items = ["Thoroughness beats speed.", "If nothing material, say so clearly."]
-        roles = self._roles(items)
-        self.assertEqual(roles[0].instruction, " ".join(items))
-
     def test_large_joined_paragraph_is_accepted(self):
         items = ["a" * 5000, "b" * 5000,
                  "If nothing material, say so clearly.",
@@ -2514,14 +2509,16 @@ class CheckStagingDirTests(unittest.TestCase):
         with open(os.path.join(self.tmp.name, "context.md"), "w", encoding="utf-8") as f:
             f.write(text)
 
-    def test_valid_staging_dir_prints_ok(self):
+    def test_valid_but_uncaptured_staging_dir_is_refused(self):
+        # The happy path needs --prepare (tests/test_codex_council_cli.py).
         self._write_valid_roles()
         self._write_context()
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            codex_council._check_staging_dir(self.tmp.name)
-        self.assertIn("staging OK", buf.getvalue())
-        self.assertIn("(1 roles; max parallel 6)", buf.getvalue())
+            _assert_usage_exit(
+                self, lambda: codex_council._check_staging_dir(self.tmp.name),
+                expect_in_stderr="no completed capture")
+        self.assertNotIn("staging OK", buf.getvalue())
 
     def test_missing_context_mentions_staging_hint(self):
         self._write_valid_roles()
@@ -2596,7 +2593,8 @@ class CheckStagingDirTests(unittest.TestCase):
         self.assertIn("do not chmod it", err)
         self.assertIn("do not reuse its name", err)
         self.assertIn("`mktemp -d` again", err)
-        self.assertIn("re-Write BOTH roles.json and context.md", err)
+        self.assertIn("Write request.json, roles.json, and context.md in the NEW "
+                      "directory, run --prepare and then --discover there", err)
 
     def test_symlink_to_private_dir_is_rejected(self):
         real = os.path.join(self.tmp.name, "real")
@@ -2673,10 +2671,9 @@ class CheckStagingDirTests(unittest.TestCase):
         self.assertIn("do not mkdir it", err)
 
     def test_a_directory_that_already_launched_is_refused(self):
-        """Each launch needs its own directory: the launch's own shell
-        redirections truncate out.md and err.log before the runner starts,
-        so the pre-flight is the last point that can refuse a relaunch into
-        a directory whose council may still be running. Any launch output
+        """Each launch needs its own directory: a directory holding launch
+        output may hold a running council, so the pre-flight refuses it
+        before anything can truncate out.md or err.log. Any launch output
         counts, a dangling symlink included, and the refusal comes before
         the staged files are even parsed."""
         self._write_valid_roles()
@@ -2708,8 +2705,9 @@ class CheckStagingDirTests(unittest.TestCase):
                     )
                 self.assertIn(f"({name} present)", err)
                 self.assertIn("every launch needs its own directory", err)
-                self.assertIn("Run `mktemp -d` again, run --discover in the "
-                              "NEW directory", err)
+                self.assertIn("Run `mktemp -d` again. Write request.json, "
+                              "roles.json, and context.md in the NEW "
+                              "directory, run --prepare", err)
                 self.assertEqual(out.getvalue(), "")
                 (os.rmdir if name == "replies" else os.remove)(path)
         # Refused before parsing: a broken roles file never gets that far.
@@ -2825,34 +2823,6 @@ class ReadContextFileTests(unittest.TestCase):
         self.assertEqual(codex_council._read_context_file(path), content)
 
 
-class ReadStdinBodyTests(unittest.TestCase):
-    def test_returns_decoded_body(self):
-        self.assertEqual(codex_council._read_stdin_body(io.BytesIO(b"hello")), "hello")
-
-    def test_large_multibyte_stdin_is_accepted_without_truncation(self):
-        content = "€" * 4_000_000
-        self.assertEqual(
-            codex_council._read_stdin_body(io.BytesIO(content.encode("utf-8"))),
-            content,
-        )
-
-    def test_rejects_invalid_utf8(self):
-        buf = io.StringIO()
-        with contextlib.redirect_stderr(buf):
-            with self.assertRaises(SystemExit) as ctx:
-                codex_council._read_stdin_body(io.BytesIO(b"\xff\xfe bad bytes"))
-        self.assertEqual(ctx.exception.code, 1)
-        self.assertIn("not valid UTF-8", buf.getvalue())
-
-    def test_empty_rejected(self):
-        buf = io.StringIO()
-        with contextlib.redirect_stderr(buf):
-            with self.assertRaises(SystemExit) as ctx:
-                codex_council._read_stdin_body(io.BytesIO(b"   \n  "))
-        self.assertEqual(ctx.exception.code, 1)
-        self.assertIn("Empty input", buf.getvalue())
-
-
 class ArgParseTests(unittest.TestCase):
     def test_help_describes_contextual_programmatic_collaboration(self):
         out = io.StringIO()
@@ -2871,23 +2841,29 @@ class ArgParseTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 codex_council._parse_args(["--help"])
         help_text = " ".join(out.getvalue().split())
-        self.assertIn("must be private (0700, user-owned, non-symlink) at "
-                      "launch as well as preflight", help_text)
+        self.assertIn("must be private (0700, user-owned, non-symlink)", help_text)
+        self.assertIn("Run --prepare RUNDIR first", help_text)
+        self.assertNotIn("--roles-file", help_text)
+        self.assertNotIn("--context-file", help_text)
         self.assertIn("mktemp -d", help_text)
         self.assertIn("--skill-contract", help_text)
         self.assertIn("replies/", help_text)
         self.assertIn("--follow", help_text)
 
-    def test_roles_file_parses_to_namespace(self):
-        args = codex_council._parse_args(["--roles-file", "x.json"])
-        self.assertEqual(args.roles_file, "x.json")
-
-    def test_context_file_parses_to_namespace(self):
+    def test_staged_inputs_parse_only_for_the_supervised_child(self):
         args = codex_council._parse_args([
-            "--roles-file", "x.json",
-            "--context-file", "context.md",
+            "--roles-file", "x.json", "--context-file", "context.md",
+            "--supervisor-lock-fd", "3",
         ])
-        self.assertEqual(args.context_file, "context.md")
+        self.assertEqual((args.roles_file, args.context_file), ("x.json", "context.md"))
+        for argv in (["--roles-file", "x.json"], ["--context-file", "context.md"],
+                     ["--roles-file", "x.json", "--context-file", "context.md"]):
+            buf = io.StringIO()
+            with self.subTest(argv=argv), contextlib.redirect_stderr(buf), \
+                    self.assertRaises(SystemExit) as ctx:
+                codex_council._parse_args(argv)
+            self.assertEqual(ctx.exception.code, 2)
+            self.assertIn("there is no direct launch", buf.getvalue())
 
     def test_empty_roles_file_rejected(self):
         buf = io.StringIO()

@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "plugins/codex-council/skills/codex-council/scripts"
 RUNNER = SCRIPTS / "codex_council.py"
 sys.path.insert(0, str(SCRIPTS))
+sys.path.insert(0, str(ROOT / "tests"))
 
 # The authoring environment can run pure-module tests without a full checkout.
 # CI and every clone contain the runner and must run this integration suite.
@@ -25,6 +26,7 @@ HAS_RUNNER = RUNNER.exists()
 if HAS_RUNNER:
     import codex_council  # noqa: E402
     import council_liveness  # noqa: E402
+    import council_testlib  # noqa: E402
 
 
 def write(path, value):
@@ -102,8 +104,9 @@ class WorkflowCliTests(unittest.TestCase):
         return directory
 
     def launch(self, directory):
-        return self.cli("--roles-file", directory / "roles.json",
-                        "--context-file", directory / "context.md")
+        """--start's supervised child in the foreground (its exit code and
+        streams), the runner's only path to workers."""
+        return council_testlib.run_supervised(str(directory), self.env, self.source)
 
     def calls(self):
         if not self.log.exists():
@@ -150,6 +153,45 @@ class WorkflowCliTests(unittest.TestCase):
         stale = self.cli("--freshness", directory)
         self.assertEqual(stale.returncode, 1, stale.stdout)
         self.assertIn("output/", json.loads(stale.stdout)["changed_paths"])
+
+    def test_failed_preparation_never_falls_through_to_a_launch(self):
+        directory = self.base / "run-unprepared"
+        directory.mkdir(mode=0o700)
+        self.runs.append(directory)
+        write(directory / "roles.json", [{"id": "contribution", "label": "Current contribution",
+                                          "instruction": ["Inspect the current question."]}])
+        write(directory / "request.json", {"schema": "codex-council/request@1",
+                                           "task_id": "task-one", "source_root": str(self.source),
+                                           "include": ["."], "reason": ""})
+        (directory / "context.md").write_text("Current captured task.\n")
+        self.assertEqual(self.cli("--prepare", directory).returncode, 2)
+        for mode in ("--discover", "--check-staging-dir", "--start"):
+            proc = self.cli(mode, directory)
+            self.assertEqual(proc.returncode, 2, (mode, proc.stdout, proc.stderr))
+            self.assertIn("no completed capture", proc.stderr)
+        self.assertFalse((directory / "supervisor.lock").exists())
+        self.assertFalse(self.execs())
+
+    def test_there_is_no_direct_launch(self):
+        directory = self.stage()
+        proc = self.cli("--roles-file", directory / "roles.json",
+                        "--context-file", directory / "context.md")
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn("there is no direct launch", proc.stderr)
+        self.assertFalse(self.execs())
+
+    def test_a_prepared_run_executes_at_most_once(self):
+        directory = self.stage()
+        first = self.launch(directory)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        before = (directory / "result.json").read_bytes()
+        for name in ("supervisor.lock", "supervisor.json"):
+            (directory / name).unlink()  # even with --start's own claim reset
+        second = self.launch(directory)
+        self.assertEqual(second.returncode, 2, second.stderr)
+        self.assertIn("already executed", second.stderr)
+        self.assertEqual(len(self.execs()), 1)
+        self.assertEqual((directory / "result.json").read_bytes(), before)
 
     def test_default_permissions_are_read_only_and_external_tools_disabled(self):
         directory = self.stage(roles=[{"id": "view", "label": "Perspective",

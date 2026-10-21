@@ -15,9 +15,8 @@ of lines the follower emitted:
   S5  a role is byte-silent for a while, then succeeds.
   S6  a role writes stdout lines no JSON parser accepts while its stderr
       keeps printing, then succeeds.
-  S7  the host stops an attached launch in a background task (SIGTERM to
-      its process group) while a role is silent: the interruption is clean
-      and settled replies stay.
+  S7  the runner's process group gets SIGTERM while a role is silent: the
+      interruption is clean and settled replies stay.
   S8  --start from a shell in its own session; after it returns, that
       shell's group gets SIGHUP, SIGTERM, and SIGKILL: the council finishes.
   S9  the --start process itself is SIGKILLed right after it spawned the
@@ -63,6 +62,7 @@ TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 if TESTS_DIR not in sys.path:
     sys.path.insert(0, TESTS_DIR)
 
+import council_testlib  # noqa: E402
 import fake_codex  # noqa: E402
 
 RUNNER = os.path.abspath(os.path.join(
@@ -257,7 +257,6 @@ class Council:
         self.roles = roles
         self.base = tempfile.mkdtemp(prefix="council-liveness-")
         self.staged = []
-        self.run_dir = self.stage("run")
         self.pid_dir = os.path.join(self.base, "pids")
         os.mkdir(self.pid_dir)
         env = {key: value for key, value in os.environ.items()
@@ -272,6 +271,7 @@ class Council:
         self.env = env
         self.proc = None
         self.followers = []
+        self.run_dir = self.stage("run")
 
     def __enter__(self):
         return self
@@ -280,7 +280,7 @@ class Council:
         self.close()
 
     def stage(self, name, roles=None):
-        """A new private run directory holding roles.json and context.md."""
+        """A new private run directory, captured (context-only) by --prepare."""
         run_dir = os.path.join(self.base, name)
         os.mkdir(run_dir, 0o700)
         with open(os.path.join(run_dir, "roles.json"), "w",
@@ -289,6 +289,14 @@ class Council:
         with open(os.path.join(run_dir, "context.md"), "w",
                   encoding="utf-8") as f:
             f.write("Liveness scenario context.\n")
+        source = os.path.join(self.base, name + "-source")
+        os.mkdir(source, 0o700)
+        council_testlib.write_request(run_dir, source)
+        prepared = subprocess.run(
+            [PYTHON, self.runner, "--prepare", run_dir], capture_output=True,
+            text=True, env=self.env, stdin=subprocess.DEVNULL, timeout=60)
+        if prepared.returncode != 0:
+            raise RuntimeError("--prepare failed: " + prepared.stderr)
         self.staged.append(run_dir)
         return run_dir
 
@@ -326,14 +334,19 @@ class Council:
         return None
 
     def launch(self):
-        with open(self.path("out.md"), "wb") as out, \
-                open(self.path("err.log"), "wb") as err:
-            self.proc = subprocess.Popen(
-                [PYTHON, self.runner,
-                 "--roles-file", self.path("roles.json"),
-                 "--context-file", self.path("context.md")],
-                stdout=out, stderr=err, env=self.env, cwd=self.run_dir,
-                start_new_session=True)
+        """--start's supervised child, claimed as --start claims it, with
+        this harness holding its process handle."""
+        lock = council_testlib.claim_supervisor_lock(self.run_dir)
+        argv = council_testlib.supervised_argv(self.run_dir, lock)
+        argv[:2] = [PYTHON, self.runner]
+        try:
+            with open(self.path("out.md"), "wb") as out, \
+                    open(self.path("err.log"), "wb") as err:
+                self.proc = subprocess.Popen(
+                    argv, stdout=out, stderr=err, env=self.env,
+                    cwd=self.run_dir, start_new_session=True, pass_fds=(lock,))
+        finally:
+            os.close(lock)
 
     def follow(self, via_parent=False):
         argv = [PYTHON, self.runner, "--follow", self.run_dir]
@@ -624,9 +637,18 @@ def s6_malformed_lines(runner, fake_bin):
         err = c.read("err.log")
         ok = "status=ok" in reply and "fake reply from codex" in reply
         crashed = "Traceback" in err or "crashed" in err
-        passed = code == 0 and runner_code == 0 and ok and not crashed
+        # The reply survives, but unparsed protocol records leave the
+        # evidence incomplete, so required coverage (and exit 0) is withheld.
+        try:
+            result = json.loads(c.read("result.json"))
+            gaps = result["roles"]["garbled"]["coverage_gaps"]
+        except (ValueError, KeyError):
+            gaps = None
+        passed = (code == 0 and runner_code == 1 and ok and not crashed
+                  and gaps == ["incomplete-attempt-evidence"])
         detail = (f"follower exit={code}; runner exit={runner_code}; "
-                  f"reply ok={ok}; traceback or crash in err.log={crashed}")
+                  f"reply ok={ok}; coverage gaps={gaps}; "
+                  f"traceback or crash in err.log={crashed}")
         return Outcome("S6", "malformed stdout lines, chatty stderr", passed,
                        detail, len(follower.lines))
 
@@ -666,7 +688,7 @@ def s7_tracked_stop(runner, fake_bin):
                   f"status={runner_state.get('state')}/"
                   f"{runner_state.get('exit')}; settled reply kept={kept}; "
                   f"fake survivors={len(survivors)}")
-        return Outcome("S7", "host stops a tracked launch", passed, detail,
+        return Outcome("S7", "runner group SIGTERMed mid-run", passed, detail,
                        len(follower.lines))
 
 
@@ -800,7 +822,8 @@ def s10_concurrent_starts(runner, fake_bin):
                   and _started_pid(winner[1]) == record.get("pid")
                   and (status.get("runner") or {}).get("pid")
                   == record.get("pid")
-                  and err_log.startswith("[codex-council] dispatching ")
+                  and err_log.startswith("[codex-council] preparing 1 captured ")
+                  and err_log.count("[codex-council] dispatching ") == 1
                   and err_log.count("CODEX_COUNCIL_DONE") == 1
                   and _completed(status, err_log, out) and execs == 1)
             if not ok:

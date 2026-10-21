@@ -214,6 +214,56 @@ def _answer(message, spec):
     return None
 
 
+def _codex_override(config, setting):
+    """Codex -c semantics: split once on '=', TOML value or raw string, and
+    the key split on every '.' with no quote handling."""
+    key, _, raw = setting.partition("=")
+    key, raw = key.strip(), raw.strip()
+    try:
+        import tomllib
+        value = tomllib.loads("_x_ = " + raw)["_x_"]
+    except Exception:
+        value = raw.strip("\"'")
+    segments = key.split(".")
+    for segment in segments[:-1]:
+        if not isinstance(config.get(segment), dict):
+            config[segment] = {}
+        config = config[segment]
+    config[segments[-1]] = value
+
+
+def run_policy_server(argv, scenario):
+    """The council's execution-policy probe (launched with -c overrides):
+    config/read answers the scenario's "policy_config" (default: no MCP
+    servers) with the overrides applied, as Codex does. Logged apart from
+    discovery to FAKE_CODEX_POLICY_LOG; FAKE_CODEX_PID_DIR gets
+    policy-<pid>.pid."""
+    _record(f"policy-{os.getpid()}.pid", str(os.getpid()))
+    config = json.loads(json.dumps(scenario.get("policy_config", {"mcp_servers": {}})))
+    for index, arg in enumerate(argv[:-1]):
+        if arg == "-c":
+            _codex_override(config, argv[index + 1])
+    methods = {"initialize": {"result": {"codexHome": "/fake-codex-home"}},
+               "config/read": {"result": {"config": config, "origins": {}}},
+               "configRequirements/read": {"result": {
+                   "requirements": scenario.get("policy_requirements")}}}
+    methods.update(scenario.get("policy_methods", {}))
+    while True:
+        raw = sys.stdin.buffer.readline()
+        if not raw:
+            return 0
+        if not raw.strip():
+            continue
+        message = json.loads(raw)
+        method = message.get("method")
+        _append("FAKE_CODEX_POLICY_LOG", str(method))
+        if method is None or "id" not in message:
+            continue
+        code = _answer(message, methods.get(method))
+        if code is not None:
+            return code
+
+
 def run_app_server(scenario):
     server = scenario.get("server", {})
     methods = scenario.get("methods", {})
@@ -461,6 +511,8 @@ def main():
     scenario = _scenario()
     if argv[:1] == ["--version"]:
         return run_version(scenario)
+    if argv[:1] == ["app-server"] and "-c" in argv:
+        return run_policy_server(argv, scenario)
     if argv[:1] == ["app-server"]:
         return run_app_server(scenario)
     if argv[:1] == ["exec"]:

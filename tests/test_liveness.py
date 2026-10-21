@@ -1759,7 +1759,11 @@ def _golden_s0():
            "grounded selections). codex exec does not report the model or "
            "effort that served a turn; values above are what the council "
            "sent, and \"native inheritance\" means no override was sent.\n\n"
-           + "\n".join(section(r) for r in roles))
+           + "\n".join(section(r) for r in roles)
+           + "\n## Captured evidence\n\nRead `result.json` and per-attempt logs "
+           "before reconciliation. Run `--freshness` before applying any "
+           "candidate change. Execution success is not a substantive "
+           "verification verdict.\n")
     golden = {"out.md": out}
     for r in roles:
         golden[f"replies/{r}.md"] = (
@@ -1772,8 +1776,9 @@ class LivenessScenarioTests(unittest.TestCase):
     """Every scenario in liveness_scenarios.py, run once, concurrently."""
 
     # Follower lines S0 gives when every routine line is relayed too
-    # (dispatch, model selection, three starts, three completions, done).
-    S0_ALL_LINES = 9
+    # (preparing, dispatch, model selection, three starts, three
+    # completions, done).
+    S0_ALL_LINES = 10
 
     @classmethod
     def setUpClass(cls):
@@ -1788,7 +1793,7 @@ class LivenessScenarioTests(unittest.TestCase):
     def test_s0_happy_path_is_unchanged_with_fewer_lines(self):
         outcome = self._assert_passed("S0")
         self.assertEqual(outcome.outputs, _golden_s0())
-        self.assertEqual(outcome.follower_lines, 6)
+        self.assertEqual(outcome.follower_lines, 7)
         self.assertLess(outcome.follower_lines, self.S0_ALL_LINES)
 
     def test_s1_held_pipe(self):
@@ -1809,7 +1814,7 @@ class LivenessScenarioTests(unittest.TestCase):
     def test_s6_malformed_lines(self):
         self._assert_passed("S6")
 
-    def test_s7_host_stop_of_a_tracked_launch_is_clean(self):
+    def test_s7_sigterm_to_the_runner_group_is_clean(self):
         self._assert_passed("S7")
 
     def test_s8_start_survives_its_shell_group_dying(self):

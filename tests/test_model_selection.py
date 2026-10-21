@@ -22,6 +22,7 @@ import io
 import json
 import os
 import random
+import shutil
 import signal
 import stat
 import subprocess
@@ -43,6 +44,7 @@ import council_discovery  # noqa: E402
 import council_failures  # noqa: E402
 import council_liveness  # noqa: E402
 import council_selection  # noqa: E402
+import council_workflow  # noqa: E402
 import fake_codex  # noqa: E402
 from council_testlib import (  # noqa: E402
     EPOCH,
@@ -1077,11 +1079,16 @@ class AuthoringValidationTests(unittest.TestCase):
 # ---------- preflight: the selection plan ----------
 
 class PreflightPlanTests(unittest.TestCase):
+    """The pre-flight's plan lines for a captured run (in-process; the
+    execution-policy probe is stubbed, every role shares one snapshot)."""
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.run_dir = os.path.join(tmp.name, "run")
         os.mkdir(self.run_dir, 0o700)
+        self.source = os.path.join(tmp.name, "source")
+        os.mkdir(self.source, 0o700)
         codex_home = os.path.join(tmp.name, "codex-home")
         os.mkdir(codex_home)
         for patcher in (
@@ -1092,6 +1099,8 @@ class PreflightPlanTests(unittest.TestCase):
                          side_effect=AssertionError("preflight discovered")),
             patch.object(council_discovery, "_discover",
                          side_effect=AssertionError("preflight discovered")),
+            patch.object(council_workflow, "inspect_policy",
+                         return_value={"overrides": []}),
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -1100,11 +1109,22 @@ class PreflightPlanTests(unittest.TestCase):
             f.write("please review\n")
 
     def _stage(self, entries, snapshot=None):
+        raw = json.dumps(entries)
         with open(os.path.join(self.run_dir, "roles.json"), "w",
                   encoding="utf-8") as f:
-            json.dump(entries, f)
+            f.write(raw)
+        council_testlib.write_request(self.run_dir, self.source)
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                roles = codex_council._parse_roles_json(raw)
+        except SystemExit:
+            return  # an authoring defect the pre-flight refuses first
+        council_workflow.prepare(self.run_dir, roles, "please review\n")
         if snapshot is not None:
-            council_discovery._write_snapshot(self.run_dir, snapshot)
+            for role in roles:
+                council_discovery._write_snapshot(os.path.join(
+                    self.run_dir, "catalogs", council_workflow.role_key(role.id)),
+                    snapshot)
 
     def _preflight(self):
         out = io.StringIO()
@@ -1123,7 +1143,8 @@ class PreflightPlanTests(unittest.TestCase):
         lines = self._preflight()
         self.assertRegex(lines[0], r"^\[codex-council\] staging OK: .+ "
                                    r"\(4 roles; max parallel 6\) version=\S+$")
-        self.assertEqual(lines[1:], [
+        self.assertTrue(lines[5].startswith("[codex-council] execution plan: roles=4 "))
+        self.assertEqual(lines[1:5], [
             "[codex-council] selection plan: plain: native inheritance",
             "[codex-council] selection plan: pin: explicit override (model "
             f"{CUSTOM}, effort brisk); unverified: not in the discovered "
@@ -1139,7 +1160,7 @@ class PreflightPlanTests(unittest.TestCase):
         self._stage([_routed("route"), _native_effort("tune")])
         with patch.dict(os.environ, {ROUTING_ENV: "off"}):
             lines = self._preflight()
-        self.assertEqual(lines[1:], [
+        self.assertEqual(lines[1:3], [
             "[codex-council] selection plan: route: native inheritance "
             "(routing off)",
             "[codex-council] selection plan: tune: native inheritance "
@@ -2436,7 +2457,21 @@ tearDownModule = council_testlib.remove_fake_codex
 
 
 class LaunchEndToEndTests(unittest.TestCase):
-    """--discover, preflight, launch, and --follow as real subprocesses."""
+    """--prepare, --discover, preflight, launch, and --follow as real
+    subprocesses.
+
+    Every launch needs its own captured run directory. The harness keeps
+    the tests' shape: discover() turns per-role planning discovery on (under
+    the scenario active at that call) and returns PLANNED, a placeholder
+    snapshot_id; stage() captures a new directory, discovers each role there,
+    and writes each role's own snapshot_id in place of PLANNED. A launch of
+    an already launched directory first re-stages the same roles into a new
+    one, planned under the same planning scenario, so the launch still sees
+    any evidence change made since. Roles without an execution object
+    resume a saved thread of the one logical task (the project, task e2e).
+    """
+
+    PLANNED = "5ca1ab1e5ca1ab1e"
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -2459,7 +2494,11 @@ class LaunchEndToEndTests(unittest.TestCase):
             XDG_STATE_HOME=self.state_home,
             CODEX_HOME=self._mkdir("codex-home"),
         )
+        self.current = None
         self.scenario(fake_codex.default_scenario())
+        self.planning = None  # the scenario discover() planned under
+        self.staged = None
+        self.runs = 0
         self.addCleanup(lambda: council_testlib.assert_only_discovery_methods(
             self, fake_codex.read_lines(self.method_log)))
 
@@ -2469,6 +2508,7 @@ class LaunchEndToEndTests(unittest.TestCase):
         return path
 
     def scenario(self, scenario):
+        self.current = scenario
         fake_codex.write_scenario(self.scenario_path, scenario)
 
     def run_script(self, *args, **env):
@@ -2478,14 +2518,10 @@ class LaunchEndToEndTests(unittest.TestCase):
             stdin=subprocess.DEVNULL, timeout=120)
 
     def discover(self):
-        """Run --discover; return the planning snapshot id."""
-        proc = self.run_script("--discover", self.run_dir,
-                               "--skill-contract", EPOCH)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        snapshot, problem = council_discovery._read_snapshot(self.run_dir)
-        self.assertIsNone(problem)
-        self.forget_discovery()
-        return snapshot["snapshot_id"]
+        """Plan every later stage with per-role discovery under the current
+        scenario; return the placeholder each role's own id replaces."""
+        self.planning = self.current
+        return self.PLANNED
 
     def forget_discovery(self):
         for path in [self.method_log, *glob.glob(
@@ -2497,21 +2533,93 @@ class LaunchEndToEndTests(unittest.TestCase):
         """True when the app-server was spawned since forget_discovery."""
         return os.path.exists(os.path.join(self.pid_dir, "server.pid"))
 
+    def catalog(self, role_id="architect"):
+        return os.path.join(self.run_dir, "catalogs", role_id)
+
     def stage(self, entries, context="please review\n"):
-        with open(os.path.join(self.run_dir, "roles.json"), "w",
-                  encoding="utf-8") as f:
+        """Capture a new run directory (self.run_dir while it is unused)."""
+        if os.path.exists(os.path.join(self.run_dir, "request.json")):
+            self.runs += 1
+            self.run_dir = self._mkdir(f"run-{self.runs}")
+        self.staged = (copy.deepcopy(entries), context)
+        entries = copy.deepcopy(entries)
+        for entry in entries:
+            entry.setdefault("execution", {"continuity": "resume"})
+        roles_path = os.path.join(self.run_dir, "roles.json")
+        with open(roles_path, "w", encoding="utf-8") as f:
             json.dump(entries, f)
         with open(os.path.join(self.run_dir, "context.md"), "w",
                   encoding="utf-8") as f:
             f.write(context)
+        council_testlib.write_request(self.run_dir, self.project,
+                                      task_id="e2e")
+        prepared = self.run_script("--prepare", self.run_dir,
+                                   "--skill-contract", EPOCH)
+        if prepared.returncode != 0:
+            # Only a roles authoring defect may stop a capture here; the
+            # preflight and launch then refuse it the same way.
+            self.assertIn("--roles-file", prepared.stderr)
+            return
+        if self.planning is None:
+            return
+        fake_codex.write_scenario(self.scenario_path, self.planning)
+        try:
+            found = self.run_script("--discover", self.run_dir,
+                                    "--skill-contract", EPOCH)
+            self.assertEqual(found.returncode, 0, found.stderr)
+        finally:
+            fake_codex.write_scenario(self.scenario_path, self.current)
+        for entry in entries:
+            selection = entry.get("selection")
+            if isinstance(selection, dict) and selection.get(
+                    "snapshot_id") == self.PLANNED:
+                snapshot, problem = council_discovery._read_snapshot(
+                    self.catalog(entry["id"]))
+                self.assertIsNone(problem)
+                selection["snapshot_id"] = snapshot["snapshot_id"]
+        with open(roles_path, "w", encoding="utf-8") as f:
+            json.dump(entries, f)
+        self.forget_discovery()
 
-    def launch_args(self, skill_contract=True):
-        args = ["--roles-file", os.path.join(self.run_dir, "roles.json"),
-                "--context-file", os.path.join(self.run_dir, "context.md")]
-        return args + (["--skill-contract", EPOCH] if skill_contract else [])
+    def _ready(self):
+        """A launched directory is re-staged into a new one first."""
+        if os.path.exists(os.path.join(self.run_dir, "supervisor.lock")):
+            self.stage(*self.staged)
 
-    def launch(self, skill_contract=True, **env):
-        return self.run_script(*self.launch_args(skill_contract), **env)
+    def launch(self, **env):
+        self._ready()
+        return council_testlib.run_supervised(
+            self.run_dir, {**self.env, **env}, self.project, timeout=120)
+
+    def launch_to_files(self, **env):
+        """The launch with out.md and err.log in the run directory, as
+        --start gives it; returns the completed process."""
+        self._ready()
+        with open(os.path.join(self.run_dir, "out.md"), "wb") as out, \
+                open(os.path.join(self.run_dir, "err.log"), "wb") as err:
+            lock = council_testlib.claim_supervisor_lock(self.run_dir)
+            try:
+                return subprocess.run(
+                    council_testlib.supervised_argv(self.run_dir, lock),
+                    stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+                    env={**self.env, **env}, cwd=self.project,
+                    pass_fds=(lock,), timeout=120)
+            finally:
+                os.close(lock)
+
+    def launch_popen(self, **kwargs):
+        """The launch as a running process; the caller waits for it."""
+        self._ready()
+        lock = council_testlib.claim_supervisor_lock(self.run_dir)
+        try:
+            proc = subprocess.Popen(
+                council_testlib.supervised_argv(self.run_dir, lock),
+                stdin=subprocess.DEVNULL, env=self.env, cwd=self.project,
+                pass_fds=(lock,), **kwargs)
+        finally:
+            os.close(lock)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        return proc
 
     def argvs(self):
         found = []
@@ -2660,7 +2768,7 @@ class LaunchEndToEndTests(unittest.TestCase):
         """An account switch shows a different catalog at launch."""
         snapshot_id = self.discover()
         self.stage([_routed(snapshot_id=snapshot_id)])
-        snapshot_path = os.path.join(self.run_dir,
+        snapshot_path = os.path.join(self.catalog(),
                                      council_discovery.SNAPSHOT_FILENAME)
         with open(snapshot_path, "rb") as f:
             planning_bytes = f.read()
@@ -2685,13 +2793,14 @@ class LaunchEndToEndTests(unittest.TestCase):
             codex_council._read_roles_file(
                 os.path.join(self.run_dir, "roles.json")))
         planned, _ = council_selection._resolve_run_selections(
-            roles, self.run_dir, "auto", at_launch=False)
+            roles, self.catalog(), "auto", at_launch=False)
         self.assertEqual(planned[0].decision.provenance, "routed")
         # The pre-flight itself now refuses the directory: it launched.
         preflight = self.run_script("--check-staging-dir", self.run_dir,
                                     "--skill-contract", EPOCH)
         self.assertEqual(preflight.returncode, 2, preflight.stdout)
-        self.assertIn("already holds a council launch (replies present)",
+        self.assertIn("already holds a council launch (replies, "
+                      "supervisor.lock, supervisor.json present)",
                       preflight.stderr)
 
     def _lyra_retired_scenario(self):
@@ -2749,6 +2858,8 @@ class LaunchEndToEndTests(unittest.TestCase):
         retirement reads "retired ... (not routable)". A user pin of it is
         still forwarded unchanged, with a note."""
         self.scenario(self._lyra_retired_scenario())
+        self.stage([_entry(model=LYRA, effort="brisk",
+                           selection={"mode": "user"})])
         proc = self.run_script("--discover", self.run_dir,
                                "--skill-contract", EPOCH)
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -2758,8 +2869,6 @@ class LaunchEndToEndTests(unittest.TestCase):
                       "upgrade suggested: ", line)
         self.assertNotIn("; retires ", line)
         self.forget_discovery()
-        self.stage([_entry(model=LYRA, effort="brisk",
-                           selection={"mode": "user"})])
         preflight = self.run_script("--check-staging-dir", self.run_dir,
                                     "--skill-contract", EPOCH)
         self.assertEqual(preflight.returncode, 0, preflight.stderr)
@@ -2833,12 +2942,7 @@ class LaunchEndToEndTests(unittest.TestCase):
         self.scenario(fake_codex.default_scenario(catalog=[
             e for e in fake_codex.default_catalog() if e["model"] != VEGA
         ] + [fake_codex.model_entry(hostile, displayName=VEGA)]))
-        with open(os.path.join(self.run_dir, "out.md"), "wb") as out, \
-                open(os.path.join(self.run_dir, "err.log"), "wb") as err:
-            launch = subprocess.run(
-                [sys.executable, SCRIPT, *self.launch_args()],
-                stdin=subprocess.DEVNULL, stdout=out, stderr=err,
-                env=self.env, cwd=self.project, timeout=120)
+        launch = self.launch_to_files()
         self.assertEqual(launch.returncode, 0)
         follower = subprocess.run(
             [sys.executable, SCRIPT, "--follow", self.run_dir,
@@ -3018,12 +3122,11 @@ class LaunchEndToEndTests(unittest.TestCase):
              ("server.pid", "grandchild.pid")),
             (signal.SIGHUP, "version probe", hung_version, ("version.pid",)),
         ):
-            self.forget_discovery()
             self.scenario(scenario)
-            proc = subprocess.Popen(
-                [sys.executable, SCRIPT, *self.launch_args()],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env,
-                cwd=self.project, stdin=subprocess.DEVNULL,
+            self._ready()
+            self.forget_discovery()
+            proc = self.launch_popen(
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 preexec_fn=council_testlib.default_signal_dispositions)
             try:
                 deadline = time.monotonic() + 30
@@ -3051,8 +3154,10 @@ class LaunchEndToEndTests(unittest.TestCase):
                 self.assertEqual(proc.returncode, 128 + signum)
                 self.assertEqual(stdout, b"")
                 self.assertEqual(stderr.decode(),
+                                 "[codex-council] preparing 1 captured "
+                                 "contributions; no worker dispatched yet\n"
                                  f"\n[codex-council] interrupted by {name}\n")
-                self.assertRegex(stderr.decode().strip(),
+                self.assertRegex(stderr.decode().strip().splitlines()[-1],
                                  council_liveness.FOLLOW_INTERRUPTED_PATTERN)
                 for pid in children:
                     self.assertTrue(council_testlib.pid_gone(pid), pid)
@@ -3086,22 +3191,28 @@ class LaunchEndToEndTests(unittest.TestCase):
         for pid in children:
             self.addCleanup(council_testlib.kill_quietly, pid)
         status = self.run_script("--status", self.run_dir)
-        self.assertTrue(status.stdout.startswith("runner: starting (pid "),
+        # Running, with no role dispatched yet: launch discovery is pending.
+        self.assertTrue(status.stdout.startswith("runner: running (pid "),
                         status.stdout)
+        self.assertIn("architect: queued", status.stdout)
         cancel = self.run_script("--cancel", self.run_dir,
                                  "--skill-contract", EPOCH)
         self.assertEqual(cancel.returncode, 0, cancel.stdout)
         with open(os.path.join(self.run_dir, "err.log"),
                   encoding="utf-8") as f:
             self.assertEqual(f.read(),
+                             "[codex-council] preparing 1 captured contributions; "
+                             "no worker dispatched yet\n"
                              "\n[codex-council] interrupted by SIGTERM\n")
         self.assertEqual(council_liveness.lock_state(self.run_dir), "free")
         for pid in children:
             self.assertTrue(council_testlib.pid_gone(pid), pid)
         self.assertEqual(self.argvs(), [])
         status = self.run_script("--status", self.run_dir)
+        # The captured run records its interruption; no role was dispatched.
         self.assertTrue(status.stdout.startswith(
-            "runner: ended before dispatch (pid "), status.stdout)
+            "runner: interrupted (exit 143)"), status.stdout)
+        self.assertIn("architect: queued", status.stdout)
 
     def test_launch_discovery_stderr_reaches_no_output(self):
         """An app-server that prints account data to stderr and exits:
@@ -3113,12 +3224,7 @@ class LaunchEndToEndTests(unittest.TestCase):
             "startup_stderr": " ".join(fake_codex.LEAK_SENTINELS),
             "startup_exit": 2}
         self.scenario(scenario)
-        with open(os.path.join(self.run_dir, "out.md"), "wb") as out, \
-                open(os.path.join(self.run_dir, "err.log"), "wb") as err:
-            launch = subprocess.run(
-                [sys.executable, SCRIPT, *self.launch_args()],
-                stdin=subprocess.DEVNULL, stdout=out, stderr=err,
-                env=self.env, cwd=self.project, timeout=120)
+        launch = self.launch_to_files()
         self.assertEqual(launch.returncode, 0)
         (argv,) = self.argvs()
         self.assert_no_overrides(argv)
@@ -3320,8 +3426,9 @@ class LaunchEndToEndTests(unittest.TestCase):
         self.assertEqual(self.saved_thread("architect"), thread)
 
     def test_untagged_pins_are_refused_before_any_worker(self):
-        """A model with no selection never reports staging OK and never
-        dispatches, with or without --skill-contract."""
+        """A model with no selection is never captured, never reports
+        staging OK (with or without --skill-contract), and never
+        dispatches."""
         self.stage([_entry(model=CUSTOM)])
         for contract in (("--skill-contract", EPOCH), ()):
             with self.subTest(contract=contract):
@@ -3330,13 +3437,11 @@ class LaunchEndToEndTests(unittest.TestCase):
                 self.assertEqual(preflight.returncode, 2, preflight.stdout)
                 self.assertIn("declare selection.mode", preflight.stderr)
                 self.assertEqual(preflight.stdout, "")
-        for skill_contract in (True, False):
-            with self.subTest(skill_contract=skill_contract):
-                proc = self.launch(skill_contract=skill_contract)
-                self.assertEqual(proc.returncode, 2)
-                self.assertIn("declare selection.mode", proc.stderr)
-                self.assertNotIn("dispatching", proc.stderr)
-                self.assertEqual(self.argvs(), [])
+        proc = self.launch()
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("declare selection.mode", proc.stderr)
+        self.assertNotIn("dispatching", proc.stderr)
+        self.assertEqual(self.argvs(), [])
 
     def test_authoring_defect_at_launch_exits_2_before_any_worker(self):
         self.discover()
@@ -3355,12 +3460,14 @@ class LaunchEndToEndTests(unittest.TestCase):
         self.assertFalse(self.launch_discovered())
 
     def test_a_staged_launch_refusal_starts_over_in_a_new_directory(self):
-        """A staged launch that refuses before dispatch has already made its
-        directory a launched one (the command's own redirections created
-        out.md and err.log), so the recovery it writes to err.log never asks
-        for a pre-flight re-run there, which would be refused; it starts
-        over in a new directory with its own --discover, and that works."""
-        empty_bin = self._mkdir("empty-bin")
+        """A launch that refuses before dispatch has already claimed its
+        directory (--start's supervisor.lock, out.md, and err.log), so the
+        recovery it writes to err.log never asks for a pre-flight re-run
+        there, which would be refused; it starts over in a new directory
+        with its own capture and discovery, and that works."""
+        # No codex on PATH, but ps for the runner's own identity record.
+        no_codex = self._mkdir("empty-bin") + os.pathsep + os.path.dirname(
+            shutil.which("ps"))
 
         def empty_context():
             with open(os.path.join(self.run_dir, "context.md"), "w",
@@ -3373,14 +3480,14 @@ class LaunchEndToEndTests(unittest.TestCase):
                 json.dump([_entry("architect", _="")], f)
 
         cases = (
-            ("codex missing", {"PATH": empty_bin}, None,
+            ("codex missing", {"PATH": no_codex}, None,
              "Codex CLI not found on PATH"),
             ("empty context", {}, empty_context, "empty or whitespace-only"),
             ("roles defect", {}, roles_defect, "unknown field(s) '_'"),
         )
         for index, (name, env, break_input, expected) in enumerate(cases):
             with self.subTest(refusal=name):
-                self.run_dir = self._mkdir(f"run-{index}")
+                self.run_dir = self._mkdir(f"refused-{index}")
                 self.discover()
                 self.stage([_entry("architect")])
                 preflight = self.run_script(
@@ -3389,17 +3496,10 @@ class LaunchEndToEndTests(unittest.TestCase):
                 self.assertEqual(preflight.returncode, 0, preflight.stderr)
                 if break_input is not None:
                     break_input()
-                # The SKILL launch shape: `> out.md 2> err.log`.
-                err_log = os.path.join(self.run_dir, "err.log")
-                with open(os.path.join(self.run_dir, "out.md"), "wb") as out, \
-                        open(err_log, "wb") as err:
-                    launch = subprocess.run(
-                        [sys.executable, SCRIPT, *self.launch_args()],
-                        stdin=subprocess.DEVNULL, stdout=out, stderr=err,
-                        env={**self.env, **env}, cwd=self.project,
-                        timeout=120)
+                launch = self.launch_to_files(**env)
                 self.assertEqual(launch.returncode, 2)
-                with open(err_log, encoding="utf-8") as f:
+                with open(os.path.join(self.run_dir, "err.log"),
+                          encoding="utf-8") as f:
                     logged = f.read()
                 self.assertIn(expected, logged)
                 self.assertEqual(logged.count(
@@ -3424,11 +3524,11 @@ class LaunchEndToEndTests(unittest.TestCase):
 
     def test_a_rejected_directory_recovery_is_the_complete_sequence(self):
         """A directory that is not private is abandoned. Its recovery names
-        every step the new directory needs, in order: `mktemp -d`,
-        --discover there, both files with the new snapshot_id, then the
-        pre-flight; following it literally passes. Skipping the discovery
-        step, as the recovery once did, leaves an automatic selection with
-        no snapshot to name."""
+        every step the new directory needs, in order: `mktemp -d`, the
+        three files, --prepare then --discover there, each role's new
+        snapshot_id, then the pre-flight; following it literally passes.
+        Skipping the discovery step leaves an automatic selection with no
+        snapshot to name."""
         old_id = self.discover()
         self.stage([_routed(snapshot_id=old_id)])
         os.chmod(self.run_dir, 0o755)
@@ -3440,13 +3540,15 @@ class LaunchEndToEndTests(unittest.TestCase):
                 recovery = council_common.STAGING_DIR_RECOVERY
                 self.assertIn(recovery, proc.stderr)
                 steps = [recovery.index(step) for step in (
-                    "`mktemp -d` again", "run --discover in that new "
-                    "directory", "re-Write BOTH roles.json and context.md",
-                    "the new snapshot_id in every routed or native_effort "
-                    "selection", "re-run --check-staging-dir on it")]
+                    "`mktemp -d` again",
+                    "Write request.json, roles.json, and context.md in the "
+                    "NEW directory", "run --prepare and then --discover there",
+                    "each role's new snapshot_id in every routed or "
+                    "native_effort selection", "run --check-staging-dir on it")]
                 self.assertEqual(steps, sorted(steps))
         self.forget_discovery()
         # Without the discovery step the rewrite has no snapshot to name.
+        self.planning = None
         self.run_dir = self._mkdir("no-discovery")
         self.stage([_routed(snapshot_id=old_id)])
         skipped = self.run_script("--check-staging-dir", self.run_dir,
@@ -3465,11 +3567,11 @@ class LaunchEndToEndTests(unittest.TestCase):
         self.assertEqual(self.argvs(), [])
 
     def test_an_early_input_refusal_at_launch_starts_over_elsewhere(self):
-        """The input and path checks run before the launch reads anything,
-        but after its own redirections created out.md and err.log, so a
-        missing, unreadable, or misplaced input gets the same new-directory
-        recovery as every later staged-launch refusal, never only the
-        original-directory hint. Stdin mode keeps the plain hint."""
+        """The supervised child's input and path checks run before it reads
+        anything, but after --start claimed the directory, so a missing,
+        unreadable, or misplaced input gets the same new-directory recovery
+        as every later launch refusal, never only the original-directory
+        hint. There is no direct launch to recover instead."""
         elsewhere = self._mkdir("elsewhere")
 
         def remove(name):
@@ -3502,18 +3604,19 @@ class LaunchEndToEndTests(unittest.TestCase):
                 self.run_dir = self._mkdir(f"early-{index}")
                 self.discover()
                 self.stage([_entry("architect")])
-                args = self.launch_args()
+                lock = council_testlib.claim_supervisor_lock(self.run_dir)
+                self.addCleanup(os.close, lock)
+                args = council_testlib.supervised_argv(self.run_dir, lock)
                 moved = break_input()
                 if moved is not None:
                     args[args.index("--roles-file") + 1] = moved
-                # The SKILL launch shape: `> out.md 2> err.log`.
                 err_log = os.path.join(self.run_dir, "err.log")
                 with open(os.path.join(self.run_dir, "out.md"), "wb") as out, \
                         open(err_log, "wb") as err:
                     launch = subprocess.run(
-                        [sys.executable, SCRIPT, *args],
-                        stdin=subprocess.DEVNULL, stdout=out, stderr=err,
-                        env=self.env, cwd=self.project, timeout=120)
+                        args, stdin=subprocess.DEVNULL, stdout=out,
+                        stderr=err, env=self.env, cwd=self.project,
+                        pass_fds=(lock,), timeout=120)
                 self.assertEqual(launch.returncode, 2)
                 with open(err_log, encoding="utf-8") as f:
                     logged = f.read()
@@ -3530,113 +3633,52 @@ class LaunchEndToEndTests(unittest.TestCase):
                 self.assertEqual(rerun.returncode, 2, rerun.stdout)
                 self.assertIn("already holds a council launch",
                               rerun.stderr)
-        # Stdin mode has no staged directory to abandon.
-        missing = os.path.join(elsewhere, "absent.json")
-        proc = self.run_script("--roles-file", missing)
+        proc = self.run_script("--roles-file",
+                               os.path.join(elsewhere, "absent.json"))
         self.assertEqual(proc.returncode, 2)
-        self.assertIn(codex_council.STAGING_PATH_HINT, proc.stderr)
-        self.assertNotIn(council_common.STAGED_LAUNCH_RESTART, proc.stderr)
+        self.assertIn("there is no direct launch", proc.stderr)
         self.assertEqual(self.argvs(), [])
 
     def test_a_launch_directory_is_never_reused_for_another_launch(self):
-        """The skill's launch command opens out.md and err.log before the
-        runner starts, so from that moment the directory may hold a running
-        council: the pre-flight and --discover refuse it, and after the run
-        the report, log, and planning snapshot are left untouched."""
+        """--start claims the directory before the runner starts, so from
+        that moment it may hold a running council: the pre-flight,
+        --discover, and another --start refuse it, and after the run the
+        report, log, and planning snapshot are left untouched."""
         snapshot_id = self.discover()
         self.stage([_routed(snapshot_id=snapshot_id)])
         preflight = self.run_script("--check-staging-dir", self.run_dir,
                                     "--skill-contract", EPOCH)
         self.assertEqual(preflight.returncode, 0, preflight.stderr)
-        # What `> out.md 2> err.log` does before the runner even starts.
-        out = open(os.path.join(self.run_dir, "out.md"), "wb")
-        err = open(os.path.join(self.run_dir, "err.log"), "wb")
-        self.addCleanup(out.close)
-        self.addCleanup(err.close)
-        running = self.run_script("--check-staging-dir", self.run_dir,
+        started = self.run_script("--start", self.run_dir,
                                   "--skill-contract", EPOCH)
-        self.assertEqual(running.returncode, 2, running.stdout)
-        self.assertIn("already holds a council launch (out.md, err.log "
-                      "present)", running.stderr)
-        launch = subprocess.run(
-            [sys.executable, SCRIPT, *self.launch_args()],
-            stdin=subprocess.DEVNULL, stdout=out, stderr=err, env=self.env,
-            cwd=self.project, timeout=120)
-        self.assertEqual(launch.returncode, 0)
-        out.close()
-        err.close()
+        self.assertEqual(started.returncode, 0, started.stderr)
+        deadline = time.monotonic() + 60
+        while council_liveness.lock_state(self.run_dir) != "free":
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.05)
         outputs = {}
-        for name in ("out.md", "err.log",
-                     council_discovery.SNAPSHOT_FILENAME):
+        for name in ("out.md", "err.log", os.path.join(
+                "catalogs", "architect", council_discovery.SNAPSHOT_FILENAME)):
             with open(os.path.join(self.run_dir, name), "rb") as f:
                 outputs[name] = f.read()
         self.assertIn(b"CODEX_COUNCIL_DONE ok=1 total=1", outputs["err.log"])
         self.forget_discovery()
         for args in (("--check-staging-dir", self.run_dir),
-                     ("--discover", self.run_dir)):
+                     ("--discover", self.run_dir),
+                     ("--start", self.run_dir)):
             with self.subTest(command=args[0]):
                 proc = self.run_script(*args, "--skill-contract", EPOCH)
                 self.assertEqual(proc.returncode, 2, proc.stdout)
                 self.assertIn("already holds a council launch (out.md, "
-                              "err.log, replies present)", proc.stderr)
+                              "err.log, replies, supervisor.lock, "
+                              "supervisor.json present)", proc.stderr)
                 self.assertIn(council_common.LAUNCHED_DIR_RECOVERY,
                               proc.stderr)
         self.assertFalse(self.launch_discovered())
         for name, content in outputs.items():
             with open(os.path.join(self.run_dir, name), "rb") as f:
                 self.assertEqual(f.read(), content, name)
-
-    def test_a_subdirectory_launch_discovers_and_runs_at_the_git_root(self):
-        """Execution-context parity from a Git subdirectory: discovery's
-        config/read cwd and every worker's -C are the same Git top level,
-        not the launch directory, so a .codex/config.toml below the root
-        is outside the discovered baseline (whether codex exec also ignores
-        it is Codex's side and is not verified live here)."""
-        repo = self._mkdir("repo")
-        env = {**self.env, "GIT_CONFIG_GLOBAL": os.devnull,
-               "GIT_CONFIG_NOSYSTEM": "1"}
-        subprocess.run(["git", "init", "-q", repo], env=env, check=True,
-                       capture_output=True)
-        subdir = os.path.join(repo, "pkg", "sub")
-        os.makedirs(subdir)
-        toplevel = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"], cwd=subdir, env=env,
-            check=True, capture_output=True, text=True).stdout.strip()
-        request_log = os.path.join(self.root, "requests.log")
-        env["FAKE_CODEX_REQUEST_LOG"] = request_log
-
-        def run_from_subdir(*args):
-            return subprocess.run(
-                [sys.executable, SCRIPT, *args], capture_output=True,
-                text=True, env=env, cwd=subdir, stdin=subprocess.DEVNULL,
-                timeout=120)
-
-        proc = run_from_subdir("--discover", self.run_dir,
-                               "--skill-contract", EPOCH)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        snapshot, problem = council_discovery._read_snapshot(self.run_dir)
-        self.assertIsNone(problem)
-        self.stage([_routed(snapshot_id=snapshot["snapshot_id"])])
-        launch = run_from_subdir(*self.launch_args())
-        self.assertEqual(launch.returncode, 0, launch.stderr)
-        config_reads = [
-            json.loads(line)["params"]["cwd"]
-            for line in fake_codex.read_lines(request_log)
-            if json.loads(line)["method"] == "config/read"
-        ]
-        # Planning discovery, then the launch's own revalidation.
-        self.assertEqual(config_reads, [toplevel, toplevel])
-        self.assertEqual(snapshot["context"]["project_root"], toplevel)
-        (argv,) = self.argvs()
-        self.assertEqual(argv[argv.index("-C") + 1], toplevel)
-        with open(os.path.join(self.pid_dir, "server.env"),
-                  encoding="utf-8") as f:
-            spawned_in = json.load(f)["cwd"]
-        # The processes themselves ran in the subdirectory.
-        self.assertEqual(os.path.realpath(spawned_in),
-                         os.path.realpath(subdir))
-        self.assertNotEqual(os.path.realpath(subdir),
-                            os.path.realpath(toplevel))
+        self.assertEqual(len(self.argvs()), 1)
 
     def test_reply_files_match_the_report_and_the_follower_reaches_done(self):
         snapshot_id = self.discover()
@@ -3650,11 +3692,7 @@ class LaunchEndToEndTests(unittest.TestCase):
         err = open(os.path.join(self.run_dir, "err.log"), "wb")
         self.addCleanup(out.close)
         self.addCleanup(err.close)
-        launch = subprocess.Popen(
-            [sys.executable, SCRIPT, *self.launch_args()],
-            stdin=subprocess.DEVNULL, stdout=out, stderr=err, env=self.env,
-            cwd=self.project)
-        self.addCleanup(lambda: launch.poll() is None and launch.kill())
+        launch = self.launch_popen(stdout=out, stderr=err)
         follower = subprocess.run(
             [sys.executable, SCRIPT, "--follow", self.run_dir,
              "--skill-contract", EPOCH],
@@ -3662,9 +3700,11 @@ class LaunchEndToEndTests(unittest.TestCase):
         self.assertEqual(follower.returncode, 0, follower.stderr)
         self.assertEqual(launch.wait(timeout=120), 0)
         lines = follower.stdout.splitlines()
-        self.assertTrue(lines[0].startswith("[codex-council] dispatching 4 "))
+        self.assertEqual(lines[0], "[codex-council] preparing 4 captured "
+                                   "contributions; no worker dispatched yet")
+        self.assertTrue(lines[1].startswith("[codex-council] dispatching 4 "))
         self.assertEqual(
-            lines[1], "[codex-council] model selection: routing=auto; "
+            lines[2], "[codex-council] model selection: routing=auto; "
                       "discovery=ok; native=1 user=1 routed=1 native_effort=1 "
                       "fallback=0")
         self.assertRegex(lines[-1], council_liveness.FOLLOW_DONE_PATTERN)

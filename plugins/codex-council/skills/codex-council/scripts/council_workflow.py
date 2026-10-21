@@ -174,16 +174,18 @@ def load_plan(run_dir: str | Path, roles: list[Any] | None = None,
     return plan
 
 
-def bind_roles(run_dir: str, roles: list[Any], body: str, *, at_launch: bool,
-               probe_policy: bool = True, on_progress=None
-               ) -> tuple[list[Any], dict[str, Any] | None]:
+def _require_plan(run_dir: str, roles: list[Any], body: str) -> dict[str, Any]:
     plan = load_plan(run_dir, roles, body, verify_inputs=True)
     if plan is None:
-        # Legacy direct CLI remains available, but never silently lets a new
-        # policy granting writes operate on the live tree.
-        if any(role.execution is not None for role in roles):
-            raise WorkspaceError("execution policies require --prepare before launch")
-        return roles, None
+        raise WorkspaceError("this directory has no completed capture; write "
+                             "request.json and run --prepare first")
+    return plan
+
+
+def bind_roles(run_dir: str, roles: list[Any], body: str, *, at_launch: bool,
+               probe_policy: bool = True, on_progress=None
+               ) -> tuple[list[Any], dict[str, Any]]:
+    plan = _require_plan(run_dir, roles, body)
     directory = private_dir(run_dir)
     bound = []
     for role in roles:
@@ -208,19 +210,18 @@ def bind_roles(run_dir: str, roles: list[Any], body: str, *, at_launch: bool,
     return bound, plan
 
 
-def discover_prepared(run_dir: str, roles: list[Any], body: str) -> bool:
-    """True when this is a prepared run; each role owns its model snapshot."""
-    plan = load_plan(run_dir, roles, body, verify_inputs=True)
-    if plan is None:
-        return False
+def discover_prepared(run_dir: str, roles: list[Any], body: str) -> None:
+    """Each role of a prepared run owns its model snapshot, discovered in the
+    same resolved workspace path it executes in. Each summary ends with its
+    role's catalogs/<role>/model-snapshot.json path."""
+    plan = _require_plan(run_dir, roles, body)
+    directory = private_dir(run_dir)
     from council_discovery import _discover_command
 
     for role in roles:
         binding = plan["roles"][role.id]
-        print(f"[codex-council] discovery for role={role.id}", flush=True)
-        _discover_command(str(Path(run_dir) / binding["catalog"]),
-                          project_root=str(Path(run_dir) / binding["workspace"]))
-    return True
+        _discover_command(str(directory / binding["catalog"]),
+                          project_root=str(directory / binding["workspace"]))
 
 
 def resolve_selections(roles: list[Any], run_dir: str, routing_mode: str,
@@ -230,9 +231,6 @@ def resolve_selections(roles: list[Any], run_dir: str, routing_mode: str,
 
     bound, plan = bind_roles(run_dir, roles, body, at_launch=at_launch,
                             probe_policy=probe_policy, on_progress=on_progress)
-    if plan is None:
-        resolved, launch = _resolve_run_selections(roles, run_dir, routing_mode, at_launch)
-        return resolved, launch, None
     resolved, snapshots = [], []
     for role in bound:
         binding = plan["roles"][role.id]
@@ -252,7 +250,7 @@ def resolve_selections(roles: list[Any], run_dir: str, routing_mode: str,
     launch = None
     if snapshots:
         versions = {s["context"]["codex_cli_version"] for s in snapshots}
-        problems = [p for s in snapshots for p in s["problems"]]
+        problems = list(dict.fromkeys(p for s in snapshots for p in s["problems"]))
         eligible = all(s["routing"]["eligible"] for s in snapshots)
         launch = {"status": "ok" if all(s["status"] == "ok" for s in snapshots)
                   else "unavailable", "problems": problems,

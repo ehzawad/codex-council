@@ -11,8 +11,12 @@ its DISCOVERY_METHODS allowlist, live in fake_codex.py.
 """
 
 import contextlib
+import fcntl
 import io
+import json
 import os
+import secrets
+import shutil
 import signal
 import subprocess
 import sys
@@ -72,6 +76,71 @@ def clean_env(**extra):
     }
     env.update(extra)
     return env
+
+
+# ---------- captured runs: the only way the runner launches workers ----------
+
+def write_request(run_dir, source_root, include=(), task_id="test-task"):
+    """request.json for a context-only capture (or `include` paths) of
+    source_root, which must not overlap run_dir."""
+    path = os.path.join(run_dir, "request.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"schema": "codex-council/request@1", "task_id": task_id,
+                   "reason": "Exercise the runner on a disposable fixture.",
+                   "source_root": source_root,
+                   "include": None if include is None else list(include)}, f)
+    os.chmod(path, 0o600)
+
+
+def prepare_run(test, run_dir, env, cwd, source_root=None, include=(),
+                task_id="test-task"):
+    """Write request.json and run --prepare; a source root defaults to an
+    empty sibling of run_dir. Returns the completed --prepare process."""
+    if source_root is None:
+        source_root = run_dir.rstrip(os.sep) + "-source"
+        if not os.path.isdir(source_root):
+            os.makedirs(source_root, mode=0o700)
+            test.addCleanup(shutil.rmtree, source_root, True)
+    write_request(run_dir, source_root, include, task_id)
+    proc = subprocess.run(
+        [sys.executable, SCRIPT, "--prepare", run_dir, "--skill-contract", EPOCH],
+        capture_output=True, text=True, env=env, cwd=cwd,
+        stdin=subprocess.DEVNULL, timeout=60)
+    test.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+    return proc
+
+
+def claim_supervisor_lock(run_dir):
+    """Claim RUNDIR the way --start does: an exclusive, locked, tokened
+    supervisor.lock. The caller owns (and closes) the descriptor."""
+    fd = os.open(os.path.join(run_dir, "supervisor.lock"),
+                 os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    os.write(fd, secrets.token_hex(16).encode("ascii"))
+    return fd
+
+
+def supervised_argv(run_dir, lock_fd):
+    return [sys.executable, SCRIPT,
+            "--roles-file", os.path.join(run_dir, "roles.json"),
+            "--context-file", os.path.join(run_dir, "context.md"),
+            "--skill-contract", EPOCH, "--supervisor-lock-fd", str(lock_fd)]
+
+
+def run_supervised(run_dir, env, cwd, *, timeout=120, merged=False, **kwargs):
+    """Run --start's supervised child in the foreground, as --start would
+    (its claim, its argv), so a test sees the runner's own exit code,
+    stdout (the report) and stderr (err.log's content)."""
+    fd = claim_supervisor_lock(run_dir)
+    try:
+        streams = ({"stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
+                   if merged else {"capture_output": True})
+        kwargs.setdefault("stdin", subprocess.DEVNULL)
+        return subprocess.run(supervised_argv(run_dir, fd), text=True, env=env,
+                              cwd=cwd, pass_fds=(fd,), timeout=timeout,
+                              **streams, **kwargs)
+    finally:
+        os.close(fd)
 
 
 # ---------- processes the fake codex leaves behind ----------

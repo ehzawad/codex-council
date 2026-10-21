@@ -2033,12 +2033,30 @@ class DiscoverySummaryTests(unittest.TestCase):
 # ---------- --discover end to end ----------
 
 class DiscoverCommandTests(FakeCodexTestCase):
+    """--discover on a captured run: one snapshot per role, discovered in
+    that role's scratch workspace (here the single role "r")."""
+
     def setUp(self):
         super().setUp()
         self.run_dir = self._mkdir("run")
-        self.snapshot_path = os.path.join(self.run_dir, "model-snapshot.json")
+        self.catalog = os.path.join(self.run_dir, "catalogs", "r")
+        self.workspace = os.path.join(self.run_dir, "workspaces", "r")
+        self.snapshot_path = os.path.join(self.catalog, "model-snapshot.json")
+        self.prepared = False
+
+    def prepare(self):
+        with open(os.path.join(self.run_dir, "roles.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump([{"id": "r", "label": "R", "instruction": ["Review."]}], f)
+        with open(os.path.join(self.run_dir, "context.md"), "w",
+                  encoding="utf-8") as f:
+            f.write("please review\n")
+        council_testlib.prepare_run(self, self.run_dir, self.env, self.project_root)
+        self.prepared = True
 
     def run_discover(self, scenario=None, run_dir=None, **env):
+        if run_dir is None and not self.prepared:
+            self.prepare()
         fake_codex.write_scenario(
             self.scenario_path,
             fake_codex.default_scenario() if scenario is None else scenario)
@@ -2050,8 +2068,6 @@ class DiscoverCommandTests(FakeCodexTestCase):
             cwd=self.project_root, stdin=subprocess.DEVNULL, timeout=60)
 
     def test_writes_a_private_snapshot_and_prints_the_summary(self):
-        with open(os.path.join(self.run_dir, "roles.json"), "w") as f:
-            f.write("[]")
         proc = self.run_discover()
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stderr, "")
@@ -2061,17 +2077,19 @@ class DiscoverCommandTests(FakeCodexTestCase):
                          r"provider openai \(default\); version=\S+$",
                          lines[0])
         self.assertIsNotNone(match, lines[0])
-        self.assertEqual(lines[-1], f"snapshot: {self.snapshot_path}")
+        self.assertEqual(lines[-1],
+                         f"snapshot: {os.path.realpath(self.snapshot_path)}")
         self.assertEqual(stat.S_IMODE(os.stat(self.snapshot_path).st_mode),
                          0o600)
-        self.assertEqual(sorted(os.listdir(self.run_dir)),
-                         ["model-snapshot.json", "roles.json"])
-        snapshot, problem = council_discovery._read_snapshot(self.run_dir)
+        self.assertEqual(os.listdir(self.catalog), ["model-snapshot.json"])
+        self.assertFalse(os.path.exists(
+            os.path.join(self.run_dir, "model-snapshot.json")))
+        snapshot, problem = council_discovery._read_snapshot(self.catalog)
         self.assertIsNone(problem)
         self.assertEqual(snapshot["snapshot_id"], match.group(1))
-        # Not a git repo: the root is the process cwd (a physical path).
+        # Discovered in the role's scratch workspace, not the caller's cwd.
         self.assertEqual(snapshot["context"]["project_root"],
-                         os.path.realpath(self.project_root))
+                         os.path.realpath(self.workspace))
         self.assertEqual(lines[:-1],
                          council_discovery._discovery_summary(snapshot))
 
@@ -2139,7 +2157,7 @@ class DiscoverCommandTests(FakeCodexTestCase):
                          + re.escape(
                              f"version={council_common._plugin_version()}; "))
         self.assertTrue(first.endswith(UNAVAILABLE_TAIL))
-        snapshot, _ = council_discovery._read_snapshot(self.run_dir)
+        snapshot, _ = council_discovery._read_snapshot(self.catalog)
         self.assertEqual(snapshot["status"], "unavailable")
 
     def test_unavailable_discovery_still_exits_0(self):
@@ -2156,7 +2174,7 @@ class DiscoverCommandTests(FakeCodexTestCase):
         self.assertIn(
             "routing: unavailable — CODEX_COUNCIL_MODEL_ROUTING=off",
             proc.stdout.splitlines())
-        snapshot, _ = council_discovery._read_snapshot(self.run_dir)
+        snapshot, _ = council_discovery._read_snapshot(self.catalog)
         self.assertEqual(snapshot["routing"]["mode"], "off")
 
     def test_invalid_routing_env_is_a_usage_error_before_discovery(self):
@@ -2202,10 +2220,12 @@ class DiscoverCommandTests(FakeCodexTestCase):
         ids = [re.search(r"snapshot_id=([0-9a-f]{16})", p.stdout).group(1)
                for p in (first, second)]
         self.assertNotEqual(ids[0], ids[1])
-        snapshot, _ = council_discovery._read_snapshot(self.run_dir)
+        snapshot, _ = council_discovery._read_snapshot(self.catalog)
         self.assertEqual(snapshot["snapshot_id"], ids[1])
 
     def popen_discover(self, scenario, **kwargs):
+        if not self.prepared:
+            self.prepare()
         fake_codex.write_scenario(self.scenario_path, scenario)
         return subprocess.Popen(
             [sys.executable, SCRIPT, "--discover", self.run_dir,
@@ -2219,7 +2239,7 @@ class DiscoverCommandTests(FakeCodexTestCase):
         _, stderr = proc.communicate(timeout=60)
         self.assertEqual((proc.returncode, stderr), (1, b""))
         # The snapshot is written before the summary and stays valid.
-        snapshot, problem = council_discovery._read_snapshot(self.run_dir)
+        snapshot, problem = council_discovery._read_snapshot(self.catalog)
         self.assertIsNone(problem)
         self.assertEqual(snapshot["status"], "ok")
 
@@ -2307,9 +2327,11 @@ class DiscoverCommandTests(FakeCodexTestCase):
                 self.assertFalse(os.path.exists(self.snapshot_path))
 
     def test_write_failure_removes_a_stale_snapshot_and_says_inherit(self):
-        with open(self.snapshot_path, "w", encoding="utf-8") as f:
+        # _discover_command itself, on a plain private catalog directory.
+        stale = os.path.join(self.run_dir, "model-snapshot.json")
+        with open(stale, "w", encoding="utf-8") as f:
             f.write('{"stale": true}')
-        os.chmod(self.snapshot_path, 0o600)
+        os.chmod(stale, 0o600)
         out = io.StringIO()
         with self.fake_env(fake_codex.default_scenario()), \
              patch.object(council_common.os, "replace",
@@ -2362,29 +2384,27 @@ class FakeCodexExecTests(FakeCodexTestCase):
         self.assertEqual(resumes[0][resumes[0].index("resume") + 1], thread_id)
 
     def test_runner_launch_resumes_through_the_fake(self):
-        run_dir = self._mkdir("launch")
-        with open(os.path.join(run_dir, "roles.json"), "w",
-                  encoding="utf-8") as f:
-            json.dump([{"id": "architect", "label": "Architect",
-                        "instruction": ["Review; if nothing material, say "
-                                        "so. Thoroughness beats speed."]}], f)
-        with open(os.path.join(run_dir, "context.md"), "w",
-                  encoding="utf-8") as f:
-            f.write("please review\n")
         env = dict(self.env, XDG_STATE_HOME=self._mkdir("state"),
                    CODEX_HOME=self._mkdir("codex-home"))
         for name in ("CODEX_COUNCIL_SESSION_KEY", "CODEX_COUNCIL_MAX_PARALLEL",
                      "CODEX_COUNCIL_STALL_SECS"):
             env.pop(name, None)
-        args = [sys.executable, SCRIPT,
-                "--roles-file", os.path.join(run_dir, "roles.json"),
-                "--context-file", os.path.join(run_dir, "context.md"),
-                "--skill-contract", EPOCH]
-        for phase in ("fresh", "resume"):
+        for phase, continuity in (("fresh", "fresh"), ("resume", "resume")):
             with self.subTest(phase=phase):
-                proc = subprocess.run(
-                    args, capture_output=True, text=True, env=env,
-                    cwd=run_dir, stdin=subprocess.DEVNULL, timeout=60)
+                run_dir = self._mkdir(f"launch-{phase}")
+                with open(os.path.join(run_dir, "roles.json"), "w",
+                          encoding="utf-8") as f:
+                    json.dump([{"id": "architect", "label": "Architect",
+                                "instruction": ["Review the change."],
+                                "execution": {"continuity": continuity}}], f)
+                with open(os.path.join(run_dir, "context.md"), "w",
+                          encoding="utf-8") as f:
+                    f.write("please review\n")
+                # One logical task and source, so the second run resumes.
+                council_testlib.prepare_run(self, run_dir, env, run_dir,
+                                            source_root=self.project_root)
+                proc = council_testlib.run_supervised(run_dir, env, run_dir,
+                                                      timeout=60)
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assertIn(f"architect: started ({phase})", proc.stderr)
                 self.assertIn("fake reply from codex", proc.stdout)

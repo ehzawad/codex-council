@@ -1371,8 +1371,7 @@ def cancel_command(run_dir):
     if not is_detached(run_dir, view):
         _print_stdout(
             "--cancel refused: this run was not launched with --start (no "
-            f"{SUPERVISOR_LOCK_FILENAME}); a tracked run ends when its "
-            "background task is stopped")
+            f"{SUPERVISOR_LOCK_FILENAME}); nothing was signalled")
         return CANCEL_EXIT_REFUSED
     detached = supervisor_state(run_dir, view)
     supervisor = detached.supervisor
