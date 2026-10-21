@@ -182,9 +182,9 @@ cases check selective invocation and multi-turn context fidelity. Record the act
 host model, Claude Code version, Codex version and effective configuration. Unknown
 or failed gates remain explicit; do not merge automatically on fake-suite success.
 
-Documentation tests validate executable command/schema contracts and packaging.
-They do not freeze hundreds of prose phrases. Markdown is the source; the committed
-docs/codex-council.pdf is built from every current document by scripts/build-docs.sh.
+Documentation tests validate executable command/schema contracts and packaging,
+plus a few literal skill instructions. Markdown is the only source, with diagrams
+as Mermaid blocks. [README Testing](README.md#testing) gives the commands.
 
 Non-goals are predefined roles, hardcoded model rankings, peer debate, automatic
 per-turn invocation, automatic patch integration, a second agent loop replacing

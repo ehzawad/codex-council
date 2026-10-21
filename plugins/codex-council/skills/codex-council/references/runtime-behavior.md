@@ -7,7 +7,9 @@ request.json, roles.json, context.md; prepare; discover; update only selection
 fields; preflight. Launch only after preflight exits 0, in a separate foreground
 call to `--start`. Do not use redirects, shell detachment, or a host background
 task to start the supervisor. Every command in the current skill uses
-`--skill-contract 5`; an epoch mismatch requires update/reload, never argument repair.
+`--skill-contract 5`. An epoch mismatch means updating the plugin and starting a
+fresh session, or loading a matching checkout with `claude --plugin-dir`; never
+argument repair.
 
 `--start` repeats local staging validation and claims supervisor.lock, err.log and
 out.md exclusively. It starts the runner in its own session, passing only

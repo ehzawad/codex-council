@@ -21,13 +21,8 @@ The skill speaks contract epoch 5. The runner uses only the standard library and
 POSIX process controls. Missing policy metadata blocks restricted execution rather
 than granting bypass. Neither native user configuration nor the host Claude
 model/effort is edited. The fake-Codex test suite makes no claim about real-model
-quality or real-host sandbox enforcement; [local validation](docs/LOCAL_VALIDATION.md)
-covers the signed-in host checks.
-
-The full documentation (this README, [DESIGN.md](DESIGN.md), the skill, its
-references and the local validation guide) is also one PDF,
-[docs/codex-council.pdf](docs/codex-council.pdf), with every diagram drawn as
-vector graphics.
+quality or real-host sandbox enforcement; [Testing](#testing) describes the
+opt-in signed-in host checks. See [DESIGN.md](DESIGN.md) for the mechanism.
 
 ## Install and invoke
 
@@ -53,8 +48,8 @@ a Write rule for the temporary directory is enough) and an allow rule for the ru
 command pattern. The skill does not pre-approve Write.
 
 The main skill is deliberately small. It reads focused references when needed,
-not all documentation on every invocation. Tests, build scripts, and project docs
-are outside the installed plugin source (`plugins/codex-council`).
+not all documentation on every invocation. Tests and project documentation are
+outside the installed plugin source (`plugins/codex-council`).
 
 ## Architecture
 
@@ -252,35 +247,50 @@ intent must be checked by Claude. Raw logs may hold sensitive tool output. Keep
 them private. The exec reader holds each attempt's protocol output in memory, so
 runner RAM is not bounded for arbitrarily chatty workers.
 
-## Development
+## Testing
+
+From the repository root, with Python 3.12 or later:
 
 ```zsh
-python3 -m unittest discover -s tests -p 'test_*.py' -v
+env -u CODEX_COUNCIL_LIVE_TESTS -u CODEX_COUNCIL_LIVE_WORKFLOW \
+  python3 -m unittest discover -s tests -p 'test_*.py' -v
 uvx --from 'ruff==0.15.21' ruff check .
 claude plugin validate plugins/codex-council
 claude plugin validate .
 ```
 
-CI runs the full fake/protocol/process suite on Ubuntu and macOS. No real model
-credentials or inference are used by default. Opt-in real-host checks and a
-copy-pastable validation prompt are in [LOCAL_VALIDATION.md](docs/LOCAL_VALIDATION.md).
-Module-DAG tests cover every runner module. Documentation tests check parseable commands, JSON shapes and packaging,
-not hundreds of exact prose phrases.
+The offline suite runs unit, fake-Codex protocol, CLI and real-process liveness
+tests; it uses no Codex account and no inference. CI runs it on Ubuntu (Python
+3.12 to 3.15) and macOS (3.13), plus the same Ruff check.
 
-Load this checkout in a fresh session with Claude Code's
-`--plugin-dir ./plugins/codex-council` option; it changes nothing installed.
-`./scripts/dev-link.sh` instead points the installed plugin cache and registry at
-this checkout. Do not modify global model settings to test the plugin.
+Two opt-in gates use the installed `codex`, the signed-in account and real usage.
+Run them only after the offline checks pass; each needs its variable set to `1`:
 
-`scripts/build-docs.sh` rebuilds [docs/codex-council.pdf](docs/codex-council.pdf)
-from this README, DESIGN.md, SKILL.md, every reference and
-docs/LOCAL_VALIDATION.md. It needs `uvx`, Chrome or Chromium, and network access
-to mermaid.ink, which renders each `mermaid` block to SVG; the SVG is inlined so
-every diagram prints as vector graphics, and the build refuses a PDF that holds a
-raster image. The repository holds no image files: the diagrams above are their
-only source. In the PDF, links between these documents jump within it, other
-repository links point at GitHub, and the headings are bookmarks. Rebuild and
-commit the PDF whenever one of those documents changes.
+```zsh
+CODEX_COUNCIL_LIVE_TESTS=1 python3 -m unittest tests.test_live_codex -v
+CODEX_COUNCIL_LIVE_WORKFLOW=1 python3 -m unittest discover -s tests -p 'test_live_workflow.py' -v
+```
+
+`test_live_codex` checks model/effort routing, the `-c` overrides sent and thread
+continuity on trivial prompts. `test_live_workflow` checks that workspace-write
+allows a scratch write but denies an external write and a command-network
+connection, and that read-only denies both writes, using temporary canaries and a
+host-local listener. A model that declines the probe is not a pass, and a refused
+policy is never a reason to enable bypass. The workflow gate prints the private
+evidence directories it keeps; inspect them, then remove them once the runner has
+exited. Smoke-test threads stay in Codex history.
+
+For a host smoke check, start one fresh session from this checkout, which changes
+nothing installed:
+
+```zsh
+claude --plugin-dir ./plugins/codex-council
+```
+
+Invoke `/codex-council:codex-council` on a small task, then check the brief,
+`--status`, `result.json` and `--freshness` before accepting the result. Record the
+commit, OS, Claude Code and Codex versions, and host model/effort. Do not change
+global model settings to test the plugin.
 
 ## License
 

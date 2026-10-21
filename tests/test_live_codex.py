@@ -8,7 +8,7 @@ spend a handful of real turns on trivial prompts:
     CODEX_COUNCIL_LIVE_TESTS=1 python3 -m unittest tests.test_live_codex -v
 
 Each council follows the captured invocation contract the skill follows
-(docs/LOCAL_VALIDATION.md, references/invocation-contract.md): write
+(references/invocation-contract.md; README.md#testing gives the commands): write
 request.json, roles.json, and context.md into a private run directory,
 then --prepare, --discover (when a selection needs this run's catalog),
 --check-staging-dir, --start, and --follow, and finally --status until the

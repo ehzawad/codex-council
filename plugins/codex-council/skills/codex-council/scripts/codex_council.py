@@ -1937,9 +1937,10 @@ def _parse_args(argv):
             f"--skill-contract {args.skill_contract} does not match this "
             f"script's contract epoch {SKILL_CONTRACT_EPOCH}: stale "
             "SKILL/script pair. Installed plugin: update it from its "
-            "marketplace, then reload plugins or start a fresh session. "
-            "Development checkout: re-run scripts/dev-link.sh and restart "
-            "the session. Never change the epoch to get past it."
+            "marketplace, then start a fresh session. Development "
+            "checkout: start a fresh session with claude --plugin-dir "
+            "./plugins/codex-council from a matching checkout. Never "
+            "change the epoch to get past it."
         )
     return args
 

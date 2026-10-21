@@ -125,22 +125,6 @@ class DocumentationContractTests(unittest.TestCase):
         self.assertIn("quote the reply or the attempt log, or check it against "
                       "`result.json`; do not paraphrase it from memory", text)
 
-    def test_the_pdf_is_built_from_every_current_document_and_committed(self):
-        script = (ROOT / "scripts/build-docs.sh").read_text()
-        listed = re.search(r"(?ms)^docs=\(\n(.*?)^\)", script).group(1).split()
-        skill = "plugins/codex-council/skills/codex-council"
-        built = [entry.strip('"').replace("$skill", skill) for entry in listed]
-        current = {"README.md", "DESIGN.md", f"{skill}/SKILL.md",
-                   *(str(p.relative_to(ROOT)) for p in REFERENCES.glob("*.md")),
-                   *(str(p.relative_to(ROOT)) for p in (ROOT / "docs").glob("*.md"))}
-        self.assertEqual(sorted(built), sorted(current))
-        self.assertEqual(len(built), len(set(built)))
-        self.assertTrue((ROOT / "docs/codex-council.pdf").is_file())
-        self.assertIn("](docs/codex-council.pdf)", (ROOT / "README.md").read_text())
-        ignored = (ROOT / ".gitignore").read_text().split()
-        self.assertFalse([line for line in ignored if "pdf" in line])
-        self.assertFalse((ROOT / "CHANGELOG.md").exists())
-
     def test_ci_job_names_match_the_required_checks(self):
         ci = (ROOT / ".github/workflows/ci.yml").read_text()
         self.assertIn("    name: test (${{ matrix.label }})\n", ci)
