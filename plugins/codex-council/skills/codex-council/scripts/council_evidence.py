@@ -282,6 +282,11 @@ def write_result(run_dir: Path, plan: dict[str, Any], results: list[Any],
             role_gaps.append("no-attempt-evidence")
         if any(not attempt.get("evidence_complete") for attempt in attempts):
             role_gaps.append("incomplete-attempt-evidence")
+        role_ok = bool(result is not None and result.ok)
+        # A clean exit with a message is not a finished turn: the final
+        # attempt must have reported turn.completed before coverage counts.
+        if role_ok and attempts and attempts[-1].get("turn_completed_observed") is not True:
+            role_gaps.append("turn-completion-not-observed")
         artifacts = None
         if execution_state == "done" and baseline_intact:
             try:
@@ -290,7 +295,6 @@ def write_result(run_dir: Path, plan: dict[str, Any], results: list[Any],
                                               directory)
             except (OSError, ValueError):
                 role_gaps.append("artifact-inspection-incomplete")
-        role_ok = bool(result is not None and result.ok)
         required = binding["execution"]["required"]
         if required and (not role_ok or role_gaps):
             gaps.append(f"{role_id}:required-contribution-incomplete")

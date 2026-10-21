@@ -324,6 +324,20 @@ class WorkflowCliTests(unittest.TestCase):
         self.assertEqual(self.launch(next_run).returncode, 0)
         self.assertTrue(self.result(next_run)["required_contributions_complete"])
 
+    def test_clean_exit_without_a_completed_turn_is_not_complete_coverage(self):
+        directory = self.stage("UNFINISHED_TURN: start the required check.")
+        proc = self.launch(directory)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        result = self.result(directory)
+        contribution = result["roles"]["contribution"]
+        self.assertFalse(contribution["attempts"][-1]["turn_completed_observed"])
+        self.assertIn("turn-completion-not-observed", contribution["coverage_gaps"])
+        self.assertFalse(result["required_contributions_complete"])
+        self.assertIn("contribution:required-contribution-incomplete", result["coverage_gaps"])
+        # The partial reply and raw evidence are preserved for inspection.
+        self.assertEqual(contribution["interpretation"]["text"],
+                         "I am about to run the required check.")
+
     def test_discovery_and_execution_share_each_actual_workspace(self):
         self.env["CODEX_COUNCIL_MODEL_ROUTING"] = "auto"
         directory = self.stage()

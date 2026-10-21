@@ -143,6 +143,12 @@ def execute(argv):
         message = f"Baseline exit {before}; candidate exit {after}. Inspect the evidence."
     else:
         message = "Fixture contribution completed; no substantive verdict is inferred."
+    if "UNFINISHED_TURN" in body:
+        emit({"type": "item.completed", "item": {"type": "agent_message",
+              "text": "I am about to run the required check."}})
+        emit({"type": "item.started", "item": {"type": "command_execution",
+              "command": "python3 required_check.py"}})
+        return 0
     emit({"type": "item.completed", "item": {"type": "agent_message", "text": message}})
     emit({"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 10}})
     return 0
