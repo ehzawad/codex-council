@@ -41,6 +41,17 @@ it will contribute. No panel approval gate unless requested. New network access,
 native external tools, or unrestricted execution needs the user's authorization;
 never reinterpret “review this” as permission to enable bypass.
 
+## Permissions across turns
+
+This skill's pre-approval of `mktemp -d` and the runner commands lasts only for the
+turn that invokes it. Before any of them in a later turn (a follow-up `--status`,
+`--freshness` or `--cancel` after a Monitor notification, or any new council),
+invoke this skill again first. Writing `request.json`, `roles.json` and `context.md`
+needs Write permission in the run directory, which this skill does not grant. In a
+`dontAsk` or other unattended session, the user's session or project settings must
+allow Write there (for example a Write rule for the temporary directory) and the
+runner command pattern; without them, report the denial instead of skipping steps.
+
 ## Capture once, then discover
 
 Read [invocation-contract.md](references/invocation-contract.md) for the exact

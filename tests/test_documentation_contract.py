@@ -100,6 +100,21 @@ class DocumentationContractTests(unittest.TestCase):
                 parsed = codex_council._parse_args(argv)
                 self.assertEqual(parsed.skill_contract, codex_council.SKILL_CONTRACT_EPOCH)
 
+    def test_skill_says_pre_approval_ends_with_its_turn_and_names_write(self):
+        text = " ".join(SKILL.read_text().split())
+        self.assertIn("lasts only for the turn that invokes it", text)
+        for step in ("`--status`", "`--freshness`", "`--cancel`", "any new council"):
+            self.assertIn(step, text.split("lasts only for the turn")[1][:400])
+        self.assertIn("invoke this skill again first", text)
+        self.assertIn("needs Write permission in the run directory, which this skill "
+                      "does not grant", text)
+        self.assertIn("`dontAsk`", text)
+        frontmatter = SKILL.read_text().split("---", 2)[1]
+        self.assertNotIn("Write", frontmatter)
+        readme = " ".join((ROOT / "README.md").read_text().split())
+        self.assertIn("does not carry into later turns", readme)
+        self.assertIn("The skill does not pre-approve Write.", readme)
+
     def test_the_pdf_is_built_from_every_current_document_and_committed(self):
         script = (ROOT / "scripts/build-docs.sh").read_text()
         listed = re.search(r"(?ms)^docs=\(\n(.*?)^\)", script).group(1).split()

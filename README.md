@@ -42,11 +42,15 @@ A new turn alone is not a reason to invoke. Requests for Claude's own subagents
 remain a separate workflow; genuinely unresolved intent gets a brief clarification.
 
 For the turn that invokes it, the skill pre-approves `mktemp -d` and the runner
-commands exactly as SKILL.md writes them. Claude Code asks before Claude itself
-invokes a skill that pre-approves tools, so in a `dontAsk` or other unattended
-session invoke `/codex-council:codex-council` directly or allow
-`Skill(codex-council:codex-council)`. Writing the staging files into the run
-directory, which is outside the project, still needs Write permission there.
+commands exactly as SKILL.md writes them. That pre-approval does not carry into
+later turns, so SKILL.md tells Claude to invoke the skill again before a follow-up
+`--status`, `--freshness` or `--cancel` and before every new council. Claude Code
+asks before Claude itself invokes a skill that pre-approves tools, so in a `dontAsk`
+or other unattended session invoke `/codex-council:codex-council` directly or allow
+`Skill(codex-council:codex-council)`. Such a session also needs, in its session or
+project settings, Write permission for the run directory (it is outside the project;
+a Write rule for the temporary directory is enough) and an allow rule for the runner
+command pattern. The skill does not pre-approve Write.
 
 The main skill is deliberately small. It reads focused references when needed,
 not all documentation on every invocation. Tests, build scripts, and project docs
