@@ -1,0 +1,40 @@
+name: Assemble collaboration feature
+on:
+  push:
+    branches: [codex/adaptive-collaboration-20261021]
+    paths: [.council-integrate.py]
+permissions:
+  contents: write
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Integrate against the checked base
+        run: python .council-integrate.py
+      - name: Check source and focused tests
+        run: |
+          python -m compileall -q plugins tests
+          python -m unittest discover -s tests -p 'test_invocation_workflow.py' -v
+          python -m unittest discover -s tests -p 'test_workflow_cli.py' -v
+      - name: Publish ordinary source changes on the feature branch only
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -eu
+          branch=codex/adaptive-collaboration-20261021
+          rm .council-integrate.py .github/workflows/council-feature-assembly.yml
+          git config user.name 'Codex'
+          git config user.email 'noreply@openai.com'
+          git add -A
+          tree=$(git write-tree)
+          commit=$(printf '%s\n' 'feat: adaptive collaboration with captured experiments and evidence' | git commit-tree "$tree" -p c933a0b0d278972a35d1482203f9cbdb14d33e31)
+          git push --force-with-lease="refs/heads/$branch:$EXPECTED_SHA" origin "$commit:refs/heads/$branch"
+          printf 'Integrated feature commit: %s\n' "$commit"
