@@ -85,9 +85,10 @@ infer rank from names, versions, recommended markers, or remembered reputations.
 Each role has its own `catalogs/<role>/model-snapshot.json` and `snapshot_id`.
 Only model/effort/selection may change after capture; changing the task, context,
 permissions, or panel requires a new directory and capture. Source `.codex`,
-`.claude`, and `.agents` directories are not copied (AGENTS.md and CLAUDE.md are):
-inspect the scratch-native configuration, rather than assuming it preserves a
-source project's `.codex/config.toml` settings.
+`.claude`, and `.agents` directories and agent instruction files (AGENTS.md,
+AGENTS.override.md, CLAUDE.md, CLAUDE.local.md) are not copied, so state any project
+rule a role needs in its brief. Inspect the scratch-native configuration rather than
+assuming it preserves a source project's `.codex/config.toml` settings.
 
 ## Preflight, launch, follow
 

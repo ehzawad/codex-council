@@ -29,6 +29,11 @@ OMIT_DIRS = frozenset({
     ".pytest_cache", ".mypy_cache", ".ruff_cache",
 })
 OMIT_FILES = frozenset({".env", ".netrc", ".npmrc", "id_rsa", "id_ed25519"})
+# Agent instruction files Codex or Claude Code read from a working tree, at any
+# depth; compared case-insensitively because a case-insensitive filesystem
+# resolves agents.md as AGENTS.md.
+OMIT_INSTRUCTION_FILES = frozenset({"agents.md", "agents.override.md", "claude.md",
+                                    "claude.local.md"})
 CHUNK = 1024 * 1024
 
 
@@ -115,6 +120,8 @@ def _omission(name: str, exclude: list[str]) -> str | None:
     if any(part in OMIT_DIRS for part in parts):
         return "agent configuration, credentials, VCS metadata, or cache"
     leaf = parts[-1] if parts else ""
+    if leaf.casefold() in OMIT_INSTRUCTION_FILES:
+        return "agent instruction file"
     if (leaf in OMIT_FILES or (leaf.startswith(".env.")
                               and leaf not in (".env.example", ".env.sample"))
             or leaf.endswith((".pem", ".key", ".p12", ".pfx"))):

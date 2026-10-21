@@ -490,22 +490,28 @@ class WorkflowTests(WorkspaceCase):
         self.assertEqual(b.read_text(), "value = 1\n")
         self.assertEqual(self.file.read_text(), "value = 1\n")
 
-    def test_project_instructions_are_copied_and_the_plan_says_so(self):
-        (self.source / "AGENTS.md").write_text("Project instructions.\n")
-        (self.source / "CLAUDE.md").write_text("Host instructions.\n")
+    def test_agent_instruction_files_are_omitted_and_the_plan_says_so(self):
+        names = ("AGENTS.md", "AGENTS.override.md", "CLAUDE.md", "CLAUDE.local.md",
+                 "pkg/AGENTS.md", "pkg/claude.md")
+        (self.source / "pkg").mkdir()
+        for name in names:
+            (self.source / name).write_text("Instructions.\n")
         (self.source / ".codex").mkdir()
         (self.source / ".codex/config.toml").write_text('model = "pinned"\n')
         roles, body = self.stage()
         plan = workflow.prepare(str(self.run), roles, body)
         work = self.run / plan["roles"]["experiment"]["workspace"]
-        self.assertTrue((work / "AGENTS.md").exists())
-        self.assertTrue((work / "CLAUDE.md").exists())
+        for name in names:
+            self.assertFalse((work / name).exists(), name)
+            self.assertFalse((self.run / "baseline" / name).exists(), name)
+            self.assertNotIn(name, plan["snapshot"]["files"])
+            self.assertEqual(plan["snapshot"]["omitted"][name], "agent instruction file")
         self.assertFalse((work / ".codex").exists())
         self.assertIn(".codex", plan["snapshot"]["omitted"])
-        self.assertTrue(any("AGENTS.md and CLAUDE.md are copied" in item
+        self.assertTrue(any("agent instruction files" in item and "not copied" in item
                             for item in plan["limitations"]), plan["limitations"])
         lines = workflow.plan_lines(plan, roles, 0)
-        self.assertIn("selected AGENTS.md/CLAUDE.md are", lines[1])
+        self.assertIn("AGENTS.md/CLAUDE.md instruction files are not copied", lines[1])
 
     def test_context_lens_or_permission_changes_require_new_capture(self):
         roles, body = self.stage()

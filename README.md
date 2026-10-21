@@ -144,9 +144,9 @@ Configuration evidence is not an attestation of a later process: managed setting
 unsupported fields or an unknown tool inventory fail closed. No silent bypass or
 model hopping is used as recovery.
 
-Source agent configuration directories (`.codex`, `.claude`, `.agents`), credentials
-and caches are not copied; project instructions such as AGENTS.md and CLAUDE.md are
-copied like any selected file. Native model
+Source agent configuration directories (`.codex`, `.claude`, `.agents`), agent
+instruction files (AGENTS.md, AGENTS.override.md, CLAUDE.md, CLAUDE.local.md),
+credentials and caches are not copied; put any project rule a role needs in the brief. Native model
 inheritance means what Codex resolves in the **scratch execution cwd**, not a
 promise to preserve source-project `.codex/config.toml` settings. Inspect discovery
 and pin supported values explicitly when that distinction matters. Model choices

@@ -111,8 +111,9 @@ def prepare(run_dir: str, roles: list[Any], body: str) -> dict[str, Any]:
             "context_bytes": len(body.encode("utf-8")), "snapshot": snapshot,
             "roles": bindings, "backend": "private-copy",
             "limitations": ["observed-stable capture is not an atomic filesystem snapshot",
-                            "agent config directories, credentials and caches are not "
-                            "copied; AGENTS.md and CLAUDE.md are copied when selected",
+                            "agent config directories, agent instruction files "
+                            "(AGENTS.md, CLAUDE.md and their override/local variants), "
+                            "credentials and caches are not copied",
                             "sandbox restricts command writes, not all host reads",
                             "remote data and dependencies are outside the capture"]}
     atomic_json(directory / PLAN_FILE, plan)
@@ -270,8 +271,8 @@ def plan_lines(plan: dict[str, Any], roles: list[Any], stall_secs: int) -> list[
              f"workspace=private-copy-per-role; write_scope={write_scope}; "
              "permissions=observed-before-launch-not-runtime-attested",
              "[codex-council] configuration context: scratch cwd; source .codex/.claude/"
-             ".agents directories are not copied (selected AGENTS.md/CLAUDE.md are); "
-             "inspect the actual native-model discovery"]
+             ".agents directories and AGENTS.md/CLAUDE.md instruction files are not "
+             "copied; inspect the actual native-model discovery"]
     for role in roles:
         policy = parse_policy(role.execution)
         lines.append(f"[codex-council] execution plan: {role.id}: "

@@ -121,9 +121,11 @@ not proof of a source-code bug. Dependencies and external state need explicit,
 authorized setup and must be identified in the evidence.
 
 Each role's discovery runs in its actual scratch cwd. Source `.codex`, `.claude` and
-`.agents` directories are intentionally not copied or flattened into global settings;
-project instruction files such as AGENTS.md and CLAUDE.md are selected inputs and are
-copied, so they can shape a collaborator like any project file. Native inheritance
+`.agents` directories are intentionally not copied or flattened into global settings,
+and agent instruction files (AGENTS.md, AGENTS.override.md, CLAUDE.md, CLAUDE.local.md,
+at any depth, matched case-insensitively) are omitted even when an include selects
+them and recorded in `snapshot.omitted`; the brief carries any project rule a role
+needs. Native inheritance
 therefore means **the configuration Codex resolves in the execution cwd**, which
 may differ from the live project's configuration. Inspect the discovery summary;
 use a supported explicit pin when the user's intended model must be preserved.
