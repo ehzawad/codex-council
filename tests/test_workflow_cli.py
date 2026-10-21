@@ -6,6 +6,7 @@ integration. They do not claim the fake enforces a real OS sandbox.
 import contextlib
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -167,6 +168,45 @@ class WorkflowCliTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 2, proc.stderr)
         self.assertIn("managed requirements forbid the requested policy", proc.stderr)
         self.assertFalse(self.execs())
+
+    def test_cancelled_preflight_tears_down_its_policy_app_server(self):
+        directory = self.stage()
+        pidfile = self.base / "policy-server.pid"
+        self.env["FAKE_WORKFLOW_CONFIG_PAUSE"] = str(pidfile)
+        process = subprocess.Popen(
+            [sys.executable, str(RUNNER), "--check-staging-dir", str(directory)],
+            cwd=self.source, env=self.env, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        server = None
+        try:
+            deadline = time.monotonic() + 15
+            while not pidfile.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(pidfile.exists(), "policy probe never started")
+            server = int(pidfile.read_text())
+            process.terminate()
+            _, stderr = process.communicate(timeout=10)
+            self.assertEqual(process.returncode, 128 + signal.SIGTERM, stderr)
+            self.assertIn("--check-staging-dir interrupted by SIGTERM", stderr)
+            deadline = time.monotonic() + 5
+            while self._alive(server) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertFalse(self._alive(server), "policy app-server outlived preflight")
+        finally:
+            if server is not None:
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(server, signal.SIGKILL)
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+    @staticmethod
+    def _alive(pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
 
     def test_policy_mismatch_fails_before_inference_without_fallback(self):
         directory = self.stage()

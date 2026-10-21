@@ -71,6 +71,9 @@ def app_server(argv):
         elif method == "account/read":
             result = {"account": {"type": "chatgpt"}, "requiresOpenaiAuth": True}
         elif method == "config/read":
+            if os.environ.get("FAKE_WORKFLOW_CONFIG_PAUSE"):
+                Path(os.environ["FAKE_WORKFLOW_CONFIG_PAUSE"]).write_text(str(os.getpid()))
+                time.sleep(120)
             result = {"config": config(argv), "origins": {}}
         elif method == "configRequirements/read":
             result = {"requirements": json.loads(os.environ.get("FAKE_WORKFLOW_REQUIREMENTS", "null"))}

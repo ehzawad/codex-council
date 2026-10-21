@@ -2760,7 +2760,16 @@ def main():
         sys.exit(code)
 
     if args.check_staging_dir is not None:
-        _check_staging_dir(args.check_staging_dir)
+        # The policy probe owns an app-server process group, as discovery does.
+        try:
+            with _termination_raises():
+                _check_staging_dir(args.check_staging_dir)
+        except KeyboardInterrupt:
+            _diag("[codex-council] --check-staging-dir interrupted by user")
+            sys.exit(130)
+        except _TerminationSignal as stop:
+            _exit_interrupted(stop.signum,
+                              "[codex-council] --check-staging-dir interrupted by")
         return
 
     if args.discover is not None:
