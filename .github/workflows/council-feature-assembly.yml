@@ -19,7 +19,16 @@ jobs:
         with:
           python-version: '3.13'
       - name: Integrate against the checked base
-        run: python .council-integrate.py
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('.council-integrate.py')
+          text = p.read_text().replace('import ast\n', 'import ast\nimport io\n')
+          for name in ('self.text', 's.text', 'text'):
+              text = text.replace(name + '.splitlines(keepends=True)', 'io.StringIO(' + name + ').readlines()')
+          p.write_text(text)
+          PY
+          python .council-integrate.py
       - name: Remove only obsolete unused imports
         run: pipx run --spec 'ruff==0.15.21' ruff check --fix --select F401 .
       - name: Check source and focused tests
@@ -41,3 +50,22 @@ jobs:
           git commit -m 'feat: integrate captured collaboration and evidence with the existing runner'
           git push origin "HEAD:refs/heads/$branch"
           printf 'Integrated feature commit: %s\n' "$(git rev-parse HEAD)"
+      - name: Package source for offline verification (no Git credentials)
+        if: always()
+        run: |
+          python - <<'PY'
+          import os, pathlib, subprocess, zipfile
+          paths = subprocess.check_output(['git', 'ls-files', '-z']).split(b'\0')
+          with zipfile.ZipFile(os.path.join(os.environ['RUNNER_TEMP'], 'council-source.zip'), 'w', zipfile.ZIP_DEFLATED) as archive:
+              for raw in paths:
+                  if raw:
+                      path = pathlib.Path(os.fsdecode(raw))
+                      if path.is_file() and not path.is_symlink():
+                          archive.write(path, path.as_posix())
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: council-source-checkout
+          path: ${{ runner.temp }}/council-source.zip
+          retention-days: 1
