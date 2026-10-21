@@ -22,6 +22,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -261,6 +262,43 @@ class HappyPathTests(CouncilCLITestCase):
             state_files[0].endswith(f"__role-sha256-{digest}.json"),
             state_files[0],
         )
+
+    def test_an_unsafe_state_directory_refuses_the_launch_before_dispatch(self):
+        elsewhere = os.path.join(self.statedir.name, "elsewhere")
+        os.mkdir(elsewhere)
+        os.chmod(elsewhere, 0o755)
+        os.symlink(elsewhere, os.path.join(self.statedir.name, "codex-council"))
+        proc = self._launch([
+            _role("architect", "Architect", _instruction("Review architecture")),
+        ])
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn("invocation contract: saved-thread state directory",
+                      proc.stderr)
+        self.assertIn("is a symlink", proc.stderr)
+        self.assertNotIn("dispatching", proc.stderr)
+        self.assertEqual(os.listdir(elsewhere), [])
+        self.assertEqual(stat.S_IMODE(os.stat(elsewhere).st_mode), 0o755)
+
+    def test_a_launch_under_a_permissive_umask_keeps_state_private(self):
+        state_root = os.path.join(self.statedir.name, "codex-council")
+        os.mkdir(state_root)
+        os.chmod(state_root, 0o755)  # as an umask-dependent release left it
+        previous = os.umask(0o000)
+        try:
+            proc = self._launch([
+                _role("architect", "Architect",
+                      _instruction("Review architecture")),
+            ])
+        finally:
+            os.umask(previous)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(stat.S_IMODE(os.lstat(state_root).st_mode), 0o700)
+        names = os.listdir(state_root)
+        self.assertTrue(any(n.endswith(".lock") for n in names), names)
+        for name in names:
+            self.assertEqual(
+                stat.S_IMODE(os.lstat(os.path.join(state_root, name)).st_mode),
+                0o600, name)
 
     def test_happy_path_report_and_progress(self):
         proc = self._launch([

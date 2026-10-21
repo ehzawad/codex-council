@@ -40,11 +40,11 @@ met during selection are excluded and recorded in `run.json.snapshot.omitted`.
 That list is neither a complete inventory of ignored paths (implicit Git scope never
 lists them) nor a secret scan; sanitize unusual sensitive inputs yourself and
 narrow the scope before capture. Submodules, symlinks, special files, and
-case/Unicode collisions between complete selected file paths are refused or
-recorded as gaps, not silently flattened; empty-directory names and colliding
-directory components are not checked. File bytes and an executable/non-executable
-flag are captured, not the full permission mode; ownership, ACLs, extended
-attributes, sparse layout and external services are not reproduced.
+case/Unicode collisions among selected file paths, empty directories and every
+directory component are refused or recorded as gaps, not silently flattened. File
+bytes and an executable/non-executable flag are captured, not the full permission
+mode; ownership, ACLs, extended attributes, sparse layout and external services are
+not reproduced.
 
 `roles.json` is a nonempty array. This is an example, not a predefined role:
 

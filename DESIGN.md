@@ -22,6 +22,9 @@ captured inputs, and optional Codex thread. The source root and task id join the
 host-session and role key for continuity. A new scratch directory does
 not accidentally create a new logical project. Fresh is the prepared default;
 resume is explicit and history is subordinate to the complete current brief.
+Saved-thread state lives in a 0700 directory with 0600 lock and state files
+whatever the umask; an owned, too-open state directory is tightened, while a
+symlinked or foreign-owned one refuses the launch and is never changed.
 
 The staged request, context and role capability/lens contracts are frozen by
 preparation. Model/effort/selection stay fillable after discovery. Context changes,
@@ -41,11 +44,12 @@ briefly and report limitations around uncooperative external writers.
 
 Copies do not share writable inodes or Git control directories with the live tree.
 Selected symbolic links and special files are refused, as are case/Unicode
-collisions between complete selected file paths; empty-directory names and
-colliding directory components are not checked. Known credential, agent-config,
-instruction and cache paths met during selection are omitted and recorded; the
-list is not a complete inventory of ignored paths and not a secret scanner. ACLs, xattrs,
-submodules, sparse layout, remote data and dependency environments are not reproduced.
+collisions among selected file paths, empty directories and every directory
+component (`Foo/` and `foo/`, or `Foo/a.txt` and `foo/b.txt`). Known credential,
+agent-config, instruction and cache paths met during selection are omitted and
+recorded; the list is not a complete inventory of ignored paths and not a secret
+scanner. ACLs, xattrs, submodules, sparse layout, remote data and dependency
+environments are not reproduced.
 
 The frozen baseline is read-only to catch mistakes, not a same-uid trust boundary.
 Each role gets a separate writable copy and runs tests/experiments only according
@@ -97,9 +101,11 @@ revalidation, explicit pins, native fallback and per-role provenance. Each role 
 its planning snapshot in `catalogs/<key>/`; at launch each automatically selected
 role gets a fresh discovery in its own cwd, kept as
 `evidence/<key>/launch-model-snapshot.json`. Inherited and pinned roles skip that
-catalog discovery; execution-policy probes still run. Routed choices reject an
-advertised retirement; native-effort choices check the proven native model and
-advertised effort only. No thread or turn starts during model or policy discovery.
+catalog discovery; execution-policy probes still run. Routed and native-effort
+choices both reject an advertised retirement that has passed (for native effort,
+the proven native model's), and the discovery summary marks native-effort
+adjustment unavailable on a retired native model. No thread or turn starts during
+model or policy discovery.
 Nothing ranks ids, versions, recommended markers, or reputation.
 Report values describe what was sent, not an attestation of what served a turn.
 

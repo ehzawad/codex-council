@@ -1438,7 +1438,8 @@ def _retirement_passed(entry, now):
     (both "YYYY-MM-DDTHH:MM:SSZ"; None skips the check), else None.
 
     Codex can still list a model whose advertised retirement has passed;
-    it stays listed, but an automatic selection cannot route to it.
+    it stays listed, but no automatic selection (routed, or native_effort
+    on that native model) may send it.
     """
     upgrade = entry["upgrade"]
     retirement = upgrade["retirement_at"] if upgrade else None
@@ -1512,14 +1513,23 @@ def _discovery_summary(snapshot):
         # native.resolution stays evidence; the automatic action is off.
         native_text = f"unavailable — {MODEL_ROUTING_ENV}=off"
     elif native["resolution"] == "proven":
-        native_text = f"available on {native['model']}"
         entry = next(
             (m for m in models if m["model"] == native["model"]), None
         )
-        if entry is not None and entry["hidden"]:
-            # Hidden models are not listed below, but native_effort may
-            # still adjust effort on one, so show its efforts here.
-            native_text += f" (hidden; efforts: {_summary_efforts(entry)})"
+        retired = (_retirement_passed(entry, snapshot["created_at"])
+                   if entry is not None else None)
+        if retired:
+            # native_effort refuses a native model whose advertised
+            # retirement has passed, exactly as a routed choice is refused.
+            native_text = (f"unavailable — native model {native['model']} "
+                           f"advertised retirement passed ({retired})")
+        else:
+            native_text = f"available on {native['model']}"
+            if entry is not None and entry["hidden"]:
+                # Hidden models are not listed below, but native_effort may
+                # still adjust effort on one, so show its efforts here.
+                native_text += (" (hidden; efforts: "
+                                f"{_summary_efforts(entry)})")
     else:
         native_text = f"unavailable — {native['reason']}"
     visible = [entry for entry in models if not entry["hidden"]]
