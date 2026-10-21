@@ -5,7 +5,9 @@ description: >-
   task, resolve a consequential uncertainty, test competing explanations, or
   produce a useful artifact. Use when explicitly requested (codex council,
   coterie, or team), or when an independent contribution could change the next
-  decision. Shape the contribution from current goals, evidence, permissions,
+  decision, including a consequential call (a release, a root cause, a risky
+  change) where the user wants an independent check rather than a single
+  reading, even if Codex is not named. Shape the contribution from current goals, evidence, permissions,
   and unfinished work; do not invoke merely because a turn ended.
 argument-hint: "[current objective or useful contribution]"
 allowed-tools:
@@ -142,6 +144,9 @@ evidence or a discriminating check; preserve useful dissent and blocked checks.
 An empirical contribution should establish a baseline, run a discriminating test,
 inspect the actual result, and identify what remains unverified. Do not present a
 collaborator's review of its own proposed implementation as independent assurance.
+When the answer states what a collaborator observed (a value, an exit code, an error),
+quote the reply or the attempt log, or check it against `result.json`; do not
+paraphrase it from memory.
 
 Before using a finding or candidate patch against current work, compare the current
 goal with the staged brief and run:

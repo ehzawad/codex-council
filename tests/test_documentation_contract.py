@@ -115,6 +115,16 @@ class DocumentationContractTests(unittest.TestCase):
         self.assertIn("does not carry into later turns", readme)
         self.assertIn("The skill does not pre-approve Write.", readme)
 
+    def test_description_triggers_on_consequential_independent_checks(self):
+        frontmatter = " ".join(SKILL.read_text().split("---", 2)[1].split())
+        self.assertIn("where the user wants an independent check rather than a single "
+                      "reading, even if Codex is not named", frontmatter)
+
+    def test_reconciliation_quotes_or_checks_collaborator_observations(self):
+        text = " ".join(SKILL.read_text().split())
+        self.assertIn("quote the reply or the attempt log, or check it against "
+                      "`result.json`; do not paraphrase it from memory", text)
+
     def test_the_pdf_is_built_from_every_current_document_and_committed(self):
         script = (ROOT / "scripts/build-docs.sh").read_text()
         listed = re.search(r"(?ms)^docs=\(\n(.*?)^\)", script).group(1).split()
@@ -153,7 +163,8 @@ class DocumentationContractTests(unittest.TestCase):
         cases = json.loads((ROOT / "tests/fixtures/invocation_cases.json").read_text())
         ids = {case["id"] for case in cases["cases"]}
         self.assertLessEqual({"simple-no-council", "after-ten-turns", "changed-during-run",
-                             "after-compaction", "context-only", "no-redundant-invocation"}, ids)
+                             "after-compaction", "context-only", "no-redundant-invocation",
+                             "implicit-consequential"}, ids)
         self.assertEqual(len(ids), len(cases["cases"]))
         self.assertTrue(all(case["steps"] and case["expected"] for case in cases["cases"]))
 
