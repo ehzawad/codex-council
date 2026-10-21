@@ -17,8 +17,9 @@ network, native integrations and bypass require explicit authorization. A label
 such as “reviewer” never grants or revokes permissions. Separate scratch copies
 avoid overlapping file mutations but do not supply a complete OS security boundary.
 
-Choose models from each role's actual-cwd discovery snapshot. An explicit user pin
-wins and is forwarded unchanged. Otherwise a routed model+effort needs the current
+Choose models from each role's actual-cwd discovery snapshot. A syntactically
+valid explicit user pin wins and is forwarded unchanged, even when it is absent
+from the catalog. Otherwise a routed model+effort needs the current
 catalog descriptions to support both values. Native-effort selection needs a
 proven native model; otherwise omit model, effort and selection. Do not infer
 capability from product names, id spelling, version numbers, catalog order,
@@ -40,7 +41,10 @@ The selection JSON shapes are:
 ```
 
 User mode needs model and/or effort. Routed mode needs both; native_effort needs
-only effort and the runner pins the proven native model. These examples illustrate
+only effort and the runner pins the proven native model. Model and effort values
+must fully match `[A-Za-z0-9][A-Za-z0-9._:/@+-]*`; the model values `inherit` and
+`default` (any case) are rejected. Routed choices must not name a model whose
+advertised retirement has passed. These examples illustrate
 shapes; copy the actual role-specific snapshot_id and advertised values at runtime.
 Inheritance is omission, never literal inherit/default placeholders. Source `.codex`
 configuration is not copied into scratch, so inspect the actual native

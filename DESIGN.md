@@ -32,15 +32,19 @@ reusing stale input identity. Hashes bind artifacts, not semantic correctness.
 
 The capture backend makes independent copies for Git and non-Git projects. Git is a
 read-only filename/index/HEAD source, never an instruction to verify only committed
-HEAD. Current tracked and selected untracked bytes, deletions and executable bits
-are captured. Before/after inventories and file identity stamps reject observed
+HEAD. Current tracked and selected untracked bytes, deletions and an
+executable/non-executable flag are captured, not the full permission mode (copies
+are 0600/0700, the baseline 0400/0500). Before/after inventories and file identity
+stamps reject observed
 mutation. This is not an atomic filesystem snapshot: coordinate overlapping writers
 briefly and report limitations around uncooperative external writers.
 
 Copies do not share writable inodes or Git control directories with the live tree.
-Selected symbolic links, special files and non-portable name collisions are refused.
-Common credential, agent-config and cache paths are omitted and recorded. This
-reduces accidental exposure but is not a general secret scanner. ACLs, xattrs,
+Selected symbolic links and special files are refused, as are case/Unicode
+collisions between complete selected file paths; empty-directory names and
+colliding directory components are not checked. Known credential, agent-config,
+instruction and cache paths met during selection are omitted and recorded; the
+list is not a complete inventory of ignored paths and not a secret scanner. ACLs, xattrs,
 submodules, sparse layout, remote data and dependency environments are not reproduced.
 
 The frozen baseline is read-only to catch mistakes, not a same-uid trust boundary.
@@ -65,10 +69,11 @@ rules (an allow rule would run its command outside the sandbox), turns memories
 off, and, with external tools denied, empties notify, disables the examined
 external-tool features and explicitly disables the discovered MCP servers by bare
 name. Wrong/unknown types, managed overrides or requirements, an unaddressable MCP
-name or an altered inventory block execution. Preflight reports the policy and
-launch reobserves it; --start's local revalidation does not repeat slow metadata
-operations before detaching. Launch setup publishes liveness between
-bounded metadata operations so long panels do not look like silent dead runners.
+name or an altered inventory block execution. Command network requires
+workspace-write or bypass and an authorization. Preflight reports the policy and
+the detached child reobserves it; --start repeats only the local contract, capture
+and selection-authoring checks before detaching. Launch setup publishes liveness
+between bounded metadata operations so long panels do not look like dead runners.
 
 There is a remaining check-to-exec window. Config observations are not a serving
 process attestation, and the command sandbox is not a sandbox of the entire Codex
@@ -78,57 +83,145 @@ Failure never silently grants bypass or edits user configuration.
 
 ## Model discovery and selection
 
-Discovery and execution use each role's actual scratch cwd and the same Codex
-binary/environment. Relative CODEX_HOME is normalized before relocation, without
-copying credentials. Source agent configuration directories (`.codex`, `.claude`,
-`.agents`) and agent instruction files (AGENTS.md, AGENTS.override.md, CLAUDE.md,
-CLAUDE.local.md, at any depth) are deliberately not copied and are recorded in
-`snapshot.omitted`; put any project rule a role needs in the brief. Source-layer defaults may
-differ from scratch-native defaults and preflight says so.
-No silent claim of source configuration parity is made.
+Discovery and execution use each role's actual scratch cwd, the same Codex
+binary/environment and no profile override. Relative CODEX_HOME is normalized
+before relocation, without copying credentials. Source agent configuration and
+instruction files are not copied (see the
+[invocation contract](plugins/codex-council/skills/codex-council/references/invocation-contract.md)),
+so source-layer defaults may differ from scratch-native defaults; preflight says
+so, and no claim of source configuration parity is made.
 
 Discovery reads account, configuration, managed requirements and the model catalog
 through one adapter, with strict value grammar, authoring validation, launch-time
-revalidation, explicit pins, native fallback and per-role provenance. Each role owns its planning snapshot;
-launch observations are retained separately. No thread or turn starts during model
-or policy discovery. Nothing ranks ids, versions, recommended markers, or reputation.
+revalidation, explicit pins, native fallback and per-role provenance. Each role owns
+its planning snapshot in `catalogs/<key>/`; at launch each automatically selected
+role gets a fresh discovery in its own cwd, kept as
+`evidence/<key>/launch-model-snapshot.json`. Inherited and pinned roles skip that
+catalog discovery; execution-policy probes still run. Routed choices reject an
+advertised retirement; native-effort choices check the proven native model and
+advertised effort only. No thread or turn starts during model or policy discovery.
+Nothing ranks ids, versions, recommended markers, or reputation.
 Report values describe what was sent, not an attestation of what served a turn.
 
 ## Execution and lifecycle
 
-The POSIX supervisor is authoritative. --start exclusively claims a
-private directory, passes its held lock into a new session, and returns once the
-child publishes its record. Only the supervisor holds that lock; Codex children do
-not inherit it. Both lock identity/token and process-start identity are checked.
-Directories are one-use; unknown states are conservative; signal targeting is safe.
+The POSIX supervisor is authoritative. --start exclusively claims a private
+directory, passes its held lock into a new session, and waits up to ten seconds for
+the child's supervisor record: exit 0 can mean starting, running or already ended
+(its note and --status say which), and exit 1 is a spawn failure or a child that
+exited before writing its record. Only the supervisor holds that lock; Codex
+children do not inherit it. Both lock identity/token and process-start identity are
+checked. Directories are one-use and unknown states are conservative. Signals go
+only to verified recorded identities while the lock state agrees; the check and
+the signal are separate operations, not an atomic guarantee.
 
-Bounded fan-out and per-thread nonblocking locks prevent simultaneous turns in one
-saved thread. Every child has its own process group. Byte-inactivity watchdogs,
+Bounded fan-out and nonblocking per-continuity-key locks serialize runs with the
+same logical source, task, host-session scope and role; a role waiting on its key
+gives up its fan-out slot. Every child has its own process group. Byte-inactivity watchdogs,
 bounded post-exit drain, descendant cleanup, signal latching, reply-first persistence,
 and orphan reaping complete the lifecycle. The supervisor is not a reboot-persistent job scheduler.
 Same-user tampering, reparented descendants and a SIGKILL before child recording are
 not solved by the workspace copies.
 
-`preparing` is an activity signal for metadata work, not worker dispatch. --follow
-is read-only and notices lost status/identity. Terminal text is advisory: --status
-confirms released supervisor lock and vanished recorded identity. If a present
-runner stops responding, cancel it before reaping anything. Unknown means do not
-signal. An unattended host must continue observing or cancel before returning.
+`preparing` is an activity signal for metadata work, not worker dispatch. During
+the asynchronous fan-out status.json is republished on transitions and about every
+15 seconds; preparation publishes between bounded metadata operations, and
+synchronous filesystem work or finalization can leave longer gaps. --follow is
+read-only and notices lost status/identity. Terminal text is advisory: --status
+confirms a free supervisor lock and a vanished recorded identity, and --cancel
+reports success only once the lock is observed free. If a present runner stops
+responding, cancel it before reaping anything. Unknown means do not signal. An
+unattended host must continue observing or cancel before returning.
+
+`--status` combines the supervisor lock, supervisor.json, status.json and the
+process table into one state for a detached run:
+
+```mermaid
+stateDiagram-v2
+    state "starting: lock held, no status.json yet" as Starting
+    state "running: lock held, fresh tick" as Running
+    state "not responding: tick 120s or older" as Stale
+    state "still exiting: terminal state, lock held" as Exiting
+    state "ended: done, interrupted or aborted" as Ended
+    state "ended before dispatch: lock free" as EarlyEnd
+    state "gone: lock free, no terminal state" as Gone
+    state "unknown: lock and records disagree" as Unknown
+
+    [*] --> Starting: --start spawns the supervisor
+    Starting --> Running: status.json published
+    Starting --> EarlyEnd: exits before status.json
+    Running --> Stale: no tick for 120s
+    Stale --> Running: ticks again
+    Running --> Exiting: finished, or --cancel SIGTERM
+    Stale --> Exiting: --cancel SIGTERM
+    Exiting --> Ended: lock free, identity gone
+    Running --> Gone: killed without a terminal state
+    Stale --> Gone: SIGKILL
+    Running --> Unknown: unreadable or replaced records
+    Unknown --> Running: records agree again
+    Gone --> [*]: --reap any verified groups
+    Ended --> [*]
+    EarlyEnd --> [*]
+
+    classDef runner fill:#ede9fe,stroke:#6d28d9,color:#1e1037
+    classDef observer fill:#cffafe,stroke:#0e7490,color:#062a33
+    classDef evidence fill:#fef3c7,stroke:#b45309,color:#3b1d02
+    classDef failure fill:#fee2e2,stroke:#b91c1c,color:#3f0a0a
+    class Starting,Running,Exiting runner
+    class Ended evidence
+    class Stale,Unknown observer
+    class EarlyEnd,Gone failure
+```
 
 ## Replay, evidence and result semantics
 
-Every transient retry, not only a stall retry, passes the replay-safety scanner.
-A 429/5xx after tool-capable or unreadable output is replay-blocked. The exec JSONL
-omits some tool calls (a sandbox-denied code-mode command emits no item), so only a
-read-only role with external tools denied, whose unseen calls leave no effects, can
-be replayed; any other role's failed attempt is replay-blocked. The error class
-can be transient without the whole task being safe to repeat. The old thread and
-partial artifacts remain available for deliberate recovery. There is at most one
-automatic retry, after a five-second backoff.
+Every transient retry and every stale-resume recovery passes the replay-safety
+gate. The scanner checks item events against a safe-item allowlist (messages,
+reasoning, error notices) and marks undecodable lines unsafe; other top-level event
+types are accepted. The exec JSONL omits some tool calls (a sandbox-denied code-mode
+command emits no item), so only a read-only role with external tools denied, whose
+unseen calls leave no effects, can be replayed; any other role's failed attempt is
+replay-blocked. The failure verdict names a transient class; replay safety and the
+attempt budget decide the retry. There are at most two logical attempts, separated
+by a five-second backoff, and a replay-safe stale resume can additionally restart
+fresh within an attempt. The old thread and partial artifacts remain available for
+deliberate recovery.
 
-Raw protocol stdout and stderr are written per attempt as the worker runs. Metadata
-records argv, identity, prompt hash, transport outcome, protocol-reported commands,
-usage, hashes and gaps. A loss of raw storage or unreadable protocol is not disguised
+```mermaid
+flowchart TD
+    Attempt["Logical attempt n of 2"] --> Exec["codex exec, fresh or resume,<br/>in the role's scratch cwd"]
+    Exec --> Outcome{"Outcome"}
+    Outcome -- "turn completed with a reply" --> Ok["Role ok; thread saved"]
+    Outcome -- "auth, quota, model rejected,<br/>or exit 0 without a reply" --> Terminal["Terminal failure"]
+    Outcome -- "saved thread missing" --> StaleSafe{"Replay-safe?"}
+    StaleSafe -- "yes" --> FreshRun["Fresh run within this attempt,<br/>continuity-lost warning"]
+    FreshRun --> Outcome
+    StaleSafe -- "no" --> BlockedStale["replay-blocked:stale"]
+    Outcome -- "429/5xx or a stall" --> Safe{"Replay-safe?"}
+    Safe -- "no" --> Blocked["replay-blocked or stall:<br/>inspect partial effects"]
+    Safe -- "yes" --> Budget{"Attempt left?"}
+    Budget -- "yes" --> Backoff["Wait 5 seconds"]
+    Backoff --> Attempt
+    Budget -- "no" --> Final["Final transient error"]
+
+    classDef runner fill:#ede9fe,stroke:#6d28d9,color:#1e1037
+    classDef worker fill:#dcfce7,stroke:#15803d,color:#052e16
+    classDef evidence fill:#fef3c7,stroke:#b45309,color:#3b1d02
+    classDef failure fill:#fee2e2,stroke:#b91c1c,color:#3f0a0a
+    class Attempt,Outcome,StaleSafe,Safe,Budget,Backoff runner
+    class Exec,FreshRun worker
+    class Ok evidence
+    class Terminal,BlockedStale,Blocked,Final failure
+```
+
+Replay-safe means a read-only role with external tools denied whose attempt showed
+no side-effect-capable item and no unreadable output. A stall whose turn had already
+completed with a reply keeps that reply with a warning.
+
+Raw protocol stdout and stderr are written per attempt as the worker runs.
+Finalized attempt metadata records argv, pid/pgid, prompt hash, transport outcome,
+protocol-reported commands, usage, hashes and gaps; process-start identity lives in
+the supervisor and status records. A loss of raw storage or unreadable protocol is not disguised
 as complete evidence. Interrupted attempts retain their records, and settled roles'
 contributions survive cancellation. The exec reader buffers its streams in memory;
 raw spooling alone does not make total runner memory bounded.
@@ -140,12 +233,13 @@ are convenience artifacts; exact bytes remain in scratch. No artifact is applied
 committed or published automatically. Reconciliation checks evidence and current
 requirements, not vote counts or a clean transport exit.
 
-Exit 0 requires a delivered report and complete required contributions, each with
-an observed completed turn.
+Exit 0 requires a delivered report, at least one successful role, and complete
+required contributions, each with an observed completed turn.
 A failed optional role does not make a completed required contribution disappear.
 Stale captured inputs are a separate applicability verdict, not a retroactive claim
-that the old experiment never happened. --freshness covers only selected inputs:
-their bytes, empty directories, Git HEAD and the index entries of selected paths.
+that the old experiment never happened. --freshness covers only the capture:
+selected file bytes and executable flags, empty directories, Git HEAD, the index
+entries of selected paths, the recorded omission list and the staged context.
 Staging an unrelated file leaves a capture fresh; a new commit does not. Claude
 checks changed intent and external conditions separately.
 
@@ -154,7 +248,7 @@ checks changed intent and external conditions separately.
 | Module | Owns |
 |---|---|
 | codex_council | CLI, supervisor/fan-out/continuity, runner observation wiring. |
-| council_common | Private paths, atomic writes, diagnostics and shared primitives. |
+| council_common | Diagnostics, private-path policy, atomic writes, strict JSON and shared primitives. |
 | council_discovery | Bounded metadata transport, catalog/config normalization and snapshots. |
 | council_selection | Role/selection data, pure model resolver and authoring validation. |
 | council_failures | Structured failure classification and recovery wording. |
@@ -163,6 +257,54 @@ checks changed intent and external conditions separately.
 | council_policy | Capability validation and fail-closed effective-config observation. |
 | council_evidence | Raw attempts, protocol summaries, candidate artifacts and result envelope. |
 | council_workflow | Versioned invocation contracts, bindings and per-role discovery orchestration. |
+
+```mermaid
+flowchart TD
+    Entry["codex_council<br/>CLI and supervisor"]
+    Workflow["council_workflow"]
+    Liveness["council_liveness"]
+    Failures["council_failures"]
+    Evidence["council_evidence"]
+    Policy["council_policy"]
+    Selection["council_selection"]
+    Discovery["council_discovery"]
+    Workspace["council_workspace"]
+    Common["council_common"]
+
+    Entry --> Workflow
+    Entry --> Liveness
+    Entry --> Failures
+    Entry --> Evidence
+    Entry --> Common
+    Workflow --> Policy
+    Workflow --> Selection
+    Workflow --> Workspace
+    Workflow --> Discovery
+    Policy --> Discovery
+    Policy --> Workspace
+    Selection --> Discovery
+    Evidence --> Workspace
+    Discovery --> Common
+    Failures --> Common
+    Liveness --> Common
+    Selection --> Common
+
+    classDef runner fill:#ede9fe,stroke:#6d28d9,color:#1e1037
+    classDef evidence fill:#fef3c7,stroke:#b45309,color:#3b1d02
+    classDef observer fill:#cffafe,stroke:#0e7490,color:#062a33
+    classDef failure fill:#fee2e2,stroke:#b91c1c,color:#3f0a0a
+    class Entry,Workflow,Selection,Discovery,Policy,Common runner
+    class Workspace,Evidence evidence
+    class Liveness observer
+    class Failures failure
+```
+
+All of these modules run inside the runner process, so they share the runner
+colour; evidence-owning modules, the observer and failure classification keep
+their own. The entrypoint also imports the discovery, selection, policy and
+workspace modules directly; those edges are left out above for legibility. The
+workflow-to-discovery and policy-to-discovery edges are lazy, function-level
+imports.
 
 Imports form a DAG; production siblings do not import the entrypoint. The runner
 owns mutable run state. Runtime has no third-party Python dependency. Tests and
@@ -177,21 +319,21 @@ coverage, actual-cwd routing and cancellation. The liveness scenarios run in the
 full suite. CI runs it on Ubuntu with Python 3.12 to 3.15 and on macOS with 3.13.
 
 The fake does not implement Codex sandbox security or evaluate model quality.
-Opt-in signed-in host tests check real inside/outside write denials; behavioral
-cases check selective invocation and multi-turn context fidelity. Record the actual
-host model, Claude Code version, Codex version and effective configuration. Unknown
-or failed gates remain explicit; do not merge automatically on fake-suite success.
+Opt-in signed-in host tests check real inside/outside write and network denials.
+`tests/fixtures/invocation_cases.json` holds manual or host-evaluation scenarios for
+explicit invocation and context fidelity; CI validates only its structure. Record
+the actual host model, Claude Code version, Codex version and effective
+configuration. Unknown or failed gates remain explicit; do not merge automatically
+on fake-suite success.
 
-Documentation tests validate executable command/schema contracts and packaging.
-They do not freeze hundreds of prose phrases. Markdown is the source; the committed
-docs/codex-council.pdf is built from every current document by scripts/build-docs.sh.
+Documentation tests validate executable command/schema contracts and packaging,
+plus a few literal skill instructions. Markdown is the only source, with diagrams
+as Mermaid blocks. [README Testing](README.md#testing) gives the commands.
 
-Non-goals are predefined roles, hardcoded model rankings, peer debate, automatic
-per-turn invocation, automatic patch integration, a second agent loop replacing
-Codex exec, and a generic cluster scheduler. Per-role experimental workspaces give
-each contribution its own copy; they do not make the runner a job scheduler.
+Non-goals are automatic invocation, automatic patch integration, a second agent
+loop replacing Codex exec, and a generic cluster scheduler.
 
 ## Supported versions
 
-Claude Code 2.1.x, codex-cli 0.163 or later (behavior verified on 0.163.0), and
-Python 3.12 or later on macOS or Linux. The skill and runner share contract epoch 5.
+See the [README requirements](README.md#requirements). The skill and runner share
+contract epoch 5.

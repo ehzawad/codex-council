@@ -274,8 +274,10 @@ class ModuleStateTests(unittest.TestCase):
         import council_common
         import council_discovery
         import council_selection
-        # One cached project root (one git call) for state keys, workers,
-        # and discovery; one diagnostics sink for every stderr write.
+        # One shared git-root fallback for low-level callers without a
+        # prepared run (prepared runs use the captured logical source and
+        # an explicit per-role cwd); one diagnostics sink for every stderr
+        # write.
         self.assertIs(codex_council._project_root,
                       council_common._project_root)
         self.assertIs(council_discovery._project_root,

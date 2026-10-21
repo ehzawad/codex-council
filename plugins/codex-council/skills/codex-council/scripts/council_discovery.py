@@ -6,14 +6,17 @@ thread or a turn. The adapter is deliberately narrow: stdio JSON-RPC to
 `codex app-server`, five read-only methods, one monotonic deadline, and a
 strict projection into a small snapshot. Wire-format names stay inside the
 _normalize_* helpers; everything downstream reads only the snapshot. When
-Codex cannot give a usable answer the status is "unavailable", which means
-"no automatic selection": explicit user pins still apply and every other
-role inherits. Problems inside the catalog keep the status "ok" and only
-mark the catalog incomplete.
+Codex cannot give a usable answer the status is "unavailable": unusable
+launch catalog evidence can make a previously valid automatic selection
+inherit, while explicit user pins still apply. Invalid authoring and
+unavailable required execution-policy evidence still refuse the run.
+Problems inside the catalog keep the status "ok" and only mark the catalog
+incomplete.
 
 This module also owns CODEX_COUNCIL_MODEL_ROUTING, the private
-RUNDIR/model-snapshot.json file (atomic write, strict read), and the
---discover command and summary. Selection (council_selection.py) reads only
+model-snapshot.json file in a supplied role catalog directory (atomic write,
+strict read), and the per-role discovery command and summary that the public
+--discover RUNDIR runs for each role of a prepared run. Selection (council_selection.py) reads only
 the snapshots produced here.
 """
 
@@ -124,10 +127,12 @@ def _model_routing_mode():
 def _execution_context(deadline=None, project_root=None):
     """The process context discovery shares with every worker.
 
-    Workers run the PATH-resolved `codex` with this process's cwd and
-    environment and `-C <project root>`; discovery spawns the app-server the
-    same way (no cwd or env override) and passes the project root as
+    In a prepared run `project_root` is the role's scratch workspace:
+    discovery and the worker use that cwd, the same PATH-resolved `codex`
+    and environment, and no profile override, and the root is passed as
     config/read's cwd, the parameter that selects project config layers.
+    Without it (a low-level fallback) the git root of this process's cwd
+    is used.
     The runner forwards no profile, so `profile` is always null.
     CODEX_API_KEY is recorded as presence only: `codex exec` honors it but
     the app-server does not, so the catalog may not match exec's auth.
@@ -522,8 +527,9 @@ class _AppServerTransport:
 def _app_server_session(executable, deadline, cwd=None, config_overrides=()):
     """Spawn `codex app-server --listen stdio://` and yield its transport.
 
-    Launched like a worker — the same PATH-resolved binary, the inherited
-    cwd and environment, no --profile — in its own process group, and
+    Launched like a worker — the same PATH-resolved binary and environment,
+    the role's scratch cwd when `cwd` is given (a prepared run always gives
+    it), no --profile — in its own process group, and
     always torn down (_stop_process_group) however the session ends.
     """
     try:
@@ -1004,10 +1010,10 @@ _EXEC_API_KEY_REASON = (
 )
 _SIGNED_OUT_REASON = "not signed in: catalog is not account-grounded"
 # config/read origin kinds (ConfigLayerSource "type") whose values take
-# precedence even over the CLI `-m` / `-c` overrides a worker is sent: macOS
-# managed preferences delivered by MDM, and the legacy managed_config.toml
-# read from a file or from MDM. A model or effort one of them supplies
-# would silently replace an automatic choice.
+# precedence even over the CLI `-m` / `-c` overrides a worker is sent:
+# managed configuration origin types (MDM preferences, and a managed
+# configuration file read from disk or from MDM). A model or effort one of
+# them supplies would silently replace an automatic choice.
 _CLI_OVERRIDING_ORIGINS = (
     "mdm",
     "legacyManagedConfigTomlFromFile",
@@ -1213,7 +1219,8 @@ def _discover(routing_mode, project_root=None):
 # ----- the snapshot file and the --discover summary -----
 
 def _write_snapshot(run_dir, snapshot):
-    """Atomically write RUNDIR/model-snapshot.json (0600); return its path.
+    """Atomically write model-snapshot.json (0600) into `run_dir`, a role's
+    catalog directory; return its path.
 
     On any failure the previous snapshot, if one exists, is removed (best
     effort) before the error propagates: evidence from an earlier discovery
@@ -1357,7 +1364,8 @@ def _snapshot_file_problem(st):
 
 
 def _read_snapshot(run_dir):
-    """Load RUNDIR/model-snapshot.json: (snapshot, None) or (None, problem).
+    """Load model-snapshot.json from `run_dir`, a role's catalog directory:
+    (snapshot, None) or (None, problem).
 
     Accepts only the private regular file --discover writes: lstat refuses
     a symlink, special file, foreign owner, or group/other mode bits; the
@@ -1441,8 +1449,8 @@ def _retirement_passed(entry, now):
 
 def _summary_model_line(entry, now):
     """One advertised model; a retirement at or before `now` (the
-    snapshot's creation) is marked "retired ... (not routable)" so the
-    summary never offers a pair the pre-flight would refuse."""
+    snapshot's creation) is marked "retired ... (not routable)". Selection
+    grammar and eligibility are validated separately."""
     line = (f"- {_summary_model_name(entry)} — "
             f"{_quoted(entry['description'])}; "
             f"efforts: {_summary_efforts(entry)}")
@@ -1542,12 +1550,14 @@ def _discovery_summary(snapshot):
 
 
 def _discover_command(run_dir, project_root=None):
-    """--discover RUNDIR: discover, write the snapshot, print the summary.
+    """Discover for one role: write the snapshot into `run_dir` (the role's
+    catalog directory) and print the summary. The public --discover RUNDIR
+    validates the prepared run and calls this once per role.
 
-    Exits 0 whenever RUNDIR is a valid private directory that has not
-    launched a council (roles.json and context.md need not exist yet):
-    unavailable discovery, or a missing codex, is reported in the summary
-    because inheritance is always a valid outcome. A directory that
+    Exits 0 whenever `run_dir` is a valid private directory that has not
+    launched a council: unavailable discovery, or a missing codex, is
+    reported in the summary, and an automatic selection then resolves to
+    inheritance or is refused at authoring. A directory that
     already launched exits 2 before discovering, so that council's planning
     snapshot is never replaced. If the snapshot cannot be written, any
     older one is removed (best-effort) and the only line printed says to

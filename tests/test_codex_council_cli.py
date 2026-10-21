@@ -41,7 +41,7 @@ from fake_codex import EXEC_SENTINELS  # noqa: E402
 # retriable), replies with a body embedding a forged CODEX_COUNCIL_DONE
 # line, fails with a 503 on its first invocation only, makes the council
 # state directory read-only before replying, hangs byte-silent, or writes
-# stdout lines no JSON parser accepts (then, with a sleep, goes silent).
+# stdout lines the Python decoder rejects (then, with a sleep, goes silent).
 FAIL_SENTINEL = EXEC_SENTINELS["fail"]
 STDOUT_ERROR_SENTINEL = EXEC_SENTINELS["stdout_error"]
 STATUS400_429_SENTINEL = EXEC_SENTINELS["status400_429"]
@@ -566,23 +566,22 @@ class SkillContractTests(CouncilCLITestCase):
         self.assertIn("stale SKILL/script pair", proc.stderr)
         self.assertIn(f"contract epoch {council_testlib.EPOCH}", proc.stderr)
         self.assertEqual(proc.stdout, "")
-        # Installed-plugin recovery first, then the development checkout,
-        # the same order SKILL.md gives.
+        # Installed-plugin recovery first, then the development checkout.
         flat = " ".join(proc.stderr.split())
         installed = "Installed plugin: update it from its marketplace"
+        development = "claude --plugin-dir ./plugins/codex-council"
         self.assertIn(installed, flat)
-        self.assertIn("scripts/dev-link.sh", flat)
-        self.assertLess(flat.index(installed),
-                        flat.index("scripts/dev-link.sh"))
-        self.assertIn("reload plugins or start a fresh session", flat)
+        self.assertIn(development, flat)
+        self.assertLess(flat.index(installed), flat.index(development))
+        self.assertIn("then start a fresh session", flat)
         self.assertIn("Never change the epoch", flat)
         self.assertNotIn("[codex-council] dispatching", proc.stderr)
         self.assertEqual(proc.stdout, "")
 
-    def test_the_previous_epoch_4_is_a_stale_pair_on_every_path(self):
-        """A SKILL.md written for epoch 4 is refused with the stale-pair
-        recovery on every command alike."""
-        self.assertEqual(council_testlib.EPOCH, "5")
+    def test_any_other_epoch_is_a_stale_pair_on_every_path(self):
+        """Any supplied epoch different from SKILL_CONTRACT_EPOCH is refused
+        with the stale-pair recovery on every command alike."""
+        other = str(int(council_testlib.EPOCH) - 1)
         self._staged()
         run_dir = self.workdir.name
         for args in (
@@ -594,11 +593,11 @@ class SkillContractTests(CouncilCLITestCase):
         ):
             with self.subTest(command=args[0]):
                 proc = self._run(input="", args=(*args, "--skill-contract",
-                                                  "4"))
+                                                  other))
                 self.assertEqual(proc.returncode, 2, proc.stderr)
-                self.assertIn("--skill-contract 4 does not match this "
-                              "script's contract epoch 5: stale SKILL/script "
-                              "pair", proc.stderr)
+                self.assertIn(f"--skill-contract {other} does not match this "
+                              f"script's contract epoch {council_testlib.EPOCH}: "
+                              "stale SKILL/script pair", proc.stderr)
                 self.assertEqual(proc.stdout, "")
         self.assertEqual(sorted(os.listdir(run_dir)),
                          ["context.md", "roles.json"])
@@ -728,9 +727,9 @@ class StallWatchdogCliTests(CouncilCLITestCase):
         self.assertEqual(proc.stdout, "")
 
     def test_silent_hang_is_stall_killed_retried_then_terminal(self):
-        """End-to-end reproduction of the silent-wedge incident: a codex that
-        emits no bytes is terminated at the threshold, retried once (replay
-        safe — no tool work began), then reported terminally."""
+        """A codex that emits no bytes reaches the watchdog: it is terminated
+        at the threshold, retried once (no side-effect-capable work was
+        observed under a read-only policy), then reported terminally."""
         env = dict(self.env)
         env["CODEX_COUNCIL_STALL_SECS"] = "1"
         proc = self._launch(
@@ -740,8 +739,8 @@ class StallWatchdogCliTests(CouncilCLITestCase):
         self.assertIn("stall threshold reached", proc.stderr)
         self.assertIn("retriable error on attempt 1/2", proc.stderr)
         self.assertIn("[retriable:stall]", proc.stdout)
-        self.assertIn("no tool work had begun, so replay is safe",
-                      proc.stdout)
+        self.assertIn("no side-effect-capable work was observed and the "
+                      "role's policy permits replay", proc.stdout)
         self.assertNotIn("retrying", proc.stdout)
         self.assertRegex(
             self._last_nonempty_stderr_line(proc.stderr),

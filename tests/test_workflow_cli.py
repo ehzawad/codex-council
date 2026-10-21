@@ -34,7 +34,7 @@ def write(path, value):
     path.chmod(0o600)
 
 
-@unittest.skipUnless(HAS_RUNNER, "integration requires the existing runner checkout")
+@unittest.skipUnless(HAS_RUNNER, "integration requires the runner checkout")
 class WorkflowCliTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

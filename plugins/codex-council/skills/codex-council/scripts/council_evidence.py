@@ -201,7 +201,11 @@ def _bytes(root: Path, name: str) -> bytes:
 def collect_artifacts(baseline: Path, workspace: Path, snapshot: dict[str, Any],
                       evidence_dir: Path) -> dict[str, Any]:
     """Inspect changed files without following links or executing artifacts.
-    Large/binary/mode-only changes stay in the manifest, not a lossy text patch.
+
+    The manifest covers added, removed and changed non-omitted regular files,
+    executable-flag changes included; other permission changes and
+    empty-directory changes are not recorded. Large, binary and
+    executable-flag-only changes stay in the manifest, not a lossy text patch.
     """
     files, _, omitted, _ = inventory(workspace, ["."], [])
     changed = sorted(name for name in set(files) | set(snapshot["files"])

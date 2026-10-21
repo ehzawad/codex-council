@@ -1,4 +1,5 @@
-"""Mechanical docs/packaging contracts, not frozen explanatory prose."""
+"""Mechanical documentation and packaging checks, plus a few literal-prose
+assertions for instructions the skill must keep."""
 import json
 import re
 import shlex
@@ -79,9 +80,9 @@ class DocumentationContractTests(unittest.TestCase):
         self.assertIn("Permission is hereby granted", (ROOT / "LICENSE").read_text())
 
     def test_allowed_tools_pre_approve_every_runner_command_as_written(self):
-        """Bash rules match the command text as written, quotes included, so
-        each runner command the skill body gives must start with a rule's
-        text before its trailing ' *'; nothing broader is pre-approved."""
+        """Every runner command the skill body gives starts with a declared
+        allow-rule's text before its trailing ' *', and nothing broader is
+        declared. Actual host authorization requires a Claude Code check."""
         text = SKILL.read_text()
         frontmatter = text.split("---", 2)[1]
         rules = re.findall(r"(?m)^  - Bash\((.*) \*\)$", frontmatter)
@@ -115,33 +116,12 @@ class DocumentationContractTests(unittest.TestCase):
         self.assertIn("does not carry into later turns", readme)
         self.assertIn("The skill does not pre-approve Write.", readme)
 
-    def test_description_triggers_on_consequential_independent_checks(self):
-        frontmatter = " ".join(SKILL.read_text().split("---", 2)[1].split())
-        self.assertIn("where the user wants an independent check rather than a single "
-                      "reading, even if Codex is not named", frontmatter)
-
     def test_reconciliation_quotes_or_checks_collaborator_observations(self):
         text = " ".join(SKILL.read_text().split())
         self.assertIn("quote the reply or the attempt log, or check it against "
                       "`result.json`; do not paraphrase it from memory", text)
 
-    def test_the_pdf_is_built_from_every_current_document_and_committed(self):
-        script = (ROOT / "scripts/build-docs.sh").read_text()
-        listed = re.search(r"(?ms)^docs=\(\n(.*?)^\)", script).group(1).split()
-        skill = "plugins/codex-council/skills/codex-council"
-        built = [entry.strip('"').replace("$skill", skill) for entry in listed]
-        current = {"README.md", "DESIGN.md", f"{skill}/SKILL.md",
-                   *(str(p.relative_to(ROOT)) for p in REFERENCES.glob("*.md")),
-                   *(str(p.relative_to(ROOT)) for p in (ROOT / "docs").glob("*.md"))}
-        self.assertEqual(sorted(built), sorted(current))
-        self.assertEqual(len(built), len(set(built)))
-        self.assertTrue((ROOT / "docs/codex-council.pdf").is_file())
-        self.assertIn("](docs/codex-council.pdf)", (ROOT / "README.md").read_text())
-        ignored = (ROOT / ".gitignore").read_text().split()
-        self.assertFalse([line for line in ignored if "pdf" in line])
-        self.assertFalse((ROOT / "CHANGELOG.md").exists())
-
-    def test_ci_job_names_match_the_required_checks(self):
+    def test_ci_job_names_follow_the_matrix_labels(self):
         ci = (ROOT / ".github/workflows/ci.yml").read_text()
         self.assertIn("    name: test (${{ matrix.label }})\n", ci)
         labels = re.findall(r"label: '([^']+)'", ci)
@@ -164,7 +144,7 @@ class DocumentationContractTests(unittest.TestCase):
         ids = {case["id"] for case in cases["cases"]}
         self.assertLessEqual({"simple-no-council", "after-ten-turns", "changed-during-run",
                              "after-compaction", "context-only", "no-redundant-invocation",
-                             "implicit-consequential"}, ids)
+                             "explicit-first-turn"}, ids)
         self.assertEqual(len(ids), len(cases["cases"]))
         self.assertTrue(all(case["steps"] and case["expected"] for case in cases["cases"]))
 

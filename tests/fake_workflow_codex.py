@@ -15,8 +15,8 @@ def emit(value):
 
 
 def apply_codex_override(config, setting):
-    """Codex's -c semantics (config_override.rs, overrides.rs): split once on
-    '=', trim, parse the value as TOML or fall back to the raw string, then
+    """This fixture's -c handling: split once on '=', trim, parse the value
+    as TOML or fall back to it with edge quote characters stripped, then
     split the key on EVERY '.' with no quote handling. Not Python TOML keys."""
     key, separator, raw = setting.partition("=")
     key, raw = key.strip(), raw.strip()

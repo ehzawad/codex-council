@@ -485,7 +485,7 @@ class SupervisorStateTests(unittest.TestCase):
                           side_effect=OSError("no ps")):
             self.assertEqual(self._state(), "unknown")
 
-    def test_a_tracked_run_is_not_detached(self):
+    def test_a_run_without_supervisor_records_is_not_detached(self):
         _status(self.run_dir, pid=os.getpid())
         view = council_liveness.read_status(
             os.path.join(self.run_dir, council_liveness.STATUS_FILENAME))
@@ -1155,13 +1155,12 @@ class StatusCommandTests(unittest.TestCase):
         lines = self._lines()
         self.assertRegex(lines[0], r"^runner: not responding \(pid \d+ "
                                    r"present; last status tick 20\ds ago\)$")
-        # Recovery triage rule 3: stop the tracked task first, reap only
-        # once --status shows the runner gone.
+        # Stop the runner first; reap only once --status shows it gone.
         self.assertEqual(
             lines[-1],
-            "next: unless err.log says status.json not written, stop the "
-            "council's background task, confirm with --status that the "
-            "runner is gone, then --reap if live codex groups remain")
+            f"next: unless err.log says status.json not written, stop the "
+            f"runner (pid {pid}), confirm with --status that it is gone, "
+            "then --reap if live codex groups remain")
 
     def test_gone_runner_names_live_groups_and_the_reap(self):
         sleeper, identity = _sleeper_group(self)
@@ -1487,7 +1486,7 @@ class CancelCommandTests(unittest.TestCase):
         self.assertTrue(pid_running(decoy.pid))
         self.assertTrue(pid_running(holder.pid))
 
-    def test_refused_when_gone_starting_or_tracked(self):
+    def test_refused_when_gone_starting_or_without_supervisor_records(self):
         code, out = self._cancel()
         self.assertEqual(code, 1)
         self.assertIn("not launched with --start", out)
@@ -1503,6 +1502,15 @@ class CancelCommandTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn(f"the runner (pid {dead}) has already ended", out)
         self.assertIn("--reap", out)
+
+    def test_only_a_free_lock_confirms_the_runner_ended(self):
+        """An absent, replaced or unreadable lock never reads as released."""
+        for state, released in (("free", True), ("held", False),
+                                ("unknown", False), ("absent", False)):
+            with self.subTest(state=state), patch.object(
+                    council_liveness, "lock_state", return_value=state):
+                self.assertIs(council_liveness._wait_lock_released(
+                    self.run_dir, None, 0), released)
 
     def test_cancel_writes_nothing(self):
         holder, identity = _lock_holder(self, self.run_dir)
@@ -1682,8 +1690,8 @@ class CodexLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(run.warning)
 
     async def test_a_malformed_item_then_silence_is_never_replayed(self):
-        """The verification council's reproduction: an item whose type is a
-        list, a side effect, then silence under a 1s watchdog. The effect
+        """An item whose type is a list, a side effect, then silence under a
+        1s watchdog: the malformed item marks replay unsafe, so the effect
         happens once and the stall is terminal, never retried."""
         effects = os.path.join(self.tmp.name, "effects.txt")
         cmd = self._script(self._BAD_ITEM + textwrap.dedent(f"""\
@@ -1792,7 +1800,8 @@ def _golden_s0():
            + "\nModel selection: launch discovery not run (no runtime-"
            "grounded selections). codex exec does not report the model or "
            "effort that served a turn; values above are what the council "
-           "sent, and \"native inheritance\" means no override was sent.\n\n"
+           "sent, and \"native inheritance\" means no model or effort override "
+           "was sent.\n\n"
            + "\n".join(section(r) for r in roles)
            + "\n## Captured evidence\n\nRead `result.json` and per-attempt logs "
            "before reconciliation. Run `--freshness` before applying any "

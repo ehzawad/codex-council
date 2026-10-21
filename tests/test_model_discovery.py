@@ -1757,6 +1757,7 @@ class SnapshotFileTests(unittest.TestCase):
             ('{"a": 1, "a": 2}', "duplicate JSON key 'a'"),
             ('{"a": {"b": 1, "b": 1}}', "duplicate JSON key 'b'"),
             ('{"a": NaN}', "non-finite number NaN"),
+            ('{"a": 1e999}', "non-finite number 1e999"),
             ("\ud800", "is not valid JSON"),
         ):
             with self.subTest(text=text):
@@ -2410,7 +2411,8 @@ class FakeCodexExecTests(FakeCodexTestCase):
                 self.assertIn("fake reply from codex", proc.stdout)
                 # The fake resumes the requested thread: no adoption warning.
                 self.assertNotIn("adopted new id", proc.stdout + proc.stderr)
-        # No automatic selections: the launch never starts the app-server.
+        # No automatic selections: no model-discovery method reaches the
+        # fake app-server.
         self.assertEqual(self.methods(), [])
 
 

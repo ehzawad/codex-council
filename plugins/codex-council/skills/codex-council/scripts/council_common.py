@@ -1,12 +1,14 @@
 """Shared primitives for the codex-council runner (see codex_council.py).
 
-Nothing here imports a sibling module; every sibling imports from here:
+Nothing here imports a sibling module. It supplies the shared diagnostics,
+path, serialization and discovery helpers the runner modules use
+(council_workspace keeps its own capture-specific path and JSON primitives):
 single-line, control-free escaping for report and progress text
 (_report_inline, and _log_inline for err.log diagnostics), the advisory
 stderr sink (_diag), stdout output that ends quietly when nobody reads it
 any more (_print_stdout), usage exits with the uniform recovery texts, the
-one private-path policy (_private_stat_problem) and the private-directory
-gate built on it, the one-launch-per-directory gate, atomic 0600 writes,
+private-path policy (_private_stat_problem) and the private-directory gate
+built on it, the one-launch-per-directory gate, atomic 0600 writes,
 strict JSON loading, JSONL record iteration, the UTC timestamp format (_utc_iso), the project root (a
 bounded, cached git lookup), and the plugin version. Its module-level state
 (the diagnostics sink and the cached project root) exists only here.
@@ -16,6 +18,7 @@ import contextlib
 import contextvars
 import errno
 import json
+import math
 import os
 import stat
 import subprocess
@@ -78,10 +81,8 @@ LAUNCHED_DIR_RECOVERY = (
     "Recovery: every launch needs its own directory, so leave this one and "
     f"its files as they are. Run `mktemp -d` again. {NEW_DIR_SEQUENCE}"
 )
-# Uniform recovery appended to EVERY roles-file validation failure. The only
-# production writer of roles.json is an LLM; partial patches of a file that
-# already glitched once are the corruption vector, so every defect demands one
-# complete rewrite. Parse-time code cannot know its caller, so this default
+# Uniform recovery appended to EVERY roles-file validation failure: every
+# defect asks for one complete, validated rewrite. Parse-time code cannot know its caller, so this default
 # names the command that refused; the launch scopes in
 # STAGED_LAUNCH_ROLES_RECOVERY instead (see _roles_recovery).
 ROLES_REWRITE_RECOVERY = (
@@ -356,7 +357,7 @@ def _roles_recovery(text):
 def _private_stat_problem(st, *, directory):
     """Why an lstat/fstat result is not private to this user, or None.
 
-    The one private-path policy, shared by the staging and follow
+    The runner's private-path policy, shared by the staging and follow
     directory gate, the replies directory, and the model snapshot: not a
     symlink, a directory (or a regular file when `directory` is false),
     owned by the effective uid, and no group or other permission bits.
@@ -510,11 +511,20 @@ def _reject_non_finite(name):
     raise ValueError(f"non-finite number {name}")
 
 
+def _finite_float(literal):
+    """json parse_float hook: a float literal, refused when it overflows."""
+    value = float(literal)
+    if not math.isfinite(value):
+        raise ValueError(f"non-finite number {literal}")
+    return value
+
+
 def _strict_json_loads(text):
-    """json.loads that rejects duplicate keys and non-finite numbers."""
+    """json.loads that rejects duplicate keys and non-finite numbers: the
+    NaN/Infinity tokens and a float literal that overflows to infinity."""
     return json.loads(
         text, object_pairs_hook=_reject_duplicate_keys,
-        parse_constant=_reject_non_finite,
+        parse_constant=_reject_non_finite, parse_float=_finite_float,
     )
 
 
@@ -526,8 +536,9 @@ def _iter_json_objects(jsonl_output):
     *unescaped* inside a JSON string. codex/serde_json can emit an agent_message
     containing one of those literally, and splitting there would tear the record
     into two invalid fragments — silently dropping a completed reply and turning
-    a successful role into a failure. A line nested too deeply or holding an
-    out-of-range number is skipped like any other malformed line.
+    a successful role into a failure. A line Python's decoder rejects (for
+    example for excessive nesting or the integer-digit limit) is skipped
+    like any other malformed line.
     """
     for line in jsonl_output.split("\n"):
         line = line.strip()

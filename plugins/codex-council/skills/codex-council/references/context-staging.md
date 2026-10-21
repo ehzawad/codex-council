@@ -18,7 +18,8 @@ a worker to follow historical absolute paths back into the changing live tree.
 Choose capture scope from the question, including the tests, configurations and
 fixtures needed to decide it. Git tracked/untracked selection is a convenience,
 not proof that all dependencies were included. Non-Git capture uses explicit paths.
-Omitted credentials/configuration/caches are recorded. A missing dependency is a
+Known credential, configuration and cache paths met during selection are
+omitted and recorded; that is not a secret scan. A missing dependency is a
 coverage gap; do not fabricate a passing or failing empirical result.
 
 Pause overlapping managed writers only during preparation. Capture refuses observed
@@ -28,8 +29,9 @@ The baseline and role contracts are frozen; changing the context or authorizatio
 requires another invocation. Model selection fields alone can be filled after
 actual-cwd discovery.
 
-At reconciliation, --freshness checks captured filesystem scope, not the user's
-current intention or external service state. Compare both the current objective
+At reconciliation, --freshness checks the captured filesystem scope, the recorded
+omission list and the staged context, not the user's current intention or external
+service state. Compare both the current objective
 and artifacts. Recheck affected findings after changes; if the dependency scope is
 uncertain, recapture rather than claiming an old result proves current correctness.
 

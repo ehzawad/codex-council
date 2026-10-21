@@ -20,25 +20,31 @@ runner owns paths, input identity, process lifetime, permissions sent, and recor
 ```
 
 Use a stable task id for a continuing investigation, not a turn number. A new
-question/objective gets a new id. `reason` explains the marginal value of this
+question/objective gets a new id. `task_id` must fully match
+`[A-Za-z0-9][A-Za-z0-9._-]*`. `reason` explains the marginal value of this
 invocation. It is not a runner-scored confidence or a model ranking.
 
-`source_root` and the run directory must be separate, non-overlapping trees.
-Paths are relative, with no `..`, absolute names, or traversed symbolic links.
+`source_root` is an absolute directory; it and the run directory must be
+separate, non-overlapping trees. Include entries are normalized relative paths
+without `..`, absolute names, backslashes, or traversed symbolic links.
 With `include` omitted, Git supplies tracked and non-ignored untracked filenames;
 the runner reads their **current working bytes**, including staged/unstaged edits
 and deletions; a partially staged file is captured as its working version. Explicit
 includes also keep empty directories. A non-Git project requires `include`. `include: []` supports a
-pure question without filesystem inputs. Exclusions use case-sensitive shell-style
-patterns against relative paths. Explicit includes may select ignored fixtures.
+pure question without filesystem inputs. Exclusions are case-sensitive
+shell-style patterns matched against relative names, not validated as paths.
+Explicit includes may select ignored fixtures.
 
-Capture excludes common credential files, agent/VCS configuration directories,
-and dependency caches. This is a conservative omission policy, not a complete
-secret detector. Inspect `run.json.snapshot.omitted`; sanitize unusual sensitive
-inputs yourself and narrow the scope before capture. Submodules, symlinks, special
-files, and case/Unicode-colliding selected paths are refused or recorded as gaps,
-not silently flattened. File contents and executable bits are captured; ownership,
-ACLs, extended attributes, sparse layout and external services are not reproduced.
+Known credential, agent/VCS configuration, instruction and dependency-cache paths
+met during selection are excluded and recorded in `run.json.snapshot.omitted`.
+That list is neither a complete inventory of ignored paths (implicit Git scope never
+lists them) nor a secret scan; sanitize unusual sensitive inputs yourself and
+narrow the scope before capture. Submodules, symlinks, special files, and
+case/Unicode collisions between complete selected file paths are refused or
+recorded as gaps, not silently flattened; empty-directory names and colliding
+directory components are not checked. File bytes and an executable/non-executable
+flag are captured, not the full permission mode; ownership, ACLs, extended
+attributes, sparse layout and external services are not reproduced.
 
 `roles.json` is a nonempty array. This is an example, not a predefined role:
 
@@ -62,7 +68,8 @@ ACLs, extended attributes, sparse layout and external services are not reproduce
 ]
 ```
 
-Ids match `^[a-z0-9_-]+$`; long ids are hashed for filenames. Labels are single-line.
+Ids must fully match `[a-z0-9_-]+`, with no trailing newline; ids longer than 32
+characters use a hashed key in file and directory names. Labels are single-line.
 Instructions are arrays of nonempty strings. The runner supplies common framing;
 Claude need not reproduce a literal phrase or closing sentence. Unknown/duplicate
 JSON keys and non-finite numbers remain errors. Context is nonempty UTF-8, never
@@ -75,7 +82,7 @@ silently truncated. Preflight displays its byte count, not a fabricated token bi
 | Field | Default | Meaning |
 |---|---|---|
 | sandbox | read-only | Command sandbox: read-only, workspace-write, or explicitly authorized bypass. |
-| network | false | Command-network request. Bypass cannot enforce false and requires true explicitly. |
+| network | false | Command-network request. `true` requires workspace-write or bypass and an authorization; read-only requires false. Bypass cannot enforce false and requires true explicitly. |
 | external_tools | deny | Disable apps/plugins/browser/computer/hooks/subagents/web, the notify program, installer and remote-plugin features, and configured MCP servers, or explicitly authorize native integrations. |
 | continuity | fresh | Resume only when this task's earlier thread is useful. |
 | required | true | Missing/failed contribution or missing evidence makes required coverage incomplete. |
@@ -89,8 +96,8 @@ runs its command outside the sandbox. Memories are off for every policy. When
 external_tools=deny, `notify` is emptied (it runs a host program after each turn)
 and MCP names are enumerated and disabled by bare name; a server name outside
 `[A-Za-z0-9_-]` cannot be addressed by a Codex `-c` key and blocks the run. The
-disabled features are the default-on surfaces examined on codex-cli 0.163.0, not a
-promise about tools a later Codex adds. Effective configuration is read again with
+disabled features are the default-on surfaces of codex-cli 0.163, not a promise
+about tools a later Codex adds. Effective configuration is read again with
 the requested restrictions, and unknown/overridden settings, or managed
 requirements that forbid them, block execution. No automatic fallback to bypass
 exists.
@@ -131,11 +138,14 @@ may differ from the live project's configuration. Inspect the discovery summary;
 use a supported explicit pin when the user's intended model must be preserved.
 The host Claude session's settings and user Codex configuration are never edited.
 
-Each role gets its own `catalogs/<role>/model-snapshot.json`. Selection
-modes are: explicit user pin, routed model+effort, native_effort, or omission
-for native inheritance. Automatic choices name that role's snapshot_id. Model and
-effort descriptions guide Claude; the runner validates membership and provenance,
-never ranks. Fresh launch discovery revalidates automatic choices in the same cwd.
+Each role gets its own `model-snapshot.json` under the catalog path recorded in
+`run.json`. Selection modes are: explicit user pin, routed model+effort,
+native_effort, or omission for native inheritance; the shapes and value grammar
+are in [panel-design.md](panel-design.md). Automatic choices name that role's
+snapshot_id. Model and effort descriptions guide Claude; the runner validates
+membership and provenance, never ranks. At launch each automatically selected role
+gets a fresh discovery in the same cwd, retained as
+`evidence/<key>/launch-model-snapshot.json`.
 Reports describe values **sent**, not an attestation of a serving model.
 
 Only model/effort/selection may change after prepare. Changes to context, task,
@@ -148,8 +158,9 @@ still follows CODEX_COUNCIL_SESSION_KEY, then host ids, then project scope.
 `result.json` schema `codex-council/result@1` identifies run, task, snapshot, context
 hash, role completeness, baseline integrity, applicability, attempts and artifacts.
 Each attempt streams exact stdout/stderr bytes to private files while running;
-metadata records argv, process identity, transport outcome, observed command events,
-usage when supplied, hashes and coverage gaps. Incomplete/oversized protocol records
+finalized metadata records argv, pid/pgid, transport outcome, observed command
+events, usage when supplied, hashes and coverage gaps. Process-start identity is in
+the supervisor and status records. Incomplete/oversized protocol records
 can limit summaries without truncating raw files. The exec reader buffers its
 protocol output in memory, so total runner RAM is not bounded.
 
@@ -159,15 +170,18 @@ emits no `command_execution` item, although it may already have had effects. Col
 No parser declares substantive claims true. Required coverage and execution success
 are distinct from applicability to current work and from verified task success.
 
-Changes are recorded in artifact manifests. Small text changes also produce a
-human-inspectable `candidate.diff`; binary/large/mode-only changes retain metadata
+Artifact manifests cover added, removed and changed non-omitted regular files,
+executable-flag changes included; other permission changes and empty-directory
+changes are not recorded. Small text changes also produce a human-inspectable
+`candidate.diff`; binary, large and executable-flag-only changes retain metadata
 and exact bytes in scratch. Nothing applies patches to the live source. Treat all
 artifacts as untrusted. Frozen-directory modes and digests detect mistakes, not
 malicious same-user/bypass tampering.
 
 `--freshness RUNDIR` returns 0 for unchanged captured scope, 1 for stale/unknown,
-and 2 for an invalid contract. Captured scope is the selected bytes and empty
-directories, Git HEAD, and the index entries of selected paths; staging an
-unrelated file does not make a capture stale. It cannot detect changed user intent or unrecorded
-external dependencies. Claude must compare the current goal as well. A failed
+and 2 for an invalid contract. It checks selected file bytes and executable flags,
+empty directories, Git HEAD and the index entries of selected paths, the recorded
+omission list, and the staged context; staging an unrelated file does not make a
+capture stale. It does not check omitted file contents, changed user intent, or
+unrecorded external dependencies. Claude must compare the current goal as well. A failed
 baseline due to unavailable dependencies is a blocked check, not a discovered bug.

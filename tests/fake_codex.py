@@ -113,7 +113,8 @@ import uuid
 # Filled in by install(): the EXEC_SENTINELS map and NATIVE_MODEL.
 SENTINELS = __SENTINELS__
 NATIVE_MODEL = __NATIVE_MODEL__
-# Stdout lines no JSON parser accepts: nested too deeply (RecursionError), a
+# Stdout lines the current Python decoder rejects (or its configured resource
+# limits refuse), plus malformed input: nested too deeply (RecursionError), a
 # command_execution item holding an integer past Python's digit limit
 # (ValueError), invalid UTF-8, and a truncated object (JSONDecodeError).
 MALFORMED_LINES = (
@@ -215,8 +216,9 @@ def _answer(message, spec):
 
 
 def _codex_override(config, setting):
-    """Codex -c semantics: split once on '=', TOML value or raw string, and
-    the key split on every '.' with no quote handling."""
+    """This fixture's -c handling: split once on '=', parse the value as
+    TOML or fall back to it with edge quote characters stripped, and split
+    the key on every '.' with no quote handling."""
     key, _, raw = setting.partition("=")
     key, raw = key.strip(), raw.strip()
     try:

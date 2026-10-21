@@ -12,6 +12,7 @@ import contextlib
 import fnmatch
 import hashlib
 import json
+import math
 import os
 import stat
 import subprocess
@@ -80,7 +81,9 @@ def atomic_json(path: Path, value: Any) -> None:
 
 
 def read_json(path: Path, *, private: bool = True) -> Any:
-    """Strict JSON from an owned, private, regular, non-symlink file."""
+    """Strict JSON (no duplicate keys or non-finite numbers) from an owned,
+    regular, non-symlink file; group/other permission bits are refused only
+    when `private` is true."""
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, "rb") as stream:
         st = os.fstat(stream.fileno())
@@ -99,8 +102,14 @@ def read_json(path: Path, *, private: bool = True) -> Any:
         def constant(value: str) -> Any:
             raise WorkspaceError(f"non-finite JSON number: {value}")
 
+        def finite(literal: str) -> float:
+            value = float(literal)
+            if not math.isfinite(value):
+                raise WorkspaceError(f"non-finite JSON number: {literal}")
+            return value
+
         return json.loads(stream.read().decode("utf-8"), object_pairs_hook=pairs,
-                          parse_constant=constant)
+                          parse_constant=constant, parse_float=finite)
 
 
 def relative_path(value: str, *, allow_dot: bool = False) -> str:
@@ -308,6 +317,8 @@ def inventory(root: Path, include: list[str] | None, exclude: list[str]
         for value in include:
             names.update(_walk(root, relative_path(value, allow_dot=True),
                                exclude, omitted, empty))
+    # Collisions are checked over complete selected file paths only, not
+    # over empty-directory names or colliding directory components.
     portable: dict[str, str] = {}
     files, stamps = {}, {}
     for name in sorted(names):
@@ -415,7 +426,10 @@ def copy_workspace(baseline: Path, target: Path, snapshot: dict[str, Any]) -> No
 
 
 def freshness(snapshot: dict[str, Any]) -> dict[str, Any]:
-    """No assertions about excluded files or remote dependencies."""
+    """Compare selected file bytes and executable flags, empty directories,
+    Git HEAD and selected index entries, and the recorded omission
+    inventory with the capture. Omitted file contents and remote
+    dependencies are not checked."""
     try:
         root = Path(snapshot["source_root"])
         files, _, omitted, dirs = inventory(root, snapshot["include"], snapshot["exclude"])
