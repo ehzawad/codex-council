@@ -57,7 +57,6 @@ class StartCase(unittest.TestCase):
         self.base = tmp.name
         self.pid_dir = os.path.join(self.base, "pids")
         os.mkdir(self.pid_dir)
-        self.run_dir = self.stage("run")
         self.env = council_testlib.clean_env(
             PATH=council_testlib.fake_bin_dir() + os.pathsep
             + os.environ.get("PATH", ""),
@@ -65,9 +64,11 @@ class StartCase(unittest.TestCase):
             CODEX_HOME=os.path.join(self.base, "codex-home"),
             FAKE_CODEX_PID_DIR=self.pid_dir,
         )
+        self.run_dir = self.stage("run")
         self.addCleanup(self.stop_everything)
 
     def stage(self, name, roles=None, context=None):
+        """A captured (context-only) run directory, ready for --start."""
         run_dir = os.path.join(self.base, name)
         os.mkdir(run_dir, 0o700)
         with open(os.path.join(run_dir, "roles.json"), "w",
@@ -76,6 +77,7 @@ class StartCase(unittest.TestCase):
         with open(os.path.join(run_dir, "context.md"), "w",
                   encoding="utf-8") as f:
             f.write(context or f"Please review. {CONTEXT_MARKER}\n")
+        council_testlib.prepare_run(self, run_dir, self.env, self.base)
         return run_dir
 
     def run_cli(self, *args):
@@ -379,16 +381,16 @@ class SignalLatchCliTests(StartCase):
                        f"{EXEC_SENTINELS['sleep_secs']}300.")]
         run_dir = self.stage("latch", roles=roles)
         err_path = os.path.join(run_dir, "err.log")
+        lock = council_testlib.claim_supervisor_lock(run_dir)
         with open(os.path.join(run_dir, "out.md"), "wb") as out, \
                 open(err_path, "wb") as err:
             proc = subprocess.Popen(
-                [sys.executable, SCRIPT,
-                 "--roles-file", os.path.join(run_dir, "roles.json"),
-                 "--context-file", os.path.join(run_dir, "context.md"),
-                 "--skill-contract", EPOCH],
+                council_testlib.supervised_argv(run_dir, lock),
                 stdout=out, stderr=err, env=self.env, cwd=self.base,
                 stdin=subprocess.DEVNULL, start_new_session=True,
+                pass_fds=(lock,),
                 preexec_fn=council_testlib.default_signal_dispositions)
+        os.close(lock)
         self.addCleanup(lambda: proc.poll() is None and proc.kill())
         deadline = time.monotonic() + 30
         while not any(name.startswith("tool-")

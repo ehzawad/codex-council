@@ -1,535 +1,287 @@
 # codex-council
 
-Independent cross-model verification and collaboration for Claude Code.
-Claude identifies the claims, decisions, and results worth checking,
-supplies the requirements and evidence, and briefs **one or more role-framed
-OpenAI Codex agents** to challenge them from task-specific lenses. Roles can
-also investigate, reproduce, test, research, or implement authorized work.
-Claude checks their evidence, reconciles their contributions into one
-result, and stays responsible for it.
+Adaptive, on-demand **OpenAI Codex collaboration for Claude Code**: task-shaped
+contributions, captured inputs, disposable experiments, and one reconciled result.
+Claude decides when collaboration is useful, supplies current context, and remains
+responsible for the outcome. The runner owns execution and evidence, not judgment.
 
-The plugin is general-purpose, with a programmatic center of gravity:
-project implementation, computer science, software and ML/AI engineering,
-DevSecOps, debugging and testing, and technical research. There is no
-built-in role catalog: Claude composes each panel from the work in front of
-it, and one role is often enough. Model routing is adaptive: each Codex role
-runs on a model and reasoning effort discovered at runtime for its lens, or
-on your native Codex configuration. Claude itself keeps the host session's
-model and effort; council routing controls only the external Codex workers.
+A contribution can investigate, reproduce, test, research, compare alternatives, or
+build an authorized candidate. One is often enough. There is no role catalog,
+model ranking, fixed panel size, peer-debate loop, or automatic per-turn hook.
 
 ## Requirements
 
-- [Claude Code](https://claude.ai/code) 2.1.x, signed in (`claude` works in
-  your terminal).
-- [OpenAI Codex CLI](https://learn.chatgpt.com/docs/codex/cli) 0.158 or
-  later, signed in (`codex` works in your terminal).
-- Python 3.12 or later on macOS or Linux. The runner uses only the standard
-  library and POSIX process groups.
+| Component | Supported |
+|---|---|
+| Claude Code | 2.1.x, with plugin skills |
+| Codex CLI | codex-cli 0.163 or later, signed in; behavior verified on 0.163.0 |
+| Python | 3.12 or later, on macOS or Linux |
 
-## Install
+The skill speaks contract epoch 5. The runner uses only the standard library and
+POSIX process controls. Missing policy metadata blocks restricted execution rather
+than granting bypass. Neither native user configuration nor the host Claude
+model/effort is edited. The fake-Codex test suite makes no claim about real-model
+quality or real-host sandbox enforcement; [local validation](docs/LOCAL_VALIDATION.md)
+covers the signed-in host checks.
 
-```bash
-claude plugins marketplace update
+The full documentation (this README, [DESIGN.md](DESIGN.md), the skill, its
+references and the local validation guide) is also one PDF,
+[docs/codex-council.pdf](docs/codex-council.pdf), with every diagram drawn as
+vector graphics.
+
+## Install and invoke
+
+```zsh
 claude plugins marketplace add ehzawad/codex-council
 claude plugins install codex-council@codex-council
 ```
 
-The plugin stays installed across sessions.
+Invoke `/codex-council:codex-council`, ask “codex council,” or let Claude choose it
+when an independent contribution could materially improve the next decision.
+A new turn alone is not a reason to invoke. Requests for Claude's own subagents
+remain a separate workflow; genuinely unresolved intent gets a brief clarification.
 
-## Usage
+For the turn that invokes it, the skill pre-approves `mktemp -d` and the runner
+commands exactly as SKILL.md writes them. That pre-approval does not carry into
+later turns, so SKILL.md tells Claude to invoke the skill again before a follow-up
+`--status`, `--freshness` or `--cancel` and before every new council. Claude Code
+asks before Claude itself invokes a skill that pre-approves tools, so in a `dontAsk`
+or other unattended session invoke `/codex-council:codex-council` directly or allow
+`Skill(codex-council:codex-council)`. Such a session also needs, in its session or
+project settings, Write permission for the run directory (it is outside the project;
+a Write rule for the temporary directory is enough) and an allow rule for the runner
+command pattern. The skill does not pre-approve Write.
 
-Invoke the skill directly:
-
-```
-/codex-council:codex-council
-```
-
-or ask in plain words:
-
-```
-ask codex council
-codex council review
-ask the codex coterie
-codex coterie review
-ask the codex team
-reconcile with the codex team
-```
-
-Nearby wording such as "agent team" or "fan out to agents" is read from the
-conversation around it. Only a request that could equally mean the Codex
-council or Claude Code's own subagents gets one short question; under
-`claude -p` Claude states the ambiguity instead of asking.
-
-On every invocation Claude:
-
-1. reads the live work: the goal, what is in flight, what is failing or
-   uncertain, and which of its own claims most need an independent check;
-2. sizes the panel to the work, with no default count: one role for a
-   focused bug, review, or question, more only when each added role brings a
-   lens the others would not;
-3. runs metadata-only model discovery and picks each role's model and effort
-   (see [Model and effort per role](#model-and-effort-per-role));
-4. announces the panel and launches it, with no approval gate;
-5. follows the run, reads each role's reply as it lands, and reconciles one
-   answer once the council has ended.
-
-Roles do not message each other: Claude gives every role the same context,
-reconciles their replies, and stages material findings into a follow-up
-round when one is needed. All roles share your working tree, so when several
-roles may edit files, one role owns the writes and the others inspect, test,
-or propose. The council runs detached from Claude Code, so a long one is not
-cut off by the host's limits on background tasks; it keeps running (and
-spending) until it finishes or Claude cancels it, and Claude follows it
-until it ends.
-
-Claude's operating procedure is
-[`SKILL.md`](plugins/codex-council/skills/codex-council/SKILL.md). Its
-references cover
-[panel design](plugins/codex-council/skills/codex-council/references/panel-design.md),
-[context staging](plugins/codex-council/skills/codex-council/references/context-staging.md),
-and [runtime behavior](plugins/codex-council/skills/codex-council/references/runtime-behavior.md).
+The main skill is deliberately small. It reads focused references when needed,
+not all documentation on every invocation. Tests, build scripts, and project docs
+are outside the installed plugin source (`plugins/codex-council`).
 
 ## Architecture
-
-Claude stages each council in a private run directory with foreground
-calls, `--start` detaches the runner from the host, and Claude follows the
-run from disk until the runner has ended, then reconciles one result. For
-the full design, mechanism by mechanism, read
-[`docs/codex-council.pdf`](docs/codex-council.pdf): this README,
-[DESIGN.md](DESIGN.md), the skill, and its references in one document, with
-these three diagrams drawn as vector graphics.
 
 ```mermaid
 flowchart LR
     subgraph Host["Claude Code + the codex-council skill"]
         direction TB
-        Panel["Compose the role panel<br/>SKILL.md"] --> Mktemp["mktemp -d<br/>private run dir"]
-        Mktemp --> Discover["--discover, metadata only<br/>model-snapshot.json"]
-        Discover --> Inputs["roles.json: model and<br/>effort per role (pin,<br/>routed, native_effort,<br/>or inherit); context.md"]
-        Inputs --> Check["--check-staging-dir<br/>foreground pre-flight"]
-        Check --> Start["--start, foreground<br/>claims supervisor.lock<br/>+ token, err.log, out.md"]
+        Stage["mktemp -d; request.json,<br/>roles.json, context.md"] --> Prepare["--prepare<br/>baseline + per-role copies"]
+        Prepare --> Disc["--discover<br/>per-role model snapshot"]
+        Disc --> Check["--check-staging-dir<br/>selection + execution plan"]
+        Check --> Start["--start, foreground<br/>claims supervisor.lock,<br/>err.log, out.md"]
     end
 
     Host -- "detaches" --> Detached
 
-    subgraph Detached["Detached supervisor, outside any host task"]
+    subgraph Detached["Detached supervisor, its own session"]
         direction TB
-        Runner["Runner holds<br/>supervisor.lock, writes<br/>supervisor.json<br/>and status.json"] --> Fanout["Bounded parallel fan-out<br/>CODEX_COUNCIL_MAX_PARALLEL"]
-        Fanout --> RoleA["Role A<br/>liveness + watchdog"]
-        Fanout --> RoleN["Role N<br/>liveness + watchdog"]
-        RoleA --> ExecA["codex exec<br/>fresh or resumed"]
-        RoleN --> ExecN["codex exec<br/>fresh or resumed"]
-        ExecA --> Replies["replies/<br/>as each role settles"]
-        ExecN --> Replies
-        Replies --> Out["out.md report, then<br/>CODEX_COUNCIL_DONE"]
+        Runner["Runner holds supervisor.lock,<br/>writes supervisor.json<br/>and status.json"] --> Policy["Reobserve execution policy<br/>in each role's scratch cwd"]
+        Policy --> Fanout["Bounded fan-out<br/>CODEX_COUNCIL_MAX_PARALLEL"]
     end
 
-    Detached -- "err.log<br/>status.json<br/>supervisor.lock" --> Watch
+    Fanout --> Roles
 
-    subgraph Watch["Claude follows, then reconciles"]
+    subgraph Roles["Roles, one scratch copy each"]
         direction TB
-        Follow["--follow, read-only<br/>600 s keepalive"] --> Monitor["Monitor wakes Claude<br/>early replies"]
-        Monitor --> Ended["--status: ended?<br/>lock free, pid gone"]
-        Ended --> Reconcile["Read out.md, reconcile<br/>one result for the user"]
-        Ended -. "stuck or gone" .-> Ctl["--cancel if stuck<br/>--reap if gone"]
+        RoleA["Role A: codex exec<br/>sandbox, watchdog,<br/>raw attempt evidence"]
+        RoleN["Role N: codex exec<br/>sandbox, watchdog,<br/>raw attempt evidence"]
+        RoleA ~~~ RoleN
+    end
+
+    Roles -- "replies/, evidence/,<br/>result.json, out.md" --> Watch
+
+    subgraph Watch["Claude observes, then reconciles"]
+        direction TB
+        Follow["--follow, read-only"] --> Status["--status: lock released,<br/>runner identity gone"]
+        Status --> Fresh["--freshness:<br/>captured scope unchanged?"]
+        Fresh --> Reconcile["Reconcile evidence<br/>into one result"]
+        Status -. "stuck or gone" .-> Ctl["--cancel if stuck<br/>--reap if gone"]
     end
 ```
 
-## Launch Flow
-
-One launch, from staging to reconciliation. Every command Claude runs is a
-foreground call; only the council runs detached, so no host time limit
-reaches it, and the skill never launches a council as a time-limited
-background task. A start that fails gets one relaunch in a new directory;
-if that fails too, Claude stops and reports the `err.log` diagnosis.
-
-```mermaid
-sequenceDiagram
-    participant C as Claude Code
-    participant S as codex_council.py
-    participant D as Run dir
-    participant R as Detached runner
-    participant X as codex exec
-    participant M as Follower
-
-    C->>D: mktemp -d, new and private
-    C->>S: --discover, metadata only
-    S->>D: model-snapshot.json
-    C->>D: roles.json, context.md
-    C->>S: --check-staging-dir
-    S-->>C: staging OK, or exit 2
-    C->>S: --start, own foreground call
-    S->>D: claim supervisor.lock,<br/>err.log, out.md
-    S->>R: start in its own session
-    R->>D: supervisor.json
-    S-->>C: started line, then the<br/>follow, status, cancel commands
-    Note over C,S: returns once supervisor.json exists<br/>never a time-limited background launch
-    opt --start exits 1, or the runner is gone within a minute
-        C->>S: relaunch once in a NEW dir:<br/>mktemp, discover, pre-flight, --start
-        Note over C,S: if that fails too, stop and report err.log
-    end
-    par dispatch: bounded fan-out
-        R->>X: role A, fresh or resumed
-    and
-        R->>X: role N
-    end
-    C->>M: Monitor runs --follow
-    loop until the terminal line
-        R->>D: reply file, then<br/>completion line
-        M-->>C: completion line, reply=path
-        M-->>C: still running, after 600 s quiet
-    end
-    opt Monitor watch expires
-        C->>S: --status says running
-        C->>M: re-arm the same --follow
-    end
-    R->>D: out.md, then<br/>CODEX_COUNCIL_DONE
-    M-->>C: terminal line, the follower exits 0
-    C->>S: --status
-    S-->>C: done: lock free, pid gone
-    C->>D: only now read out.md
-    Note over C: reconcile one result
-```
-
-## State Scope
-
-How a role finds, locks, and resumes its saved Codex thread (see
-[Saved role threads](#saved-role-threads)).
+## One invocation
 
 ```mermaid
 flowchart TD
-    Root["Project root: Git top level,<br/>else the launch directory"] --> PHash["project hash<br/>sha256, 16 hex"]
-
-    Explicit["CODEX_COUNCIL_SESSION_KEY"] -->|"set, not blank"| Key["session key"]
-    Explicit -->|"unset or blank"| Auto["first host id set, in order:<br/>CLAUDE_CODE_SESSION_ID<br/>CLAUDE_SESSION_ID<br/>CODEX_THREAD_ID<br/>TERM_SESSION_ID<br/>TMUX_PANE, STY<br/>VSCODE_PID"]
-    Auto -->|"found: NAME=value"| Key
-    Auto -->|"none"| Wide["no session part:<br/>project-wide threads"]
-    Key --> SHash["session hash<br/>sha256, 16 hex"]
-
-    Role["role id"] -->|"32 chars or fewer"| RKey["role key = the id"]
-    Role -->|"longer"| RHash["role key =<br/>role-sha256-HEX"]
-
-    PHash --> Path
-    SHash --> Path
-    Wide --> Path
-    RKey --> Path
-    RHash --> Path
-    Path["codex-council/ under<br/>$XDG_STATE_HOME<br/>or ~/.local/state:<br/>project-session__role.json<br/>or project__role.json"]
-    Path --> Lock["flock PATH.lock<br/>without blocking"]
-    Lock -->|"another council holds it"| Wait["yield the fan-out permit,<br/>retry in 0.1 s, doubling<br/>up to 2 s"]
-    Wait --> Lock
-    Lock -->|"locked, thread saved"| Resume["codex exec resume"]
-    Lock -->|"locked, none saved"| Fresh["codex exec, fresh thread"]
-    Resume -->|"stale: clear the state,<br/>prior continuity lost"| Fresh
-    Resume --> Save["with a reply, save<br/>the thread id, never<br/>a model or effort"]
-    Fresh --> Save
+    Goal[Current goal and useful contribution] --> Inputs[request + roles + context]
+    Inputs --> Capture[Prepare captured baseline]
+    Capture --> Copies[Independent copy per role]
+    Copies --> Discover[Discover in actual execution cwd]
+    Discover --> Plan[Preflight models and capabilities]
+    Plan --> Start[Detached supervisor]
+    Start --> Evidence[Replies and raw attempt evidence]
+    Evidence --> Reconcile[Check freshness and reconcile]
 ```
 
-## How a run works
+Claude stages a fresh, decision-complete brief whenever Council is useful, whether
+that is one or ten turns after the last run. A stable task id and logical project
+identity are separate from the captured input hash and optional Codex thread.
+Previous conclusions are context, not automatically current evidence.
 
-1. **Stage.** Claude creates a private directory with `mktemp -d`, runs
-   `--discover` there (it writes `model-snapshot.json`), then writes
-   `roles.json` and `context.md`.
-2. **Preflight.** `--check-staging-dir` runs as its own foreground call and
-   refuses anything the launch would refuse, before any worker exists.
-3. **Launch.** A separate foreground call runs `--start`, which checks the
-   directory again, claims it (`supervisor.lock`, `err.log`, and `out.md`,
-   each created exclusively), starts the runner detached in a session of
-   its own, and returns within seconds with the exact `--follow`,
-   `--status`, and `--cancel` commands. The runner holds `supervisor.lock`
-   locked for its whole life, writes `supervisor.json` about itself,
-   resolves each role's model and effort, and runs one `codex exec` per
-   role, at most `CODEX_COUNCIL_MAX_PARALLEL` at a time.
-4. **Follow.** A read-only follower (`--follow`) relays the actionable lines
-   of `err.log` to Claude, and each role's reply lands in `replies/` as the
-   role settles. The runner also keeps `status.json` current, so the
-   follower reports within seconds a runner that has died; for a runner
-   that is still present but has stopped publishing status ticks, it warns
-   after 120 seconds and stops at 300. After ten quiet minutes it prints a
-   `still running` line, so a long council keeps showing progress.
-   `--cancel` stops the council.
-5. **Reconcile.** When the follower exits and `--status` confirms the
-   runner has ended (its lock is free and its process gone), Claude reads
-   `out.md` and reconciles one result for you.
+Preparation captures **working bytes**, not just Git HEAD: dirty tracked files,
+staged/unstaged edits, deletions, and non-ignored untracked files. A partially staged
+file is captured as its working version, not its staged version. Non-Git capture
+uses explicit include paths and keeps empty directories; a context-only question
+may select no files. Pause
+overlapping writers during capture. The runner detects observed changes but does
+not claim an atomic snapshot of arbitrary external writers.
 
-| Run directory entry | Written by | Holds |
+Every contribution receives an independent copy of the same baseline. Claude may
+continue independent work afterward. Copying avoids shared Git control metadata,
+unsafe hardlinks, and the incompatibility between Codex worktree and resume modes.
+It also means Git-dependent build commands can need additional setup; a missing
+environment prerequisite is a coverage gap, not evidence of a source bug.
+
+## Input and execution contracts
+
+See [invocation-contract.md](plugins/codex-council/skills/codex-council/references/invocation-contract.md)
+for complete JSON examples and fields. Permissions are separate from role labels:
+
+| Capability | Default | Scope |
 |---|---|---|
-| `model-snapshot.json` | `--discover` | this run's model catalog and what routing may do |
-| `roles.json`, `context.md` | Claude | the panel and the shared brief |
-| `supervisor.lock` | `--start`; held locked by the runner while it lives | the runner's lifetime: held means running; never removed |
-| `supervisor.json` | the runner, before any other work | who the runner is (pid, start time, process group), for `--status` and `--cancel` |
-| `out.md` | `--start` creates it; the runner's stdout | the final report |
-| `err.log` | `--start` creates it; the runner's stderr | progress lines, the heartbeat, and the final `CODEX_COUNCIL_DONE` line |
-| `replies/<role>.md` | the runner, as each role settles | that role's section of the report |
-| `status.json` | the runner | runner and role liveness, for `--follow`, `--status`, `--cancel`, and `--reap` |
+| Command sandbox | read-only | Choose workspace-write for scratch experiments; bypass requires explicit authorization. |
+| Command network | false | Explicitly authorize when necessary. Bypass cannot enforce network denial. |
+| External tools | deny | Apps/plugins/browser/computer/hooks/subagents/web, notify, installer/remote-plugin features and configured MCP servers disabled; native integrations require authorization. |
+| Thread continuity | fresh | Explicit resume within logical project, task, host session and role. |
+| Required contribution | true | Missing execution/evidence leaves required coverage incomplete. |
 
-The skill has no fallback launch. The runner still accepts an attached
-launch (`--roles-file` and `--context-file`, with `out.md` and `err.log`
-created by shell redirects and no supervisor files) for direct CLI use, and
-`--follow`, `--status`, and `--reap` still read the directories such runs,
-or earlier versions of the skill, left behind. Inside a Claude Code
-background task an attached launch is stopped at the host's time limit, so
-the skill never uses it (see
-[runtime behavior](plugins/codex-council/skills/codex-council/references/runtime-behavior.md)).
+Preflight shows role count, model/effort plan, context bytes, watchdog, scratch
+scope, capabilities and continuity. Metadata is rechecked before inference.
+Configuration evidence is not an attestation of a later process: managed settings,
+unsupported fields or an unknown tool inventory fail closed. No silent bypass or
+model hopping is used as recovery.
 
-Every mechanism has its own section in [DESIGN.md](DESIGN.md).
+Source agent configuration directories (`.codex`, `.claude`, `.agents`), agent
+instruction files (AGENTS.md, AGENTS.override.md, CLAUDE.md, CLAUDE.local.md),
+credentials and caches are not copied; put any project rule a role needs in the brief. Native model
+inheritance means what Codex resolves in the **scratch execution cwd**, not a
+promise to preserve source-project `.codex/config.toml` settings. Inspect discovery
+and pin supported values explicitly when that distinction matters. Model choices
+remain runtime-grounded; every role has its own catalog snapshot. Reports state
+what was sent, not which model served a turn.
 
-## Configuration
+## Lifecycle and evidence
 
-### Environment variables
-
-| Variable | Default | Effect |
-|---|---|---|
-| `CODEX_COUNCIL_MODEL_ROUTING` | `auto` | `off` turns automatic model and effort selection off; explicit pins still apply. Any other value exits 2. |
-| `CODEX_COUNCIL_MAX_PARALLEL` | `6` | How many roles run at once (a positive integer). Larger panels queue; Codex's own configuration does not change this. |
-| `CODEX_COUNCIL_STALL_SECS` | `1800` | The output-inactivity watchdog: seconds of silence on a role's stdout and stderr before that attempt is stopped. A positive integer overrides it; 0 disables it (runner monitoring and the post-exit drain still apply). |
-| `CODEX_COUNCIL_SESSION_KEY` | unset | An explicit scope for saved role threads (see [Saved role threads](#saved-role-threads)). |
-| `XDG_STATE_HOME` | `~/.local/state` | Saved role threads live in `$XDG_STATE_HOME/codex-council/`. |
-
-The council has no total elapsed-time or run-level deadline: a role may run
-as long as its Codex process keeps writing output, and a council takes as
-long as its slowest role. The watchdog measures output bytes, not progress.
-
-Claude Code bounds background tasks, which is why a council does not run as
-one. Since Claude Code 2.1.285 a background command stops at its time
-limit, 30 minutes by default and 2 hours at most, however much it prints
-(see the [changelog](https://code.claude.com/docs/en/changelog)), and
-Claude Code can also stop background shells under memory pressure once a
-session has sat idle for half an hour; that stop is yours to turn off with
-`CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP` (see the
-[environment variables](https://code.claude.com/docs/en/env-vars)), and the
-plugin never sets it. A council started with `--start` is outside both: it
-ends when it finishes, when Claude runs `--cancel`, or when something
-outside Claude Code stops its processes (a reboot, for example). The
-skill always uses `--start` and never falls back to a background launch.
-An attached run (the runner started directly with `--roles-file`, or one
-an earlier version launched) inside a background task is subject to both,
-and so lasts at most 2 hours.
-
-### Model and effort per role
-
-Before writing `roles.json`, Claude runs a bounded, metadata-only discovery
-that asks your installed Codex which models it advertises and how your
-native configuration resolves. It starts no Codex thread or turn. Claude
-then picks, per role, the first step that applies:
-
-1. the model or effort you named, pinned exactly as given;
-2. a model and effort pair from this run's catalog whose descriptions fit
-   the role;
-3. an effort adjustment on your proven native model;
-4. your native configuration unchanged.
-
-Each role records where its values came from in a `selection` object:
-
-| Role JSON | What the runner sends | Checked against |
-|---|---|---|
-| no `model`, `effort`, or `selection` | nothing (native inheritance) | nothing |
-| `model` and/or `effort` with `"selection": {"mode": "user"}` | the pin, unchanged | nothing; advisory notes only |
-| `model` and `effort` with `"selection": {"mode": "routed", "snapshot_id": ..., "reason": ...}` | `-m <model>` and the effort | this run's snapshot, then the launch's fresh discovery |
-| `effort` only, with `"selection": {"mode": "native_effort", "snapshot_id": ..., "reason": ...}` | `-m <proven native model>` and the effort | this run's snapshot, then the launch's fresh discovery |
-
-For example, one role object (synthetic ids; real ones are copied from the
-discovery summary):
-
-```json
-{
-  "id": "parser-boundary-checks",
-  "label": "Boundary checks",
-  "instruction": [
-    "Verify the claim that every parser path rejects an empty header.",
-    "If nothing material falls in your lens, say so clearly.",
-    "Thoroughness beats speed."
-  ],
-  "model": "future-vega-2033",
-  "effort": "brisk",
-  "selection": {
-    "mode": "routed",
-    "snapshot_id": "0ddc08d1899d8bb5",
-    "reason": "narrow bounded check; the catalog describes this model for fast checks"
-  }
-}
+```mermaid
+sequenceDiagram
+    participant C as Claude
+    participant R as Runner
+    participant X as Codex contributors
+    C->>R: prepare, discover, preflight
+    C->>R: start (separate foreground call)
+    R-->>C: follow/status/cancel commands
+    R->>X: actual scratch cwd and explicit policy
+    X-->>R: JSONL events and contribution
+    R-->>C: early replies and durable attempt logs
+    R-->>C: result.json, report, completion signal
+    C->>R: status confirms runner ended
+    C->>R: freshness before applying results
 ```
 
-A model and an effort share one grammar, `^[A-Za-z0-9][A-Za-z0-9._:/@+-]*$`,
-with case preserved. `inherit` and `default`, in any case, are refused as
-model values: inheritance is omission. A `model` or `effort` without a
-`selection` is refused (exit 2). A pin you asked for is never replaced or
-rejected for being absent from the catalog, so a custom provider's model ids
-keep working; discovery only adds advisory notes to it. If Codex cannot
-answer discovery, the summary then says to write no automatic selections:
-explicit pins still apply, and every other role inherits. `codex exec`
-reports neither the model nor the effort that served a turn, so every report
-states what the council sent, never what ran.
+The detached supervisor relies on private-directory gates, a lock token, process
+identities, liveness ticks, bounded concurrency and conservative cleanup.
+`preparing` means bounded metadata work, not worker dispatch. `--follow` is read-only.
+The final line alone does not prove completion: `--status` requires released lock
+and vanished recorded identity. `--cancel` stops a verified detached runner;
+`--reap` cleans verified recorded workers only after the runner is gone.
 
-### Native configuration
-
-A role that inherits sends no `-m` and no `-c model_reasoning_effort=...`,
-so Codex resolves the model and effort itself from its own configuration
-layers (see [Config basics](https://learn.chatgpt.com/docs/config-file/config-basic)).
-No model is hardcoded anywhere in the plugin.
-
-- **Where workers run.** Every worker runs as `codex exec -C <root>`, where
-  `<root>` is the Git top level of the directory the council was launched
-  from (or that directory outside Git), with the `codex` on your `PATH`, the
-  runner's own environment including `CODEX_HOME`, and no `--profile`.
-  Launch the council from the project whose Codex configuration you want it
-  to use.
-- **Subdirectory layers.** Discovery reads the configuration Codex resolves
-  at that same root; that was verified live to ignore a
-  `.codex/config.toml` below the root, even from a subdirectory launch.
-  That workers ignore it too follows from Codex's documentation of `-C` but
-  is not verified live.
-- **`CODEX_API_KEY`.** `codex exec` honors it but the app-server that
-  discovery talks to does not, so while it is set only explicit pins and
-  inheritance are used.
-- **Managed configuration.** Managed new-thread defaults, a managed layer
-  that outranks command-line flags and sets the model or effort, and a
-  managed provider or catalog setting each turn automatic selection off,
-  because Codex would replace or reinterpret what the council sends. An
-  explicit pin is still sent, and on such a machine it may not be the value
-  that runs.
-
-### Saved role threads
-
-Each role keeps its Codex thread per project, host session, and role id, in
-`$XDG_STATE_HOME/codex-council/`. Claude names each role id for its task, so
-a later council starts fresh roles and sees only the context Claude stages
-for it; Claude reuses a role id only when that role's own earlier work
-helps, and the reused id resumes the role's thread. A saved thread Codex no
-longer has restarts the role fresh, with a `prior continuity lost` warning
-in its reply. The scope is chosen in this order:
-
-| When | Scope |
+| Output | Meaning |
 |---|---|
-| `CODEX_COUNCIL_SESSION_KEY` is set | that key: every terminal with the same value shares the role threads |
-| a host session id is detected (Claude Code's session, `CODEX_THREAD_ID`, `TERM_SESSION_ID`, `TMUX_PANE`, `STY`, or `VSCODE_PID`) | that session |
-| none is detectable | the whole project |
+| run.json / baseline / workspaces | Invocation identity, exact captured inputs and independent experimental copies. |
+| catalogs/ | Model/configuration discovery in each actual execution cwd. |
+| evidence/ | Private raw stdout/stderr, attempt metadata, policy observations and candidate artifacts. |
+| result.json | Versioned observations, completeness and applicability, separate from collaborator interpretation. |
+| replies/ / out.md | Early role replies and the readable final report. |
 
-Integrated terminals in the same VS Code window share `VSCODE_PID`, so set
-`CODEX_COUNCIL_SESSION_KEY` to keep them apart. A role id of 32 characters
-or fewer names its state and reply files directly; a longer one is hashed.
-State holds the thread id and bookkeeping, never a model, effort, or
-selection, so a routed choice never becomes a role's default later. Saved
-threads do not expire, and leaving a role out of a council does not retire
-its thread.
+Command fields in JSONL are Codex-reported observations, not an independent OS audit.
+The runner never infers substantive correctness from a clean exit or agreement.
+Text changes may have a candidate diff; exact binary/large/mode-only changes stay
+in scratch with artifact metadata. **Nothing automatically applies, commits, or
+publishes a candidate change to the live source.** Claude checks current intent,
+freshness, evidence and integration results before accepting it.
 
-## Results and failures
+Exit 0 requires delivered output and complete required contributions; exit 1
+includes required-coverage/evidence failure, and exit 2 is invalid input or refused
+policy. `--freshness` exits 0 unchanged, 1 stale/unknown, 2 invalid contract.
+Workers start only from `--start` on a completed capture, once per run directory;
+there is no direct launch.
 
-The launch exits `0` when at least one role responded and the report was
-written, `1` when every role failed or the runner could not finish, and `2`
-for a usage or staging error. `out.md` opens with a Summary line per role,
-then each role's section; `replies/<role>.md` holds the same section, so an
-early read and the final report cannot disagree. After an interruption no
-complete report is guaranteed, but every reply already written survives.
+## Continuity and failures
 
-A failed role's message starts with a tag:
+```mermaid
+flowchart TD
+    Identity[Logical source + task + host session + role] --> Lock[Continuity lock]
+    Lock --> Choice{Explicit continuity}
+    Choice -->|fresh| New[New Codex thread]
+    Choice -->|resume| Old[Resume saved thread]
+    Old -->|thread missing| New
+    New --> Context[Complete current captured brief]
+    Old --> Context
+    Context --> Evidence[New evidence tied to current snapshot]
+```
 
-| Tag | Meaning | What happens |
-|---|---|---|
-| `[auth]` | Codex could not authenticate | Not retried; the saved thread is kept. Sign in again, then re-run. |
-| `[quota]` | a usage, quota, or credit limit, even one sent as HTTP 429 | Not retried. When the usage limit is for one model, the message ends with the same next step as a model rejection, so a routed role can re-run on your native configuration instead of waiting for the reset. |
-| `[retriable:rate-limit]`, `[retriable:5xx]` | a rate limit or server error | Retried after 5 seconds; a role gets two attempts in all. |
-| `[retriable:stall]` | the watchdog stopped a role before it began any tool work | Retried the same way, within the same two attempts. |
-| `[stall]` | the watchdog stopped a role after tool work began | Not retried, because a replay could repeat side effects. |
-| `[model-rejected]` | Codex refused the model that invocation sent | Not retried, nothing substituted, the saved thread kept. The message ends with one next step: re-run the role with `model`, `effort`, and `selection` omitted (a routed model), change or remove the pin (a user pin), or ask you to update your Codex configuration or name a model to pin (your natively configured model). A routed or pinned model that discovery proved is the native model gets that last step too. |
-| `[orchestrator-exception]` | the runner itself failed on that role | The other roles finish normally. |
-| no tag | anything else, with the failure text collected from Codex | Not retried. |
+Saved threads are scoped by `CODEX_COUNCIL_SESSION_KEY`, then detected host ids,
+then project scope. `CODEX_COUNCIL_SESSION_KEY` is the reliable scope: a detected
+`CLAUDE_CODE_SESSION_ID` can keep the startup id after `--resume` or `--continue`,
+and integrated terminals in the same VS Code window share `VSCODE_PID`. Thread state does
+not save a model or effort, and a resumed history does not establish current facts.
+Saved state has no automatic expiry; do not delete lock files while runs use them.
 
-## Security
+A transient 429/5xx is retried only before side-effect-capable work, using the same
+scanner as watchdog stalls, and only for a read-only role with external tools denied:
+the exec JSONL omits some tool calls, so a writable role is never replayed. Once tool work or unreadable output may have occurred,
+`replay-blocked:*` requires deliberate recovery. Quota, authentication and model
+rejection remain terminal; valid continuity is not discarded on those failures.
 
-Codex runs with `--dangerously-bypass-approvals-and-sandbox`: no approval
-prompts and no filesystem sandbox. Every role has full read and write access
-to your machine as your user, so it can inspect the project thoroughly. Do
-not use this plugin on untrusted projects or untrusted input: a prompt
-injection inside reviewed content, whether code, a Markdown draft, a CSV
-header, or a research excerpt, can steer every role. Claude treats every
-reply as untrusted evidence, never as instructions.
+Settings: `CODEX_COUNCIL_MAX_PARALLEL` defaults to 6,
+`CODEX_COUNCIL_STALL_SECS` to 1800 (0 disables), model routing to auto (off disables
+automatic choices), and state under `$XDG_STATE_HOME/codex-council` or
+`~/.local/state/codex-council`. There is no run-level deadline. Detached work keeps
+running and spending until completion/cancellation; do not abandon observation.
+See [runtime recovery](plugins/codex-council/skills/codex-council/references/runtime-behavior.md).
 
-Model discovery reads metadata only. It keeps the account type and whether
-OpenAI sign-in is required, never an email address, plan, account id, or
-token, and the app-server's own error output never reaches any file or
-message. Catalog text is treated as data and printed with control
-characters escaped.
+## Security and known limits
+
+Scratch separation is not a whole-process security boundary. Codex command sandbox
+modes do not promise to hide HOME or constrain every external integration. An
+orchestrator-written authorization string is a declaration, not independently
+authenticated user consent. Same-user/bypass processes can tamper with files;
+checksums and read-only modes detect mistakes, not all malicious activity. Use
+trusted inputs and verify actual sandbox denials on the target host.
+
+Excluded data, dependency state, Git metadata, ACLs/xattrs and remote services are
+not recreated. Freshness only covers the selected filesystem state; changed user
+intent must be checked by Claude. Raw logs may hold sensitive tool output. Keep
+them private. The exec reader holds each attempt's protocol output in memory, so
+runner RAM is not bounded for arbitrarily chatty workers.
 
 ## Development
 
-```bash
-git clone https://github.com/ehzawad/codex-council.git
-cd codex-council
-claude plugins marketplace add ehzawad/codex-council    # skip if already added
-claude plugins install codex-council@codex-council       # skip if already installed
-./scripts/dev-link.sh
-# then start a new Claude Code session
-```
-
-`scripts/dev-link.sh` makes the installed plugin run from this checkout:
-
-1. It links `~/.claude/plugins/cache/codex-council/codex-council/<version>/`
-   to this repository's `plugins/codex-council/`, so edits there are live.
-   The version must be one safe path component, or the script refuses.
-2. It points `installPath` and `version` in
-   `~/.claude/plugins/installed_plugins.json` at that link, because Claude
-   Code loads whatever `installPath` says, not whatever sits in the cache
-   (skipped, with a note, before the plugin is installed).
-3. It removes cache entries for other versions.
-
-Claude Code may replace the link with a fresh copy when a session starts, so
-re-run the script after each session start, `claude plugins update`, or
-version bump, or run it from a `SessionStart` hook in
-`~/.claude/settings.json` (merge it into any existing `hooks.SessionStart`
-list):
-
-```json
-{
-  "hooks": {
-    "SessionStart": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash -lc 'mkdir -p \"$HOME/.claude/logs\"; log=\"$HOME/.claude/logs/codex-council-dev-link.log\"; \"/absolute/path/to/codex-council/scripts/dev-link.sh\" >>\"$log\" 2>&1; rc=$?; if [ \"$rc\" -ne 0 ]; then printf \"%s dev-link failed exit=%s\\n\" \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" \"$rc\" >>\"$log\"; fi; exit 0'"
-          }
-        ]
-      }
-    ]
-  }
-}
-```
-
-The hook always exits 0, so a missing checkout never blocks a session, and
-it logs failures to `~/.claude/logs/codex-council-dev-link.log`. Only this
-startup hook fails open; the skill's launch and context recipes fail closed.
-
-Two guards catch a stale pairing. Every discovery summary, preflight,
-dispatch, heartbeat, and `CODEX_COUNCIL_DONE` line carries
-`version=<plugin version>`, which shows which plugin actually ran. And
-SKILL.md's commands pass `--skill-contract 4`: when the script's contract
-epoch differs, the command is refused as a stale SKILL/script pair. In a
-checkout, re-run `scripts/dev-link.sh` and restart the session; never change
-the epoch to get past it.
-
-The tests need no Codex install and no network: `tests/fake_codex.py` puts a
-scripted `codex` on `PATH`. CI runs them on Python 3.12 through 3.15, with a
-pinned ruff:
-
-```bash
-python3 -m unittest discover -s tests -p 'test_*.py'
+```zsh
+python3 -m unittest discover -s tests -p 'test_*.py' -v
 uvx --from 'ruff==0.15.21' ruff check .
-python3 tests/liveness_scenarios.py      # end-to-end liveness scenarios
-CODEX_COUNCIL_LIVE_TESTS=1 python3 -m unittest tests.test_live_codex -v   # real Codex, a few turns
+claude plugin validate plugins/codex-council
+claude plugin validate .
 ```
 
-`scripts/build-docs.sh` rebuilds `docs/codex-council.pdf` from this README,
-DESIGN.md, SKILL.md, and its references (it needs `uvx`, Chrome or
-Chromium, and network access to mermaid.ink). It renders each `mermaid`
-code block to SVG through mermaid.ink and inlines it into the page Chrome
-prints, so every diagram in the PDF is vector; the build refuses a PDF that
-holds any raster image, and it writes no image file anywhere. The
-repository holds no image files: the three diagrams above are their only
-source. In the PDF, links between these documents jump within it, other
-repository links point at GitHub, and the headings are bookmarks.
+CI runs the full fake/protocol/process suite on Ubuntu and macOS. No real model
+credentials or inference are used by default. Opt-in real-host checks and a
+copy-pastable validation prompt are in [LOCAL_VALIDATION.md](docs/LOCAL_VALIDATION.md).
+Module-DAG tests cover every runner module. Documentation tests check parseable commands, JSON shapes and packaging,
+not hundreds of exact prose phrases.
+
+Load this checkout in a fresh session with Claude Code's
+`--plugin-dir ./plugins/codex-council` option; it changes nothing installed.
+`./scripts/dev-link.sh` instead points the installed plugin cache and registry at
+this checkout. Do not modify global model settings to test the plugin.
+
+`scripts/build-docs.sh` rebuilds [docs/codex-council.pdf](docs/codex-council.pdf)
+from this README, DESIGN.md, SKILL.md, every reference and
+docs/LOCAL_VALIDATION.md. It needs `uvx`, Chrome or Chromium, and network access
+to mermaid.ink, which renders each `mermaid` block to SVG; the SVG is inlined so
+every diagram prints as vector graphics, and the build refuses a PDF that holds a
+raster image. The repository holds no image files: the diagrams above are their
+only source. In the PDF, links between these documents jump within it, other
+repository links point at GitHub, and the headings are bookmarks. Rebuild and
+commit the PDF whenever one of those documents changes.
 
 ## License
 
-MIT
+[MIT](LICENSE).

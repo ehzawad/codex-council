@@ -32,9 +32,14 @@ SCRIPT = os.path.join(SCRIPTS_DIR, "codex_council.py")
 RUNNER_MODULES = (
     "codex_council", "council_common", "council_discovery",
     "council_selection", "council_failures", "council_liveness",
+    "council_workspace", "council_policy", "council_evidence", "council_workflow",
 )
 # The siblings each module may import (dependencies point one way).
 ALLOWED_IMPORTS = {
+    "council_workspace": set(),
+    "council_policy": {"council_workspace", "council_discovery"},
+    "council_evidence": {"council_workspace"},
+    "council_workflow": {"council_workspace", "council_policy", "council_discovery", "council_selection"},
     "council_common": set(),
     "council_discovery": {"council_common"},
     "council_selection": {"council_common", "council_discovery"},
@@ -42,7 +47,8 @@ ALLOWED_IMPORTS = {
     "council_liveness": {"council_common"},
     "codex_council": {
         "council_common", "council_discovery", "council_selection",
-        "council_failures", "council_liveness",
+        "council_failures", "council_liveness", "council_workspace",
+        "council_policy", "council_evidence", "council_workflow",
     },
 }
 

@@ -34,13 +34,19 @@ LINEBREAK_CHARS = (
     "\r", "\n", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e",
     "\x85", "\u2028", "\u2029",
 )
-# What a new run directory needs before its pre-flight: its own discovery
-# snapshot, and a roles.json whose automatic selections name that snapshot
-# (the old snapshot_id identifies the abandoned directory's snapshot, so the
-# pre-flight would refuse it). Every new-directory recovery below ends with
-# this sequence.
+# What a new run directory needs before its pre-flight: its own capture, its
+# own per-role discovery snapshots, and a roles.json whose automatic
+# selections name them (an old snapshot_id identifies the abandoned
+# directory's snapshot, so the pre-flight would refuse it). Every
+# new-directory recovery below ends with this sequence.
 NEW_DIR_SNAPSHOT_CLAUSE = (
-    "with the new snapshot_id in every routed or native_effort selection"
+    "with each role's new snapshot_id in every routed or native_effort "
+    "selection"
+)
+NEW_DIR_SEQUENCE = (
+    "Write request.json, roles.json, and context.md in the NEW directory, "
+    "run --prepare and then --discover there, update roles.json "
+    f"({NEW_DIR_SNAPSHOT_CLAUSE}), and run --check-staging-dir on it."
 )
 # Action-first recovery text for a rejected staging DIRECTORY. The orchestrator
 # is an LLM; the cheapest literal reading of "create it with mktemp -d" is
@@ -49,14 +55,12 @@ NEW_DIR_SNAPSHOT_CLAUSE = (
 # sequence there: discovery, both files, the pre-flight.
 STAGING_DIR_RECOVERY = (
     "Recovery: abandon this directory — do not chmod it, do not mkdir it, "
-    "and do not reuse its name. Run `mktemp -d` again, copy the NEW printed "
-    "absolute path, run --discover in that new directory, re-Write BOTH "
-    f"roles.json and context.md there ({NEW_DIR_SNAPSHOT_CLAUSE}), and "
-    "re-run --check-staging-dir on it."
+    "and do not reuse its name. Run `mktemp -d` again and copy the NEW "
+    f"printed absolute path. {NEW_DIR_SEQUENCE}"
 )
-# A run directory holds exactly one launch. A launch leaves these behind: its
-# command's own stdout and stderr redirections and the runner's reply
-# directory, so any of them means the directory has already launched.
+# A run directory holds exactly one launch. A launch leaves these behind:
+# --start's out.md and err.log and the runner's reply directory, so any of
+# them means the directory has already launched.
 REPLIES_SUBDIR = "replies"
 LAUNCH_OUTPUTS = ("out.md", "err.log", REPLIES_SUBDIR)
 # A detached launch (--start) claims its directory with these two files
@@ -72,35 +76,31 @@ SUPERVISOR_FILES = (SUPERVISOR_LOCK_FILENAME, SUPERVISOR_FILENAME)
 # replies/.
 LAUNCHED_DIR_RECOVERY = (
     "Recovery: every launch needs its own directory, so leave this one and "
-    "its files as they are. Run `mktemp -d` again, run --discover in the "
-    "NEW directory, Write roles.json and context.md there "
-    f"({NEW_DIR_SNAPSHOT_CLAUSE}), and run --check-staging-dir on it."
+    f"its files as they are. Run `mktemp -d` again. {NEW_DIR_SEQUENCE}"
 )
 # Uniform recovery appended to EVERY roles-file validation failure. The only
 # production writer of roles.json is an LLM; partial patches of a file that
 # already glitched once are the corruption vector, so every defect demands one
 # complete rewrite. Parse-time code cannot know its caller, so this default
-# names both the pre-flight and a direct command; a staged launch scopes in
+# names the command that refused; the launch scopes in
 # STAGED_LAUNCH_ROLES_RECOVERY instead (see _roles_recovery).
 ROLES_REWRITE_RECOVERY = (
     "Recovery: rewrite the entire file passed to --roles-file in one "
     "complete Write operation; do not patch, append, or replace a "
     "substring. Do not launch until the rewritten file validates, then "
-    "re-run the pre-flight or the direct command you used."
+    "re-run the command that refused it."
 )
-# The next step for a staged launch (--roles-file with --context-file) that
-# refuses before dispatch, in place of a pre-flight re-run. The launch
-# command's own shell redirections created out.md and err.log before the
-# runner started, so the directory already holds this launch and
-# --discover and the pre-flight refuse it (_usage_exit_if_launched): the
-# fix always goes into a NEW directory. A lowercase clause, so each
-# launch-side recovery can lead with it or follow its own fix with it.
+# The next step for a launch (--start's supervised child) that refuses before
+# dispatch, in place of a pre-flight re-run. --start already claimed the
+# directory (supervisor.lock, out.md, and err.log), so --discover and the
+# pre-flight refuse it (_usage_exit_if_launched): the fix always goes into
+# a NEW directory. A lowercase clause, so each launch-side recovery can lead
+# with it or follow its own fix with it.
 STAGED_LAUNCH_RESTART = (
-    "start over in a new directory: this launch's own redirections already "
-    "created out.md and err.log in this one, so the pre-flight refuses it "
-    "now. Leave it and its files as they are, run `mktemp -d` again, run "
-    "--discover in the NEW directory, Write roles.json and context.md "
-    f"there ({NEW_DIR_SNAPSHOT_CLAUSE}), and run --check-staging-dir on it."
+    "start over in a new directory: --start already claimed this one "
+    "(supervisor.lock, out.md, and err.log), so the pre-flight refuses it "
+    "now. Leave it and its files as they are and run `mktemp -d` again. "
+    f"{NEW_DIR_SEQUENCE}"
 )
 # ROLES_REWRITE_RECOVERY's staged-launch form: the same whole-file rule,
 # applied to the roles.json written in the new directory.
@@ -342,9 +342,9 @@ def _roles_recovery(text):
     """Make `text` the recovery every roles-file defect carries in this block.
 
     The defects are raised deep in parsing and authoring validation, which
-    cannot know their caller; the staged launch wraps its roles checks in
-    this with STAGED_LAUNCH_ROLES_RECOVERY, because its directory already
-    holds this launch and a pre-flight re-run there is refused.
+    cannot know their caller; the launch wraps its roles checks in this
+    with STAGED_LAUNCH_ROLES_RECOVERY, because --start already claimed its
+    directory and a pre-flight re-run there is refused.
     """
     token = _roles_recovery_text.set(text)
     try:
@@ -433,15 +433,11 @@ def _usage_exit_if_launched(run_dir, prefix):
 
     Called by --discover, the pre-flight, and --start after the
     private-directory gate. Any of LAUNCH_OUTPUTS or SUPERVISOR_FILES
-    counts (lexists, so a dangling symlink does too). The tracked launch
-    command's shell redirections truncate out.md and err.log before the
-    runner starts, so only a step that runs before that command can stop a
-    relaunch into a directory whose council may still be running; the
-    tracked launch itself never checks. For the same reason, a staged
-    launch that refuses before dispatch never asks for a pre-flight re-run
-    in its own directory (STAGED_LAUNCH_RESTART). --start also claims the
-    directory atomically after this check (O_EXCL), so two concurrent
-    starts cannot both pass.
+    counts (lexists, so a dangling symlink does too): the directory may
+    hold a running council. A launch that refuses before dispatch never
+    asks for a pre-flight re-run in its own directory
+    (STAGED_LAUNCH_RESTART). --start also claims the directory atomically
+    after this check (O_EXCL), so two concurrent starts cannot both pass.
     """
     present = [name for name in (*LAUNCH_OUTPUTS, *SUPERVISOR_FILES)
                if os.path.lexists(os.path.join(run_dir, name))]

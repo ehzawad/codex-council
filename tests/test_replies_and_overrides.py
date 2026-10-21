@@ -104,7 +104,8 @@ class CommandOverrideTests(unittest.TestCase):
 
     def test_model_only_or_effort_only(self):
         self.assertNotIn(
-            "-c", codex_council._fresh_cmd("/r", "future-vega-2033", None))
+            "model_reasoning_effort", council_testlib.config_values(
+                codex_council._fresh_cmd("/r", "future-vega-2033", None)))
         self.assertNotIn("-m", codex_council._fresh_cmd("/r", None, "brisk"))
 
 
@@ -522,24 +523,28 @@ class EndToEndTests(unittest.TestCase):
         with open(os.path.join(self.run_dir, "context.md"), "w",
                   encoding="utf-8") as f:
             f.write("please review\n")
+        council_testlib.prepare_run(self, self.run_dir, self.env, self.run_dir)
 
-    def _launch_args(self):
-        return [sys.executable, SCRIPT,
-                "--roles-file", os.path.join(self.run_dir, "roles.json"),
-                "--context-file", os.path.join(self.run_dir, "context.md"),
-                "--skill-contract", EPOCH]
+    def _spawn(self, **kwargs):
+        """--start's supervised child, claimed as --start claims it."""
+        lock = council_testlib.claim_supervisor_lock(self.run_dir)
+        try:
+            proc = subprocess.Popen(
+                council_testlib.supervised_argv(self.run_dir, lock),
+                stdin=subprocess.DEVNULL, env=self.env, cwd=self.run_dir,
+                pass_fds=(lock,), **kwargs)
+        finally:
+            os.close(lock)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        return proc
 
     def _launch_redirected(self):
-        """Launch attached, as direct CLI use does: out.md, err.log."""
+        """Launch with out.md and err.log as --start would."""
         out = open(os.path.join(self.run_dir, "out.md"), "wb")
         err = open(os.path.join(self.run_dir, "err.log"), "wb")
         self.addCleanup(out.close)
         self.addCleanup(err.close)
-        proc = subprocess.Popen(
-            self._launch_args(), stdin=subprocess.DEVNULL, stdout=out,
-            stderr=err, env=self.env, cwd=self.run_dir)
-        self.addCleanup(lambda: proc.poll() is None and proc.kill())
-        return proc
+        return self._spawn(stdout=out, stderr=err)
 
     def _follow_proc(self):
         return subprocess.Popen(
@@ -552,8 +557,9 @@ class EndToEndTests(unittest.TestCase):
         self._stage([
             _role_json("architect", "Architect", model="future-vega-2033",
                        effort="brisk", selection={"mode": "user"}),
-            _role_json("security", "Security",
-                       instruction=_instruction(f"Review {FAIL_SENTINEL}")),
+            dict(_role_json("security", "Security",
+                            instruction=_instruction(f"Review {FAIL_SENTINEL}")),
+                 execution={"required": False}),
         ])
         launch = self._launch_redirected()
         follower = self._follow_proc()
@@ -561,10 +567,12 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(follower.returncode, 0, stderr)
         self.assertEqual(launch.wait(timeout=60), 0)
         lines = stdout.splitlines()
-        self.assertTrue(lines[0].startswith("[codex-council] dispatching 2 roles"))
+        self.assertEqual(lines[0], "[codex-council] preparing 2 captured "
+                                   "contributions; no worker dispatched yet")
+        self.assertTrue(lines[1].startswith("[codex-council] dispatching 2 roles"))
         # No runtime-grounded selection: the launch ran no discovery.
         self.assertEqual(
-            lines[1],
+            lines[2],
             "[codex-council] model selection: routing=auto; "
             "discovery=not-run (no runtime-grounded selections); native=1 "
             "user=1 routed=0 native_effort=0 fallback=0")
@@ -604,7 +612,11 @@ class EndToEndTests(unittest.TestCase):
             ["exec", "-C", with_model[0][2], "-m", "future-vega-2033",
              "-c", 'model_reasoning_effort="brisk"'])
         without = [a for a in argvs if "-m" not in a]
-        self.assertTrue(without and all("-c" not in a for a in without))
+        self.assertTrue(without)
+        for argv in without:
+            council_testlib.assert_no_model_overrides(self, argv)
+            self.assertEqual(council_testlib.config_values(argv)["approval_policy"],
+                             "never")
 
     def test_dead_stdout_logs_runner_aborted_and_follow_exits(self):
         self._stage([_role_json("architect", "Architect")])
@@ -613,12 +625,9 @@ class EndToEndTests(unittest.TestCase):
         read_end, write_end = os.pipe()
         os.close(read_end)  # nobody will ever read the report
         try:
-            proc = subprocess.Popen(
-                self._launch_args(), stdin=subprocess.DEVNULL,
-                stdout=write_end, stderr=err, env=self.env, cwd=self.run_dir)
+            proc = self._spawn(stdout=write_end, stderr=err)
         finally:
             os.close(write_end)
-        self.addCleanup(lambda: proc.poll() is None and proc.kill())
         self.assertEqual(proc.wait(timeout=60), 1)
         follower = self._follow_proc()
         stdout, stderr = follower.communicate(timeout=60)
@@ -664,27 +673,11 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(stdout.splitlines()[-1],
                          "[codex-council] interrupted by SIGTERM")
 
-    def test_stdin_mode_uses_roles_file_directory(self):
-        with open(os.path.join(self.run_dir, "roles.json"), "w",
-                  encoding="utf-8") as f:
-            json.dump([_role_json("architect", "Architect")], f)
-        proc = subprocess.run(
-            [sys.executable, SCRIPT, "--roles-file",
-             os.path.join(self.run_dir, "roles.json")],
-            input="please review\n", capture_output=True, text=True,
-            env=self.env, cwd=self.run_dir)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        path = os.path.join(self.run_dir, "replies", "architect.md")
-        self.assertIn(f"reply={path}", proc.stderr)
-        self.assertTrue(os.path.isfile(path))
-
     def test_unusable_replies_dir_never_fails_the_council(self):
         self._stage([_role_json("architect", "Architect")])
         with open(os.path.join(self.run_dir, "replies"), "w"):
             pass
-        proc = subprocess.run(
-            self._launch_args(), capture_output=True, text=True,
-            env=self.env, cwd=self.run_dir, stdin=subprocess.DEVNULL)
+        proc = council_testlib.run_supervised(self.run_dir, self.env, self.run_dir)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("reply files disabled", proc.stderr)
         self.assertNotIn("reply=", proc.stderr)

@@ -1173,6 +1173,16 @@ class StatusCommandTests(unittest.TestCase):
         self.assertIn(f"live codex groups: {sleeper.pid} (architect)", lines)
         self.assertIn("--reap", lines[-1])
 
+    def test_unfinished_roles_of_an_ended_runner_read_interrupted(self):
+        _status(self.run_dir, pid=_dead_pid(), state="interrupted", exit_code=143,
+                roles={"sleeper": {"state": "active", "attempt": 1,
+                                   "output_at": time.time() - 9},
+                       "done": {"state": "settled", "outcome": "ok"}})
+        lines = self._lines()
+        self.assertEqual(lines[0], "runner: interrupted (exit 143)")
+        self.assertEqual(lines[1], "roles: 1 of 2 settled")
+        self.assertEqual(lines[2], "  sleeper: interrupted (was active), attempt 1")
+
     def test_terminal_states(self):
         for state, code, action in (("done", 0, "read out.md"),
                                     ("interrupted", 143, "err.log")):
@@ -1347,6 +1357,30 @@ class DetachedStatusTests(unittest.TestCase):
         holder.kill()
         holder.wait()
         lines = self._lines()
+        self.assertEqual(lines[0], "runner: done (exit 0)")
+        self.assertEqual(lines[-1], "next: read out.md; the run has ended")
+
+
+    def test_a_terminal_state_published_during_the_liveness_reads_wins(self):
+        holder, identity = _lock_holder(self, self.run_dir)
+        _supervisor(self.run_dir, holder.pid, identity)
+        _status(self.run_dir, pid=holder.pid, identity=identity, roles={
+            "architect": {"state": "settled", "outcome": "ok"}})
+        real = council_liveness._process_table
+
+        def runner_finishes_then_ps(pid=None):
+            # The runner's last publish and exit land after status.json was read.
+            if holder.poll() is None:
+                _status(self.run_dir, pid=holder.pid, identity=identity,
+                        state="done", exit_code=0, roles={
+                            "architect": {"state": "settled", "outcome": "ok"}})
+                holder.kill()
+                holder.wait()
+            return real(pid)
+
+        with patch.object(council_liveness, "_process_table",
+                          runner_finishes_then_ps):
+            lines = self._lines()
         self.assertEqual(lines[0], "runner: done (exit 0)")
         self.assertEqual(lines[-1], "next: read out.md; the run has ended")
 
@@ -1759,7 +1793,11 @@ def _golden_s0():
            "grounded selections). codex exec does not report the model or "
            "effort that served a turn; values above are what the council "
            "sent, and \"native inheritance\" means no override was sent.\n\n"
-           + "\n".join(section(r) for r in roles))
+           + "\n".join(section(r) for r in roles)
+           + "\n## Captured evidence\n\nRead `result.json` and per-attempt logs "
+           "before reconciliation. Run `--freshness` before applying any "
+           "candidate change. Execution success is not a substantive "
+           "verification verdict.\n")
     golden = {"out.md": out}
     for r in roles:
         golden[f"replies/{r}.md"] = (
@@ -1772,8 +1810,9 @@ class LivenessScenarioTests(unittest.TestCase):
     """Every scenario in liveness_scenarios.py, run once, concurrently."""
 
     # Follower lines S0 gives when every routine line is relayed too
-    # (dispatch, model selection, three starts, three completions, done).
-    S0_ALL_LINES = 9
+    # (preparing, dispatch, model selection, three starts, three
+    # completions, done).
+    S0_ALL_LINES = 10
 
     @classmethod
     def setUpClass(cls):
@@ -1788,7 +1827,7 @@ class LivenessScenarioTests(unittest.TestCase):
     def test_s0_happy_path_is_unchanged_with_fewer_lines(self):
         outcome = self._assert_passed("S0")
         self.assertEqual(outcome.outputs, _golden_s0())
-        self.assertEqual(outcome.follower_lines, 6)
+        self.assertEqual(outcome.follower_lines, 7)
         self.assertLess(outcome.follower_lines, self.S0_ALL_LINES)
 
     def test_s1_held_pipe(self):
@@ -1809,7 +1848,7 @@ class LivenessScenarioTests(unittest.TestCase):
     def test_s6_malformed_lines(self):
         self._assert_passed("S6")
 
-    def test_s7_host_stop_of_a_tracked_launch_is_clean(self):
+    def test_s7_sigterm_to_the_runner_group_is_clean(self):
         self._assert_passed("S7")
 
     def test_s8_start_survives_its_shell_group_dying(self):

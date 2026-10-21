@@ -137,6 +137,12 @@ class Role:
     effort: str | None = None
     selection: Selection | None = None
     decision: SelectionDecision | None = None
+    execution: dict | None = None
+    workdir: str | None = None
+    evidence_dir: str | None = None
+    execution_overrides: tuple = ()
+    task_id: str | None = None
+    input_snapshot: str | None = None
 
 
 _INHERIT_DECISION = SelectionDecision("native")
@@ -633,7 +639,7 @@ def _model_selection_lines(roles, routing_mode, state, reason):
     return [_log_inline(line) for line in lines]
 
 
-def _resolve_run_selections(roles, run_dir, routing_mode, at_launch):
+def _resolve_run_selections(roles, run_dir, routing_mode, at_launch, project_root=None):
     """Validate authoring and attach every role's decision: the one
     orchestration behind the preflight plan and the launch.
 
@@ -665,7 +671,8 @@ def _resolve_run_selections(roles, run_dir, routing_mode, at_launch):
     launch = None
     if (at_launch and routing_mode == "auto"
             and any(_is_automatic(r) for r in roles)):
-        launch = _discover(routing_mode)
+        launch = (_discover(routing_mode) if project_root is None else
+                  _discover(routing_mode, project_root=project_root))
     now = _utc_iso(time.time()) if at_launch else authoring_now
     resolved = [
         replace(role, decision=_resolve_selection(

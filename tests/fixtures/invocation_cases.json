@@ -1,0 +1,16 @@
+{
+  "schema": "codex-council/invocation-cases@1",
+  "purpose": "Manual or host-eval scenarios, not a native Claude eval configuration or a runtime classifier.",
+  "cases": [
+    {"id": "simple-no-council", "steps": ["Correct a typo in a comment without changing behavior."], "expected": "Do not invoke solely because a tool call or turn ended."},
+    {"id": "explicit-first-turn", "steps": ["Ask Codex Council to distinguish two plausible causes of a failing test."], "expected": "Invoke with current objective, artifacts, discriminating evidence, and no fixed roster."},
+    {"id": "implicit-consequential", "steps": ["Without naming Codex, say a release should not rest on a single reading and ask which of two causes is real."], "expected": "Invoke for an independent contribution that can discriminate the causes; do not substitute a built-in subagent."},
+    {"id": "after-ten-turns", "steps": ["Work through ten changes and decisions.", "Invoke Council on the current unresolved issue."], "expected": "Reconstruct current requirements and evidence, not a stale transcript slice."},
+    {"id": "changed-during-run", "steps": ["Launch an empirical contribution against dirty code.", "Change the live implementation while the captured experiment runs."], "expected": "Scratch inputs stay stable; stale applicability blocks claims about the new live version."},
+    {"id": "after-compaction", "steps": ["Compact after recording durable requirements.", "Request a relevant collaboration."], "expected": "Reread durable context; acknowledge missing history rather than fabricate it."},
+    {"id": "not-always-review", "steps": ["Ask for a small experimental implementation to compare against a current approach."], "expected": "Frame a contribution and evidence goal, not a fixed code-review persona."},
+    {"id": "missing-dependency", "steps": ["Request a check requiring an unavailable service or dependency."], "expected": "Report blocked coverage; do not infer correctness or enable network/bypass without authorization."},
+    {"id": "no-redundant-invocation", "steps": ["Complete a useful council investigation.", "Continue without new evidence or a changed decision."], "expected": "Reuse applicable evidence; do not invoke just because another turn occurred."},
+    {"id": "context-only", "steps": ["Ask Council to compare two technical explanations supplied in the brief."], "expected": "Use a complete brief and empty capture scope; do not force a coding-only experiment."}
+  ]
+}

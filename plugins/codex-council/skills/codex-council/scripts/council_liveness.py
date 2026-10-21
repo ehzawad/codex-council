@@ -855,7 +855,7 @@ class _Follower:
         if not _reply_path_ok(line, self.replies_dir):
             return False
         if self.dispatched_at is None and line.startswith(
-                FOLLOW_DISPATCH_PREFIX):
+                (FOLLOW_DISPATCH_PREFIX, "[codex-council] preparing ")):
             self.dispatched_at = time.monotonic()
         if not self.verbose and FOLLOW_ROUTINE_PATTERN.match(line):
             return False
@@ -1066,11 +1066,13 @@ def follow(run_dir, verbose=False):
 
 # ---------- --status and --reap ----------
 
-def _role_line(role_id, role, now, table):
-    parts = [role["state"]]
+def _role_line(role_id, role, now, table, ended=False):
+    # Once the runner has published a terminal state, an unfinished role was
+    # cut off; its last published state is history, not activity.
+    parts = [f"interrupted (was {role['state']})" if ended else role["state"]]
     if role["attempt"]:
         parts.append(f"attempt {role['attempt']}")
-    if role["state"] == "active" and role["output_at"] is not None:
+    if not ended and role["state"] == "active" and role["output_at"] is not None:
         parts.append(f"quiet {max(0.0, now - role['output_at']):.0f}s")
     if role["pid"] is not None:
         alive = _identity_state(table, role["pid"], role["start_identity"])
@@ -1213,8 +1215,9 @@ def _status_lines(view, now, table, detached=None):
 def _role_lines(view, now, table, unfinished):
     lines = [f"roles: {len(view.roles) - len(unfinished)} of "
              f"{len(view.roles)} settled"]
+    ended = view.state in TERMINAL_STATES
     for role_id in unfinished[:STATUS_ROLE_LINES]:
-        lines.append(_role_line(role_id, view.roles[role_id], now, table))
+        lines.append(_role_line(role_id, view.roles[role_id], now, table, ended))
     if len(unfinished) > STATUS_ROLE_LINES:
         lines.append(f"  ... and {len(unfinished) - STATUS_ROLE_LINES} more "
                      "unfinished")
@@ -1242,13 +1245,22 @@ def status_command(run_dir):
     run_dir = _check_private_dir(
         run_dir, prefix="--status: ", recovery=RUN_DIR_RECOVERY
     )
-    view = read_status(os.path.join(run_dir, STATUS_FILENAME))
+    status_path = os.path.join(run_dir, STATUS_FILENAME)
+    view = read_status(status_path)
     detached = None
     if is_detached(run_dir, view):
         table = _process_table()
         detached = supervisor_state(run_dir, view, table)
     else:
         table = _process_table() if view is not None else None
+    if view is not None and view.state not in TERMINAL_STATES:
+        # The runner may have published its terminal state and exited
+        # between the read above and the liveness reads; that state wins.
+        final = read_status(status_path)
+        if final is not None and final.state in TERMINAL_STATES:
+            view = final
+            if detached is not None:
+                detached = supervisor_state(run_dir, view, table)
     for line in _status_lines(view, time.time(), table, detached):
         _print_stdout(line)
     return 0
@@ -1371,8 +1383,7 @@ def cancel_command(run_dir):
     if not is_detached(run_dir, view):
         _print_stdout(
             "--cancel refused: this run was not launched with --start (no "
-            f"{SUPERVISOR_LOCK_FILENAME}); a tracked run ends when its "
-            "background task is stopped")
+            f"{SUPERVISOR_LOCK_FILENAME}); nothing was signalled")
         return CANCEL_EXIT_REFUSED
     detached = supervisor_state(run_dir, view)
     supervisor = detached.supervisor
