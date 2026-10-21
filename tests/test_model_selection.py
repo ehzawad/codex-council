@@ -2910,9 +2910,9 @@ class LaunchEndToEndTests(unittest.TestCase):
         self.assertEqual(self.argvs(), [])
 
     def test_a_retired_model_is_marked_in_the_summary_and_on_a_pin(self):
-        """The summary never offers a pair the pre-flight refuses: a past
-        retirement reads "retired ... (not routable)". A user pin of it is
-        still forwarded unchanged, with a note."""
+        """The summary marks a past retirement as "retired ... (not
+        routable)". A user pin of it is still forwarded unchanged, with a
+        note."""
         self.scenario(self._lyra_retired_scenario())
         self.stage([_entry(model=LYRA, effort="brisk",
                            selection={"mode": "user"})])
