@@ -138,6 +138,19 @@ class WorkflowCliTests(unittest.TestCase):
         self.assertEqual(self.execs()[0]["cwd"], str(directory / "workspaces/contribution"))
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", self.execs()[0]["argv"])
 
+    def test_empty_source_directory_exists_in_scratch_and_its_deletion_is_stale(self):
+        (self.source / "output").mkdir()
+        directory = self.stage()
+        copied = directory / "workspaces/contribution"
+        command = [sys.executable, "-c",
+                   "from pathlib import Path; Path('output/result.txt').write_text('fixture')"]
+        self.assertEqual(subprocess.run(command, cwd=copied).returncode, 0)
+        self.assertEqual(json.loads(self.cli("--freshness", directory).stdout)["state"], "unchanged")
+        (self.source / "output").rmdir()
+        stale = self.cli("--freshness", directory)
+        self.assertEqual(stale.returncode, 1, stale.stdout)
+        self.assertIn("output/", json.loads(stale.stdout)["changed_paths"])
+
     def test_default_permissions_are_read_only_and_external_tools_disabled(self):
         directory = self.stage(roles=[{"id": "view", "label": "Perspective",
                                       "instruction": ["Investigate the current question."]}])

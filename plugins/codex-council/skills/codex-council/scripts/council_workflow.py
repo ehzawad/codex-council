@@ -19,7 +19,7 @@ from typing import Any
 from council_policy import inspect_policy, parse_policy, policy_dict
 from council_workspace import (WorkspaceError, atomic_json, capture, copy_workspace,
                                digest, freshness, private_dir, read_json,
-                               relative_path, verify_tree)
+                               relative_path, snapshot_digest, verify_tree)
 
 REQUEST_SCHEMA = "codex-council/request@1"
 PLAN_SCHEMA = "codex-council/run@1"
@@ -141,8 +141,8 @@ def load_plan(run_dir: str | Path, roles: list[Any] | None = None,
             or any(snapshot.get(key) != request[key]
                    for key in ("source_root", "include", "exclude"))):
         raise WorkspaceError("captured task or source binding differs from request.json")
-    if snapshot.get("snapshot_id") != digest({"files": snapshot.get("files"),
-                                              "git": snapshot.get("git")}):
+    if (not isinstance(snapshot.get("dirs"), list)
+            or snapshot.get("snapshot_id") != snapshot_digest(snapshot)):
         raise WorkspaceError("captured input manifest checksum does not match")
     for role_id, binding in bindings.items():
         if not isinstance(role_id, str) or not isinstance(binding, dict):
@@ -167,9 +167,9 @@ def load_plan(run_dir: str | Path, roles: list[Any] | None = None,
     if body is not None and plan.get("context_sha256") != _context_hash(body):
         raise WorkspaceError("context changed after capture; prepare a fresh invocation")
     if verify_inputs:
-        verify_tree(directory / "baseline", snapshot["files"])
+        verify_tree(directory / "baseline", snapshot["files"], snapshot["dirs"])
         for binding in bindings.values():
-            verify_tree(directory / binding["workspace"], snapshot["files"])
+            verify_tree(directory / binding["workspace"], snapshot["files"], snapshot["dirs"])
     return plan
 
 

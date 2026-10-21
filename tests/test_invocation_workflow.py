@@ -228,6 +228,28 @@ class CaptureTests(WorkspaceCase):
         with self.assertRaisesRegex(workspace.WorkspaceError, "collision"):
             self.capture()
 
+    def test_empty_directories_are_captured_copied_and_compared(self):
+        (self.source / "output").mkdir()
+        (self.source / "nested/leaf").mkdir(parents=True)
+        (self.source / "secrets").mkdir()
+        (self.source / "secrets/.env").write_text("TOKEN=x")
+        snap = self.capture()
+        self.assertEqual(snap["dirs"], ["nested/leaf", "output", "secrets"])
+        target = self.run / "scratch"
+        workspace.copy_workspace(self.baseline, target, snap)
+        for name in snap["dirs"]:
+            self.assertTrue((target / name).is_dir(), name)
+            self.assertTrue((self.baseline / name).is_dir(), name)
+        self.assertFalse((target / "secrets/.env").exists())
+        self.assertEqual(workspace.freshness(snap)["state"], "unchanged")
+        (self.source / "output").rmdir()
+        fresh = workspace.freshness(snap)
+        self.assertEqual(fresh["state"], "stale")
+        self.assertIn("output/", fresh["changed_paths"])
+        (target / "nested/leaf").rmdir()
+        with self.assertRaisesRegex(workspace.WorkspaceError, "empty directories"):
+            workspace.verify_tree(target, snap["files"], snap["dirs"])
+
     def test_modified_baseline_is_not_used(self):
         snap = self.capture()
         target = self.baseline / "subject.py"
@@ -241,7 +263,7 @@ class CaptureTests(WorkspaceCase):
         self.baseline.chmod(0o700)
         (self.baseline / ".codex").mkdir()
         with self.assertRaisesRegex(workspace.WorkspaceError, "control"):
-            workspace.verify_tree(self.baseline, snap["files"])
+            workspace.verify_tree(self.baseline, snap["files"], snap["dirs"])
 
     def test_freshness_tracks_content_additions_deletions_and_index(self):
         self.init_git()

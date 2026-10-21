@@ -211,28 +211,34 @@ def git_state(root: Path) -> dict[str, Any] | None:
 
 
 def _walk(root: Path, start: str, exclude: list[str],
-          omitted: dict[str, str]) -> set[str]:
-    """Enumerate through pinned directory descriptors, never link ancestors."""
+          omitted: dict[str, str], empty: set[str] | None = None) -> set[str]:
+    """Enumerate through pinned directory descriptors, never link ancestors.
+    Directories holding no selected entry are added to `empty`."""
     selected: set[str] = set()
+    empty = set() if empty is None else empty
 
-    def visit(parent: int, leaf: str, name: str) -> None:
+    def visit(parent: int, leaf: str, name: str) -> bool:
         reason = _omission(name, exclude)
         if reason:
             omitted[name] = reason
-            return
+            return False
         st = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
         if stat.S_ISREG(st.st_mode):
             selected.add(name)
-        elif stat.S_ISDIR(st.st_mode):
+            return True
+        if stat.S_ISDIR(st.st_mode):
             child = os.open(leaf, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                             dir_fd=parent)
             try:
+                found = False
                 for entry in os.listdir(child):
-                    visit(child, entry, f"{name}/{entry}" if name else entry)
+                    found |= visit(child, entry, f"{name}/{entry}" if name else entry)
             finally:
                 os.close(child)
-        else:
-            raise WorkspaceError(f"selected symlink or special file is not copied: {name}")
+            if not found:
+                empty.add(name)
+            return True
+        raise WorkspaceError(f"selected symlink or special file is not copied: {name}")
 
     directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
@@ -253,10 +259,12 @@ def _walk(root: Path, start: str, exclude: list[str],
 
 
 def inventory(root: Path, include: list[str] | None, exclude: list[str]
-              ) -> tuple[dict[str, Any], dict[str, tuple[int, ...]], dict[str, str]]:
+              ) -> tuple[dict[str, Any], dict[str, tuple[int, ...]], dict[str, str], list[str]]:
     """Select current bytes, not HEAD/index bytes. Explicit includes may include
-    ignored fixtures; implicit Git scope honors Git's ignore rules."""
+    ignored fixtures and record empty directories; implicit Git scope honors
+    Git's ignore rules and, like Git, lists files only."""
     omitted: dict[str, str] = {}
+    empty: set[str] = set()
     if include is None:
         raw = _git(root, "ls-files", "--cached", "--others", "--exclude-standard",
                    "-z")
@@ -278,7 +286,7 @@ def inventory(root: Path, include: list[str] | None, exclude: list[str]
         names = set()
         for value in include:
             names.update(_walk(root, relative_path(value, allow_dot=True),
-                               exclude, omitted))
+                               exclude, omitted, empty))
     portable: dict[str, str] = {}
     files, stamps = {}, {}
     for name in sorted(names):
@@ -287,7 +295,7 @@ def inventory(root: Path, include: list[str] | None, exclude: list[str]
             raise WorkspaceError(f"non-portable case/Unicode collision: {name}")
         portable[folded] = name
         files[name], stamps[name] = _hash_file(root, name)
-    return files, stamps, omitted
+    return files, stamps, omitted, sorted(empty)
 
 
 def capture(source: Path, baseline: Path, *, include: list[str] | None = None,
@@ -303,25 +311,32 @@ def capture(source: Path, baseline: Path, *, include: list[str] | None = None,
     private_dir(baseline.parent)
     exclude = [] if exclude is None else exclude
     before_git = git_state(source)
-    before, stamps, omitted = inventory(source, include, exclude)
+    before, stamps, omitted, dirs = inventory(source, include, exclude)
     baseline.mkdir(mode=0o700)
+    for name in dirs:
+        (baseline / name).mkdir(mode=0o700, parents=True, exist_ok=True)
     copied = {}
     for name, entry in before.items():
         copy, stamp = _hash_file(source, name, baseline / name)
         if copy != entry or stamp != stamps[name]:
             raise WorkspaceError(f"input changed during capture: {name}")
         copied[name] = copy
-    after, after_stamps, after_omitted = inventory(source, include, exclude)
+    after, after_stamps, after_omitted, after_dirs = inventory(source, include, exclude)
     after_git = git_state(source)
     if (after != before or stamps != after_stamps or before_git != after_git
-            or omitted != after_omitted):
+            or omitted != after_omitted or dirs != after_dirs):
         raise WorkspaceError("source changed during capture; pause writers and retry")
     snapshot = {"schema": SCHEMA, "source_root": str(source), "files": copied,
-                "include": include, "exclude": exclude, "git": before_git,
+                "dirs": dirs, "include": include, "exclude": exclude, "git": before_git,
                 "omitted": omitted, "consistency": "observed-stable-not-atomic"}
-    snapshot["snapshot_id"] = digest({"files": copied, "git": before_git})
+    snapshot["snapshot_id"] = snapshot_digest(snapshot)
     freeze(baseline)
     return snapshot
+
+
+def snapshot_digest(snapshot: dict[str, Any]) -> str:
+    return digest({"files": snapshot.get("files"), "dirs": snapshot.get("dirs"),
+                   "git": snapshot.get("git")})
 
 
 def freeze(root: Path) -> None:
@@ -342,9 +357,13 @@ def freeze(root: Path) -> None:
     root.chmod(0o500)
 
 
-def verify_tree(root: Path, expected: dict[str, Any]) -> None:
-    """Compare all entries, including unexpected additions; never follow links."""
-    names = _walk(root, ".", [], {})
+def verify_tree(root: Path, expected: dict[str, Any], dirs: list[str]) -> None:
+    """Compare all entries, including unexpected additions and empty
+    directories; never follow links."""
+    empty: set[str] = set()
+    names = _walk(root, ".", [], {}, empty)
+    if empty != set(dirs):
+        raise WorkspaceError("captured empty directories changed")
     # _walk omits control paths; an experiment may have created one. For a
     # baseline verify them too rather than letting an omitted .codex appear.
     for directory, dirs, files in os.walk(root, followlinks=False):
@@ -364,21 +383,24 @@ def verify_tree(root: Path, expected: dict[str, Any]) -> None:
 
 
 def copy_workspace(baseline: Path, target: Path, snapshot: dict[str, Any]) -> None:
-    verify_tree(baseline, snapshot["files"])
+    verify_tree(baseline, snapshot["files"], snapshot["dirs"])
     target.mkdir(mode=0o700)
+    for name in snapshot["dirs"]:
+        (target / name).mkdir(mode=0o700, parents=True, exist_ok=True)
     for name, value in snapshot["files"].items():
         if _hash_file(baseline, name, target / name)[0] != value:
             raise WorkspaceError(f"baseline changed while copying: {name}")
-    verify_tree(target, snapshot["files"])
+    verify_tree(target, snapshot["files"], snapshot["dirs"])
 
 
 def freshness(snapshot: dict[str, Any]) -> dict[str, Any]:
     """No assertions about excluded files or remote dependencies."""
     try:
         root = Path(snapshot["source_root"])
-        files, _, omitted = inventory(root, snapshot["include"], snapshot["exclude"])
+        files, _, omitted, dirs = inventory(root, snapshot["include"], snapshot["exclude"])
         changed = sorted(name for name in set(files) | set(snapshot["files"])
                          if files.get(name) != snapshot["files"].get(name))
+        changed += sorted(f"{name}/" for name in set(dirs) ^ set(snapshot["dirs"]))
         metadata_changed = git_state(root) != snapshot["git"]
         omissions_changed = omitted != snapshot["omitted"]
         return {"state": "stale" if changed or metadata_changed or omissions_changed

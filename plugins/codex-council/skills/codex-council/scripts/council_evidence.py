@@ -203,7 +203,7 @@ def collect_artifacts(baseline: Path, workspace: Path, snapshot: dict[str, Any],
     """Inspect changed files without following links or executing artifacts.
     Large/binary/mode-only changes stay in the manifest, not a lossy text patch.
     """
-    files, _, omitted = inventory(workspace, ["."], [])
+    files, _, omitted, _ = inventory(workspace, ["."], [])
     changed = sorted(name for name in set(files) | set(snapshot["files"])
                      if files.get(name) != snapshot["files"].get(name))
     artifacts, patches = [], []
@@ -252,7 +252,7 @@ def write_result(run_dir: Path, plan: dict[str, Any], results: list[Any],
     manifest = plan["snapshot"]
     gaps: list[str] = []
     try:
-        verify_tree(run_dir / "baseline", manifest["files"])
+        verify_tree(run_dir / "baseline", manifest["files"], manifest["dirs"])
         baseline_intact = True
     except (OSError, ValueError):
         baseline_intact = False
