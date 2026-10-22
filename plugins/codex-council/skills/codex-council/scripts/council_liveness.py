@@ -153,13 +153,15 @@ FOLLOW_ROUTINE_PATTERN = re.compile(
 )
 # Recovery for a rejected run directory. These commands only read (or
 # signal verified processes), so the fix is always "point at the real run
-# directory", never chmod or mkdir.
+# directory", never chmod or mkdir. --freshness (codex_council.main) uses
+# it too.
 RUN_DIR_RECOVERY = (
     "Recovery: pass the exact absolute mktemp directory the council was "
     "launched from (the directory holding roles.json, out.md, and err.log). "
     "--follow, --status, --reap, and --cancel only read DIR/err.log, "
-    "DIR/status.json, and the supervisor files; do not chmod or mkdir "
-    "anything for them."
+    "DIR/status.json, and the supervisor files, and --freshness only reads "
+    "the capture records, DIR/request.json, and DIR/context.md; do not "
+    "chmod or mkdir anything for them."
 )
 
 
@@ -302,18 +304,22 @@ def _terminate_group(pgid, table=None):
     other groups and processes (its descendants) were signalled.
 
     SIGTERM to all, wait up to REAP_GRACE_SECS for the codex group, then
-    SIGKILL whatever of them remains.
+    SIGKILL whatever of them remains. The SIGKILL goes to the same targets
+    even when the wait is interrupted (Ctrl-C during --reap), so a worker
+    that ignores SIGTERM is never left running.
     """
     groups, pids = descendant_targets(pgid, table)
-    signal_targets([pgid, *groups], pids, signal.SIGTERM)
-    deadline = time.monotonic() + REAP_GRACE_SECS
-    while time.monotonic() < deadline:
-        try:
-            os.killpg(pgid, 0)
-        except OSError:
-            break
-        time.sleep(0.05)
-    signal_targets([pgid, *groups], pids, signal.SIGKILL)
+    try:
+        signal_targets([pgid, *groups], pids, signal.SIGTERM)
+        deadline = time.monotonic() + REAP_GRACE_SECS
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(pgid, 0)
+            except OSError:
+                break
+            time.sleep(0.05)
+    finally:
+        signal_targets([pgid, *groups], pids, signal.SIGKILL)
     return len(groups) + len(pids)
 
 

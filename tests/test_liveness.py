@@ -1269,6 +1269,72 @@ class ReapCommandTests(unittest.TestCase):
         leader.wait(timeout=5)
         self.assertTrue(pid_gone(tool))
 
+    def _sigterm_ignoring_group(self, marker=None):
+        """A process leading its own group that survives SIGTERM (noting
+        each one in `marker` when given), once its handler is in place."""
+        leader = subprocess.Popen([sys.executable, "-c", textwrap.dedent(f"""\
+            import signal, time
+            def seen(signum, frame):
+                marker = {marker!r}
+                if marker is not None:
+                    open(marker, "w").close()
+            signal.signal(signal.SIGTERM, seen)
+            print("ready", flush=True)
+            while True:
+                time.sleep(60)
+            """)], start_new_session=True, stdout=subprocess.PIPE, text=True)
+
+        def cleanup():
+            with contextlib.suppress(OSError):
+                os.killpg(leader.pid, signal.SIGKILL)
+            leader.wait()
+            leader.stdout.close()
+
+        self.addCleanup(cleanup)
+        self.assertEqual(leader.stdout.readline(), "ready\n")
+        return leader
+
+    def test_an_interrupted_grace_wait_still_sends_the_sigkill(self):
+        """Ctrl-C during the SIGTERM grace wait cannot leave a worker that
+        ignores SIGTERM alive: the SIGKILL to the same targets is sent in a
+        finally."""
+        leader = self._sigterm_ignoring_group()
+        with patch.object(council_liveness.time, "sleep",
+                          side_effect=KeyboardInterrupt), \
+                self.assertRaises(KeyboardInterrupt):
+            council_liveness._terminate_group(leader.pid, {})
+        self.assertTrue(pid_gone(leader.pid))
+
+    def test_ctrl_c_during_reap_kills_what_it_was_ending_and_exits_130(self):
+        marker = os.path.join(self.run_dir, "sigterm-seen")
+        leader = self._sigterm_ignoring_group(marker)
+        _status(self.run_dir, pid=_dead_pid(), roles={"ours": {
+            "state": "active", "pid": leader.pid, "pgid": leader.pid,
+            "start_identity":
+                council_liveness.process_start_identity(leader.pid)}})
+        reap = subprocess.Popen(
+            [sys.executable, SCRIPT, "--reap", self.run_dir],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=clean_env(), stdin=subprocess.DEVNULL,
+            preexec_fn=default_signal_dispositions)
+        try:
+            deadline = time.monotonic() + 30
+            while not os.path.exists(marker):  # in the grace wait now
+                self.assertIsNone(reap.poll(), "--reap ended too early")
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.01)
+            reap.send_signal(signal.SIGINT)
+            _, stderr = reap.communicate(timeout=30)
+        finally:
+            if reap.poll() is None:
+                reap.kill()
+                reap.communicate()
+        self.assertEqual(reap.returncode, 130, stderr)
+        self.assertEqual(stderr, "[codex-council] --reap interrupted by user; "
+                                 "run --status, then --reap again if live "
+                                 "codex groups remain\n")
+        self.assertTrue(pid_gone(leader.pid))
+
 
 class DetachedStatusTests(unittest.TestCase):
     """--status for a --start run: the detached states and actions."""

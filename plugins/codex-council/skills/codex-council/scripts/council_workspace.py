@@ -11,6 +11,7 @@ source, and Git metadata/configuration is never borrowed by an experiment.
 from __future__ import annotations
 
 import contextlib
+import errno
 import fnmatch
 import hashlib
 import json
@@ -38,6 +39,12 @@ OMIT_FILES = frozenset({".env", ".netrc", ".npmrc", "id_rsa", "id_ed25519"})
 OMIT_INSTRUCTION_FILES = frozenset({"agents.md", "agents.override.md", "claude.md",
                                     "claude.local.md"})
 CHUNK = 1024 * 1024
+# What O_NOFOLLOW reports for a symlink final component (ELOOP; EMLINK on
+# FreeBSD; EFTYPE on NetBSD) or O_DIRECTORY for a link or non-directory
+# component (ENOTDIR).
+LINK_ERRNOS = frozenset(code for code in (errno.ELOOP, errno.EMLINK, errno.ENOTDIR,
+                                          getattr(errno, "EFTYPE", None))
+                        if code is not None)
 
 
 class WorkspaceError(ValueError):
@@ -79,17 +86,19 @@ def private_mkdirs(path: Path) -> None:
 
 
 def portable_collision(names: Any, dirs: Any = ()) -> tuple[str, str] | None:
-    """The first pair of distinct selected paths that are equal after NFC
-    normalization and case folding, or None. Compared over complete file
-    paths, empty directories, and every directory component of both, so
-    Foo/ and foo/, or Foo/a.txt and foo/b.txt, collide; a file and a
-    directory with folded-equal names collide too."""
+    """The first pair of distinct selected paths that are equal under
+    Unicode canonical caseless matching (NFD, case folding, NFD again), or
+    None. Compared over complete file paths, empty directories, and every
+    directory component of both, so Foo/ and foo/, or Foo/a.txt and
+    foo/b.txt, collide; a file and a directory with folded-equal names
+    collide too."""
     seen: dict[str, str] = {}
     for name in sorted({*names, *dirs}):
         parts = PurePosixPath(name).parts
         for depth in range(1, len(parts) + 1):
             path = "/".join(parts[:depth])
-            folded = unicodedata.normalize("NFC", path).casefold()
+            folded = unicodedata.normalize(
+                "NFD", unicodedata.normalize("NFD", path).casefold())
             other = seen.setdefault(folded, path)
             if other != path:
                 return other, path
@@ -102,6 +111,8 @@ def atomic_json(path: Path, value: Any) -> None:
     fd, temp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         with os.fdopen(fd, "wb") as stream:
+            # A umask that clears owner bits must not leave it unreadable.
+            os.fchmod(stream.fileno(), 0o600)
             stream.write(canonical(value) + b"\n")
             stream.flush()
             os.fsync(stream.fileno())
@@ -144,8 +155,11 @@ def read_json(path: Path, *, private: bool = True) -> Any:
                 raise WorkspaceError(f"non-finite JSON number: {literal}")
             return value
 
-        return json.loads(stream.read().decode("utf-8"), object_pairs_hook=pairs,
-                          parse_constant=constant, parse_float=finite)
+        try:
+            return json.loads(stream.read().decode("utf-8"), object_pairs_hook=pairs,
+                              parse_constant=constant, parse_float=finite)
+        except RecursionError:
+            raise WorkspaceError(f"JSON nesting too deep: {path}") from None
 
 
 def relative_path(value: str, *, allow_dot: bool = False) -> str:
@@ -194,11 +208,18 @@ def regular(root: Path, name: str) -> Iterator[Any]:
             directory = child
         fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
                      dir_fd=directory)
+    except OSError as exc:
+        if exc.errno in LINK_ERRNOS:
+            raise WorkspaceError("selected input or a directory in its path is a "
+                                 f"symlink or not a directory: {name}") from None
+        raise
     finally:
         os.close(directory)
+    # Before fdopen: fdopen of a directory raises an error naming the fd.
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise WorkspaceError(f"selected input is not a regular file: {name}")
     with os.fdopen(fd, "rb") as stream:
-        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
-            raise WorkspaceError(f"selected input is not a regular file: {name}")
         yield stream
 
 
@@ -277,9 +298,13 @@ def git_state(root: Path, include: list[str] | None, exclude: list[str]
 
 
 def _walk(root: Path, start: str, exclude: list[str],
-          omitted: dict[str, str], empty: set[str] | None = None) -> set[str]:
+          omitted: dict[str, str], empty: set[str] | None = None,
+          special: dict[str, str] | None = None, *, hint: str = "") -> set[str]:
     """Enumerate through pinned directory descriptors, never link ancestors.
-    Directories holding no selected entry are added to `empty`."""
+    Directories holding no selected entry are added to `empty`. A symlink or
+    special file is refused (its refusal ending in `hint`) unless `special`
+    is a dict; then it is recorded there by kind and never opened, followed
+    or descended."""
     selected: set[str] = set()
     empty = set() if empty is None else empty
 
@@ -304,7 +329,10 @@ def _walk(root: Path, start: str, exclude: list[str],
             if not found:
                 empty.add(name)
             return True
-        raise WorkspaceError(f"selected symlink or special file is not copied: {name}")
+        if special is not None:
+            special[name] = "symlink" if stat.S_ISLNK(st.st_mode) else "special-file"
+            return True
+        raise WorkspaceError(f"selected symlink or special file is not copied: {name}{hint}")
 
     directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
@@ -313,47 +341,97 @@ def _walk(root: Path, start: str, exclude: list[str],
                 visit(directory, entry, entry)
         else:
             parts = PurePosixPath(relative_path(start)).parts
-            for part in parts[:-1]:
-                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                                dir_fd=directory)
-                os.close(directory)
-                directory = child
+            try:
+                for part in parts[:-1]:
+                    child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                    dir_fd=directory)
+                    os.close(directory)
+                    directory = child
+            except OSError as exc:
+                if exc.errno not in LINK_ERRNOS:
+                    raise
+                # Exclusions are matched below this descent, so the fix is
+                # the include path itself.
+                raise WorkspaceError("selected input or a directory in its path is a "
+                                     f"symlink or not a directory: {start}; name it in "
+                                     "include by a path through real directories"
+                                     ) from None
             visit(directory, parts[-1], start)
     finally:
         os.close(directory)
     return selected
 
 
-def inventory(root: Path, include: list[str] | None, exclude: list[str]
+def inventory(root: Path, include: list[str] | None, exclude: list[str], *,
+              special: dict[str, str] | None = None, portable: bool = True,
+              hints: bool = True
               ) -> tuple[dict[str, Any], dict[str, tuple[int, ...]], dict[str, str], list[str]]:
     """Select current bytes, not HEAD/index bytes. Explicit includes may include
     ignored fixtures and record empty directories; implicit Git scope honors
-    Git's ignore rules and, like Git, lists files only."""
+    Git's ignore rules and, like Git, lists files only. It refuses, by name,
+    a submodule (populated, empty or missing), an untracked nested
+    repository, and a symlink or special file it is not told to exclude.
+    `special` is passed to _walk; `portable=False` skips the collision check
+    for output that is not a capture; `hints=False` leaves the request.json
+    fix out of refusals, for a run already prepared from that request."""
     omitted: dict[str, str] = {}
     empty: set[str] = set()
+    fix = "; add it to exclude in request.json" if hints else ""
+    select = fix and f"{fix}, or select its files with include"
     if include is None:
         raw = _git(root, "ls-files", "--cached", "--others", "--exclude-standard",
                    "-z")
         if raw is None:
             raise WorkspaceError("non-Git inputs require explicit include paths")
+        index = _git(root, "ls-files", "--stage", "-z")
+        if index is None:
+            raise WorkspaceError("Git index could not be read")
+        for entry in index.split(b"\0"):
+            fields, _, path = entry.partition(b"\t")  # "<mode> <object> <stage>"
+            name = os.fsdecode(path)
+            if fields.startswith(b"160000 ") and not _omission(name, exclude):
+                raise WorkspaceError(f"Git submodule is not copied: {name}{select}")
         names = set()
-        for value in raw.split(b"\0"):
+        # Sorted, so a listed link or nested repository is met before any
+        # tracked path below it (a tracked directory replaced by a link):
+        # excluding it omits those paths too, never read through it.
+        for value in sorted(raw.split(b"\0")):
             if not value:
                 continue
-            name = relative_path(os.fsdecode(value))
-            reason = _omission(name, exclude)
+            name = os.fsdecode(value)
+            if name.endswith("/"):
+                # Git lists an untracked nested repository as one entry;
+                # its exclusion may be spelled with the slash or without.
+                name = relative_path(name[:-1])
+                reason = _omission(name, exclude) or _omission(f"{name}/", exclude)
+                if reason:
+                    omitted[name] = reason
+                    continue
+                raise WorkspaceError(f"nested Git repository is not copied: {name}/{select}")
+            name = relative_path(name)
+            parts = PurePosixPath(name).parts
+            parents = ("/".join(parts[:depth]) for depth in range(1, len(parts)))
+            reason = _omission(name, exclude) or next(
+                (omitted[parent] for parent in parents if parent in omitted), None)
             if reason:
                 omitted[name] = reason
                 continue
-            if not os.path.lexists(root / name):
+            try:
+                st = os.lstat(root / name)
+            except (FileNotFoundError, NotADirectoryError):
                 continue  # tracked deletion: absence is part of this capture
+            if stat.S_ISLNK(st.st_mode):
+                raise WorkspaceError(f"selected symlink is not copied: {name}{fix}")
+            if not stat.S_ISREG(st.st_mode):
+                raise WorkspaceError("selected special file or directory is not copied: "
+                                     f"{name}{fix}")
             names.add(name)
     else:
         names = set()
         for value in include:
             names.update(_walk(root, relative_path(value, allow_dot=True),
-                               exclude, omitted, empty))
-    collision = portable_collision(names, empty)
+                               exclude, omitted, empty, special, hint=fix))
+    collision = portable_collision(names, empty) if portable else None
     if collision is not None:
         raise WorkspaceError("non-portable case/Unicode collision: "
                              f"{collision[0]} and {collision[1]}")
@@ -467,7 +545,12 @@ def freshness(snapshot: dict[str, Any]) -> dict[str, Any]:
     dependencies are not checked."""
     try:
         root = Path(snapshot["source_root"])
-        files, _, omitted, dirs = inventory(root, snapshot["include"], snapshot["exclude"])
+        if not root.is_dir():
+            # Said plainly: a Git scope would otherwise report "non-Git
+            # inputs require explicit include paths".
+            raise WorkspaceError(f"source_root is missing or not a directory: {root}")
+        files, _, omitted, dirs = inventory(root, snapshot["include"], snapshot["exclude"],
+                                            hints=False)
         changed = sorted(name for name in set(files) | set(snapshot["files"])
                          if files.get(name) != snapshot["files"].get(name))
         changed += sorted(f"{name}/" for name in set(dirs) ^ set(snapshot["dirs"]))

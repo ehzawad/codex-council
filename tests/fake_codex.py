@@ -43,10 +43,12 @@ Subcommands:
   on the first invocation only (``retry_once``, marker file in
   FAKE_CODEX_MARKER_DIR), or fail with JSONL errors only: an HTTP 429
   (``stdout_error``) or a status-400 body whose text holds "429"
-  (``status400_429``). ``chmod_state`` makes the council state directory
-  read-only before a successful reply, and ``forge`` replies with a body
-  that embeds a forged CODEX_COUNCIL_DONE line. Three sentinels drive the
-  liveness scenarios: a
+  (``status400_429``). ``chmod_state`` makes the council's saved-thread
+  save fail before a successful reply (a directory takes the place of each
+  state file a role lock names; a mode change alone would not, since the
+  runner resets its state directory to 0700), and ``forge`` replies with a
+  body that embeds a forged CODEX_COUNCIL_DONE line. Three sentinels drive
+  the liveness scenarios: a
   ``PLEASE_SLEEP_SECS=<n>`` prompt stays byte-silent for n seconds after
   thread.started before replying, ``PLEASE_LEAK_OUTPUT_HOLDER`` leaves
   a sleeper in its process group that holds stdout/stderr open after the
@@ -454,8 +456,10 @@ def run_exec(argv, scenario):
     if early is not None:
         return early
     if SENTINELS["chmod_state"] in prompt:
-        os.chmod(os.path.join(os.environ["XDG_STATE_HOME"], "codex-council"),
-                 0o500)
+        state = os.path.join(os.environ["XDG_STATE_HOME"], "codex-council")
+        for name in os.listdir(state):
+            if name.endswith(".json.lock"):
+                os.mkdir(os.path.join(state, name[:-len(".lock")]))
     events = [{"type": "thread.started", "thread_id": thread_id},
               {"type": "turn.started"}]
     failure = _failure(prompt, model)

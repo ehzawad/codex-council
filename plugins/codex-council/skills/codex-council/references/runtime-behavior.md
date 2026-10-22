@@ -58,9 +58,11 @@ verification verdict. Exit 1 means no successful role, undelivered output, or
 incomplete required coverage/evidence; exit 2 means invalid inputs or refused
 execution policy. `--start` itself exits 0 when the supervisor record appears or
 after waiting ten seconds for it (its note says when the runner is still starting
-or already ended), 1 when the supervisor could not start or exited before its
-record, and 2 for a refused directory. Workers run only through `--start` on a completed `--prepare`,
-once per run directory; there is no direct launch.
+or already ended), still 0 when its own stdout is closed or broken (one stderr line
+then names the pid and directory and says to run --status), 1 when the supervisor
+could not start or exited before its record, and 2 for a refused directory.
+Workers run only through `--start` on a completed `--prepare`, once per run
+directory; there is no direct launch.
 
 ## Liveness triage, before any retry
 
@@ -80,7 +82,9 @@ once per run directory; there is no direct launch.
 
 --cancel uses the signal latch and verified identity checks. SIGKILL or
 reboot cannot execute cleanup; verified --reap is the recovery for surviving
-recorded workers. Detached tool sessions that already left the observed process
+recorded workers. An interrupted --reap still sends its final SIGKILL to the
+verified group it was ending, then exits 130; run --status and --reap again for
+any that remain. Detached tool sessions that already left the observed process
 hierarchy remain a documented process-cleanup limit. This is not a cluster OS or a
 container runtime, and does not promise survival across reboot.
 
@@ -114,13 +118,15 @@ status.json, err.log, out.md, replies/. Evidence: `evidence/<key>/` and result.j
 Each `<key>` is the role key `run.json` records (a hashed key for ids over 32
 characters). Run roots, control/evidence files, and every scratch directory the
 capture creates are private whatever the umask, as are workspaces/, evidence/,
-catalogs/ and replies/. The saved-thread state directory
-under `$XDG_STATE_HOME/codex-council` is created 0700 and its lock files 0600; an
-owned, too-open state directory or lock file from an earlier release is tightened,
-while a symlinked, foreign-owned or non-directory state path is refused by
-`--check-staging-dir` and again before dispatch, and is never changed. Raw logs can contain sensitive
-tool output; do not publish or attach them indiscriminately. Cleanup is deliberate:
-never delete a directory or role lock while its processes may still use it.
+catalogs/ and replies/. The saved-thread state directory under
+`$XDG_STATE_HOME/codex-council` (only when that is an absolute path; otherwise
+`~/.local/state/codex-council`) is created 0700 and its lock files 0600; an owned
+state directory with any other mode is reset to 0700 and an owned, too-open lock
+file from an earlier release is tightened, while a symlinked, foreign-owned or
+non-directory state path is refused by `--check-staging-dir` and again before
+dispatch, and is never changed. Raw logs can contain sensitive tool output; do not
+publish or attach them indiscriminately. Cleanup is deliberate: never delete a
+directory or role lock while its processes may still use it.
 
 Saved role threads have explicit fresh/resume selection and are scoped by logical
 project, task, host session and role id. CODEX_COUNCIL_SESSION_KEY is the reliable

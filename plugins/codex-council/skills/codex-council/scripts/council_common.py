@@ -456,8 +456,9 @@ def _usage_exit_if_launched(run_dir, prefix):
 def _atomic_write_private(path, data):
     """Atomically replace `path` with the bytes `data` as a 0600 file.
 
-    Temp file in the same directory (O_CREAT|O_EXCL|O_NOFOLLOW, mode 0600),
-    full write, fsync, then os.replace — a reader never sees a partial file.
+    Temp file in the same directory (O_CREAT|O_EXCL|O_NOFOLLOW, set to 0600
+    through its descriptor, since a umask can clear owner bits too), full
+    write, fsync, then os.replace — a reader never sees a partial file.
     Any failure removes the temp file and propagates; each caller owns its
     failure policy (reply files are advisory, a snapshot must not go stale).
     """
@@ -481,6 +482,7 @@ def _atomic_write_private(path, data):
         else:
             raise FileExistsError("could not allocate a unique temp file")
         try:
+            os.fchmod(fd, 0o600)
             view = memoryview(data)
             while view:
                 written = os.write(fd, view)

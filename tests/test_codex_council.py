@@ -25,9 +25,12 @@ import json
 import os
 import re
 import signal
+import socket
 import stat
+import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -412,6 +415,206 @@ class StatePrivacyTests(unittest.TestCase):
             codex_council._try_role_state_lock("architect")
         self.assertEqual(self._mode(state), 0o700)
 
+    def test_a_lock_path_that_cannot_be_opened_is_a_state_dir_error(self):
+        """A symlink, a directory, a socket, or a file this user cannot
+        open at the lock path is refused in the runner's own words (never
+        a raw OSError), and nothing there is changed or followed."""
+        self._state(os.path.join(self.tmp.name, "codex-council"))
+        codex_council._ensure_state_dir()
+        lock_path = codex_council._state_lock_path("architect")
+        target = os.path.join(self.tmp.name, "target")
+
+        def symlink():
+            os.symlink(target, lock_path)
+
+        def directory():
+            os.mkdir(lock_path, 0o700)
+
+        def unix_socket():
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.addCleanup(listener.close)
+            # Bound by its relative name: the full path can be longer
+            # than a socket address allows.
+            cwd = os.getcwd()
+            os.chdir(os.path.dirname(lock_path))
+            try:
+                listener.bind(os.path.basename(lock_path))
+            finally:
+                os.chdir(cwd)
+
+        def unreadable():
+            os.close(os.open(lock_path, os.O_CREAT | os.O_WRONLY, 0o600))
+            os.chmod(lock_path, 0o000)
+
+        cases = [("symlink", symlink), ("directory", directory),
+                 ("socket", unix_socket)]
+        if os.geteuid() != 0:  # root opens a mode-000 file anyway
+            cases.append(("unreadable", unreadable))
+        for name, plant in cases:
+            with self.subTest(lock=name):
+                plant()
+                try:
+                    before = os.lstat(lock_path)
+                    with self.assertRaises(codex_council.StateDirError) as ctx:
+                        codex_council._try_role_state_lock("architect")
+                    message = str(ctx.exception)
+                    self.assertIn(repr(lock_path), message)
+                    self.assertIn("is not an owned regular file this user can "
+                                  "open; it is not changed or used", message)
+                    self.assertIsNone(ctx.exception.__cause__)
+                    self.assertTrue(ctx.exception.__suppress_context__)
+                    after = os.lstat(lock_path)
+                    self.assertEqual((after.st_ino, after.st_mode),
+                                     (before.st_ino, before.st_mode))
+                    self.assertFalse(os.path.lexists(target))
+                finally:
+                    # Each case starts from a clean lock path even when
+                    # an earlier one failed.
+                    if os.path.isdir(lock_path) and not os.path.islink(lock_path):
+                        os.rmdir(lock_path)
+                    else:
+                        os.remove(lock_path)
+
+    def test_a_relative_xdg_state_home_is_ignored(self):
+        """XDG_STATE_HOME counts only when absolute (the XDG specification
+        ignores a relative value, a literal "~/..." included): a relative
+        one creates nothing under the current directory."""
+        home = os.path.join(self.tmp.name, "home")
+        cwd = os.path.join(self.tmp.name, "project")
+        os.mkdir(home, 0o700)
+        os.mkdir(cwd, 0o700)
+        expected = os.path.join(home, ".local", "state", "codex-council")
+        for value in ("state", "~/state", "./state", ""):
+            with self.subTest(XDG_STATE_HOME=value):
+                proc = subprocess.run(
+                    [sys.executable, "-c",
+                     "import codex_council\n"
+                     "print(codex_council._ensure_state_dir())\n"
+                     "print(codex_council.STATE_DIR)\n"],
+                    cwd=cwd, capture_output=True, text=True, timeout=60,
+                    env=dict(_env_without_session_key(), HOME=home,
+                             XDG_STATE_HOME=value, PYTHONPATH=SCRIPTS_DIR,
+                             PYTHONDONTWRITEBYTECODE="1"))
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stdout.splitlines(),
+                                 [expected, expected])
+                self.assertEqual(self._mode(expected), 0o700)
+                self.assertEqual(os.listdir(cwd), [])
+        absolute = os.path.join(self.tmp.name, "xdg")
+        with patch.dict(os.environ, {"XDG_STATE_HOME": absolute}):
+            self.assertEqual(codex_council._state_home(), absolute)
+
+    def test_a_relative_home_is_not_used_either(self):
+        """A relative $HOME would put ~/.local/state under the current
+        directory too; the account's home directory stands in for it."""
+        account = os.path.join(self.tmp.name, "account")
+
+        class Entry:
+            pw_dir = account
+
+        os.environ.pop("XDG_STATE_HOME", None)
+        for home in ("relhome", "./relhome"):
+            with self.subTest(HOME=home), \
+                    patch.dict(os.environ, {"HOME": home}), \
+                    patch.object(codex_council.pwd, "getpwuid",
+                                 return_value=Entry) as lookup:
+                self.assertEqual(codex_council._state_home(),
+                                 os.path.join(account, ".local", "state"))
+                lookup.assert_called_once_with(os.geteuid())
+        with patch.dict(os.environ, {"HOME": account}), \
+                patch.object(codex_council.pwd, "getpwuid") as lookup:
+            self.assertEqual(codex_council._state_home(),
+                             os.path.join(account, ".local", "state"))
+            lookup.assert_not_called()
+
+    def test_the_state_dir_checked_is_the_one_used(self):
+        """A "link/.." spelling is checked where the I/O resolves it, never
+        at its lexically normalized twin."""
+        real = os.path.join(self.tmp.name, "real")
+        os.makedirs(os.path.join(real, "inner"), 0o700)
+        os.symlink(os.path.join(real, "inner"),
+                   os.path.join(self.tmp.name, "link"))
+        state = self._state(
+            os.path.join(self.tmp.name, "link", "..", "codex-council"))
+        self.assertEqual(codex_council._ensure_state_dir(), state)
+        lock = codex_council._try_role_state_lock("architect")
+        self.assertIsNotNone(lock)
+        codex_council._release_role_state_lock(lock)
+        codex_council.save_session("architect", "sid-spelled")
+        self.assertEqual(codex_council.load_session("architect")[0],
+                         "sid-spelled")
+        used = os.path.join(real, "codex-council")
+        self.assertEqual(self._mode(used), 0o700)
+        self.assertEqual(sorted(os.listdir(used)), sorted(
+            os.path.basename(codex_council._state_path("architect")) + suffix
+            for suffix in ("", ".lock")))
+        self.assertFalse(os.path.lexists(
+            os.path.join(self.tmp.name, "codex-council")))
+
+    def test_an_owned_state_dir_of_any_other_mode_is_reset_to_0700(self):
+        """No group/other bits is not enough: an owned real directory
+        missing owner bits (0500, 000, ...) is reset to 0700 too, so the
+        pre-flight never passes a state directory the role lock then
+        cannot use."""
+        for mode in (0o500, 0o300, 0o100, 0o600, 0o000):
+            with self.subTest(mode=f"{mode:04o}"):
+                state = self._state(
+                    os.path.join(self.tmp.name, f"state-{mode:04o}"))
+                os.mkdir(state)
+                os.chmod(state, mode)
+                self.addCleanup(os.chmod, state, 0o700)
+                self.assertEqual(codex_council._ensure_state_dir(), state)
+                self.assertEqual(self._mode(state), 0o700)
+                lock = codex_council._try_role_state_lock("architect")
+                self.assertIsNotNone(lock)
+                codex_council._release_role_state_lock(lock)
+                codex_council.save_session("architect", "sid-reset")
+                self.assertEqual(codex_council.load_session("architect")[0],
+                                 "sid-reset")
+
+    def test_a_state_dir_a_concurrent_council_created_unusable_is_reset(self):
+        """Two first creations race: the other council's mkdir under an
+        owner-clearing umask (0o200 leaves 0500) wins, so this one's
+        FileExistsError path must still end with a usable 0700 directory."""
+        state = self._state(os.path.join(self.tmp.name, "codex-council"))
+        real_mkdir = os.mkdir
+
+        def lose_the_race(path, mode=0o777):
+            real_mkdir(path, 0o500)
+            raise FileExistsError(path)
+
+        with patch.object(codex_council.os, "mkdir", lose_the_race):
+            codex_council._ensure_state_dir()
+        self.addCleanup(os.chmod, state, 0o700)
+        self.assertEqual(self._mode(state), 0o700)
+        lock = codex_council._try_role_state_lock("architect")
+        self.assertIsNotNone(lock)
+        codex_council._release_role_state_lock(lock)
+
+    def test_private_writes_are_0600_under_an_owner_clearing_umask(self):
+        """A umask can clear owner bits too: under 0o400 a file created
+        0600 comes out 0200. The shared atomic writer (state, status,
+        supervisor and reply files) and execution.claim set 0600 through
+        their descriptor."""
+        state = self._state(os.path.join(self.tmp.name, "codex-council"))
+        run_dir = os.path.join(self.tmp.name, "run")
+        os.mkdir(run_dir, 0o700)
+        self._umask(0o400)
+        written = os.path.join(run_dir, "written.json")
+        council_common._atomic_write_private(written, b'{"ok": true}')
+        codex_council._claim_execution(run_dir)
+        codex_council.save_session("architect", "sid-umask")
+        for path in (written,
+                     os.path.join(run_dir, codex_council.EXECUTION_CLAIM_FILENAME),
+                     codex_council._state_path("architect")):
+            with self.subTest(file=os.path.basename(path)):
+                self.assertEqual(self._mode(path), 0o600)
+        with open(written, "rb") as f:
+            self.assertEqual(f.read(), b'{"ok": true}')
+        self.assertEqual(self._mode(state), 0o700)
+        self.assertEqual(codex_council.load_session("architect")[0],
+                         "sid-umask")
+
 
 class StateIOTests(unittest.TestCase):
     def setUp(self):
@@ -482,6 +685,47 @@ class StateIOTests(unittest.TestCase):
                     sid, meta = codex_council.load_session("architect")
                 self.assertIsNone(sid)
                 self.assertIsNone(meta)
+
+    def test_a_fifo_state_file_reads_as_no_saved_thread_at_once(self):
+        """A FIFO at the state path must not hang a resume role (which
+        holds its continuity lock meanwhile): it reads as no saved thread,
+        like corrupt state."""
+        with patch.dict(os.environ, _env_without_session_key(), clear=True):
+            path = codex_council._state_path("architect")
+            os.mkfifo(path, 0o600)
+            loaded = []
+            worker = threading.Thread(
+                target=lambda: loaded.append(
+                    codex_council.load_session("architect")),
+                daemon=True)
+            worker.start()
+            worker.join(10)
+            if worker.is_alive():
+                # Release the blocked open so the thread can finish.
+                with contextlib.suppress(OSError):
+                    os.close(os.open(path, os.O_WRONLY | os.O_NONBLOCK))
+                worker.join(10)
+                self.fail("load_session blocked on a FIFO state file")
+        self.assertEqual(loaded, [(None, None)])
+
+    def test_a_symlinked_or_foreign_state_file_is_not_used(self):
+        """The state file is never read through a symlink, and only an
+        owned regular file counts as a saved thread."""
+        with patch.dict(os.environ, _env_without_session_key(), clear=True):
+            codex_council.save_session("architect", "sid-elsewhere")
+            path = codex_council._state_path("architect")
+            elsewhere = os.path.join(self.tmp.name, "elsewhere.json")
+            os.rename(path, elsewhere)
+            os.symlink(elsewhere, path)
+            self.assertEqual(codex_council.load_session("architect"),
+                             (None, None))
+            os.remove(path)
+            os.rename(elsewhere, path)
+            self.assertEqual(codex_council.load_session("architect")[0],
+                             "sid-elsewhere")
+            with patch("os.geteuid", return_value=os.geteuid() + 1):
+                self.assertEqual(codex_council.load_session("architect"),
+                                 (None, None))
 
     def test_clear_session_removes_only_that_role(self):
         with patch.dict(os.environ, _env_without_session_key(), clear=True):

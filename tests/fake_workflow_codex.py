@@ -141,6 +141,13 @@ def execute(argv):
     if "AUTH_FAILURE" in body:
         emit({"type": "turn.failed", "error": {"message": "HTTP 401 Unauthorized"}})
         return 1
+    if "SYMLINK_FIXTURE" in body:
+        # A role's own tool shim and test pipe beside a real edit; the runner
+        # must list them, never follow or open them.
+        (cwd / "subject.py").write_text("value = 2\n")
+        (cwd / "bin").mkdir()
+        os.symlink("/usr/bin/git", cwd / "bin/git")
+        os.mkfifo(cwd / "test.fifo")
     if "EXPERIMENT_FIXTURE" in body:
         if config(argv).get("sandbox_mode") != "workspace-write":
             return 2

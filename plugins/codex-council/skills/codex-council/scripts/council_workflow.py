@@ -35,7 +35,7 @@ def role_key(role_id: str) -> str:
     return "role-sha256-" + hashlib.sha256(role_id.encode("utf-8")).hexdigest()
 
 
-def _request(run_dir: Path) -> dict[str, Any]:
+def _request(run_dir: Path, *, strict_source: bool = True) -> dict[str, Any]:
     value = read_json(run_dir / "request.json", private=False)
     if not isinstance(value, dict) or set(value) - REQUEST_KEYS:
         raise WorkspaceError("request.json contains an unknown field or is not an object")
@@ -48,7 +48,10 @@ def _request(run_dir: Path) -> dict[str, Any]:
     source = value.get("source_root")
     if not isinstance(source, str) or not os.path.isabs(source):
         raise WorkspaceError("source_root must be an absolute directory path")
-    value["source_root"] = str(Path(source).resolve(strict=True))
+    try:
+        value["source_root"] = str(Path(source).resolve(strict=strict_source))
+    except RuntimeError:  # a symlink loop, before Python 3.13
+        raise WorkspaceError(f"source_root is a symlink loop: {source}") from None
     for key in ("include", "exclude"):
         entries = value.get(key)
         if entries is not None and (not isinstance(entries, list)
@@ -58,7 +61,8 @@ def _request(run_dir: Path) -> dict[str, Any]:
         for item in value["include"]:
             relative_path(item, allow_dot=True)
     value.setdefault("include", None)
-    value.setdefault("exclude", [])
+    if value.get("exclude") is None:
+        value["exclude"] = []  # null means no exclusions, as capture records it
     return value
 
 
@@ -89,7 +93,10 @@ def prepare(run_dir: str, roles: list[Any], body: str) -> dict[str, Any]:
     # A failed capture consumes this directory, even if it never wrote run.json.
     claim = os.open(directory / "prepare.lock", os.O_WRONLY | os.O_CREAT
                     | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    os.close(claim)
+    try:
+        os.fchmod(claim, 0o600)  # 0600 whatever the umask
+    finally:
+        os.close(claim)
     snapshot = capture(source, directory / "baseline", include=request["include"],
                        exclude=request["exclude"])
     for name in ("workspaces", "evidence", "catalogs"):
@@ -122,8 +129,8 @@ def prepare(run_dir: str, roles: list[Any], body: str) -> dict[str, Any]:
 
 
 def load_plan(run_dir: str | Path, roles: list[Any] | None = None,
-              body: str | None = None, *, verify_inputs: bool = False
-              ) -> dict[str, Any] | None:
+              body: str | None = None, *, verify_inputs: bool = False,
+              strict_source: bool = True) -> dict[str, Any] | None:
     directory = private_dir(run_dir)
     path = directory / PLAN_FILE
     if not os.path.lexists(path):
@@ -133,7 +140,14 @@ def load_plan(run_dir: str | Path, roles: list[Any] | None = None,
     plan = read_json(path)
     if not isinstance(plan, dict) or plan.get("schema") != PLAN_SCHEMA:
         raise WorkspaceError("unsupported or invalid run.json")
-    request = _request(directory)
+    request = _request(directory, strict_source=strict_source)
+    recorded = plan.get("snapshot")
+    if (not strict_source and isinstance(recorded, dict)
+            and not os.path.isdir(request["source_root"])):
+        # --freshness only: a source gone with a link it was spelled
+        # through no longer resolves to the recorded root, so the rest of
+        # the request is checked against that root (freshness: unknown).
+        request["source_root"] = recorded.get("source_root")
     if plan.get("request_sha256") != digest(request):
         raise WorkspaceError("request changed after capture; prepare a fresh invocation")
     snapshot, bindings = plan.get("snapshot"), plan.get("roles")
@@ -286,15 +300,26 @@ def plan_lines(plan: dict[str, Any], roles: list[Any], stall_secs: int) -> list[
 
 def freshness_command(run_dir: str) -> int:
     directory = private_dir(run_dir)
-    plan = load_plan(directory)
+    # A moved or deleted source is a freshness answer (unknown), not a
+    # contract error.
+    plan = load_plan(directory, strict_source=False)
     if plan is None:
         raise WorkspaceError("this run has no captured inputs")
-    result = freshness(plan["snapshot"])
+    snapshot = plan["snapshot"]
+    source = _request(directory, strict_source=False)["source_root"]
+    if not os.path.isdir(source):
+        # The source request.json names is gone, though the recorded root
+        # may outlive a link it was reached through: unknown, named as
+        # spelled.
+        snapshot = {**snapshot, "source_root": source}
+    result = freshness(snapshot)
     try:
         context = (directory / "context.md").read_bytes()
         if hashlib.sha256(context).hexdigest() != plan["context_sha256"]:
-            result = {"state": "stale", "reason": "staged context changed"}
+            result.update(state="stale", reason="staged context changed")
     except OSError:
-        result = {"state": "unknown", "reason": "context unavailable"}
+        result["reason"] = "context unavailable"
+        if result["state"] != "stale":
+            result["state"] = "unknown"
     print(json.dumps(result, ensure_ascii=True, sort_keys=True))
     return 0 if result["state"] == "unchanged" else 1
