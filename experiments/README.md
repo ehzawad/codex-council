@@ -1,96 +1,72 @@
-# Decision receipts: checkout-only experiment for issue #22
+# Optional host-position receipts (issue #22)
 
-This is **not an installed plugin feature**. The stable runner, skill, permissions,
-model selection, run formats and invocation timing are unchanged. Nothing imports
-this helper from the plugin; nothing injects its output into Claude's context.
-Use it explicitly from this checkout while evaluating the idea. Do not merge or
-promote it merely because deterministic tests pass.
+**Checkout-only experiment; keep PR #23 open and unmerged for local evaluation.**
+Nothing in the installed plugin, skill, permissions, model selection, or normal
+invocation path changes. The helper adds no default prompt content.
 
-## The corrected mental model
+## Who decides?
 
-A **chunk** is some work. A **worker/role** is who does it. A **checkpoint** is a
-useful decision boundary. A **receipt** records the evidence and reasoning behind
-that decision. These are not one-to-one. One Codex worker can implement several
-chunks, run several checks, and return one contribution. One receipt can cover
-several criteria and contributions from multiple runs; several independent
-receipts can refer to the same run. No new worker is created by this helper.
+Council contributes observations, explanations, proposals, or artifacts for any
+task. Claude, as lead host, decides what to do within the user's instructions and
+permissions. Other hosts can use the same helper. A collaborator's conclusion is
+input to that decision, not an approval or veto.
 
-Do not require a new role, rule, process, review, or receipt for every chunk. Reuse
-criteria when the requirements are the same. Chunk size, role count, model/thread
-continuity and when to invoke Council remain host decisions. The design borrows
-explicit evidence boundaries from [Helix](https://shopify.engineering/helix), not
-its ordered gate sequence or platform-specific reviews.
+This helper records the host's **working position**, not a Council verdict:
 
-Fresh context remains authoritative. Historical receipts are useful only when the
-current inputs do not explain a consequential prior decision: for example, why
-an alternative was rejected, what an earlier experiment actually ruled out, or
-which assumptions supported a decision before compaction. Current code alone may
-not preserve those reasons. If current artifacts and the fresh brief already
-contain the needed information, **skip receipts entirely**. A past rejection is
-not a permanent veto, and acceptance is not a general permission grant.
+| `host_position` | Meaning |
+|---|---|
+| `use_for_now` | The host provisionally relies on this scoped result. All declared criteria need supporting evidence and unchanged captured inputs. |
+| `revisit` | The host wants to reconsider. Passing checks do not prevent this. |
+| `needs_evidence` | At least one declared check is blocked or unassessed. |
+| `set_aside` | Stop relying on this position; retain its history. No new evidence is claimed. |
 
-## Small first slice, not a checkpoint scheduler
+These labels describe records, not instructions for the host or workflow. Even a
+valid `use_for_now` receipt grants no permission to edit, publish, or merge. Host
+attribution (`recorded_by`) is self-reported, not authenticated user approval.
 
-`decision_receipts.py` reuses the existing capture/integrity helpers and reads
-existing prepared runs and their evidence. It never dispatches Codex, executes
-commands found in evidence, modifies a run, applies artifacts, changes model
-settings, or schedules a follow-up. Git metadata reads can occur during freshness
-checks, using the same helper as the runner.
+One worker can handle many chunks and checks. Several contributions can support
+one receipt. There is no worker, role, rule, or receipt per chunk. Use a receipt
+only to retain a consequential reason or experiment that the current brief does
+not already preserve. Otherwise skip it. Current intent and evidence outrank
+history; there is no automatic lookup or context injection.
 
-There are three explicit operations:
+## Working with Claude's existing loop
 
-- `declare`: freeze task-specific criteria against one or more **prepared but not
-  launched** runs with the same captured subject. No recapture or second source
-  copy is needed. Use an existing private directory outside source/run trees.
-- `decide`: record the host's accepted/rejected/blocked/withdrawn decision with an
-  expected revision. Command evidence must match a recorded command event and its
-  declared expected exit; a judgment remains a judgment, not empirical proof.
-- `status`: inspect only the selected receipt against an explicitly supplied
-  current decision contract and currently readable inputs/evidence. Default output
-  is at most **2048 UTF-8 bytes**, not tokens. Omissions are reported, and stale or
-  unknown binding status is never silently removed to fit the budget.
+Claude or its workflow continues to plan, test, revise, and recover. This helper
+starts no worker, retry, rollback, or follow-up and blocks no unrelated work. It
+only validates explicit record operations. Reconsideration need not wait for it.
 
-No automatic history search, parent-dependency graph, approval authority,
-transitions that control other work, or global memory. A single private JSON file
-preserves revisions under a stable advisory lock and atomic replacement. A
-compare-and-set revision prevents lost updates; a busy lock returns a conflict,
-not an indefinite wait. There is a 1 MiB history bound for this small experiment.
-No success is claimed if persistence fails. Do not remove a live lock file.
+When changing course, the host may record `revisit` even after successful checks,
+or `set_aside` after requirements change or old run evidence disappears. A different
+question or criteria needs a new declaration. Restoring file bytes does not undo a
+recorded change of position; reread current intent before reuse.
 
-The **current decision contract** is not the entire conversation. It is the narrow
-question, requirements and assumptions whose answer the host is considering reusing.
-Other turns can change without invalidating it. The host must update this contract
-when the question or assumptions actually change; the tool cannot read the user's
-mind. Referenced requirements, fixtures and dependency lock files should also be
-in the prepared run's captured scope.
+Claude Code's [dynamic workflows](https://code.claude.com/docs/en/workflows) own
+their scripted execution loops. Its [rewind](https://code.claude.com/docs/en/checkpointing)
+is separate: Bash changes, external changes, and many subagent edits are not
+reliably restored by session checkpoints. Receipt storage is not automatically
+synchronized with rewind. Never assume recovery undoes every side effect.
 
-## Example: one worker, two checks, one decision
+## Usage
 
-Prepare a normal Council run using the existing skill. The final candidate should
-already be its captured input. A read-only contribution can check several
-properties in one turn. Before `--start`, write a contract such as:
+Python 3.12+, macOS or Ubuntu. Prepare a normal Council run first. Keep a private
+receipt directory outside the source/run trees. Before the selected runs launch,
+write a narrow contract (not the conversation history):
 
 ```json
 {
   "schema": "codex-council/decision-contract@1",
   "task_id": "parser-check",
-  "decision_id": "parser-boundary",
-  "question": "Does this candidate preserve valid input and reject invalid input?",
-  "assumptions": ["Only the captured fixtures and local behavior are in scope."],
-  "criteria": [
-    {"id": "valid", "kind": "command", "expected_exit": 0,
-     "expectation": "The valid-input test command succeeds."},
-    {"id": "invalid", "kind": "command", "expected_exit": 1,
-     "expectation": "The deliberately invalid-input probe fails as expected."}
-  ]
+  "decision_id": "input-behavior",
+  "question": "Does this candidate preserve the required input behavior?",
+  "assumptions": ["Only captured fixtures and local behavior are in scope."],
+  "criteria": [{"id": "behavior", "kind": "command", "expected_exit": 0,
+                "expectation": "The relevant behavioral test succeeds."}]
 }
 ```
 
-`task_id` must equal the prepared run's task id. Choose expectations from the
-actual checks; `expected_exit: 1` above is an example, not a universal failure
-rule. An investigation can succeed by disproving a hypothesis.
-
-From the repository checkout, substitute the actual absolute paths:
+`task_id` must match the prepared runs; all referenced runs examine the same
+captured subject. Repeat `--run` to bind multiple runs. Use actual absolute paths:
 
 ```zsh
 python3 experiments/decision_receipts.py declare \
@@ -98,134 +74,100 @@ python3 experiments/decision_receipts.py declare \
   --contract /absolute/contract.json --run /absolute/prepared-run
 ```
 
-Now launch/follow Council normally. After it has ended, read `result.json`, the
-reply, and relevant attempt logs. Use the actual `run_id`, role id, attempt
-metadata filename, and **zero-based command index** to author the decision:
+Launch/follow Council normally. After the run ends, Claude inspects its reply,
+`result.json`, and evidence, then explicitly authors a record such as:
 
 ```json
 {
   "expected_revision": 0,
-  "actor": "local-host",
-  "disposition": "accepted",
-  "rationale": "Both declared behaviors were observed; no broader claim is made.",
-  "outcomes": [
-    {"criterion_id": "valid", "outcome": "supported",
-     "evidence": {"run_id": "ACTUAL_RUN_ID", "role_id": "ACTUAL_ROLE_ID",
-                  "attempt_file": "ACTUAL_ATTEMPT_FILENAME.json", "command_index": 0}},
-    {"criterion_id": "invalid", "outcome": "supported",
-     "evidence": {"run_id": "ACTUAL_RUN_ID", "role_id": "ACTUAL_ROLE_ID",
-                  "attempt_file": "ACTUAL_ATTEMPT_FILENAME.json", "command_index": 1}}
-  ]
+  "recorded_by": "claude-code-lead",
+  "host_position": "use_for_now",
+  "rationale": "I provisionally rely on this result for the declared scope only.",
+  "outcomes": [{"criterion_id": "behavior", "outcome": "supported",
+                "evidence": {"run_id": "ACTUAL_RUN_ID", "role_id": "ACTUAL_ROLE_ID",
+                             "attempt_file": "ACTUAL_ATTEMPT_FILENAME.json",
+                             "command_index": 0}}]
 }
 ```
 
+The command index is zero-based. Outcomes are `supported`, `contradicted`,
+`blocked`, or `unassessed`; the first two require evidence. Account for every
+criterion except when setting aside: use `outcomes: []` and explain why. Every
+update uses the current revision. `set_aside` may use changed requirements but
+must retain the same task/decision ids; it does not revalidate the new question.
+
 ```zsh
-python3 experiments/decision_receipts.py decide \
+python3 experiments/decision_receipts.py record \
   --store /absolute/private-receipt-dir \
-  --contract /absolute/current-contract.json --decision /absolute/decision.json
+  --contract /absolute/current-contract.json --decision /absolute/host-position.json
 python3 experiments/decision_receipts.py status \
   --store /absolute/private-receipt-dir --contract /absolute/current-contract.json
 ```
 
-For non-Git work, use the runner's explicit input selection. A criterion with
-`kind: "judgment"` has no `expected_exit`; its evidence contains just `run_id` and
-`role_id`. The host records its rationale after assessing that contribution.
-Such a receipt is explicitly labeled `host-judgment-of-collaborator-text`.
+`status` exits 0 for matching recorded bindings, 1 for stale/unknown, and 2 for
+invalid inputs or conflict. **Exit 0 is not approval, correctness, or a merge
+recommendation.** Read `recorded_host_position` separately. The default summary
+is bounded to 2,048 UTF-8 bytes and retains the binding status and advisory-only
+label even when details are omitted. No current contract means unknown.
 
-Every criterion needs an outcome: supported, contradicted, blocked, or unassessed.
-Supported/contradicted need evidence. Accepted requires all supported; rejected
-requires at least one contradicted; blocked requires at least one gap. Withdrawn
-has no new outcomes and a rationale, retaining the previous history. Any revision
-uses the current `expected_revision`; a conflict requires rereading, not blind
-retry. Changed criteria need a new declaration, not rewriting the old record.
+Expected nonzero exits can support intentional failure reproductions. For
+non-command reasoning use `kind: "judgment"`, omit `expected_exit`, and reference
+only `run_id` and `role_id`. That remains the host's judgment about a contribution,
+not empirical proof. Non-Git and context-only tasks use the same protocol.
 
-`status` returns 0 only for unchanged captured bindings, 1 for stale/unknown, and
-2 for invalid input or a conflict. **Exit 0 does not mean accepted or correct.**
-Inspect `recorded_disposition` as well. Without a current contract the binding is
-unknown. Recall does not change historical decisions. A rejected candidate that
-later changes is stale history, not evidence against its new version.
+## Boundaries
 
-## What can go wrong, and what this prototype does not promise
+Reusable supporting/contradicting evidence currently requires input-preserving,
+read-only contributions with external tools and command network disabled. This is
+a limit of the experiment, **not a restriction on Council's task or role**. A
+writable worker can still implement and test many chunks. Capture its final
+candidate for validation only when a reusable final-state record is worthwhile;
+this helper cannot prove that an earlier green check examined the final bytes.
 
-**Wrong scope or circular reasoning.** A convenient test can pass while missing
-the actual requirement. The same model can invent a weak criterion and accept its
-own answer. A matching exit code does not establish test adequacy, independence,
-or task success. The host still checks relevance and may commission independent
-work when useful. There is no automatic second reviewer.
+Hashes and Codex JSONL do not prove test adequacy, independence, truth, or actual
+sandbox enforcement. Scope may omit dependencies, remote state, toolchain changes,
+or new intent. Check those separately. Broad scope can cause needless invalidation;
+rehashing large inputs/logs costs time. Missing evidence means unknown.
 
-**Version confusion.** Evidence for input A cannot certify candidate B after a
-writer changes it. This first version accepts evidentiary outcomes only from
-input-preserving read-only contributions with external tools denied, checking
-both baseline and worker workspace against the captured subject. After writable
-experiments, capture the chosen final candidate for a final-state check when a
-reusable acceptance is worthwhile. The same collaborator can do several chunks
-before that boundary. Do not recheck every trivial edit just to earn a receipt.
-The helper does not prove that an earlier command in a mutating run tested its
-final output. It refuses that claim instead of trusting a final prose assurance.
+Private JSON, advisory locking, revision checks, and atomic replacement preserve
+history but are not a same-user security boundary. Reads never execute recorded
+commands. Receipt schema is now `decision-receipt@2`; old `@1` records and the old
+`decide` command are intentionally not silently reinterpreted. Inspect old records
+with their original checkout; start a new declaration for new work.
 
-**Stale or anchoring history.** Fresh requirements win. Relevant source/reference
-changes make the old binding stale; missing or changed evidence makes it unknown.
-All recorded raw streams are rehashed at recording and recall. Current contract
-and scope matching do not observe remote services, toolchain changes, hidden
-inputs, changed user intent or unrecorded dependencies. Include meaningful version
-information in the contract and recheck external conditions separately. Matching
-bindings are not an attestation of a current execution environment.
+## Local evaluation prompt
 
-**Context and bookkeeping costs.** Nothing is loaded automatically. Select one
-relevant receipt, read its bounded summary, and fetch detailed evidence only when
-needed. Do not paste the whole history into `context.md`. Even with small output,
-rehashing large captures/logs can be expensive. No cross-run cache, arbitrary
-optimization or automatic invalidation exception is added in this experiment.
+```text
+Review PR #23 against current main. Read issue #22, this README, and the diff.
+Do not merge, enable auto-merge, close the issue, publish, or change main.
+Preserve native model/effort settings, credentials, and permission boundaries.
 
-**Trust and lifecycle.** Local JSON, hashes, permissions and advisory locks are
-not a same-user security boundary. `actor` is self-attributed, never authenticated
-human approval. Raw JSONL is Codex-reported evidence, not an independent OS audit.
-Checks are observed, not atomic against arbitrary outside writers. Keep evidence
-until its decision is no longer needed; deleting runs makes recall unknown. No
-permission or native setting is changed by any receipt disposition.
+Claude is the lead decision-maker within my instructions. Council is an on-demand,
+task-shaped collaborator, not a fixed reviewer or authority. One worker may do
+many chunks. Receipts record Claude's revisable position, not Council approval.
+No automatic receipt lookup, extra reviewer, workflow, or per-turn invocation.
 
-## Verification and local go/no-go
+Run the offline tests and pinned lint. Then use disposable fixtures and the
+installed signed-in tools to compare fresh-context-only work with explicit
+receipt lookup under equivalent current inputs and available evidence.
+Check one worker/many checks; a non-coding task; handoff after compaction; changed
+requirements; reconsideration after passing checks; setting aside after missing
+evidence; rollback without reviving an old position; and no receipt for a simple
+task. A native repair loop must remain free to change course.
 
-Run from this checkout (Python 3.12+ on macOS or Ubuntu):
+Record exact versions/SHAs, observed behavior, added calls/context, stale-position
+mistakes, and bookkeeping. Fix reproduced defects only on the PR branch and rerun
+checks; do not weaken protections or claim fake tests prove real sandbox behavior.
+Separate Git conflict status, CI, and functional usefulness. Report ready for my
+review, needs changes, or insufficient evidence. I decide whether to merge.
+```
 
 ```zsh
 python3 -B -m unittest discover -s tests -p 'test_decision_receipts.py' -v
 python3 -B -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
-The tests include one real runner invocation with a fake Codex worker performing
-two actual local checks, without dispatching a worker per check. The fake proves
-protocol integration, not model quality or actual Codex sandbox enforcement.
-Other tests cover non-Git judgment, expected failures, two runs/one decision,
-changed candidates/criteria, missing evidence, bounded output, concurrent updates,
-interrupted persistence, and unchanged installed-plugin files.
-
-Use this local evaluation prompt with Claude, Codex, or Antigravity:
-
-```text
-Evaluate the checkout-only decision-receipt experiment for issue #22.
-Read experiments/README.md and the actual diff. Do not change native models,
-permissions or the stable plugin. Do not merge or publish anything.
-
-First run the offline tests and inspect their assertions. Then, with my normal
-signed-in local tools, test one worker doing several chunks/checks with a single
-useful final decision. Use the existing Council capture and execution path; the
-receipt helper must not cause another worker to be dispatched on its own.
-
-Compare fresh-context-only handling with explicit receipt lookup after a
-compaction or interruption, including a rejected alternative with unchanged
-inputs and another whose requirements have changed. Also include a simple task
-where the correct decision is not to use receipts at all. Use equivalent current
-inputs and available evidence for the comparison; do not give the receipt variant
-privileged facts. Preserve current requirements over any historical decision.
-
-Record actual model/tool calls, total added context bytes, repeated experiments,
-stale acceptance/rejection mistakes, and human bookkeeping. Distinguish deterministic
-binding checks from model judgment. A smaller summary is not proof of a better
-decision. Report pass/fail/unknown with evidence and recommend keep, revise, or
-remove. Do not enlarge this into a workflow engine to make the evaluation pass.
-```
-
-Promotion needs evidence of reduced repeated work or better handoff without worse
-stale decisions or unnecessary calls/context. If the fresh brief already suffices,
-leaving this experiment unused, or removing it, is a successful design outcome.
+Offline tests use fake protocol data plus a real-runner subprocess fixture, not
+paid inference or real sandbox validation. Promote only after local comparisons
+show useful handoffs or less repeated work without worse decisions or overhead.
+Leaving this experiment unused or removing it is a valid outcome.

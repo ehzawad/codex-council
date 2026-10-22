@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Opt-in decision receipts. No worker dispatch, scheduler, or prompt injection.
+"""Optional records of the host's working position, never a Council verdict.
+
+Claude (or the caller's lead host) owns decisions within user authorization.
+Collaborators supply observations and proposals; this helper only records the
+host's revisable position. It never drives a workflow, dispatches workers,
+injects context, grants approval, or applies/reverts changes.
 
 This checkout-only experiment reads prepared Council runs. Hashes establish
 record identity, not semantic truth, independent review, or user authorization.
@@ -33,10 +38,11 @@ try:
 finally:
     sys.dont_write_bytecode = _previous_bytecode
 
-SCHEMA = "codex-council/decision-receipt@1"
+SCHEMA = "codex-council/decision-receipt@2"
 CONTRACT = "codex-council/decision-contract@1"
 ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}\Z")
 MAX_STATE_BYTES = 1024 * 1024
+HOST_POSITIONS = ("use_for_now", "revisit", "needs_evidence", "set_aside")
 
 
 def require(condition: bool, message: str) -> None:
@@ -125,7 +131,10 @@ def read(root: Path) -> dict[str, Any]:
     require(isinstance(value["runs"], dict) and 0 < len(value["runs"]) <= 16, "invalid run bindings")
     require(isinstance(value["history"], list), "invalid history")
     for number, event in enumerate(value["history"], 1):
-        require(isinstance(event, dict) and event.get("revision") == number, "invalid revision sequence")
+        require(isinstance(event, dict) and type(event.get("revision")) is int
+                and event["revision"] == number, "invalid revision sequence")
+        require(event.get("host_position") in HOST_POSITIONS
+                and text(event.get("recorded_by"), 200), "invalid recorded host position")
     return value
 
 
@@ -263,15 +272,24 @@ def evidence(state: dict, rule: dict, outcome: dict) -> dict:
             else "host-judgment-of-collaborator-text"}
 
 
-def decide(directory: str | Path, decision: dict, current: dict) -> dict:
-    fields(decision, {"expected_revision", "actor", "disposition", "rationale", "outcomes"})
+def record(directory: str | Path, decision: dict, current: dict) -> dict:
+    """Validate a host-authored record, not whether the host may continue work."""
+    fields(decision, {"expected_revision", "recorded_by", "host_position", "rationale", "outcomes"})
     require(type(decision["expected_revision"]) is int and decision["expected_revision"] >= 0,
             "expected_revision must be a nonnegative integer")
-    require(text(decision["actor"], 200) and text(decision["rationale"]), "actor and rationale required")
-    require(decision["disposition"] in ("accepted", "rejected", "blocked", "withdrawn"), "invalid disposition")
+    require(text(decision["recorded_by"], 200) and text(decision["rationale"]), "recorded_by and rationale required")
+    require(decision["host_position"] in HOST_POSITIONS, "invalid host_position")
     with locked(directory) as root:
         state = read(root)
-        require(contract(current) == state["contract"], "decision contract changed; declare a new receipt")
+        current = contract(current)
+        position = decision["host_position"]
+        if position == "set_aside":
+            # Retiring a previous position makes no claim about new evidence.
+            # Permit this even when requirements changed or old runs are gone.
+            require(all(current[key] == state["contract"][key]
+                        for key in ("task_id", "decision_id")), "decision identity changed")
+        else:
+            require(current == state["contract"], "decision contract changed; declare a new receipt")
         require(decision["expected_revision"] == len(state["history"]), "revision conflict; reread before updating")
         rules = {rule["id"]: rule for rule in state["contract"]["criteria"]}
         outcomes = decision["outcomes"]
@@ -288,29 +306,31 @@ def decide(directory: str | Path, decision: dict, current: dict) -> dict:
                 observations.append(evidence(state, rules[key], outcome))
             else:
                 require("evidence" not in outcome, "blocked/unassessed outcomes must not claim usable evidence")
-        disposition = decision["disposition"]
-        if disposition == "withdrawn":
-            require(not outcomes, "withdrawal has no new evidence; explain it in rationale")
+        if position == "set_aside":
+            require(not outcomes, "set_aside has no new evidence; explain it in rationale")
         else:
             require(set(seen) == set(rules), "account for every declared criterion")
-            if disposition == "accepted":
-                require(set(seen.values()) == {"supported"}, "acceptance requires every criterion supported")
+            if position == "use_for_now":
+                require(set(seen.values()) == {"supported"}, "use_for_now requires every criterion supported")
                 for stored in state["runs"].values():
                     _, plan = checked_plan(stored["directory"])
                     require(digest(plan) == stored["plan_digest"], "run contract changed")
                     require(freshness(plan["snapshot"])["state"] == "unchanged",
                             "current subject is stale or unknown")
-            elif disposition == "rejected":
-                require("contradicted" in seen.values(), "rejection needs a contradicted criterion")
-            else:
-                require(any(v in ("blocked", "unassessed") for v in seen.values()), "blocked decision needs a gap")
+            elif position == "needs_evidence":
+                require(any(v in ("blocked", "unassessed") for v in seen.values()),
+                        "needs_evidence requires a gap")
+            # revisit may follow passing checks: the host can change strategy
+            # without manufacturing a failed criterion or a new worker run.
         event = {**decision, "revision": len(state["history"]) + 1,
-                 "evidence": observations, "authority": "self-attributed-host-decision-not-authentication"}
+                 "evidence": observations, "current_contract_sha256": digest(current),
+                 "authority": "self-attributed-host-position-not-approval"}
         # Preserve historical outcomes. Current applicability is computed only
         # at explicit recall against a supplied current decision contract.
         state["history"].append(event)
         save(root, state)
-        return {"revision": event["revision"], "disposition": disposition}
+        return {"revision": event["revision"], "host_position": position,
+                "decision_owner": "host", "authority": "advisory-only"}
 
 
 def status(directory: str | Path, current: dict | None = None, *, max_bytes: int = 2048) -> dict:
@@ -357,13 +377,13 @@ def status(directory: str | Path, current: dict | None = None, *, max_bytes: int
                         binding = "unknown"
         result = {"decision_id": state["contract"]["decision_id"],
                   "revision": len(state["history"]),
-                  "recorded_disposition": latest["disposition"] if latest else "undeclared-outcome",
+                  "recorded_host_position": latest["host_position"] if latest else "not-recorded",
                   "binding_status": binding,
-                  "next_action": "reconcile-current-request; never automatic permission or proof",
+                  "decision_owner": "host", "authority": "advisory-only",
                   "gaps": sorted(set(gaps)), "details_omitted": False}
         details = {"question": state["contract"]["question"],
                    "rationale": latest["rationale"] if latest else None,
-                   "actor": latest["actor"] if latest else None,
+                   "recorded_by": latest["recorded_by"] if latest else None,
                    "criterion_outcomes": {item["criterion_id"]: item["outcome"]
                                           for item in latest["outcomes"]} if latest else {},
                    "record": str(root / "receipt.json")}
@@ -384,10 +404,10 @@ def main(argv: list[str] | None = None) -> int:
     begin.add_argument("--store", required=True)
     begin.add_argument("--contract", required=True)
     begin.add_argument("--run", action="append", required=True)
-    record = commands.add_parser("decide", help="record an attributed host decision, not model votes")
-    record.add_argument("--store", required=True)
-    record.add_argument("--decision", required=True)
-    record.add_argument("--contract", required=True)
+    note = commands.add_parser("record", help="record the host's revisable position; never decide for it")
+    note.add_argument("--store", required=True)
+    note.add_argument("--decision", required=True)
+    note.add_argument("--contract", required=True)
     recall = commands.add_parser("status", help="read only the explicitly selected decision; no auto retrieval")
     recall.add_argument("--store", required=True)
     recall.add_argument("--contract")
@@ -396,8 +416,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "declare":
             result = declare(args.store, read_json(Path(args.contract), private=False), args.run)
-        elif args.command == "decide":
-            result = decide(args.store, read_json(Path(args.decision), private=False),
+        elif args.command == "record":
+            result = record(args.store, read_json(Path(args.decision), private=False),
                             read_json(Path(args.contract), private=False))
         else:
             current = read_json(Path(args.contract), private=False) if args.contract else None

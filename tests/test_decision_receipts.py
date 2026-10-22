@@ -99,25 +99,25 @@ class ReceiptTests(unittest.TestCase):
         write_result(run, plan, [Result(role=self.roles[0])])
         return spool.key + ".json"
 
-    def decision(self, attempt, disposition="accepted", run=None, plan=None):
+    def decision(self, attempt, host_position="use_for_now", run=None, plan=None):
         plan = plan or self.plan
-        return {"expected_revision": 0, "actor": "test-host", "disposition": disposition,
+        return {"expected_revision": 0, "recorded_by": "test-host", "host_position": host_position,
                 "rationale": "Both declared predicates match the observed exits.",
                 "outcomes": [{"criterion_id": name, "outcome": "supported",
                               "evidence": {"run_id": plan["run_id"], "role_id": "batch",
                                            "attempt_file": attempt, "command_index": index}}
                              for index, name in enumerate(("positive", "negative"))]}
 
-    def accepted(self):
+    def use_for_now(self):
         self.declare()
         decision = self.decision(self.finish())
-        receipts.decide(self.store, decision, self.spec)
+        receipts.record(self.store, decision, self.spec)
         return decision
 
     def test_one_worker_supports_multiple_chunks_and_expected_failure(self):
-        self.accepted()
+        self.use_for_now()
         summary = receipts.status(self.store, self.spec)
-        self.assertEqual(summary["recorded_disposition"], "accepted")
+        self.assertEqual(summary["recorded_host_position"], "use_for_now")
         self.assertEqual(summary["binding_status"], "match")
         self.assertEqual(len(summary["criterion_outcomes"]), 2)
         self.assertLessEqual(len(canonical(summary)) + 1, 2048)
@@ -132,11 +132,11 @@ class ReceiptTests(unittest.TestCase):
                                   "expectation": "The two columns agree in this captured table."}]
         self.declare()
         self.finish()
-        decision = {"expected_revision": 0, "actor": "host", "disposition": "accepted",
+        decision = {"expected_revision": 0, "recorded_by": "host", "host_position": "use_for_now",
                     "rationale": "Reviewed the comparison; no extrapolation beyond these rows.",
                     "outcomes": [{"criterion_id": "comparison", "outcome": "supported",
                                   "evidence": {"run_id": self.plan["run_id"], "role_id": "batch"}}]}
-        receipts.decide(self.store, decision, self.spec)
+        receipts.record(self.store, decision, self.spec)
         state = receipts.read(self.store)
         self.assertEqual(state["history"][0]["evidence"][0]["provenance"],
                          "host-judgment-of-collaborator-text")
@@ -150,22 +150,22 @@ class ReceiptTests(unittest.TestCase):
         a, b = self.finish(), self.finish(other, second)
         decision = self.decision(a)
         decision["outcomes"][1]["evidence"].update(run_id=second["run_id"], attempt_file=b)
-        receipts.decide(self.store, decision, self.spec)
+        receipts.record(self.store, decision, self.spec)
         self.assertEqual(receipts.status(self.store, self.spec)["binding_status"], "match")
 
     def test_no_current_contract_is_unknown(self):
-        self.accepted()
+        self.use_for_now()
         self.assertEqual(receipts.status(self.store)["binding_status"], "unknown")
 
-    def test_current_requirements_override_old_acceptance(self):
-        self.accepted()
+    def test_current_requirements_override_old_position(self):
+        self.use_for_now()
         changed = copy.deepcopy(self.spec)
         changed["criteria"][0]["expected_exit"] = 1
         self.assertEqual(receipts.status(self.store, changed)["binding_status"], "stale")
-        self.assertEqual(receipts.status(self.store, changed)["recorded_disposition"], "accepted")
+        self.assertEqual(receipts.status(self.store, changed)["recorded_host_position"], "use_for_now")
 
     def test_source_and_fixture_edits_invalidate_receipt(self):
-        self.accepted()
+        self.use_for_now()
         for name in ("subject.py", "requirements.txt"):
             path = self.source / name
             old = path.read_bytes()
@@ -173,29 +173,29 @@ class ReceiptTests(unittest.TestCase):
             self.assertEqual(receipts.status(self.store, self.spec)["binding_status"], "stale")
             path.write_bytes(old)
 
-    def test_old_rejection_is_not_a_permanent_veto(self):
+    def test_old_revisit_position_is_not_a_permanent_veto(self):
         self.declare()
-        decision = self.decision(self.finish(), "rejected")
+        decision = self.decision(self.finish(), "revisit")
         decision["outcomes"][0]["outcome"] = "contradicted"
         decision["outcomes"][0]["evidence"]["command_index"] = 1
-        receipts.decide(self.store, decision, self.spec)
+        receipts.record(self.store, decision, self.spec)
         (self.source / "subject.py").write_text("value = 2\n")
         summary = receipts.status(self.store, self.spec)
-        self.assertEqual((summary["recorded_disposition"], summary["binding_status"]), ("rejected", "stale"))
+        self.assertEqual((summary["recorded_host_position"], summary["binding_status"]), ("revisit", "stale"))
 
-    def test_refuses_stale_candidate_at_acceptance(self):
+    def test_refuses_stale_candidate_at_recording(self):
         self.declare()
         decision = self.decision(self.finish())
         (self.source / "subject.py").write_text("value = 2\n")
         with self.assertRaisesRegex(WorkspaceError, "stale or unknown"):
-            receipts.decide(self.store, decision, self.spec)
+            receipts.record(self.store, decision, self.spec)
 
-    def test_candidate_changed_after_checks_is_not_accepted(self):
+    def test_candidate_changed_after_checks_cannot_be_used_for_now(self):
         self.declare()
         decision = self.decision(self.finish())
         (self.run / "workspaces/batch/subject.py").write_text("value = 2\n")
         with self.assertRaisesRegex(WorkspaceError, "captured input changed"):
-            receipts.decide(self.store, decision, self.spec)
+            receipts.record(self.store, decision, self.spec)
 
     def test_writable_experiment_is_not_final_candidate_proof(self):
         self.roles = [RoleFixture(id="batch", execution={"sandbox": "workspace-write"})]
@@ -204,7 +204,7 @@ class ReceiptTests(unittest.TestCase):
         self.plan = self.stage(self.run)
         self.declare()
         with self.assertRaisesRegex(WorkspaceError, "captured final-state"):
-            receipts.decide(self.store, self.decision(self.finish()), self.spec)
+            receipts.record(self.store, self.decision(self.finish()), self.spec)
 
     def test_no_posthoc_criteria_declaration(self):
         self.finish()
@@ -222,58 +222,58 @@ class ReceiptTests(unittest.TestCase):
         changed = copy.deepcopy(self.spec)
         changed["question"] = "New question"
         with self.assertRaisesRegex(WorkspaceError, "contract changed"):
-            receipts.decide(self.store, decision, changed)
+            receipts.record(self.store, decision, changed)
 
-    def test_blocked_check_cannot_be_accepted(self):
+    def test_blocked_check_cannot_be_used_for_now(self):
         self.declare()
         decision = self.decision("missing")
         decision["outcomes"] = [{"criterion_id": key, "outcome": "blocked"} for key in ("positive", "negative")]
         with self.assertRaisesRegex(WorkspaceError, "every criterion supported"):
-            receipts.decide(self.store, decision, self.spec)
-        decision["disposition"] = "blocked"
-        receipts.decide(self.store, decision, self.spec)
+            receipts.record(self.store, decision, self.spec)
+        decision["host_position"] = "needs_evidence"
+        receipts.record(self.store, decision, self.spec)
 
     def test_wrong_expected_exit_does_not_pass(self):
         self.declare()
         decision = self.decision(self.finish())
         decision["outcomes"][0]["evidence"]["command_index"] = 1
         with self.assertRaisesRegex(WorkspaceError, "contradicts"):
-            receipts.decide(self.store, decision, self.spec)
+            receipts.record(self.store, decision, self.spec)
 
     def test_unknown_or_missing_criterion_does_not_pass(self):
         self.declare()
         decision = self.decision(self.finish())
         decision["outcomes"].pop()
         with self.assertRaisesRegex(WorkspaceError, "every declared"):
-            receipts.decide(self.store, decision, self.spec)
+            receipts.record(self.store, decision, self.spec)
 
-    def test_stale_revision_cannot_overwrite_and_withdrawal_preserves_history(self):
-        decision = self.accepted()
+    def test_stale_revision_cannot_overwrite_and_setting_aside_preserves_history(self):
+        decision = self.use_for_now()
         with self.assertRaisesRegex(WorkspaceError, "revision conflict"):
-            receipts.decide(self.store, decision, self.spec)
-        withdraw = {"expected_revision": 1, "actor": "host", "disposition": "withdrawn",
+            receipts.record(self.store, decision, self.spec)
+        withdraw = {"expected_revision": 1, "recorded_by": "host", "host_position": "set_aside",
                     "rationale": "The previous conclusion used an incomplete requirement.", "outcomes": []}
-        receipts.decide(self.store, withdraw, self.spec)
+        receipts.record(self.store, withdraw, self.spec)
         state = receipts.read(self.store)
-        self.assertEqual([item["disposition"] for item in state["history"]], ["accepted", "withdrawn"])
+        self.assertEqual([item["host_position"] for item in state["history"]], ["use_for_now", "set_aside"])
 
     def test_failed_atomic_write_keeps_previous_record(self):
-        self.accepted()
+        self.use_for_now()
         before = (self.store / "receipt.json").read_bytes()
-        withdraw = {"expected_revision": 1, "actor": "host", "disposition": "withdrawn",
-                    "rationale": "Withdraw for review", "outcomes": []}
+        withdraw = {"expected_revision": 1, "recorded_by": "host", "host_position": "set_aside",
+                    "rationale": "Set aside for review", "outcomes": []}
         with patch("council_workspace.os.replace", side_effect=OSError("fixture disk failure")):
             with self.assertRaises(OSError):
-                receipts.decide(self.store, withdraw, self.spec)
+                receipts.record(self.store, withdraw, self.spec)
         self.assertEqual((self.store / "receipt.json").read_bytes(), before)
 
-    def test_active_supervisor_cannot_be_accepted(self):
+    def test_active_supervisor_cannot_be_used_for_now(self):
         self.declare()
         decision = self.decision(self.finish())
         with open(self.run / "supervisor.lock", "rb") as stream:
             fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
             with self.assertRaises(BlockingIOError):
-                receipts.decide(self.store, decision, self.spec)
+                receipts.record(self.store, decision, self.spec)
 
     def test_receipt_lock_conflict_is_bounded(self):
         self.declare()
@@ -282,7 +282,7 @@ class ReceiptTests(unittest.TestCase):
                 receipts.status(self.store, self.spec)
 
     def test_changed_or_missing_evidence_is_unknown(self):
-        self.accepted()
+        self.use_for_now()
         log = next((self.run / "evidence/batch").glob("*.stdout.jsonl"))
         log.write_text("changed")
         self.assertEqual(receipts.status(self.store, self.spec)["binding_status"], "unknown")
@@ -294,15 +294,17 @@ class ReceiptTests(unittest.TestCase):
         decision = self.decision(self.finish())
         next((self.run / "evidence/batch").glob("*.stdout.jsonl")).write_text("forged")
         with self.assertRaisesRegex(WorkspaceError, "checksum mismatch"):
-            receipts.decide(self.store, decision, self.spec)
+            receipts.record(self.store, decision, self.spec)
 
     def test_changed_plan_or_context_is_unknown(self):
-        self.accepted()
+        self.use_for_now()
         (self.run / "context.md").write_text("other context")
         self.assertEqual(receipts.status(self.store, self.spec)["binding_status"], "unknown")
 
     def test_summary_bounds_never_hide_staleness(self):
-        self.accepted()
+        decision = self.use_for_now()
+        decision.update(expected_revision=1, rationale="Long scoped explanation. " * 60)
+        receipts.record(self.store, decision, self.spec)
         changed = copy.deepcopy(self.spec)
         changed["question"] = "changed"
         summary = receipts.status(self.store, changed, max_bytes=512)
@@ -311,7 +313,7 @@ class ReceiptTests(unittest.TestCase):
         self.assertLessEqual(len(canonical(summary)) + 1, 512)
 
     def test_status_is_read_only(self):
-        self.accepted()
+        self.use_for_now()
         before = {p.name: p.read_bytes() for p in self.store.iterdir() if p.is_file()}
         receipts.status(self.store, self.spec)
         self.assertEqual({p.name: p.read_bytes() for p in self.store.iterdir() if p.is_file()}, before)
@@ -332,7 +334,7 @@ class ReceiptTests(unittest.TestCase):
         log.unlink()
         log.symlink_to(self.source / "subject.py")
         with self.assertRaises((OSError, WorkspaceError)):
-            receipts.decide(self.store, decision, self.spec)
+            receipts.record(self.store, decision, self.spec)
 
     def test_no_receipts_in_plugin_and_no_production_import(self):
         for path in (ROOT / "plugins").rglob("*.py"):
@@ -370,14 +372,14 @@ class ReceiptTests(unittest.TestCase):
         self.assertFalse((self.run / "execution.claim").exists())
 
     def test_two_processes_cannot_overwrite_same_revision(self):
-        self.accepted()
+        self.use_for_now()
         spec = self.root / "contract.json"
         instruction = self.root / "decision.json"
         write(spec, self.spec)
-        write(instruction, {"expected_revision": 1, "actor": "host", "disposition": "withdrawn",
-                            "rationale": "Withdraw pending inspection.", "outcomes": []})
+        write(instruction, {"expected_revision": 1, "recorded_by": "host", "host_position": "set_aside",
+                            "rationale": "Set aside pending inspection.", "outcomes": []})
         argv = [sys.executable, "-B", str(ROOT / "experiments/decision_receipts.py"),
-                "decide", "--store", str(self.store), "--contract", str(spec),
+                "record", "--store", str(self.store), "--contract", str(spec),
                 "--decision", str(instruction)]
         processes = [subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE) for _ in range(2)]
         try:
@@ -392,12 +394,12 @@ class ReceiptTests(unittest.TestCase):
                     process.communicate()
 
     def test_late_scratch_change_does_not_keep_matching_bindings(self):
-        self.accepted()
+        self.use_for_now()
         (self.run / "workspaces/batch/subject.py").write_text("value = 99\n")
         self.assertEqual(receipts.status(self.store, self.spec)["binding_status"], "unknown")
 
-    def test_source_loss_is_unknown_not_accepted_current(self):
-        self.accepted()
+    def test_source_loss_is_unknown_not_current(self):
+        self.use_for_now()
         self.source.rename(self.root / "gone")
         self.assertEqual(receipts.status(self.store, self.spec)["binding_status"], "unknown")
 
@@ -409,6 +411,84 @@ class ReceiptTests(unittest.TestCase):
         with self.assertRaises(OSError):
             receipts.status(self.store, self.spec)
 
+    def test_a_completed_contribution_does_not_choose_for_the_host(self):
+        self.declare()
+        self.finish()
+        summary = receipts.status(self.store, self.spec)
+        self.assertEqual(summary["recorded_host_position"], "not-recorded")
+        self.assertEqual(summary["decision_owner"], "host")
+        self.assertEqual(receipts.read(self.store)["history"], [])
+
+    def test_host_can_revisit_even_after_all_checks_pass(self):
+        decision = self.use_for_now()
+        decision.update(expected_revision=1, host_position="revisit",
+                        rationale="The checks pass, but another approach may fit better.")
+        receipts.record(self.store, decision, self.spec)
+        self.assertEqual(receipts.status(self.store, self.spec)["recorded_host_position"], "revisit")
+        self.assertEqual([row["host_position"] for row in receipts.read(self.store)["history"]],
+                         ["use_for_now", "revisit"])
+
+    def test_set_aside_survives_changed_requirements_and_missing_runs(self):
+        self.use_for_now()
+        changed = copy.deepcopy(self.spec)
+        changed["question"] = "The goal has changed; inspect a different property."
+        self.run.rename(self.root / "removed-run")
+        receipts.record(self.store, {
+            "expected_revision": 1, "recorded_by": "host", "host_position": "set_aside",
+            "rationale": "Course correction; earlier evidence is not being reused.", "outcomes": []}, changed)
+        summary = receipts.status(self.store, changed)
+        self.assertEqual(summary["recorded_host_position"], "set_aside")
+        self.assertEqual(summary["binding_status"], "stale")
+        self.assertEqual(len(receipts.read(self.store)["history"]), 2)
+
+    def test_set_aside_cannot_address_another_decision(self):
+        self.use_for_now()
+        changed = copy.deepcopy(self.spec)
+        changed["decision_id"] = "another-decision"
+        with self.assertRaisesRegex(WorkspaceError, "identity changed"):
+            receipts.record(self.store, {
+                "expected_revision": 1, "recorded_by": "host", "host_position": "set_aside",
+                "rationale": "Wrong target", "outcomes": []}, changed)
+
+    def test_advisory_authority_survives_the_smallest_summary(self):
+        self.use_for_now()
+        summary = receipts.status(self.store, self.spec, max_bytes=512)
+        self.assertEqual(summary["authority"], "advisory-only")
+        self.assertEqual(summary["decision_owner"], "host")
+        self.assertLessEqual(len(canonical(summary)) + 1, 512)
+        self.assertNotIn("next_action", summary)
+
+    def test_old_final_sounding_positions_are_not_silently_reinterpreted(self):
+        self.declare()
+        decision = self.decision(self.finish())
+        for old in ("accepted", "rejected", "blocked", "withdrawn"):
+            with self.subTest(old=old):
+                decision["host_position"] = old
+                with self.assertRaisesRegex(WorkspaceError, "invalid host_position"):
+                    receipts.record(self.store, decision, self.spec)
+        self.assertEqual(receipts.read(self.store)["history"], [])
+
+    def test_legacy_receipt_schema_is_not_silently_migrated(self):
+        self.use_for_now()
+        state = receipts.read(self.store)
+        state["schema"] = "codex-council/decision-receipt@1"
+        receipts.save(self.store, state)
+        with self.assertRaisesRegex(WorkspaceError, "schema mismatch"):
+            receipts.status(self.store, self.spec)
+
+    def test_restored_bytes_do_not_restore_a_set_aside_host_position(self):
+        self.use_for_now()
+        subject = self.source / "subject.py"
+        original = subject.read_bytes()
+        subject.write_text("value = 99\n")
+        receipts.record(self.store, {
+            "expected_revision": 1, "recorded_by": "host", "host_position": "set_aside",
+            "rationale": "Do not reuse that position after this course correction.", "outcomes": []}, self.spec)
+        subject.write_bytes(original)
+        summary = receipts.status(self.store, self.spec)
+        self.assertEqual(summary["binding_status"], "match")
+        self.assertEqual(summary["recorded_host_position"], "set_aside")
+
     def test_forged_result_digest_is_refused(self):
         self.declare()
         decision = self.decision(self.finish())
@@ -417,7 +497,7 @@ class ReceiptTests(unittest.TestCase):
         data["roles"]["batch"]["interpretation"]["text"] = "different"
         write(path, data)
         with self.assertRaisesRegex(WorkspaceError, "result checksum"):
-            receipts.decide(self.store, decision, self.spec)
+            receipts.record(self.store, decision, self.spec)
 
 
 class ReceiptRunnerIntegrationTests(unittest.TestCase):
@@ -451,12 +531,12 @@ class ReceiptRunnerIntegrationTests(unittest.TestCase):
         self.assertEqual(launched.returncode, 0, launched.stdout + launched.stderr)
         self.assertEqual(len(case.execs()), 1)
         attempt = next((run / "evidence/contribution").glob("attempt-*.json")).name
-        decision = {"expected_revision": 0, "actor": "fixture-host", "disposition": "accepted",
+        decision = {"expected_revision": 0, "recorded_by": "fixture-host", "host_position": "use_for_now",
                     "rationale": "Two checks in the same worker; no separate role per chunk.",
                     "outcomes": [{"criterion_id": name, "outcome": "supported", "evidence": {
                         "run_id": plan["run_id"], "role_id": "contribution", "attempt_file": attempt,
                         "command_index": i}} for i, name in enumerate(("a", "b"))]}
-        receipts.decide(store, decision, spec)
+        receipts.record(store, decision, spec)
         self.assertEqual(receipts.status(store, spec)["binding_status"], "match")
         self.assertEqual((case.source / "subject.py").read_text(), "value = 1\n")
         self.assertEqual(len(case.execs()), 1, "recording and recall must not start another worker")
