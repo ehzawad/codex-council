@@ -214,7 +214,7 @@ class BareInvocationTests(CouncilCLITestCase):
         self.assertEqual(proc.returncode, 2, proc.stderr)
         self.assertIn(roles_path, proc.stderr)
         self.assertIn(context_path, proc.stderr)
-        self.assertIn("same mktemp directory", proc.stderr)
+        self.assertIn("same run directory", proc.stderr)
         self.assertNotIn("[codex-council] dispatching", proc.stderr)
         self.assertNotIn("CODEX_COUNCIL_DONE", proc.stderr)
         self.assertEqual(proc.stdout, "")
@@ -235,7 +235,7 @@ class BareInvocationTests(CouncilCLITestCase):
             f.write("real context\n")
         proc = self._child(roles_path, context_path, self._dummy_fd())
         self.assertEqual(proc.returncode, 2, proc.stderr)
-        self.assertIn("same mktemp directory", proc.stderr)
+        self.assertIn("same run directory", proc.stderr)
         self.assertIn(roles_dir.name, proc.stderr)
         self.assertIn(context_dir.name, proc.stderr)
         self.assertNotIn("[codex-council] dispatching", proc.stderr)
@@ -706,8 +706,9 @@ class PrepareAndFreshnessRefusalTests(CouncilCLITestCase):
         self.assertEqual(proc.returncode, 2, proc.stderr)
         self.assertTrue(proc.stderr.startswith("--prepare: "), proc.stderr)
         self.assertTrue(proc.stderr.endswith(
-            "; start over in a new private directory (if the inputs "
-            "changed during capture, pause overlapping writers first).\n"),
+            "; start over in a new directory from `--new-run` (if the "
+            "inputs changed during capture, pause overlapping writers "
+            "first).\n"),
             proc.stderr)
         self.assertNotIn("pause overlapping writers and start over",
                          proc.stderr)
@@ -726,7 +727,8 @@ class PrepareAndFreshnessRefusalTests(CouncilCLITestCase):
         flat = " ".join(proc.stderr.split())
         self.assertIn(f"--freshness: {self.workdir.name!r} is mode 0755",
                       flat)
-        self.assertIn("pass the exact absolute mktemp directory", flat)
+        self.assertIn("pass the exact absolute run directory the council was "
+                      "launched from (the one `--new-run` printed", flat)
         self.assertIn("--freshness only reads the capture records", flat)
         self.assertIn("do not chmod or mkdir anything for them", flat)
         self.assertEqual(proc.stdout, "")

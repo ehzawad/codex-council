@@ -148,8 +148,9 @@ FOLLOW_ROUTINE_PATTERN = re.compile(
 # directory", never chmod or mkdir. --freshness (codex_council.main) uses
 # it too.
 RUN_DIR_RECOVERY = (
-    "Recovery: pass the exact absolute mktemp directory the council was "
-    "launched from (the directory holding roles.json, out.md, and err.log). "
+    "Recovery: pass the exact absolute run directory the council was "
+    "launched from (the one `--new-run` printed, holding roles.json, out.md, "
+    "and err.log). "
     "--follow, --status, --reap, and --cancel only read DIR/err.log, "
     "DIR/status.json, and the supervisor files, and --freshness only reads "
     "the capture records, DIR/request.json, and DIR/context.md; do not "
@@ -448,6 +449,8 @@ class RunView:
     tick_at: float | None
     roles: dict
     mode: str | None = None
+    # False when roles, a role record, or a recorded pid/pgid was unreadable.
+    roles_intact: bool = True
 
 
 def _int(value, minimum):
@@ -472,16 +475,17 @@ def _text(value):
     return value if isinstance(value, str) and value else None
 
 
-def read_status(path):
+def read_status(path, dir_fd=None):
     """status.json as a RunView, or None when there is no usable file.
 
     Unknown fields are ignored and a consumed field of the wrong type, or a
     number no float can hold, reads as unknown (None), so an unexpected
-    file degrades to fewer facts, never to a wrong claim.
+    file degrades to fewer facts, never to a wrong claim. `path` is
+    relative to `dir_fd` when one is given.
     """
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
-                     | os.O_CLOEXEC)
+                     | os.O_CLOEXEC, dir_fd=dir_fd)
         # Before fdopen, which raises on a directory and leaves the
         # descriptor open (this is polled).
         if not stat.S_ISREG(os.fstat(fd).st_mode):
@@ -498,10 +502,13 @@ def read_status(path):
     state = runner.get("state")
     roles = {}
     raw_roles = data.get("roles")
-    for role_id, raw in (raw_roles.items() if isinstance(raw_roles, dict)
-                         else ()):
+    intact = isinstance(raw_roles, dict)
+    for role_id, raw in (raw_roles.items() if intact else ()):
         if not isinstance(raw, dict):
+            intact = False
             continue
+        intact = intact and all(raw.get(key) is None or _int(raw[key], 2)
+                                for key in ("pid", "pgid"))
         roles[role_id] = {
             "state": raw.get("state") if raw.get("state") in ROLE_STATES
             else "unknown",
@@ -520,6 +527,7 @@ def read_status(path):
         roles=roles,
         mode=runner.get("mode") if runner.get("mode") in RUNNER_MODES
         else None,
+        roles_intact=intact,
     )
 
 
@@ -578,17 +586,17 @@ def supervisor_record(pid, lock_stat, version, epoch, started_at,
     }
 
 
-def read_supervisor(path):
+def read_supervisor(path, dir_fd=None):
     """supervisor.json as a SupervisorView, or None when unusable.
 
     Tolerant like read_status: a field of the wrong type reads as unknown
     (None). The file must also be a private regular file (not a symlink,
     this user's, mode 0600 or tighter), since --cancel signals the pid it
-    names.
+    names. `path` is relative to `dir_fd` when one is given.
     """
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
-                     | os.O_CLOEXEC)
+                     | os.O_CLOEXEC, dir_fd=dir_fd)
         # Before fdopen, as in read_status.
         if _private_stat_problem(os.fstat(fd), directory=False) is not None:
             os.close(fd)

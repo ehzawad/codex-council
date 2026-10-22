@@ -3609,7 +3609,7 @@ class LaunchEndToEndTests(unittest.TestCase):
 
     def test_a_rejected_directory_recovery_is_the_complete_sequence(self):
         """A directory that is not private is abandoned. Its recovery names
-        every step the new directory needs, in order: `mktemp -d`, the
+        every step the new directory needs, in order: `--new-run`, the
         three files, --prepare then --discover there, each role's new
         snapshot_id, then the pre-flight; following it literally passes.
         Skipping the discovery step leaves an automatic selection with no
@@ -3625,7 +3625,7 @@ class LaunchEndToEndTests(unittest.TestCase):
                 recovery = council_common.STAGING_DIR_RECOVERY
                 self.assertIn(recovery, proc.stderr)
                 steps = [recovery.index(step) for step in (
-                    "`mktemp -d` again",
+                    "`--new-run` again",
                     "Write request.json, roles.json, and context.md in the "
                     "NEW directory", "run --prepare and then --discover there",
                     "each role's new snapshot_id in every routed or "
@@ -3682,7 +3682,7 @@ class LaunchEndToEndTests(unittest.TestCase):
             ("context is a directory", context_dir, "path is a directory"),
             ("roles not UTF-8", not_utf8, "is not valid UTF-8"),
             ("roles in another directory", roles_elsewhere,
-             "must be in the same mktemp directory"),
+             "must be in the same run directory"),
         )
         for index, (name, break_input, expected) in enumerate(cases):
             with self.subTest(refusal=name):

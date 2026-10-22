@@ -2203,7 +2203,7 @@ class DiscoverCommandTests(FakeCodexTestCase):
                 self.assertTrue(proc.stderr.startswith("--discover: "),
                                 proc.stderr)
                 self.assertIn(detail, proc.stderr)
-                self.assertIn("Run `mktemp -d` again", proc.stderr)
+                self.assertIn("Run `--new-run` again", proc.stderr)
                 self.assertEqual(proc.stdout, "")
         self.assertEqual(os.listdir(public), [])
         self.assertEqual(os.listdir(self.run_dir), [])

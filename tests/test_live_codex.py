@@ -555,7 +555,7 @@ class LiveCouncilCase(unittest.TestCase):
         return run
 
     def prepared(self, *roles):
-        """A fresh private run directory (as `mktemp -d` makes one) with
+        """A fresh private run directory (as --new-run makes one) with
         request.json, roles.json, and context.md written and captured by
         --prepare. The request captures no files (`include: []`): the
         smoke prompt needs none."""

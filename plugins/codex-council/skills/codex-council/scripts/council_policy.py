@@ -100,7 +100,10 @@ def config_overrides(policy: ExecutionPolicy, mcp_names: tuple[str, ...] = ()
                  "sandbox_workspace_write.exclude_tmpdir_env_var=true",
                  f"sandbox_workspace_write.network_access={str(policy.network).lower()}",
                  # Memories carry earlier sessions into a fresh contribution.
-                 "features.memories=false"]
+                 "features.memories=false",
+                 # The workspace is the project root: no AGENTS.md or .codex
+                 # layer from a Git repo above the run directory.
+                 "project_root_markers=[]"]
     if policy.external_tools == "deny":
         overrides.extend(f"features.{name}=false" for name in DISABLED_FEATURES)
         overrides.append('web_search="disabled"')

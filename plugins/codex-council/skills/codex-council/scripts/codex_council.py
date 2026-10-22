@@ -7,9 +7,10 @@ actual execution cwd, launches a detached supervisor, and records
 raw protocol evidence separately from collaborator interpretation. It neither
 judges substantive claims nor applies candidate changes to the live project.
 
-The only flow: --prepare, --discover, --check-staging-dir, --start; then
---follow/--status and --freshness before reconciliation. --cancel and --reap
-act only on verified process identities and the supervisor lock.
+The only flow: --new-run, --prepare, --discover, --check-staging-dir,
+--start; then --follow/--status and --freshness before reconciliation.
+--cancel and --reap act only on verified process identities and the
+supervisor lock; --prune-runs deletes only on request (see council_runs).
 Workers run only in --start's supervised child, only for a completed capture,
 and at most once per run directory.
 
@@ -74,6 +75,7 @@ from council_common import (  # noqa: E402
     _iter_json_objects,
     _log_inline,
     _plugin_version,
+    _print_stdout,
     _private_stat_problem,
     _project_root,
     _report_inline,
@@ -132,6 +134,7 @@ from council_workspace import WorkspaceError  # noqa: E402
 from council_policy import (  # noqa: E402
     ServiceTierOverridden, command_options, effects_possible, parse_policy, policy_dict)
 from council_evidence import AttemptEvidence, write_result  # noqa: E402
+from council_runs import DEFAULT_PRUNE_DAYS, RunsError, new_run, prune_runs  # noqa: E402
 from council_workflow import (  # noqa: E402
     prepare, load_plan, discover_prepared, resolve_selections, plan_lines,
     freshness_command,
@@ -216,10 +219,11 @@ DEFAULT_STALL_SECS = 1800
 # heartbeats with a rising quiet value before the watchdog fires.
 PROGRESS_HEARTBEAT_SECS = 300
 # Contract epoch for the optional --skill-contract handshake. Bump only when
-# SKILL.md's command contract changes incompatibly. Epoch 5 is the captured
-# workflow: request.json and --prepare before --discover, --check-staging-dir
-# and --start, per-role catalogs and workspaces, and result.json evidence.
-SKILL_CONTRACT_EPOCH = 5
+# SKILL.md's command contract changes incompatibly. Epoch 6 is the captured
+# workflow in a --new-run directory: request.json and --prepare before
+# --discover, --check-staging-dir and --start, per-role catalogs and
+# workspaces, and result.json evidence.
+SKILL_CONTRACT_EPOCH = 6
 # --start waits at most this long for its supervisor to write
 # supervisor.json (or exit early). It bounds the start command only, never
 # a running council.
@@ -256,9 +260,9 @@ COLLABORATION_BRIEF = (
     "Thoroughness beats speed."
 )
 STAGING_PATH_HINT = (
-    "Staging hint: use the exact directory printed by `mktemp -d` for "
+    "Staging hint: use the exact directory printed by `--new-run` for "
     "both roles.json and context.md in this invocation; keep roles, context, "
-    "out.md, and err.log under the same mktemp directory. Shell variables do "
+    "out.md, and err.log under the same run directory. Shell variables do "
     "not persist across Claude Code Bash calls."
 )
 # STAGING_PATH_HINT's launch form, for an input or path defect the supervised
@@ -1887,9 +1891,10 @@ def _parse_args(argv):
             "there is no built-in catalog."
         ),
         epilog=(
-            "Run --prepare RUNDIR first (RUNDIR/request.json, roles.json, "
-            "and context.md); every other launch step needs its completed "
-            "capture. --discover RUNDIR records each role's model snapshot "
+            "Allocate RUNDIR with --new-run (or use any private 0700 "
+            "directory), write its request.json, roles.json, and context.md, "
+            "then run --prepare RUNDIR; every other launch step needs its "
+            "completed capture. --discover RUNDIR records each role's model snapshot "
             "(metadata only; no thread or turn is started), and role "
             "objects accept a 'selection' object, required whenever the "
             "optional 'model' or 'effort' is present: mode 'user' for an "
@@ -1902,8 +1907,8 @@ def _parse_args(argv):
             "A model Codex rejects fails the role as [model-rejected] and a "
             "usage or credit limit as [quota]; neither is retried. SKILL "
             f"contract epoch {SKILL_CONTRACT_EPOCH}.\n\n"
-            "RUNDIR must be private (0700, user-owned, non-symlink), e.g. one "
-            "created by `mktemp -d`, and --discover and the preflight refuse "
+            "RUNDIR must be private (0700, user-owned, non-symlink), e.g. the "
+            "one --new-run prints, and --discover and the preflight refuse "
             "a directory that already launched. Each "
             "settled role's section is also "
             "written to <RUNDIR>/replies/<key>.md before its completion line "
@@ -2048,6 +2053,48 @@ def _parse_args(argv):
             "Cannot be combined with another command."
         ),
     )
+    # None, not False, when absent: the mode loop below treats any value
+    # but None as a selected mode.
+    parser.add_argument(
+        "--new-run", action="store_const", const=True, default=None,
+        help=(
+            "Allocate one fresh private run directory, "
+            "<state>/codex-council/runs/<UTC YYYYMMDDTHHMMSSZ>-<random>/ "
+            "(state: $XDG_STATE_HOME when absolute, else ~/.local/state), "
+            "0700 whatever the umask, and print its absolute path. It "
+            "persists across reboots. An existing state or runs directory "
+            "that is a symlink, foreign, or not private is refused (exit 2) "
+            "and never repaired. Cannot be combined with another command."
+        ),
+    )
+    parser.add_argument(
+        "--prune-runs", action="store_const", const=True, default=None,
+        help=(
+            "Maintenance, only on request: list the direct children of the "
+            "runs directory --new-run uses, and say for each whether it is "
+            "eligible for deletion or why it is skipped. Eligible only: a "
+            "launched run whose status.json terminal state is older than "
+            "--older-than days, whose supervisor lock is the recorded file "
+            "and free (held through removal), and whose recorded runner and "
+            "codex process groups are verifiably gone. A process the runner "
+            "never recorded (such as a tool command codex left running in "
+            "the background) is not detected. Never follows a "
+            "link, cancels, reaps, or touches saved threads. Exits 0 when "
+            "done, 1 when a deletion failed partway, 2 for invalid "
+            "arguments or an unsafe runs directory."
+        ),
+    )
+    parser.add_argument(
+        "--older-than", default=None, metavar="DAYS",
+        help=(f"With --prune-runs: a run's terminal status must be older "
+              f"than DAYS whole days, 0 to 999999999 (default "
+              f"{DEFAULT_PRUNE_DAYS})."),
+    )
+    parser.add_argument(
+        "--delete", action="store_const", const=True, default=None,
+        help=("With --prune-runs: delete the eligible runs. Without it, "
+              "nothing is deleted."),
+    )
     parser.add_argument(
         "--skill-contract", default=None, type=int, metavar="EPOCH",
         help=(
@@ -2090,6 +2137,8 @@ def _parse_args(argv):
         ("--status", args.status),
         ("--cancel", args.cancel),
         ("--reap", args.reap),
+        ("--new-run", args.new_run),
+        ("--prune-runs", args.prune_runs),
     )
     for name, value in commands:
         if value == "":
@@ -2101,6 +2150,15 @@ def _parse_args(argv):
                 parser.error(f"{name} cannot be combined with {flag}")
     if args.verbose and args.follow is None:
         parser.error("--verbose requires --follow")
+    for flag, value in (("--older-than", args.older_than),
+                        ("--delete", args.delete)):
+        if value is not None and args.prune_runs is None:
+            parser.error(f"{flag} requires --prune-runs")
+    if args.older_than is not None:
+        if not re.fullmatch(r"[0-9]{1,9}", args.older_than):
+            parser.error("--older-than must be a whole number of days from 0 "
+                         f"to 999999999; got {args.older_than!r}")
+        args.older_than = int(args.older_than)
     # The supervised child of --start only: never a public launch route.
     if args.supervisor_lock_fd is not None and (
             args.roles_file is None or args.context_file is None
@@ -2214,7 +2272,7 @@ def _usage_exit_if_staging_dirs_differ(roles_file, context_file,
     if roles_dir != context_dir:
         _usage_exit(
             "codex-council input staging error:\n"
-            f"- --roles-file and --context-file must be in the same mktemp "
+            f"- --roles-file and --context-file must be in the same run "
             f"directory; got roles dir {roles_dir!r} and context dir "
             f"{context_dir!r}.\n"
             f"{hint}"
@@ -2930,6 +2988,24 @@ def _force_utf8_streams():
 def main():
     _force_utf8_streams()
     args = _parse_args(sys.argv[1:])
+    # STATE_DIR is read at call time (tests patch it).
+    if args.new_run is not None:
+        try:
+            path = new_run(STATE_DIR)
+        except (RunsError, OSError) as exc:
+            _usage_exit("--new-run: " + _report_inline(exc)
+                        + "; nothing was used")
+        _print_stdout(path)
+        return
+    if args.prune_runs is not None:
+        days = (DEFAULT_PRUNE_DAYS if args.older_than is None
+                else args.older_than)
+        try:
+            code = prune_runs(STATE_DIR, days, delete=args.delete is not None)
+        except (RunsError, OSError) as exc:
+            _usage_exit("--prune-runs: " + _report_inline(exc)
+                        + "; nothing was deleted")
+        sys.exit(code)
     # Preserve relative CODEX_HOME semantics when execution moves to a scratch
     # cwd. No config file is edited and credentials are never copied.
     home = os.environ.get("CODEX_HOME")
@@ -2944,9 +3020,9 @@ def main():
             plan = prepare(directory, roles, body)
         except (OSError, ValueError) as exc:
             _usage_exit("--prepare: " + _report_inline(exc)
-                        + "; start over in a new private directory (if the "
-                        "inputs changed during capture, pause overlapping "
-                        "writers first).")
+                        + "; start over in a new directory from `--new-run` "
+                        "(if the inputs changed during capture, pause "
+                        "overlapping writers first).")
         print(f"[codex-council] captured snapshot={plan['snapshot']['snapshot_id']} "
               f"files={len(plan['snapshot']['files'])} roles={len(roles)} "
               f"omitted={len(plan['snapshot']['omitted'])} version={_plugin_version()}")

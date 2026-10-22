@@ -13,6 +13,9 @@ Exit 0 is not approval; read recorded_host_position.
 
 evidence limits: only fresh, read-only contributions with external tools and
 network off. Hashes bind record identity; they are not semantic proof.
+
+run storage: runs made with the runner's --new-run persist; a deliberate
+--prune-runs --delete removes runs, and receipts bound to them then read unknown.
 """
 from __future__ import annotations
 
@@ -26,6 +29,7 @@ import os
 import re
 import stat
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -50,12 +54,15 @@ MAX_STATE_BYTES = 1024 * 1024
 HOST_POSITIONS = ("use_for_now", "revisit", "needs_evidence", "set_aside")
 OUTCOMES = ("supported", "contradicted", "blocked", "unassessed")
 RAW = argparse.RawDescriptionHelpFormatter
+TEMP_AREAS = ("/tmp", "/private/tmp", "/var/folders")  # plus $TMPDIR and tempfile.gettempdir()
 DECLARE_HELP = """\
 contract JSON: {"schema": "codex-council/decision-contract@1", "task_id",
   "decision_id", "question", "assumptions": [text], "criteria": [{"id",
   "expectation", "kind": "command", "expected_exit": int} or {"id",
   "expectation", "kind": "judgment"}]}
-Bind 1-16 prepared, unlaunched runs of the same task and captured subject."""
+Bind 1-16 prepared, unlaunched runs of the same task and captured subject.
+Output "warnings" names a run or store in a temporary area (it can vanish at
+reboot; status then reads unknown). A warning never refuses."""
 RECORD_HELP = """\
 decision JSON: {"expected_revision": int, "recorded_by", "rationale",
   "host_position": "use_for_now"|"revisit"|"needs_evidence"|"set_aside",
@@ -231,6 +238,18 @@ def checked_plan(directory: str | Path, *, pristine: bool = False) -> tuple[Path
     return root, plan, {"run.json": sha(run), "context.md": sha(context)}
 
 
+def temporary_areas() -> set[Path]:
+    """Resolved areas whose contents can vanish at reboot."""
+    spellings = [os.environ.get("TMPDIR"), *TEMP_AREAS]
+    with contextlib.suppress(OSError):  # no usable temp dir: nothing more to compare
+        spellings.append(tempfile.gettempdir())
+    areas = set()
+    for item in filter(None, spellings):
+        with contextlib.suppress(OSError):  # unresolvable spelling: warn less, never refuse
+            areas.add(Path(os.path.realpath(item)))
+    return {area for area in areas if area.parent != area}  # never flag all of "/"
+
+
 def declare(directory: str | Path, spec: dict, runs: list[str | Path]) -> dict:
     spec = contract(spec)
     require(0 < len(runs) <= 16, "declare 1 to 16 prepared runs")
@@ -252,7 +271,16 @@ def declare(directory: str | Path, spec: dict, runs: list[str | Path]) -> dict:
             subject = candidate
             bindings[plan["run_id"]] = {"directory": str(path), "plan_digest": digest(plan)}
         save(root, {"schema": SCHEMA, "contract": spec, "runs": bindings, "history": []})
-        return {"revision": 0, "decision_id": spec["decision_id"], "state": "declared"}
+        result = {"revision": 0, "decision_id": spec["decision_id"], "state": "declared"}
+        areas = temporary_areas()
+        named = [("receipt store", root)] + [(f"run {key}", Path(item["directory"]))
+                                             for key, item in bindings.items()]
+        warnings = [f"{label} {path} is in a temporary area: it can vanish at reboot and "
+                    "the receipt then reads unknown" for label, path in named
+                    if any(path.is_relative_to(area) for area in areas)]
+        if warnings:  # warn, never refuse
+            result["warnings"] = warnings
+        return result
 
 
 def idle(root: Path) -> None:

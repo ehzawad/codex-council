@@ -30,6 +30,7 @@ RUNNER_MODULES = (
     "codex_council", "council_common", "council_discovery",
     "council_selection", "council_failures", "council_liveness",
     "council_workspace", "council_policy", "council_evidence", "council_workflow",
+    "council_runs",
 )
 # The siblings each module may import (dependencies point one way).
 ALLOWED_IMPORTS = {
@@ -42,10 +43,12 @@ ALLOWED_IMPORTS = {
     "council_selection": {"council_common", "council_discovery"},
     "council_failures": {"council_common"},
     "council_liveness": {"council_common"},
+    "council_runs": {"council_common", "council_liveness"},
     "codex_council": {
         "council_common", "council_discovery", "council_selection",
         "council_failures", "council_liveness", "council_workspace",
         "council_policy", "council_evidence", "council_workflow",
+        "council_runs",
     },
 }
 

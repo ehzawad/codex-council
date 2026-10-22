@@ -49,7 +49,7 @@ NEW_DIR_SEQUENCE = (
 # repair of the same path, demand a NEW one, and give the full sequence.
 STAGING_DIR_RECOVERY = (
     "Recovery: abandon this directory — do not chmod it, do not mkdir it, "
-    "and do not reuse its name. Run `mktemp -d` again and copy the NEW "
+    "and do not reuse its name. Run `--new-run` again and copy the NEW "
     f"printed absolute path. {NEW_DIR_SEQUENCE}"
 )
 # A run directory holds exactly one launch. A launch leaves these behind:
@@ -70,7 +70,7 @@ SUPERVISOR_FILES = (SUPERVISOR_LOCK_FILENAME, SUPERVISOR_FILENAME)
 # replies/.
 LAUNCHED_DIR_RECOVERY = (
     "Recovery: every launch needs its own directory, so leave this one and "
-    f"its files as they are. Run `mktemp -d` again. {NEW_DIR_SEQUENCE}"
+    f"its files as they are. Run `--new-run` again. {NEW_DIR_SEQUENCE}"
 )
 # Uniform recovery appended to EVERY roles-file validation failure: every
 # defect asks for one complete, validated rewrite. Parse-time code cannot know its caller, so this default
@@ -91,7 +91,7 @@ ROLES_REWRITE_RECOVERY = (
 STAGED_LAUNCH_RESTART = (
     "start over in a new directory: --start already claimed this one "
     "(supervisor.lock, out.md, and err.log), so the pre-flight refuses it "
-    "now. Leave it and its files as they are and run `mktemp -d` again. "
+    "now. Leave it and its files as they are and run `--new-run` again. "
     f"{NEW_DIR_SEQUENCE}"
 )
 # ROLES_REWRITE_RECOVERY's staged-launch form: the same whole-file rule,
@@ -403,10 +403,10 @@ def _check_private_dir(path, prefix="--check-staging-dir: ",
     if problem is not None:
         kind, fragment = problem
         ending = {
-            "symlink": ", not the directory printed by `mktemp -d`.",
+            "symlink": ", not the directory printed by `--new-run`.",
             "type": ".",
             "owner": f", not the invoking user (uid {os.geteuid()}).",
-            "mode": (", not private 0700 — not the private mode `mktemp -d` "
+            "mode": (", not private 0700 — not the private mode `--new-run` "
                      "produces. Files already written here may have been "
                      "readable by other local users."),
         }[kind]

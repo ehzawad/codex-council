@@ -17,6 +17,10 @@ import time
 import unittest
 from pathlib import Path
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from council_testlib import EPOCH  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "plugins/codex-council/skills/codex-council/scripts/codex_council.py"
 ENABLED = os.environ.get("CODEX_COUNCIL_LIVE_WORKFLOW") == "1"
@@ -163,7 +167,7 @@ class LiveWorkflowTests(unittest.TestCase):
 
     def cli(self, *args, timeout=90):
         return subprocess.run([sys.executable, str(RUNNER), *map(str, args),
-                               "--skill-contract", "5"], cwd=self.source, env=self.env,
+                               "--skill-contract", EPOCH], cwd=self.source, env=self.env,
                               stdin=subprocess.DEVNULL, capture_output=True, text=True,
                               timeout=timeout)
 

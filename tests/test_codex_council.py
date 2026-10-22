@@ -2948,9 +2948,9 @@ class CheckStagingDirTests(unittest.TestCase):
         )
 
     def test_mode_failure_recovery_forbids_chmod_and_reuse(self):
-        """A hint like 'Create it with mktemp -d' is satisfiable by
+        """A hint like 'Create it with mkdir' is satisfiable by
         chmod/mkdir on the same predictable path; the recovery must
-        demand abandoning the dir for a NEW mktemp one."""
+        demand abandoning the dir for a NEW --new-run one."""
         os.chmod(self.tmp.name, 0o775)
         self.addCleanup(lambda: os.chmod(self.tmp.name, 0o700))
         buf = io.StringIO()
@@ -2962,7 +2962,7 @@ class CheckStagingDirTests(unittest.TestCase):
         self.assertIn("abandon this directory", err)
         self.assertIn("do not chmod it", err)
         self.assertIn("do not reuse its name", err)
-        self.assertIn("`mktemp -d` again", err)
+        self.assertIn("`--new-run` again", err)
         self.assertIn("Write request.json, roles.json, and context.md in the NEW "
                       "directory, run --prepare and then --discover there", err)
 
@@ -3027,7 +3027,7 @@ class CheckStagingDirTests(unittest.TestCase):
             )
 
     def test_nonexistent_path_does_not_invite_mkdir(self):
-        """A missing-path error must demand a fresh mktemp -d, never a
+        """A missing-path error must demand a fresh --new-run, never a
         mkdir of the same predictable path (which would defeat the
         private-staging guarantee)."""
         missing = os.path.join(self.tmp.name, "missing")
@@ -3075,7 +3075,7 @@ class CheckStagingDirTests(unittest.TestCase):
                     )
                 self.assertIn(f"({name} present)", err)
                 self.assertIn("every launch needs its own directory", err)
-                self.assertIn("Run `mktemp -d` again. Write request.json, "
+                self.assertIn("Run `--new-run` again. Write request.json, "
                               "roles.json, and context.md in the NEW "
                               "directory, run --prepare", err)
                 self.assertEqual(out.getvalue(), "")
@@ -3213,10 +3213,13 @@ class ArgParseTests(unittest.TestCase):
                 codex_council._parse_args(["--help"])
         help_text = " ".join(out.getvalue().split())
         self.assertIn("must be private (0700, user-owned, non-symlink)", help_text)
-        self.assertIn("Run --prepare RUNDIR first", help_text)
+        self.assertIn("Allocate RUNDIR with --new-run (or use any private 0700 "
+                      "directory), write its request.json, roles.json, and "
+                      "context.md, then run --prepare RUNDIR;", help_text)
         self.assertNotIn("--roles-file", help_text)
         self.assertNotIn("--context-file", help_text)
-        self.assertIn("mktemp -d", help_text)
+        self.assertIn("--new-run", help_text)
+        self.assertIn("--prune-runs", help_text)
         self.assertIn("--skill-contract", help_text)
         self.assertIn("replies/", help_text)
         self.assertIn("--follow", help_text)

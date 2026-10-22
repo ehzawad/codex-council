@@ -179,6 +179,51 @@ class ReceiptTests(unittest.TestCase):
             for path, data in swapped.items():
                 path.write_bytes(data)
 
+    @contextlib.contextmanager
+    def temporary_areas(self, tmpdir=None, gettempdir=None, fixed=()):
+        """Only these spellings count as temporary areas; an exception means no usable temp dir."""
+        found = gettempdir if isinstance(gettempdir, Exception) else (
+            lambda: str(gettempdir or self.root / "elsewhere"))
+        with (patch.dict(os.environ), patch.object(receipts, "TEMP_AREAS", tuple(map(str, fixed))),
+              patch.object(receipts.tempfile, "gettempdir", side_effect=found)):
+            os.environ.pop("TMPDIR", None)
+            if tmpdir is not None:
+                os.environ["TMPDIR"] = str(tmpdir)
+            yield
+
+    def test_declare_warns_about_temporary_run_and_store_without_refusing(self):
+        argv = self.cli_args("declare") + ["--run", self.run]  # fixtures live under gettempdir()
+        code, out, err = self.main(*argv)
+        self.assertEqual(code, 0, err)
+        result = json.loads(out)
+        self.assertEqual(result["state"], "declared")
+        self.assertEqual([line.split(" is in a temporary area")[0] for line in result["warnings"]],
+                         [f"receipt store {self.store}", f"run {self.plan['run_id']} {self.run}"])
+        self.assertTrue(all("reboot" in line for line in result["warnings"]))
+        self.assertEqual(list(receipts.read(self.store)["runs"]), [self.plan["run_id"]])
+
+    def test_declare_warnings_use_resolved_temporary_areas(self):
+        alias = self.root / "run-alias"
+        alias.symlink_to(self.run, target_is_directory=True)
+        run = f"run {self.plan['run_id']} {self.run}"
+        cases = {"none": ({}, False, False),
+                 "tmpdir-symlink-spelling": ({"tmpdir": alias}, False, True),
+                 "gettempdir": ({"gettempdir": self.root / "receipt-gettempdir"}, True, False),
+                 "fixed-area": ({"fixed": [self.root]}, True, True),
+                 "filesystem-root-ignored": ({"tmpdir": "/", "fixed": ["/"]}, False, False),
+                 "no-usable-tempdir": ({"gettempdir": FileNotFoundError("none")}, False, False)}
+        for label, (areas, store_warns, run_warns) in cases.items():
+            with self.subTest(label):
+                self.store = self.root / f"receipt-{label}"
+                self.store.mkdir(mode=0o700)
+                with self.temporary_areas(**areas):
+                    result = self.declare()
+                expected = [f"receipt store {self.store}"] * store_warns + [run] * run_warns
+                self.assertEqual([line.split(" is in a temporary area")[0]
+                                  for line in result.get("warnings", [])], expected)
+                self.assertEqual("warnings" in result, bool(expected))
+                self.assertEqual(result["state"], "declared")
+
     def test_one_worker_supports_multiple_chunks_and_expected_failure(self):
         self.use_for_now()
         summary = receipts.status(self.store, self.spec)

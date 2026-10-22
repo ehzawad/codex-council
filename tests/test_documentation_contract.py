@@ -88,7 +88,7 @@ class DocumentationContractTests(unittest.TestCase):
         rules = re.findall(r"(?m)^  - Bash\((.*) \*\)$", frontmatter)
         runner = ('python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/'
                   'scripts/codex_council.py"')
-        self.assertEqual(rules, ["mktemp -d", runner])
+        self.assertEqual(rules, [runner])
         self.assertEqual(len(re.findall(r"(?m)^  - ", frontmatter)), len(rules))
         body = text.split("---", 2)[2]
         commands = re.findall(r"(?m)^(python3 .*)$", body)
@@ -115,6 +115,15 @@ class DocumentationContractTests(unittest.TestCase):
         readme = " ".join((ROOT / "README.md").read_text().split())
         self.assertIn("does not carry into later turns", readme)
         self.assertIn("The skill does not pre-approve Write.", readme)
+
+    def test_skill_allocates_each_run_with_new_run_and_prunes_only_on_request(self):
+        text = SKILL.read_text()
+        self.assertNotIn("mktemp", text)
+        flat = " ".join(text.split())
+        new_run = flat.index('codex_council.py" --new-run --skill-contract')
+        self.assertLess(new_run, flat.index("--prepare 'ABS_RUNDIR'"))
+        self.assertIn("use its printed absolute path literally", flat)
+        self.assertIn("`--prune-runs` is maintenance, only on user request", flat)
 
     def test_reconciliation_quotes_or_checks_collaborator_observations(self):
         text = " ".join(SKILL.read_text().split())
