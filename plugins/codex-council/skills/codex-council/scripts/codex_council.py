@@ -143,18 +143,19 @@ def _state_home():
     The XDG base-directory specification says a relative value (a literal
     "~/..." included) is invalid and must be ignored; used as given it
     would put the state directory under the current directory, usually the
-    user's project. A relative $HOME would do the same, so then the
-    account's home directory from the password database stands in for it.
+    user's project. A relative or empty $HOME would do the same (an empty
+    one expands to /.local/state), so then the account's home directory
+    from the password database stands in for it.
     """
     home = os.environ.get("XDG_STATE_HOME", "")
     if os.path.isabs(home):
         return home
-    state = os.path.expanduser("~/.local/state")
-    if not os.path.isabs(state):
+    if not os.path.isabs(os.environ.get("HOME", "")):
+        # Unset gives the same directory expanduser would use.
         with contextlib.suppress(KeyError):
-            state = os.path.join(pwd.getpwuid(os.geteuid()).pw_dir,
-                                 ".local", "state")
-    return state
+            return os.path.join(pwd.getpwuid(os.geteuid()).pw_dir,
+                                ".local", "state")
+    return os.path.expanduser("~/.local/state")
 
 
 STATE_DIR = os.path.join(_state_home(), "codex-council")
@@ -644,10 +645,13 @@ def load_session(role_id):
     try:
         fd = os.open(_state_path(role_id), os.O_RDONLY | os.O_NOFOLLOW
                      | os.O_NONBLOCK | os.O_CLOEXEC)
+        # Checked before fdopen, which raises on a directory and leaves
+        # the descriptor open.
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
+            os.close(fd)
+            return None, None
         with os.fdopen(fd, "rb") as f:
-            st = os.fstat(f.fileno())
-            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
-                return None, None
             meta = json.loads(f.read())
     except (OSError, ValueError, RecursionError):
         return None, None

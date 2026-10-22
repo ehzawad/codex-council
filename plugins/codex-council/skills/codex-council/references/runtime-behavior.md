@@ -121,8 +121,10 @@ capture creates are private whatever the umask, as are workspaces/, evidence/,
 catalogs/ and replies/. The saved-thread state directory under
 `$XDG_STATE_HOME/codex-council` (only when that is an absolute path; otherwise
 `~/.local/state/codex-council`) is created 0700 and its lock files 0600; an owned
-state directory with any other mode is reset to 0700 and an owned, too-open lock
-file from an earlier release is tightened, while a symlinked, foreign-owned or
+state directory with any other mode is reset to 0700 (one without an owner read
+bit is refused with move-aside advice where Python cannot change a mode without
+following a link, as with glibc before 2.32) and an owned, too-open lock file from
+an earlier release is tightened, while a symlinked, foreign-owned or
 non-directory state path is refused by `--check-staging-dir` and again before
 dispatch, and is never changed. Raw logs can contain sensitive tool output; do not
 publish or attach them indiscriminately. Cleanup is deliberate: never delete a

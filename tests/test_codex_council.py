@@ -506,14 +506,15 @@ class StatePrivacyTests(unittest.TestCase):
 
     def test_a_relative_home_is_not_used_either(self):
         """A relative $HOME would put ~/.local/state under the current
-        directory too; the account's home directory stands in for it."""
+        directory too, and an empty one at /.local/state; the account's home
+        directory stands in for both."""
         account = os.path.join(self.tmp.name, "account")
 
         class Entry:
             pw_dir = account
 
         os.environ.pop("XDG_STATE_HOME", None)
-        for home in ("relhome", "./relhome"):
+        for home in ("relhome", "./relhome", ""):
             with self.subTest(HOME=home), \
                     patch.dict(os.environ, {"HOME": home}), \
                     patch.object(codex_council.pwd, "getpwuid",
@@ -707,6 +708,17 @@ class StateIOTests(unittest.TestCase):
                 worker.join(10)
                 self.fail("load_session blocked on a FIFO state file")
         self.assertEqual(loaded, [(None, None)])
+
+    def test_a_directory_state_path_leaks_no_descriptor(self):
+        """fdopen of a directory raises with its descriptor still open, so
+        each such read used to leak one."""
+        with patch.dict(os.environ, _env_without_session_key(), clear=True):
+            os.mkdir(codex_council._state_path("architect"))
+            before = len(os.listdir("/dev/fd"))
+            for _ in range(20):
+                self.assertEqual(codex_council.load_session("architect"),
+                                 (None, None))
+            self.assertEqual(len(os.listdir("/dev/fd")), before)
 
     def test_a_symlinked_or_foreign_state_file_is_not_used(self):
         """The state file is never read through a symlink, and only an

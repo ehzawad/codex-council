@@ -43,9 +43,11 @@ lists them) nor a secret scan; sanitize unusual sensitive inputs yourself and
 narrow the scope before capture. A selected symlink or special file is refused by
 name, as are, with `include` omitted, a Git submodule (populated, empty or missing)
 and an untracked nested Git repository. Each refusal names the path and the fix:
-add it to `exclude` (it is then recorded in `snapshot.omitted`), or select a
-submodule's or nested repository's files with an explicit `include`. None is
-silently flattened or dropped. Collisions under Unicode canonical caseless matching
+add it to `exclude` (it is then recorded in `snapshot.omitted`; a name with glob
+characters such as `[id].js` is given as the escaped pattern), or select a
+submodule's or nested repository's files with an explicit `include`. Excluding a
+symlink also omits the tracked paths below it. None is silently flattened or
+dropped. Collisions under Unicode canonical caseless matching
 among selected file paths, empty directories and every directory component are
 refused too. File bytes and an executable/non-executable flag are captured, not the
 full permission mode; ownership, ACLs, extended attributes, sparse layout and
@@ -189,8 +191,8 @@ malicious same-user/bypass tampering.
 `--freshness RUNDIR` returns 0 for unchanged captured scope, 1 for stale/unknown,
 and 2 for an invalid contract. It checks selected file bytes and executable flags,
 empty directories, Git HEAD and the index entries of selected paths, the recorded
-omission list, and the staged context; staging an unrelated file does not make a
-capture stale. A changed staged context adds its reason and keeps the file-level
+omission list, and the staged context; staging an unrelated file, or an excluded
+or omitted one, does not make a capture stale. A changed staged context adds its reason and keeps the file-level
 detail (changed paths, Git and omission flags), as `result.json` applicability
 does; a moved or deleted source root reports unknown (exit 1), not an invalid
 contract. It does not check omitted file contents, changed user intent, or

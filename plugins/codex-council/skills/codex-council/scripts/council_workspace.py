@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import fnmatch
+import glob
 import hashlib
 import json
 import math
@@ -132,12 +133,13 @@ def read_json(path: Path, *, private: bool = True) -> Any:
     regular, non-symlink file; group/other permission bits are refused only
     when `private` is true."""
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    # Before fdopen, which raises on a directory and leaves the descriptor open.
+    st = os.fstat(fd)
+    if (not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid()
+            or (private and st.st_mode & 0o077)):
+        os.close(fd)
+        raise WorkspaceError(f"not an owned private regular file: {path}")
     with os.fdopen(fd, "rb") as stream:
-        st = os.fstat(stream.fileno())
-        if (not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid()
-                or (private and st.st_mode & 0o077)):
-            raise WorkspaceError(f"not an owned private regular file: {path}")
-
         def pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
             result: dict[str, Any] = {}
             for key, value in items:
@@ -188,6 +190,22 @@ def _omission(name: str, exclude: list[str]) -> str | None:
     if any(fnmatch.fnmatchcase(name, pattern) for pattern in exclude):
         return "requested exclusion"
     return None
+
+
+def _exclude_fix(name: str) -> str:
+    """The request.json fix for refused `name`. Exclude patterns are
+    shell-style, so a name with glob metacharacters ([id].js) is given as
+    the escaped pattern that matches it."""
+    pattern = glob.escape(name)
+    if pattern == name:
+        return "; add it to exclude in request.json"
+    return f"; add it to exclude in request.json as {json.dumps(pattern)}"
+
+
+def _within(name: str, omitted: dict[str, str]) -> bool:
+    """Whether `name` or a directory above it was omitted."""
+    parts = PurePosixPath(name).parts
+    return any("/".join(parts[:depth]) in omitted for depth in range(1, len(parts) + 1))
 
 
 def _stamp(st: os.stat_result) -> tuple[int, ...]:
@@ -277,9 +295,10 @@ def _in_scope(name: str, include: list[str] | None, exclude: list[str]) -> bool:
         item == "." or name == item or name.startswith(item + "/") for item in include)
 
 
-def git_state(root: Path, include: list[str] | None, exclude: list[str]
-              ) -> dict[str, Any] | None:
-    """HEAD plus the index entries of selected paths only. Staging an
+def git_state(root: Path, include: list[str] | None, exclude: list[str],
+              omitted: dict[str, str] | None = None) -> dict[str, Any] | None:
+    """HEAD plus the index entries of selected paths only, never of a path
+    inventory `omitted` or one below an omitted entry. Staging an
     unrelated file does not make a capture stale. Captured bytes are the
     working files; a partially staged file is captured as its working version."""
     top = _git(root, "rev-parse", "--show-toplevel")
@@ -288,9 +307,11 @@ def git_state(root: Path, include: list[str] | None, exclude: list[str]
     index = _git(root, "ls-files", "--stage", "-z")
     if index is None:
         raise WorkspaceError("Git index could not be read")
+    omitted = {} if omitted is None else omitted
     selected = b"\0".join(
         entry for entry in index.split(b"\0")
-        if entry and _in_scope(os.fsdecode(entry.split(b"\t", 1)[-1]), include, exclude))
+        if entry and _in_scope(name := os.fsdecode(entry.split(b"\t", 1)[-1]),
+                               include, exclude) and not _within(name, omitted))
     head = _git(root, "rev-parse", "--verify", "HEAD")
     return {"root": os.fsdecode(top.rstrip(b"\n")),
             "head": head.decode("ascii").strip() if head is not None else None,
@@ -299,10 +320,10 @@ def git_state(root: Path, include: list[str] | None, exclude: list[str]
 
 def _walk(root: Path, start: str, exclude: list[str],
           omitted: dict[str, str], empty: set[str] | None = None,
-          special: dict[str, str] | None = None, *, hint: str = "") -> set[str]:
+          special: dict[str, str] | None = None, *, hints: bool = False) -> set[str]:
     """Enumerate through pinned directory descriptors, never link ancestors.
     Directories holding no selected entry are added to `empty`. A symlink or
-    special file is refused (its refusal ending in `hint`) unless `special`
+    special file is refused (naming the exclude fix when `hints`) unless `special`
     is a dict; then it is recorded there by kind and never opened, followed
     or descended."""
     selected: set[str] = set()
@@ -332,7 +353,8 @@ def _walk(root: Path, start: str, exclude: list[str],
         if special is not None:
             special[name] = "symlink" if stat.S_ISLNK(st.st_mode) else "special-file"
             return True
-        raise WorkspaceError(f"selected symlink or special file is not copied: {name}{hint}")
+        raise WorkspaceError("selected symlink or special file is not copied: "
+                             f"{name}{_exclude_fix(name) if hints else ''}")
 
     directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
@@ -352,10 +374,10 @@ def _walk(root: Path, start: str, exclude: list[str],
                     raise
                 # Exclusions are matched below this descent, so the fix is
                 # the include path itself.
+                fix = "; name it in include by a path through real directories"
                 raise WorkspaceError("selected input or a directory in its path is a "
-                                     f"symlink or not a directory: {start}; name it in "
-                                     "include by a path through real directories"
-                                     ) from None
+                                     f"symlink or not a directory: {start}"
+                                     f"{fix if hints else ''}") from None
             visit(directory, parts[-1], start)
     finally:
         os.close(directory)
@@ -376,8 +398,13 @@ def inventory(root: Path, include: list[str] | None, exclude: list[str], *,
     fix out of refusals, for a run already prepared from that request."""
     omitted: dict[str, str] = {}
     empty: set[str] = set()
-    fix = "; add it to exclude in request.json" if hints else ""
-    select = fix and f"{fix}, or select its files with include"
+
+    def fix(name: str) -> str:
+        return _exclude_fix(name) if hints else ""
+
+    def select(name: str) -> str:
+        return fix(name) and f"{fix(name)}, or select its files with include"
+
     if include is None:
         raw = _git(root, "ls-files", "--cached", "--others", "--exclude-standard",
                    "-z")
@@ -386,12 +413,12 @@ def inventory(root: Path, include: list[str] | None, exclude: list[str], *,
         index = _git(root, "ls-files", "--stage", "-z")
         if index is None:
             raise WorkspaceError("Git index could not be read")
-        for entry in index.split(b"\0"):
-            fields, _, path = entry.partition(b"\t")  # "<mode> <object> <stage>"
-            name = os.fsdecode(path)
-            if fields.startswith(b"160000 ") and not _omission(name, exclude):
-                raise WorkspaceError(f"Git submodule is not copied: {name}{select}")
+        # Each entry is "<mode> <object> <stage>\t<path>"; 160000 is a gitlink.
+        gitlinks = {os.fsdecode(path) for fields, _, path in
+                    (entry.partition(b"\t") for entry in index.split(b"\0"))
+                    if fields.startswith(b"160000 ")}
         names = set()
+        real_dirs: set[str] = set()
         # Sorted, so a listed link or nested repository is met before any
         # tracked path below it (a tracked directory replaced by a link):
         # excluding it omits those paths too, never read through it.
@@ -399,38 +426,53 @@ def inventory(root: Path, include: list[str] | None, exclude: list[str], *,
             if not value:
                 continue
             name = os.fsdecode(value)
-            if name.endswith("/"):
-                # Git lists an untracked nested repository as one entry;
-                # its exclusion may be spelled with the slash or without.
-                name = relative_path(name[:-1])
-                reason = _omission(name, exclude) or _omission(f"{name}/", exclude)
-                if reason:
-                    omitted[name] = reason
-                    continue
-                raise WorkspaceError(f"nested Git repository is not copied: {name}/{select}")
-            name = relative_path(name)
+            # Git lists an untracked nested repository as one "name/" entry;
+            # its exclusion may be spelled with the slash or without.
+            nested = name.endswith("/")
+            name = relative_path(name[:-1] if nested else name)
             parts = PurePosixPath(name).parts
-            parents = ("/".join(parts[:depth]) for depth in range(1, len(parts)))
-            reason = _omission(name, exclude) or next(
-                (omitted[parent] for parent in parents if parent in omitted), None)
+            reason = _omission(name, exclude) or (
+                _omission(f"{name}/", exclude) if nested else None)
+            for depth in range(1, len(parts)):
+                if reason:
+                    break
+                parent = "/".join(parts[:depth])
+                reason = omitted.get(parent)
+                if reason or parent in real_dirs:
+                    continue
+                if not os.path.islink(root / parent):
+                    real_dirs.add(parent)
+                    continue
+                # A link Git does not list (an ignored one) above a tracked
+                # path: refused and excluded by its own name, like a listed one.
+                reason = _omission(parent, exclude)
+                if not reason:
+                    raise WorkspaceError(f"selected symlink is not copied: {parent}"
+                                         f"{fix(parent)}")
+                omitted[parent] = reason
             if reason:
                 omitted[name] = reason
                 continue
+            if nested:
+                raise WorkspaceError(f"nested Git repository is not copied: {name}/"
+                                     f"{select(name)}")
+            if name in gitlinks:  # populated, empty or missing
+                raise WorkspaceError(f"Git submodule is not copied: {name}{select(name)}")
             try:
                 st = os.lstat(root / name)
             except (FileNotFoundError, NotADirectoryError):
                 continue  # tracked deletion: absence is part of this capture
             if stat.S_ISLNK(st.st_mode):
-                raise WorkspaceError(f"selected symlink is not copied: {name}{fix}")
+                raise WorkspaceError(f"selected symlink is not copied: {name}{fix(name)}")
             if not stat.S_ISREG(st.st_mode):
                 raise WorkspaceError("selected special file or directory is not copied: "
-                                     f"{name}{fix}")
+                                     f"{name}{fix(name)}")
             names.add(name)
     else:
         names = set()
         for value in include:
             names.update(_walk(root, relative_path(value, allow_dot=True),
-                               exclude, omitted, empty, special, hint=fix))
+                               exclude, omitted, empty, special, hints=hints))
     collision = portable_collision(names, empty) if portable else None
     if collision is not None:
         raise WorkspaceError("non-portable case/Unicode collision: "
@@ -453,8 +495,8 @@ def capture(source: Path, baseline: Path, *, include: list[str] | None = None,
         raise WorkspaceError("run directory must be outside the source tree")
     private_dir(baseline.parent)
     exclude = [] if exclude is None else exclude
-    before_git = git_state(source, include, exclude)
     before, stamps, omitted, dirs = inventory(source, include, exclude)
+    before_git = git_state(source, include, exclude, omitted)
     baseline.mkdir(mode=0o700)
     os.chmod(baseline, 0o700)
     for name in dirs:
@@ -466,7 +508,7 @@ def capture(source: Path, baseline: Path, *, include: list[str] | None = None,
             raise WorkspaceError(f"input changed during capture: {name}")
         copied[name] = copy
     after, after_stamps, after_omitted, after_dirs = inventory(source, include, exclude)
-    after_git = git_state(source, include, exclude)
+    after_git = git_state(source, include, exclude, after_omitted)
     if (after != before or stamps != after_stamps or before_git != after_git
             or omitted != after_omitted or dirs != after_dirs):
         raise WorkspaceError("source changed during capture; pause writers and retry")
@@ -554,7 +596,8 @@ def freshness(snapshot: dict[str, Any]) -> dict[str, Any]:
         changed = sorted(name for name in set(files) | set(snapshot["files"])
                          if files.get(name) != snapshot["files"].get(name))
         changed += sorted(f"{name}/" for name in set(dirs) ^ set(snapshot["dirs"]))
-        metadata_changed = git_state(root, snapshot["include"], snapshot["exclude"]) != snapshot["git"]
+        metadata_changed = git_state(root, snapshot["include"], snapshot["exclude"],
+                                     omitted) != snapshot["git"]
         omissions_changed = omitted != snapshot["omitted"]
         return {"state": "stale" if changed or metadata_changed or omissions_changed
                 else "unchanged", "changed_paths": changed,

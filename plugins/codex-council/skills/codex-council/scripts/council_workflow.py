@@ -49,9 +49,15 @@ def _request(run_dir: Path, *, strict_source: bool = True) -> dict[str, Any]:
     if not isinstance(source, str) or not os.path.isabs(source):
         raise WorkspaceError("source_root must be an absolute directory path")
     try:
-        value["source_root"] = str(Path(source).resolve(strict=strict_source))
+        value["source_root"] = str(Path(source).resolve(strict=True))
     except RuntimeError:  # a symlink loop, before Python 3.13
-        raise WorkspaceError(f"source_root is a symlink loop: {source}") from None
+        if strict_source:
+            raise WorkspaceError(f"source_root is a symlink loop: {source}") from None
+    except OSError:
+        if strict_source:
+            raise
+        # --freshness: a source that no longer resolves stays as spelled, so
+        # it reads as missing; never resolved lexically ("gone-link/..").
     for key in ("include", "exclude"):
         entries = value.get(key)
         if entries is not None and (not isinstance(entries, list)
