@@ -1,7 +1,7 @@
 """Per-role model selection: one resolver for preflight and launch.
 
-A role inherits (no model, effort, or selection), carries an explicit user
-pin, or carries a runtime-grounded choice ("routed" pair or
+A role inherits its model settings (no model, effort, or selection), carries
+an explicit user pin, or carries a runtime-grounded choice ("routed" pair or
 "native_effort") bound to this run's --discover snapshot. Authoring
 defects exit 2 (_validate_selection_authoring); evidence that stops
 supporting a valid automatic choice resolves it to native inheritance with
@@ -15,7 +15,8 @@ by the preflight and the launch (_resolve_run_selections: authoring
 validation, then, at launch only, a fresh discovery in the role's own
 scratch cwd for an automatically selected role), and the
 text that reports each decision in err.log, out.md, reply files, and the
-preflight plan.
+preflight plan. An independently requested service tier is opt-in and checked
+against the resolved model; it is never selected or discarded by routing.
 """
 
 import collections
@@ -36,6 +37,7 @@ from council_discovery import (
     _discover,
     _read_snapshot,
     _retirement_passed,
+    _service_tier_id,
 )
 
 # One grammar for model and effort values. Shape checks only: no value list
@@ -103,8 +105,8 @@ class SelectionDecision:
     `provenance` is what the council does (native, user, routed,
     native_effort, or fallback when an automatic request resolved to native
     inheritance). Dispatch uses ONLY dispatch_model and
-    dispatch_effort (None = that override is not sent); the requested
-    values are kept for reporting. `note` is a fallback reason or a user-pin
+    dispatch_effort and dispatch_service_tier (None = that override is not
+    sent); the requested values are kept for reporting. `note` is a fallback reason or a user-pin
     advisory. `native_model` is the native model the resolving evidence
     proves (None when unproven or absent). The field is advisory and is not
     independently dispatched (native_effort resolution can place the same
@@ -120,6 +122,7 @@ class SelectionDecision:
     reason: str | None = None
     note: str | None = None
     native_model: str | None = None
+    dispatch_service_tier: str | None = None
 
 
 @dataclass(frozen=True)
@@ -128,7 +131,7 @@ class Role:
 
     `model` and `effort` are the requested per-role Codex overrides exactly
     as authored (None = not requested; omitting model, effort, and
-    selection inherits Codex's native configuration), and `selection`
+    selection inherits Codex's native model settings), and `selection`
     declares their provenance. What is actually sent is `decision`,
     resolved once at launch before fan-out (see _resolve_run_selections
     and _role_decision).
@@ -146,6 +149,9 @@ class Role:
     execution_overrides: tuple = ()
     task_id: str | None = None
     input_snapshot: str | None = None
+    # Independent of model/effort provenance: only an explicit user request
+    # may populate this field, including alongside a routed selection.
+    service_tier: str | None = None
 
 
 _INHERIT_DECISION = SelectionDecision("native")
@@ -174,7 +180,7 @@ def _parse_role_selection(entry, ctx):
 
 
 def _validate_optional_role_field(entry, field, ctx):
-    """Return a validated model/effort value, or None when omitted.
+    """Return a validated model/effort/tier value, or None when omitted.
 
     A grammar failure in an explicit user pin (selection.mode 'user') says
     how to repair the pin; any other says how to inherit.
@@ -186,11 +192,14 @@ def _validate_optional_role_field(entry, field, ctx):
         selection = entry.get("selection")
         user_pin = (isinstance(selection, dict)
                     and selection.get("mode") == "user")
+        hint = ("use the exact service tier the user requested; "
+                "never silently drop the request" if field == "service_tier" else
+                USER_PIN_VALUE_HINT if user_pin else INHERIT_HINT)
         _roles_usage_exit(
             f"--roles-file {ctx}: optional field {field!r} must be a "
             "non-empty string matching "
             f"{SELECTION_VALUE_PATTERN.pattern} (got {value!r}); "
-            f"{USER_PIN_VALUE_HINT if user_pin else INHERIT_HINT}."
+            f"{hint}."
         )
     if field == "model" and value.lower() in RESERVED_MODEL_VALUES:
         _roles_usage_exit(
@@ -218,8 +227,8 @@ def _parse_selection(entry, model, effort, ctx):
     inherit.
 
     {"mode": "user"} (optionally with "reason") is an explicit pin and
-    needs model and/or effort. {"mode": "routed", "snapshot_id", "reason"}
-    needs both; {"mode": "native_effort", "snapshot_id", "reason"} needs
+    needs model, effort, or a separate service_tier. A routed selection
+    needs model and effort; {"mode": "native_effort", "snapshot_id", "reason"} needs
     effort and forbids model (the runner pins the proven native model). No
     selection means inheritance: a model or effort without one was already
     refused (see _parse_role_selection).
@@ -257,10 +266,11 @@ def _parse_selection(entry, model, effort, ctx):
             f"{', '.join(repr(k) for k in unknown)}; selection.mode "
             f"'{mode}' takes only {shape}."
         )
-    if mode == "user" and model is None and effort is None:
+    if (mode == "user" and model is None and effort is None
+            and "service_tier" not in entry):
         _roles_usage_exit(
             f"--roles-file {ctx}: selection.mode 'user' needs 'model' and/or "
-            "'effort'; to inherit, omit model, effort, and selection."
+            "'effort' or 'service_tier'; to inherit, omit model, effort, and selection."
         )
     if mode == "routed" and (model is None or effort is None):
         _roles_usage_exit(
@@ -585,8 +595,8 @@ def _validate_selection_authoring(roles, planning, planning_problem,
     Runs in preflight and at launch, before any worker. `now` is compared
     with advertised retirements: the current time in preflight, the
     planning snapshot's creation time at launch (see
-    _resolve_run_selections). Explicit pins are never checked against
-    the catalog, and with routing off automatic roles are not errors: they
+    _resolve_run_selections). This check never rejects explicit model/effort
+    pins against the catalog, and with routing off automatic roles are not errors: they
     resolve to native inheritance.
     """
     if routing_mode == "off":
@@ -602,6 +612,58 @@ def _validate_selection_authoring(roles, planning, planning_problem,
 
 
 # ---------- launch-time resolution ----------
+
+def _validate_service_tier(role, decision, evidence, problem=None):
+    """Fail closed on an opt-in tier; never drop it through routing fallback.
+
+    Check the resolved dispatch model, or the proven current native model.
+    Catalog gaps elsewhere and routing=off do not prevent this exact check.
+    A pin suppresses managed new-thread defaults; effective-config inspection
+    separately verifies that higher-precedence layers let its model/tier hold.
+    A snapshot from before tiers were recorded has no service_tiers key: that
+    is missing evidence, so it asks for a new --discover. A launch snapshot
+    is not retained on this exit, so the refusal names discovery's problems.
+    """
+    if evidence is None or evidence["status"] != "ok":
+        if evidence is not None:
+            problem = ", ".join(evidence["problems"])
+        gap = f"discovery unavailable ({problem or 'no detail recorded'})"
+    else:
+        blockers = [reason for reason in evidence["routing"]["reasons"]
+                    if reason != ROUTING_OFF_NOTE and not reason.startswith((
+                        "catalog incomplete: ", "managed new-thread defaults ",
+                        "managed layer overrides CLI flags ("))]
+        model = decision.dispatch_model or _proven_native_model(evidence)
+        entry = _catalog_entry(evidence, model) if model else None
+        if blockers:
+            gap = "; ".join(blockers)
+        elif model is None:
+            gap = ("model cannot be established: "
+                   + (evidence["native"]["reason"] or "native model unproven"))
+        elif entry is None:
+            alias = _catalog_alias(evidence, model)
+            hint = f"; use the execution id '{alias[1]}'" if alias else ""
+            gap = (f"model '{model}' is not an advertised execution id in "
+                   f"this role's discovered catalog{hint}")
+            if not evidence["catalog"]["complete"]:
+                # A dropped malformed record looks absent; name the cause.
+                gap += "".join(f" ({reason})" for reason in evidence["routing"]["reasons"]
+                               if reason.startswith("catalog incomplete: "))
+        elif "service_tiers" not in entry:
+            gap = ("this role's model snapshot has no service-tier metadata; "
+                   "rerun --discover on this run directory")
+        elif _service_tier_id(role.service_tier) not in entry["service_tiers"]:
+            gap = (f"not advertised for model '{model}' "
+                   f"(request tier '{_service_tier_id(role.service_tier)}')")
+        else:
+            return
+    _roles_usage_exit(_report_inline(
+        f"--roles-file role '{role.id}': requested service tier "
+        f"'{role.service_tier}': {gap}; no worker started. "
+        "Refresh this role's discovery or choose a supported model/tier; "
+        "do not silently remove an explicit user request."
+    ))
+
 
 def _launch_discovery_state(routing_mode, automatic, launch):
     """(state, reason) of launch discovery for err.log and the report.
@@ -660,9 +722,9 @@ def _resolve_run_selections(roles, run_dir, routing_mode, at_launch, project_roo
     launch snapshot or None). The caller passes one role and that role's
     catalog directory. Only the launch (`at_launch`) discovers, in the
     role's own scratch cwd (`project_root`), and only when the role carries
-    an automatic selection and routing is on: inherited and explicit-pin
-    roles skip launch model-catalog discovery (execution-policy metadata
-    probes still run). The caller retains the launch snapshot separately as
+    an automatic selection and routing is on, or an explicit tier request:
+    inherited and explicit-pin roles without a tier skip launch model-catalog
+    discovery (execution-policy metadata probes still run). The caller retains the launch snapshot separately as
     evidence/<key>/launch-model-snapshot.json; it never overwrites the
     planning snapshot. The preflight passes the resolver no launch
     snapshot, so its decisions are the plan.
@@ -684,51 +746,66 @@ def _resolve_run_selections(roles, run_dir, routing_mode, at_launch, project_roo
     _validate_selection_authoring(
         roles, planning, planning_problem, routing_mode, authoring_now
     )
+    for role in roles:
+        if role.service_tier is not None:
+            _validate_service_tier(role, _resolve_selection(
+                role, planning, None, routing_mode, authoring_now
+            ), planning, planning_problem)
     launch = None
-    if (at_launch and routing_mode == "auto"
-            and any(_is_automatic(r) for r in roles)):
+    tier_requested = any(r.service_tier is not None for r in roles)
+    automatic = routing_mode == "auto" and any(_is_automatic(r) for r in roles)
+    if at_launch and (tier_requested or automatic):
         launch = (_discover(routing_mode) if project_root is None else
                   _discover(routing_mode, project_root=project_root))
     now = _utc_iso(time.time()) if at_launch else authoring_now
-    resolved = [
-        replace(role, decision=_resolve_selection(
-            role, planning, launch, routing_mode, now
-        ))
-        for role in roles
-    ]
+    resolved = []
+    evidence = launch if at_launch else planning
+    for role in roles:
+        decision = _resolve_selection(role, planning, launch, routing_mode, now)
+        if role.service_tier is not None:
+            _validate_service_tier(role, decision, evidence)
+            decision = replace(decision, dispatch_service_tier=role.service_tier,
+                               native_model=_proven_native_model(evidence))
+        resolved.append(replace(role, decision=decision))
     return resolved, launch
 
 
 # ---------- selection text for reports and the preflight plan ----------
 
-def _sent_values(model, effort):
-    """"model X, effort Y" for whichever of the two is present."""
+def _sent_values(model, effort, service_tier=None):
+    """The model, effort and tier overrides present in a decision."""
     parts = []
     if model:
         parts.append(f"model {model}")
     if effort:
         parts.append(f"effort {effort}")
+    if service_tier:
+        parts.append(f"service tier {service_tier}")
     return ", ".join(parts)
 
 
 def _selection_summary_note(decision):
-    """The Summary-line note for what one role sent ("" = inherited)."""
-    sent = _sent_values(decision.dispatch_model, decision.dispatch_effort)
+    """The Summary-line note for what one role sent ("" = nothing sent)."""
+    sent = _sent_values(decision.dispatch_model, decision.dispatch_effort,
+                        decision.dispatch_service_tier)
+    tier = (f"; service tier {decision.dispatch_service_tier}"
+            if decision.dispatch_service_tier else "")
     if decision.provenance == "user":
         return f" (explicit: {sent})"
     if decision.provenance == "routed":
         return f" (routed: {sent})"
     if decision.provenance == "native_effort":
         return (f" (routed effort: {decision.dispatch_effort} on native "
-                f"model {decision.dispatch_model})")
+                f"model {decision.dispatch_model}{tier})")
     if decision.provenance == "fallback":
-        return " (native inheritance; routing fell back)"
-    return ""
+        return f" (native inheritance; routing fell back{tier})"
+    return f" (native model/effort inheritance{tier})" if tier else ""
 
 
 def _selection_section_text(decision):
     """The `_Model selection: ..._` text every role section carries."""
-    sent = _sent_values(decision.dispatch_model, decision.dispatch_effort)
+    sent = _sent_values(decision.dispatch_model, decision.dispatch_effort,
+                        decision.dispatch_service_tier)
     if decision.provenance == "user":
         text = f"explicit override — sent {sent}"
     elif decision.provenance == "routed":
@@ -755,10 +832,20 @@ def _selection_section_text(decision):
 
 
 def _selection_plan_text(decision):
+    text = _model_selection_plan_text(decision)
+    if decision.dispatch_service_tier:
+        revalidated = text.endswith("revalidated at launch")
+        text += f"; explicit service tier {decision.dispatch_service_tier}"
+        if not revalidated:
+            text += "; revalidated at launch"
+    return text
+
+
+def _model_selection_plan_text(decision):
     """One role's preflight plan; automatic choices are revalidated."""
     sent = _sent_values(decision.dispatch_model, decision.dispatch_effort)
     if decision.provenance == "user":
-        text = f"explicit override ({sent})"
+        text = f"explicit override ({sent})" if sent else "native model/effort inheritance"
         return f"{text}; {decision.note}" if decision.note else text
     if decision.provenance == "routed":
         return f"routed ({sent}); revalidated at launch"

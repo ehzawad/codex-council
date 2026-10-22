@@ -30,6 +30,11 @@ DISABLED_FEATURES = ("apps", "plugins", "browser_use", "browser_use_external",
 MCP_NAME = re.compile(r"[A-Za-z0-9_-]+")
 
 
+class ServiceTierOverridden(WorkspaceError):
+    """A higher-precedence configuration layer changes the checked model
+    or tier; a fresh run directory cannot fix that."""
+
+
 @dataclass(frozen=True)
 class ExecutionPolicy:
     sandbox: str = "read-only"
@@ -219,6 +224,40 @@ def inspect_policy(root: str, policy: ExecutionPolicy, *,
             "attestation": "configuration-observed-not-exec-attested",
             "external_tools": policy.external_tools,
             "cwd": root, "checked_at": time.time()}
+
+
+def inspect_service_tier(root: str, overrides: tuple[str, ...], *,
+                         model: str | None, effort: str | None, tier: str,
+                         native_model: str | None) -> dict[str, Any]:
+    """Observe the final invocation's model/tier, including managed layers.
+
+    Advertisement alone is insufficient: managed configuration can outrank
+    CLI overrides. Use the same cwd, safety restrictions, and selection
+    settings as the worker. This is configuration evidence, not a serving-tier
+    attestation, and never edits config.toml or returns raw configuration.
+    """
+    from council_discovery import _service_tier_id
+
+    settings = list(overrides)
+    if model is not None:
+        settings.append(f'model="{model}"')
+    if effort is not None:
+        settings.append(f'model_reasoning_effort="{effort}"')
+    settings.append(f'service_tier="{tier}"')
+    observed, _ = _read_config(root, tuple(settings))
+    expected_model = model or native_model
+    if expected_model is None or observed.get("model") != expected_model:
+        raise ServiceTierOverridden(
+            "requested service tier cannot be established: "
+            "effective model differs from the checked catalog model")
+    actual = observed.get("service_tier")
+    if not isinstance(actual, str) or _service_tier_id(actual) != _service_tier_id(tier):
+        raise ServiceTierOverridden(
+            "requested service tier cannot be established: "
+            "effective service_tier differs from the sent override")
+    return {"sent_service_tier": tier, "request_tier": _service_tier_id(tier),
+            "checked_model": expected_model, "cwd": root, "checked_at": time.time(),
+            "attestation": "configuration-observed-not-exec-attested"}
 
 
 def _read_config(root: str, overrides: tuple[str, ...]) -> tuple[dict[str, Any], Any]:

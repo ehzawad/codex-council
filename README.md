@@ -60,82 +60,107 @@ Claude stays the orchestrator. The runner is a standard-library Python CLI that
 captures inputs, launches one detached supervisor per run directory and records
 evidence; every contribution is a `codex exec` worker in its own scratch copy.
 
-```mermaid
-flowchart LR
-    subgraph Host["Claude Code session"]
-        direction TB
-        Skill["codex-council skill<br/>briefs, selects, reconciles"]
-    end
-    subgraph Runner["Runner CLI: codex_council.py"]
-        direction TB
-        Capture["--prepare<br/>--discover<br/>--check-staging-dir"]
-        Start["--start"]
-        Observe["--follow, --status<br/>--freshness<br/>--cancel, --reap"]
-    end
-    Supervisor["Detached supervisor<br/>own session, holds supervisor.lock"]
-    subgraph Workers["Codex workers, one per role"]
-        direction TB
-        W1["codex exec, role A<br/>own scratch copy"]
-        W2["codex exec, role B<br/>own scratch copy"]
-    end
-    RunDir[("Private run directory<br/>run.json, baseline/, workspaces/<br/>catalogs/, evidence/, replies/<br/>result.json, out.md")]
-
-    Skill -- "writes request.json,<br/>roles.json, context.md" --> RunDir
-    Skill --> Capture
-    Skill --> Start
-    Skill --> Observe
-    Capture -- "capture and per-role copies" --> RunDir
-    Start -- "spawns" --> Supervisor
-    Supervisor -- "bounded fan-out" --> W1
-    Supervisor -- "bounded fan-out" --> W2
-    W1 -- "JSONL, reply" --> Supervisor
-    W2 -- "JSONL, reply" --> Supervisor
-    Supervisor -- "status.json, err.log,<br/>raw attempts, replies" --> RunDir
-    Observe -- "reads" --> RunDir
-
-    classDef host fill:#dbeafe,stroke:#1d4ed8,color:#0b1b3f
-    classDef runner fill:#ede9fe,stroke:#6d28d9,color:#1e1037
-    classDef worker fill:#dcfce7,stroke:#15803d,color:#052e16
-    classDef evidence fill:#fef3c7,stroke:#b45309,color:#3b1d02
-    classDef observer fill:#cffafe,stroke:#0e7490,color:#062a33
-    class Skill host
-    class Capture,Start,Supervisor runner
-    class W1,W2 worker
-    class RunDir evidence
-    class Observe observer
+```
+ Claude Code session
+ +------------------------+               +-------------+
+ | codex-council skill    | writes        | Private run |
+ | briefs, selects,       | request.json, | directory   |
+ | reconciles             |-------------->|             |
+ +------------------------+ roles.json,   | run.json    |
+   |                        context.md    | baseline/   |
+   | runs each command                    | workspaces/ |
+   v                                      | catalogs/   |
+ Runner CLI: codex_council.py             | evidence/   |
+ +------------------------+               | replies/    |
+ | --prepare, --discover, | capture and   | result.json |
+ | --check-staging-dir    |-------------->| out.md      |
+ |                        | per-role      |             |
+ |                        | copies        |             |
+ +------------------------+               |             |
+ | --start                |               |             |
+ +------------------------+               |             |
+ | --follow, --status,    | reads         |             |
+ | --freshness,           |-------------->|             |
+ | --cancel, --reap       |               |             |
+ +------------------------+               |             |
+   |                                      |             |
+   | --start spawns                       |             |
+   v                                      |             |
+ +------------------------+ status.json,  |             |
+ | Detached supervisor    | err.log, raw  |             |
+ | own session, holds     |-------------->|             |
+ | supervisor.lock        | attempts,     |             |
+ |                        | replies       |             |
+ +------------------------+               +-------------+
+   |     ^           |     ^
+   |     |           |     |    v  bounded fan-out
+   v     |           v     |    ^  JSONL, reply
+ +-------------+   +-------------+
+ | codex exec  |   | codex exec  |
+ | role A      |   | role B      |
+ | own scratch |   | own scratch |
+ | copy        |   | copy        |
+ +-------------+   +-------------+
+ Codex workers, one per role
 ```
 
 ## One invocation
 
 Each step is its own foreground command with `--skill-contract 5`. A run directory
-is used once: anything other than model/effort/selection changes needs a new one.
+is used once: anything other than model/effort/selection/service_tier changes
+needs a new one.
 
-```mermaid
-flowchart TD
-    Brief["Claude: mktemp -d, write request.json,<br/>roles.json and context.md"] --> Prepare["--prepare: observed-stable capture,<br/>read-only baseline, per-role copies, run.json"]
-    Prepare --> Discover["--discover: per-role metadata probe<br/>in that role's scratch cwd"]
-    Discover --> Select["Claude: optionally fill model,<br/>effort and selection from the snapshots"]
-    Select --> Check["--check-staging-dir: contract, capture,<br/>selection authoring, execution policy"]
-    Check -- "exit 2: selection" --> Repair["Fix model, effort or<br/>selection fields"]
-    Repair -.-> Check
-    Check -- "exit 2: needs recapture" --> Recapture["Recapture in a<br/>new directory"]
-    Recapture -.-> Brief
-    Check -- "exit 0" --> Start["--start: claim supervisor.lock, err.log,<br/>out.md; spawn the detached supervisor"]
-    Start --> Follow["--follow under Monitor; read<br/>settled replies as they arrive"]
-    Follow --> Status["--status: lock free and recorded<br/>runner identity gone"]
-    Status --> Fresh["--freshness: captured scope<br/>and staged context unchanged?"]
-    Fresh --> Reconcile["Claude reconciles result.json,<br/>replies and attempt evidence"]
-    Status -. "not responding" .-> Cancel["--cancel the verified runner"]
-    Status -. "gone, live groups" .-> Reap["--reap verified codex groups"]
-
-    classDef host fill:#dbeafe,stroke:#1d4ed8,color:#0b1b3f
-    classDef runner fill:#ede9fe,stroke:#6d28d9,color:#1e1037
-    classDef observer fill:#cffafe,stroke:#0e7490,color:#062a33
-    classDef failure fill:#fee2e2,stroke:#b91c1c,color:#3f0a0a
-    class Brief,Select,Reconcile host
-    class Prepare,Discover,Check,Start runner
-    class Follow,Status,Fresh observer
-    class Repair,Recapture,Cancel,Reap failure
+```
+ Claude: mktemp -d, write request.json, <-----------+
+ roles.json and context.md                          |
+   |                                                |
+   v                                                |
+ --prepare: observed-stable capture, read-only      |
+ baseline, per-role copies, run.json                |
+   |                                                |
+   v                                                |
+ --discover: per-role metadata probe in that        |
+ role's scratch cwd                                 |
+   |                                                |
+   v                                                |
+ Claude: optionally fill model, effort and          |
+ selection from the snapshots; service_tier         |
+ only on an explicit user request                   |
+   |                                                |
+   v                                                |
+ --check-staging-dir: contract, capture, <-----+    |
+ selection authoring, execution policy         |    |
+   |                                           |    |
+   +-- exit 2: selection --> Fix model,        |    |
+   |   effort, selection or service_tier       |    |
+   |   fields ---------------------------------+    |
+   |                                                |
+   +-- exit 2: needs recapture --> Recapture        |
+   |   in a new directory --------------------------+
+   |
+   | exit 0
+   v
+ --start: claim supervisor.lock, err.log, out.md;
+ spawn the detached supervisor
+   |
+   v
+ --follow under Monitor; read settled replies as
+ they arrive
+   |
+   v
+ --status: lock free and recorded runner identity
+ gone
+   |
+   +-- not responding --> --cancel the verified runner
+   +-- gone, live groups --> --reap verified codex groups
+   |
+   v
+ --freshness: captured scope and staged context
+ unchanged?
+   |
+   v
+ Claude reconciles result.json, replies and attempt
+ evidence
 ```
 
 Claude stages a fresh, decision-complete brief whenever a council is useful, whether
@@ -183,37 +208,45 @@ inventory of ignored paths nor a secret scan, so put any project rule a role nee
 in the brief. Native model inheritance means what Codex resolves in the **scratch
 execution cwd**, not the source project's `.codex/config.toml`. Every role has its
 own catalog snapshot; pin supported values explicitly when that distinction
-matters. Reports state what was sent, not which model served a turn.
+matters. Fast mode is opt-in per role and only on an explicit user request: Claude
+sets that role's `service_tier` to `fast`, which costs more usage. Not every model
+has a Fast tier, so preflight and launch check the tier against that role's own
+discovery and refuse with exit 2 when it is not advertised or cannot be proven. It
+is a per-invocation override; `~/.codex/config.toml` is never edited. Reports state
+what was sent, not which model or tier served a turn.
 
 ## Lifecycle and evidence
 
-```mermaid
-sequenceDiagram
-    box rgba(59,130,246,0.18) Host
-        participant C as Claude
-    end
-    box rgba(139,92,246,0.18) Runner
-        participant R as Runner CLI
-        participant S as Detached supervisor
-    end
-    box rgba(34,197,94,0.18) Workers
-        participant X as codex exec per role
-    end
-    box rgba(245,158,11,0.18) Evidence
-        participant D as Run directory
-    end
-    C->>R: --prepare, --discover, --check-staging-dir
-    R->>D: run.json, baseline/, workspaces/, catalogs/
-    C->>R: --start, its own foreground call
-    R->>S: spawn in a new session with the held lock
-    S->>D: supervisor.json, then status.json ticks
-    R-->>C: started line and follow/status/cancel commands
-    S->>X: scratch cwd, explicit policy, current brief
-    X-->>S: JSONL events and reply
-    S->>D: raw attempts, replies/role.md, result.json, out.md
-    C->>R: --follow relays err.log progress
-    C->>R: --status: lock free, runner identity gone
-    C->>R: --freshness before using any result
+```
+ Host      C  Claude
+ Runner    R  Runner CLI
+           S  Detached supervisor
+ Workers   X  codex exec per role
+ Evidence  D  Run directory
+ Arrows:   --> call or write, <.. reply
+
+ C   R   S   X   D
+ |-->|   |   |   |  --prepare, --discover,
+ |   |   |   |   |  --check-staging-dir
+ |   |---------->|  run.json, baseline/,
+ |   |   |   |   |  workspaces/, catalogs/
+ |-->|   |   |   |  --start, its own foreground call
+ |   |-->|   |   |  spawn in a new session with the
+ |   |   |   |   |  held lock
+ |   |   |------>|  supervisor.json, then status.json
+ |   |   |   |   |  ticks
+ |<..|   |   |   |  started line and follow/status/
+ |   |   |   |   |  cancel commands
+ |   |   |-->|   |  scratch cwd, explicit policy,
+ |   |   |   |   |  current brief
+ |   |   |<..|   |  JSONL events and reply
+ |   |   |------>|  raw attempts, replies/role.md,
+ |   |   |   |   |  result.json, out.md
+ |-->|   |   |   |  --follow relays err.log progress
+ |-->|   |   |   |  --status: lock free, runner
+ |   |   |   |   |  identity gone
+ |-->|   |   |   |  --freshness before using any
+ |   |   |   |   |  result
 ```
 
 The detached supervisor relies on private-directory gates, a lock token, process
@@ -253,28 +286,37 @@ capture, once per run directory.
 
 ## Continuity and failures
 
-```mermaid
-flowchart TD
-    Key["Continuity key: logical source,<br/>task, host session, role"] --> Lock{"Continuity lock free?"}
-    Lock -- "held by another council" --> Wait["Wait without a fan-out slot"]
-    Wait --> Lock
-    Lock -- "acquired" --> Mode{"execution.continuity"}
-    Mode -- "fresh" --> Fresh["New Codex thread"]
-    Mode -- "resume" --> Resume["Resume the saved thread"]
-    Resume -- "thread missing,<br/>replay-safe" --> Fresh
-    Resume -- "thread missing,<br/>possible tool work" --> Blocked["replay-blocked:stale<br/>thread and effects kept"]
-    Fresh --> Brief["Complete current captured brief"]
-    Resume --> Brief
-    Brief --> Evidence["New evidence tied to<br/>the current capture"]
-
-    classDef runner fill:#ede9fe,stroke:#6d28d9,color:#1e1037
-    classDef worker fill:#dcfce7,stroke:#15803d,color:#052e16
-    classDef evidence fill:#fef3c7,stroke:#b45309,color:#3b1d02
-    classDef failure fill:#fee2e2,stroke:#b91c1c,color:#3f0a0a
-    class Key,Lock,Wait,Mode runner
-    class Fresh,Resume,Brief worker
-    class Evidence evidence
-    class Blocked failure
+```
+ Continuity key: logical source, task,
+ host session, role
+   |
+   v
+ Continuity lock free? <---------------------+
+   |                                         |
+   +-- held by another council -->           |
+   |   Wait without a fan-out slot ----------+
+   |
+   | acquired
+   v
+ execution.continuity
+   |
+   +------------------------+
+   | fresh                  | resume
+   v                        v
+ New Codex thread         Resume the saved thread
+   |   ^                    |    |    |
+   |   |  thread missing,   |    |    | thread missing,
+   |   |  replay-safe       |    |    | possible tool work
+   |   +--------------------+    |    v
+   |                             |  replay-blocked:stale
+   |                             |  thread and effects kept
+   +-----------------------------+
+   |
+   v
+ Complete current captured brief
+   |
+   v
+ New evidence tied to the current capture
 ```
 
 Saved threads are scoped by `CODEX_COUNCIL_SESSION_KEY`, then detected host ids,

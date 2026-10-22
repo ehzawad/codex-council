@@ -766,13 +766,19 @@ def _normalize_upgrade(value):
     return {"model": value["model"], "retirement_at": retirement_at}, None
 
 
+def _service_tier_id(value):
+    """Codex's config alias; all other advertised tier ids stay exact."""
+    return "priority" if value == "fast" else value
+
+
 def _normalize_model_entry(item):
     """One wire model record -> (entry, None) or (None, first bad field).
 
     Additive fields are ignored; wrong types are rejected, never coerced
-    (hidden "false" or a boolean retirementAt make the entry unusable). The
-    dispatch identity is `model` — what `-m` receives — kept distinct from
-    the picker `id`, which is recorded as catalog_id.
+    (hidden "false" or a boolean retirementAt make the entry unusable; bad
+    serviceTiers drop only the tier metadata). The dispatch identity is
+    `model` — what `-m` receives — kept distinct from the picker `id`,
+    which is recorded as catalog_id.
     """
     if not isinstance(item, dict):
         return None, "entry"
@@ -791,7 +797,21 @@ def _normalize_model_entry(item):
     upgrade, bad_field = _normalize_upgrade(item.get("upgradeInfo"))
     if bad_field:
         return None, bad_field
-    return {
+    # Older CLIs omit this additive field: absence advertises no tiers. Tier
+    # metadata must not disable ordinary model/effort selection, so malformed
+    # tiers leave the entry usable without a service_tiers key; an opt-in tier
+    # request then refuses for missing metadata.
+    tiers = item.get("serviceTiers", [])
+    if isinstance(tiers, list) and all(
+        isinstance(tier, dict) and _nonempty_str(tier.get("id"))
+        for tier in tiers
+    ):
+        tiers = [tier["id"] for tier in tiers]
+        if len(set(tiers)) != len(tiers):
+            tiers = None
+    else:
+        tiers = None
+    entry = {
         "model": item["model"],
         "catalog_id": item["id"],
         "display_name": item["displayName"],
@@ -800,8 +820,12 @@ def _normalize_model_entry(item):
         "recommended": item["isDefault"],
         "default_effort": item["defaultReasoningEffort"],
         "efforts": efforts,
+        "service_tiers": tiers,
         "upgrade": upgrade,
-    }, None
+    }
+    if tiers is None:
+        del entry["service_tiers"]
+    return entry, None
 
 
 def _normalize_model_page(result):
@@ -1318,6 +1342,12 @@ def _is_snapshot_model(entry):
         return False
     if not all(isinstance(entry.get(k), bool) for k in ("hidden", "recommended")):
         return False
+    # Historical snapshots without tier metadata remain usable for efforts;
+    # a tier request still needs affirmative advertisement.
+    tiers = entry.get("service_tiers", [])
+    if (not isinstance(tiers, list) or not all(_nonempty_str(t) for t in tiers)
+            or len(set(tiers)) != len(tiers)):
+        return False
     efforts = entry.get("efforts")
     if not isinstance(efforts, list) or not all(
         isinstance(option, dict) and _nonempty_str(option.get("effort"))
@@ -1455,6 +1485,8 @@ def _summary_model_line(entry, now):
     line = (f"- {_summary_model_name(entry)} — "
             f"{_quoted(entry['description'])}; "
             f"efforts: {_summary_efforts(entry)}")
+    if entry.get("service_tiers"):
+        line += f"; service tiers: {', '.join(entry['service_tiers'])}"
     if entry["recommended"]:
         line += "; recommended"
     upgrade = entry["upgrade"]
@@ -1556,6 +1588,10 @@ def _discovery_summary(snapshot):
     ]
     if hidden:
         lines.append(f"hidden (not routable): {', '.join(hidden)}")
+        for entry in models:
+            if entry["hidden"] and entry.get("service_tiers"):
+                lines.append(f"- {_summary_model_name(entry)}; service tiers: "
+                             f"{', '.join(entry['service_tiers'])} (explicit pins only)")
     return [_report_inline(line) for line in lines]
 
 

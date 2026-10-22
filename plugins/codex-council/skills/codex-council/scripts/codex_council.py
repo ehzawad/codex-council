@@ -126,10 +126,11 @@ from council_selection import (  # noqa: E402
     _selection_plan_text,
     _selection_section_text,
     _selection_summary_note,
+    _validate_optional_role_field,
 )
 from council_workspace import WorkspaceError  # noqa: E402
 from council_policy import (  # noqa: E402
-    command_options, effects_possible, parse_policy, policy_dict)
+    ServiceTierOverridden, command_options, effects_possible, parse_policy, policy_dict)
 from council_evidence import AttemptEvidence, write_result  # noqa: E402
 from council_workflow import (  # noqa: E402
     prepare, load_plan, discover_prepared, resolve_selections, plan_lines,
@@ -377,8 +378,12 @@ def _workflow_selection(roles, run_dir, routing_mode, at_launch, body, probe_pol
             _finish_evidence(state="refused")
             _RUN.finish("aborted", 2)
             _diag("[codex-council] runner aborted exit=2: captured invocation refused before workers")
-        _usage_exit("invocation contract: " + _report_inline(exc)
-                    + "; prepare a fresh run directory; never enable bypass to recover.")
+        if isinstance(exc, ServiceTierOverridden):
+            recovery = ("a managed configuration layer overrides the requested model "
+                        "or tier; report this to the user rather than dropping the request.")
+        else:
+            recovery = "prepare a fresh run directory; never enable bypass to recover."
+        _usage_exit("invocation contract: " + _report_inline(exc) + "; " + recovery)
 
 
 def _finish_evidence(results=None, state="done"):
@@ -794,19 +799,19 @@ def _compose_prompt(role, body):
 
 # ---------- async codex invocation ----------
 
-def _model_overrides(model=None, effort=None):
+def _model_overrides(model=None, effort=None, service_tier=None):
     """Parent `codex exec` options for one invocation's dispatched values.
 
-    Callers pass only a SelectionDecision's dispatch_model/dispatch_effort.
-    Empty when neither is sent, so an inheriting role gets no override at
-    all and Codex resolves its native configuration in the worker's
-    execution context. Placed with `-C` BEFORE any `resume` subcommand,
+    Callers pass only a SelectionDecision's dispatch values. Empty when
+    none are sent; a role may inherit its model/effort while requesting a
+    service tier. Codex resolves omitted settings in the worker's execution
+    context. Placed with `-C` BEFORE any `resume` subcommand,
     where parent-placed `-m`/`-c` apply to both fresh and resumed turns.
     The overrides are per-invocation, not sticky: a resumed turn without
     them runs on the current native configuration, not the thread's
-    recorded model. Both values match
+    recorded model. All supplied values match
     SELECTION_VALUE_PATTERN (checked at parse time, and for a pinned native
-    model at resolution), so neither can start with "-" or hold whitespace,
+    model at resolution), so none can start with "-" or hold whitespace,
     quotes, backslashes, or control characters: `-m <model>` stays one argv
     value, and the TOML basic string in model_reasoning_effort="<effort>"
     needs no escaping and cannot be broken out of.
@@ -816,22 +821,25 @@ def _model_overrides(model=None, effort=None):
         opts += ["-m", model]
     if effort:
         opts += ["-c", f'model_reasoning_effort="{effort}"']
+    if service_tier:
+        opts += ["-c", f'service_tier="{service_tier}"']
     return opts
 
 
-def _resume_cmd(root, session_id, model=None, effort=None, execution_options=None):
+def _resume_cmd(root, session_id, model=None, effort=None, execution_options=None,
+                service_tier=None):
     options = (["--sandbox", "read-only", "-c", 'approval_policy="never"']
                if execution_options is None else execution_options)
-    return ["codex", "exec", "-C", root, *_model_overrides(model, effort),
+    return ["codex", "exec", "-C", root, *_model_overrides(model, effort, service_tier),
             *options, "resume", session_id, "--skip-git-repo-check", "--json", "-"]
 
 
-def _fresh_cmd(root, model=None, effort=None, execution_options=None):
+def _fresh_cmd(root, model=None, effort=None, execution_options=None, service_tier=None):
     # Policy switches are on the parent exec command, as are model overrides.
     # Without bound options (unit tests only) the default is read-only.
     options = (["--sandbox", "read-only", "-c", 'approval_policy="never"']
                if execution_options is None else execution_options)
-    return ["codex", "exec", "-C", root, *_model_overrides(model, effort),
+    return ["codex", "exec", "-C", root, *_model_overrides(model, effort, service_tier),
             *options, "--json", "--skip-git-repo-check", "-"]
 
 
@@ -1315,6 +1323,8 @@ async def _run_role_invocation(role, attempt, run_codex):
                         else load_session(role.id))
     execution = ({"execution_options": command_options(policy, role.execution_overrides)}
                  if policy is not None else {})
+    if decision.dispatch_service_tier is not None:
+        execution["service_tier"] = decision.dispatch_service_tier
     warning = None
 
     if session_id:
@@ -1740,6 +1750,10 @@ def _format_role_section(r):
         f"## {label} ({r.role.id})", "",
         f"_Model selection: {_report_inline(selection)}_", "",
     ]
+    tier = _role_decision(r.role).dispatch_service_tier
+    if tier:
+        lines.extend([f"_Service tier: explicit user request; sent {tier} "
+                      "(not serving-tier attestation)._", ""])
     if r.warning:
         lines.append(f"_Warning: {_report_inline(r.warning)}_")
         lines.append("")
@@ -1796,8 +1810,8 @@ def _format_report(results, total_elapsed, discovery_sentence=None):
 def _format_reply_file(r):
     """One role's reply file: a one-line status header plus its section.
 
-    model=/effort= are the values SENT (omitted when not sent); selection=
-    is the role's provenance; a fallback also names what was requested.
+    model=/effort=/service_tier= are values SENT (omitted when not sent); selection=
+    is model/effort provenance; a fallback also names what was requested.
     """
     status = "ok" if r.ok else "FAILED"
     decision = _role_decision(r.role)
@@ -1812,6 +1826,8 @@ def _format_reply_file(r):
         fields.append(f"model={decision.dispatch_model}")
     if decision.dispatch_effort:
         fields.append(f"effort={decision.dispatch_effort}")
+    if decision.dispatch_service_tier:
+        fields.append(f"service_tier={decision.dispatch_service_tier}")
     if decision.provenance == "fallback":
         if decision.requested_model:
             fields.append(f"requested_model={decision.requested_model}")
@@ -2289,7 +2305,7 @@ def _validate_role_label(label, ctx):
 ROLE_FIELDS = ("id", "label", "instruction")
 # Optional per-role keys: omitting model, effort, and selection inherits
 # Codex's native model settings; omitting execution uses the default policy.
-OPTIONAL_ROLE_FIELDS = ("model", "effort", "selection", "execution")
+OPTIONAL_ROLE_FIELDS = ("model", "effort", "selection", "service_tier", "execution")
 
 
 def _normalize_instruction_list(value, ctx):
@@ -2332,7 +2348,7 @@ def _parse_roles_json(raw):
     """Parse the --roles-file blob into a list of Role objects.
 
     Validates each entry has exactly the id/label/instruction fields plus
-    the optional model/effort/selection/execution keys (instruction is a list of
+    the optional model/effort/selection/service_tier/execution keys (instruction is a list of
     sentence-sized strings, normalized and joined to one paragraph), id is
     well-formed, model/effort (when present) match SELECTION_VALUE_PATTERN,
     the selection object is well-formed for its mode and present whenever
@@ -2368,7 +2384,7 @@ def _parse_roles_json(raw):
                 f"--roles-file {ctx}: unknown field(s) "
                 f"{', '.join(repr(k) for k in unknown)}. Each role object "
                 "must have exactly 'id', 'label', and 'instruction', plus "
-                "optionally 'model', 'effort', 'selection', and "
+                "optionally 'model', 'effort', 'selection', 'service_tier', and "
                 "'execution' — no other keys."
             )
         for field in ROLE_FIELDS:
@@ -2393,6 +2409,7 @@ def _parse_roles_json(raw):
         _validate_role_id(rid, ctx)
         _validate_role_label(label, ctx)
         _validate_role_instruction(instruction, ctx)
+        service_tier = _validate_optional_role_field(entry, "service_tier", ctx)
         model, effort, selection = _parse_role_selection(entry, ctx)
         if rid in seen:
             _roles_usage_exit(
@@ -2406,7 +2423,7 @@ def _parse_roles_json(raw):
         except WorkspaceError as exc:
             _roles_usage_exit(f"--roles-file {ctx}: {exc}.")
         roles.append(Role(rid, label, instruction, model, effort, selection,
-                          execution=execution))
+                          execution=execution, service_tier=service_tier))
     return roles
 
 
