@@ -247,6 +247,9 @@ def run_policy_server(argv, scenario):
     for index, arg in enumerate(argv[:-1]):
         if arg == "-c":
             _codex_override(config, argv[index + 1])
+    # Simulate managed layers that outrank CLI flags, independently of what
+    # the fixture advertised during discovery.
+    config.update(scenario.get("policy_forced_config", {}))
     methods = {"initialize": {"result": {"codexHome": "/fake-codex-home"}},
                "config/read": {"result": {"config": config, "origins": {}}},
                "configRequirements/read": {"result": {
@@ -462,6 +465,8 @@ def run_exec(argv, scenario):
                 os.mkdir(os.path.join(state, name[:-len(".lock")]))
     events = [{"type": "thread.started", "thread_id": thread_id},
               {"type": "turn.started"}]
+    events.extend({"type": "item.completed", "item": {"type": "error", "message": text}}
+                  for text in scenario.get("exec_item_errors", []))
     failure = _failure(prompt, model)
     if failure is not None:
         _emit(events + failure)

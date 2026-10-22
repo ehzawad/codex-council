@@ -16,7 +16,7 @@ import secrets
 from pathlib import Path
 from typing import Any
 
-from council_policy import inspect_policy, parse_policy, policy_dict
+from council_policy import inspect_policy, inspect_service_tier, parse_policy, policy_dict
 from council_workspace import (WorkspaceError, atomic_json, capture, copy_workspace,
                                digest, freshness, private_dir, private_mkdirs,
                                read_json,
@@ -262,6 +262,14 @@ def resolve_selections(roles: list[Any], run_dir: str, routing_mode: str,
         selected, snapshot = _resolve_run_selections(
             [role], str(Path(run_dir) / binding["catalog"]), routing_mode,
             at_launch, project_root=role.workdir)
+        if role.service_tier is not None and probe_policy:
+            decision = selected[0].decision
+            checked = inspect_service_tier(
+                role.workdir, role.execution_overrides,
+                model=decision.dispatch_model, effort=decision.dispatch_effort,
+                tier=decision.dispatch_service_tier, native_model=decision.native_model)
+            if at_launch:
+                atomic_json(Path(role.evidence_dir) / "service-tier.json", checked)
         if on_progress is not None:
             on_progress()
         resolved.extend(selected)

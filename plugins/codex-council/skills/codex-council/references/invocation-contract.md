@@ -151,11 +151,12 @@ native_effort, or omission for native inheritance; the shapes and value grammar
 are in [panel-design.md](panel-design.md). Automatic choices name that role's
 snapshot_id. Model and effort descriptions guide Claude; the runner validates
 membership and provenance, never ranks. At launch each automatically selected role
+and each role with an explicit service-tier request
 gets a fresh discovery in the same cwd, retained as
 `evidence/<key>/launch-model-snapshot.json`.
 Reports describe values **sent**, not an attestation of a serving model.
 
-Only model/effort/selection may change after prepare. Changes to context, task,
+Only model/effort/selection/service_tier may change after prepare. Changes to context, task,
 panel, instructions or execution policy require a fresh run directory. The logical
 source root and task id scope saved threads, not the scratch path. Session scope
 still follows CODEX_COUNCIL_SESSION_KEY, then host ids, then project scope.
