@@ -296,9 +296,11 @@ def _in_scope(name: str, include: list[str] | None, exclude: list[str]) -> bool:
 
 
 def git_state(root: Path, include: list[str] | None, exclude: list[str],
-              omitted: dict[str, str] | None = None) -> dict[str, Any] | None:
+              omitted: dict[str, str] | None = None, selected: Any = ()
+              ) -> dict[str, Any] | None:
     """HEAD plus the index entries of selected paths only, never of a path
-    inventory `omitted` or one below an omitted entry. Staging an
+    inventory `omitted` or one below an omitted entry unless it is one of
+    the `selected` files (an include below an excluded directory). Staging an
     unrelated file does not make a capture stale. Captured bytes are the
     working files; a partially staged file is captured as its working version."""
     top = _git(root, "rev-parse", "--show-toplevel")
@@ -308,14 +310,15 @@ def git_state(root: Path, include: list[str] | None, exclude: list[str],
     if index is None:
         raise WorkspaceError("Git index could not be read")
     omitted = {} if omitted is None else omitted
-    selected = b"\0".join(
+    entries = b"\0".join(
         entry for entry in index.split(b"\0")
         if entry and _in_scope(name := os.fsdecode(entry.split(b"\t", 1)[-1]),
-                               include, exclude) and not _within(name, omitted))
+                               include, exclude)
+        and (name in selected or not _within(name, omitted)))
     head = _git(root, "rev-parse", "--verify", "HEAD")
     return {"root": os.fsdecode(top.rstrip(b"\n")),
             "head": head.decode("ascii").strip() if head is not None else None,
-            "selected_index_sha256": hashlib.sha256(selected).hexdigest()}
+            "selected_index_sha256": hashlib.sha256(entries).hexdigest()}
 
 
 def _walk(root: Path, start: str, exclude: list[str],
@@ -429,7 +432,18 @@ def inventory(root: Path, include: list[str] | None, exclude: list[str], *,
             # Git lists an untracked nested repository as one "name/" entry;
             # its exclusion may be spelled with the slash or without.
             nested = name.endswith("/")
-            name = relative_path(name[:-1] if nested else name)
+            listed = name[:-1] if nested else name
+            try:
+                name = relative_path(listed)
+            except WorkspaceError:
+                # Git lists no absolute or ".." name; a backslash is the one
+                # unsafe spelling it can list, and it may be excluded.
+                reason = _omission(listed, exclude)
+                if not reason:
+                    raise WorkspaceError(f"unsafe relative path: {listed!r}"
+                                         f"{fix(listed)}") from None
+                omitted[listed] = reason
+                continue
             parts = PurePosixPath(name).parts
             reason = _omission(name, exclude) or (
                 _omission(f"{name}/", exclude) if nested else None)
@@ -496,7 +510,7 @@ def capture(source: Path, baseline: Path, *, include: list[str] | None = None,
     private_dir(baseline.parent)
     exclude = [] if exclude is None else exclude
     before, stamps, omitted, dirs = inventory(source, include, exclude)
-    before_git = git_state(source, include, exclude, omitted)
+    before_git = git_state(source, include, exclude, omitted, before)
     baseline.mkdir(mode=0o700)
     os.chmod(baseline, 0o700)
     for name in dirs:
@@ -508,7 +522,7 @@ def capture(source: Path, baseline: Path, *, include: list[str] | None = None,
             raise WorkspaceError(f"input changed during capture: {name}")
         copied[name] = copy
     after, after_stamps, after_omitted, after_dirs = inventory(source, include, exclude)
-    after_git = git_state(source, include, exclude, after_omitted)
+    after_git = git_state(source, include, exclude, after_omitted, after)
     if (after != before or stamps != after_stamps or before_git != after_git
             or omitted != after_omitted or dirs != after_dirs):
         raise WorkspaceError("source changed during capture; pause writers and retry")
@@ -597,7 +611,7 @@ def freshness(snapshot: dict[str, Any]) -> dict[str, Any]:
                          if files.get(name) != snapshot["files"].get(name))
         changed += sorted(f"{name}/" for name in set(dirs) ^ set(snapshot["dirs"]))
         metadata_changed = git_state(root, snapshot["include"], snapshot["exclude"],
-                                     omitted) != snapshot["git"]
+                                     omitted, files) != snapshot["git"]
         omissions_changed = omitted != snapshot["omitted"]
         return {"state": "stale" if changed or metadata_changed or omissions_changed
                 else "unchanged", "changed_paths": changed,

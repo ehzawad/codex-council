@@ -475,6 +475,16 @@ class CaptureTests(WorkspaceCase):
         self.assertEqual(workspace.freshness(implicit)["state"], "unchanged")
         self.git("update-index", "--cacheinfo", f"100644,{blob},subject.py")
         self.assertTrue(workspace.freshness(implicit)["git_metadata_changed"])
+        # A file included below an excluded directory is selected: its index
+        # entry still counts.
+        (self.source / "gen/keep.txt").write_text("keep")
+        self.git("add", "gen/keep.txt")
+        narrow = workspace.capture(self.source, self.run / "narrow",
+                                   include=[".", "gen/keep.txt"], exclude=["gen", "d"])
+        self.assertIn("gen", narrow["omitted"])
+        self.assertIn("gen/keep.txt", narrow["files"])
+        self.git("update-index", "--cacheinfo", f"100644,{blob},gen/keep.txt")
+        self.assertTrue(workspace.freshness(narrow)["git_metadata_changed"])
 
     def test_git_scope_excluding_a_path_omits_a_nested_repository_below_it(self):
         """A tracked file replaced by a directory holding a nested repository:
@@ -497,6 +507,17 @@ class CaptureTests(WorkspaceCase):
         self.assertEqual(snap["omitted"], {"d": "requested exclusion",
                                            "d/nested": "requested exclusion"})
 
+    def test_git_scope_lets_exclude_skip_a_name_with_a_backslash(self):
+        (self.source / "a\\b.txt").write_text("x")
+        self.init_git()
+        self.git("add", "a\\b.txt")
+        self.git("commit", "-qm", "backslash")
+        with self.assertRaisesRegex(workspace.WorkspaceError,
+                                    r"unsafe relative path: .*; add it to exclude"):
+            workspace.capture(self.source, self.baseline)
+        snap = workspace.capture(self.source, self.run / "excluded", exclude=["a?b.txt"])
+        self.assertEqual(snap["omitted"], {"a\\b.txt": "requested exclusion"})
+
     def test_the_exclude_hint_matches_a_name_with_glob_characters(self):
         """Exclude patterns are shell-style: "[id].js" as given matches
         "i.js", so the hint gives the escaped pattern."""
@@ -512,6 +533,36 @@ class CaptureTests(WorkspaceCase):
                 snap = workspace.capture(self.source, self.run / f"ok-{scope is None}",
                                          include=scope, exclude=["[[]id].js"])
                 self.assertEqual(snap["omitted"]["[id].js"], "requested exclusion")
+        (self.source / "[id].js").unlink()
+        (self.source / "[d]").write_text("file")
+        (self.source / "[l]/e").mkdir(parents=True)
+        (self.source / "[l]/e/x.txt").write_text("x")
+        self.git("add", "[d]", "[l]")
+        self.git("update-index", "--add", "--cacheinfo",
+                 "160000,1111111111111111111111111111111111111111,[s]")
+        self.git("commit", "-qm", "glob names")
+        (self.source / "[d]").unlink()
+        (self.source / "[d]").mkdir()
+        shutil.rmtree(self.source / "[l]")
+        (self.source / "[l]").symlink_to(self.base, target_is_directory=True)
+        (self.source / ".gitignore").write_text("/[[]l]\n")
+        (self.source / "[n]").mkdir()
+        (self.source / "[n]/f.txt").write_text("f")
+        subprocess.run(["git", "-C", str(self.source / "[n]"), "init", "-q"],
+                       check=True, capture_output=True)
+        exclude = []
+        for refusal, name in (("special file or directory", "d"), ("symlink", "l"),
+                              ("nested Git repository", "n"), ("Git submodule", "s")):
+            with self.subTest(refusal=refusal):
+                with self.assertRaisesRegex(
+                        workspace.WorkspaceError,
+                        f"{refusal} .*not copied: \\[{name}\\]/?; add it to exclude "
+                        f'in request\\.json as "\\[\\[\\]{name}\\]"'):
+                    workspace.capture(self.source, self.run / f"refused-{name}",
+                                      exclude=exclude)
+                exclude.append(f"[[]{name}]")
+        snap = workspace.capture(self.source, self.run / "all-excluded", exclude=exclude)
+        self.assertTrue({"[d]", "[l]", "[n]", "[s]"} <= set(snap["omitted"]))
 
     @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 directory anyway")
     def test_git_scope_refuses_an_unreadable_tracked_path_not_a_deletion(self):
@@ -1143,16 +1194,34 @@ class WorkflowTests(WorkspaceCase):
         with self.assertRaises((OSError, ValueError)):
             workflow.prepare(str(self.run), roles, body)
 
+    def test_a_source_link_that_became_a_loop_is_unknown_freshness(self):
+        link = self.base / "link"
+        link.symlink_to(self.source, target_is_directory=True)
+        roles, body = self.stage()
+        request = {**json.loads((self.run / "request.json").read_text()),
+                   "source_root": str(link)}
+        write_json(self.run / "request.json", request)
+        workflow.prepare(str(self.run), roles, body)
+        link.unlink()
+        link.symlink_to(link)
+        code, fresh = self.freshness()
+        self.assertEqual((code, fresh["state"]), (1, "unknown"), fresh)
+        self.assertEqual(fresh["error"], "WorkspaceError: source_root is missing or "
+                                         f"not a directory: {link}")
+
     def test_a_source_spelled_through_a_gone_link_and_dotdot_is_unknown(self):
         """"alias/.." no longer resolves once alias is gone; resolved
         lexically it read as the captured root and reported unchanged."""
         (self.source / "inner").mkdir()
         (self.source / "alias").symlink_to(self.source / "inner",
                                            target_is_directory=True)
+        (self.source / ".gitignore").write_text("/alias\n")
+        self.init_git()
         roles, body = self.stage()
         spelled = str(self.source / "alias" / "..")
         request = {**json.loads((self.run / "request.json").read_text()),
-                   "source_root": spelled, "exclude": ["alias"]}
+                   "source_root": spelled}
+        request.pop("include")
         write_json(self.run / "request.json", request)
         plan = workflow.prepare(str(self.run), roles, body)
         self.assertEqual(plan["snapshot"]["source_root"], str(self.source))

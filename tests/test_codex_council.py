@@ -527,6 +527,22 @@ class StatePrivacyTests(unittest.TestCase):
             self.assertEqual(codex_council._state_home(),
                              os.path.join(account, ".local", "state"))
             lookup.assert_not_called()
+        # No passwd entry either: a relative state directory, which is
+        # refused rather than created under the current directory.
+        with patch.dict(os.environ, {"HOME": ""}), \
+                patch.object(codex_council.pwd, "getpwuid", side_effect=KeyError):
+            self.assertFalse(os.path.isabs(codex_council._state_home()))
+        cwd = os.getcwd()
+        os.chdir(self.tmp.name)
+        try:
+            with patch.object(codex_council, "STATE_DIR",
+                              os.path.join(".local", "state", "codex-council")), \
+                    self.assertRaisesRegex(codex_council.StateDirError,
+                                           "no absolute saved-thread state directory"):
+                codex_council._ensure_state_dir()
+            self.assertFalse(os.path.lexists(".local"))
+        finally:
+            os.chdir(cwd)
 
     def test_the_state_dir_checked_is_the_one_used(self):
         """A "link/.." spelling is checked where the I/O resolves it, never
