@@ -8,8 +8,11 @@ import contextlib
 import copy
 import dataclasses
 import hashlib
+import io
 import json
 import os
+import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -251,11 +254,21 @@ class CaptureTests(WorkspaceCase):
             with self.subTest(names=names, dirs=dirs):
                 self.assertIsNone(workspace.portable_collision(names, dirs))
 
+    def test_collision_checker_uses_canonical_caseless_matching(self):
+        """APFS treats these as one name; NFC then case folding did not,
+        so capture failed while copying instead of refusing the pair."""
+        composed, decomposed = "\u0390", "\u03aa\u0301"
+        for names in ((composed, decomposed),
+                      (f"{composed}/a.txt", f"{decomposed}/b.txt")):
+            with self.subTest(names=names):
+                self.assertIsNotNone(workspace.portable_collision(names))
+
     def test_inventory_refuses_directory_and_component_collisions(self):
         """The capture path refuses what the checker reports; _walk is
         stubbed so case-insensitive hosts exercise it too."""
         def walk(names, dirs):
-            def fake(root, start, exclude, omitted, empty=None):
+            def fake(root, start, exclude, omitted, empty=None, special=None, *,
+                     hint=""):
                 if empty is not None:
                     empty.update(dirs)
                 return set(names)
@@ -293,6 +306,171 @@ class CaptureTests(WorkspaceCase):
                                     "non-portable case/Unicode collision: "):
             workspace.capture(self.source, self.baseline)
         self.assertFalse(self.baseline.exists())
+
+    def test_git_scope_refuses_a_tracked_symlink_by_name(self):
+        self.init_git()
+        (self.source / "link").symlink_to("subject.py")
+        self.git("add", "link")
+        self.git("commit", "-qm", "link")
+        with self.assertRaisesRegex(
+                workspace.WorkspaceError,
+                r"selected symlink is not copied: link; add it to exclude in request\.json"):
+            workspace.capture(self.source, self.baseline)
+        snap = workspace.capture(self.source, self.run / "excluded", exclude=["link"])
+        self.assertEqual(snap["omitted"]["link"], "requested exclusion")
+        self.assertIn("subject.py", snap["files"])
+
+    def test_git_scope_refuses_a_tracked_file_replaced_by_a_directory(self):
+        self.init_git()
+        self.file.unlink()
+        (self.source / "subject.py").mkdir()
+        (self.source / "subject.py/inner.txt").write_text("inner")
+        with self.assertRaisesRegex(
+                workspace.WorkspaceError,
+                "selected special file or directory is not copied: subject.py; "
+                r"add it to exclude in request\.json"):
+            workspace.capture(self.source, self.baseline)
+
+    def test_git_scope_refuses_a_submodule_populated_empty_or_missing(self):
+        self.init_git()
+        (self.source / "sub").mkdir()
+        self.git("-C", "sub", "init", "-q")
+        (self.source / "sub/inner.txt").write_text("inner")
+        self.git("-C", "sub", "add", "inner.txt")
+        self.git("-C", "sub", "commit", "-qm", "inner")
+        self.git("add", "sub")
+        self.assertIn(b"160000 ", self.git("ls-files", "--stage", "sub"))
+        refusal = ("Git submodule is not copied: sub; add it to exclude in "
+                   r"request\.json, or select its files with include")
+        for state in ("populated", "empty", "missing"):
+            if state == "empty":
+                shutil.rmtree(self.source / "sub")
+                (self.source / "sub").mkdir()
+            elif state == "missing":
+                (self.source / "sub").rmdir()
+            with self.subTest(state=state):
+                with self.assertRaisesRegex(workspace.WorkspaceError, refusal):
+                    workspace.capture(self.source, self.run / f"baseline-{state}")
+                snap = workspace.capture(self.source, self.run / f"excluded-{state}",
+                                         exclude=["sub"])
+                self.assertEqual(snap["omitted"]["sub"], "requested exclusion")
+                self.assertIn("subject.py", snap["files"])
+
+    def test_git_scope_refuses_an_untracked_nested_repository(self):
+        self.init_git()
+        (self.source / "nested").mkdir()
+        self.git("-C", "nested", "init", "-q")
+        (self.source / "nested/inner.txt").write_text("inner")
+        with self.assertRaisesRegex(
+                workspace.WorkspaceError,
+                "nested Git repository is not copied: nested/; add it to exclude in "
+                r"request\.json, or select its files with include"):
+            workspace.capture(self.source, self.baseline)
+        snap = workspace.capture(self.source, self.run / "excluded", exclude=["nested"])
+        self.assertEqual(snap["omitted"]["nested"], "requested exclusion")
+        # The refusal prints "nested/"; added to exclude as printed, it works too.
+        snap = workspace.capture(self.source, self.run / "as-printed", exclude=["nested/"])
+        self.assertEqual(snap["omitted"]["nested"], "requested exclusion")
+        self.assertEqual(workspace.freshness(snap)["state"], "unchanged")
+
+    def test_git_scope_excluding_a_link_that_replaced_a_tracked_directory(self):
+        """The refusal names the link; excluding it is enough, and the
+        tracked paths below it are omitted with it, never read through it."""
+        (self.source / "d").mkdir()
+        (self.source / "d/x.txt").write_text("x")
+        self.init_git()
+        self.git("add", "d")
+        self.git("commit", "-qm", "d")
+        host = self.base / "host"
+        host.mkdir()
+        (host / "x.txt").write_text("HOST-SECRET-SENTINEL")
+        shutil.rmtree(self.source / "d")
+        (self.source / "d").symlink_to(host, target_is_directory=True)
+        with self.assertRaisesRegex(
+                workspace.WorkspaceError,
+                r"selected symlink is not copied: d; add it to exclude in request\.json"):
+            workspace.capture(self.source, self.baseline)
+        excluded = self.run / "excluded"
+        snap = workspace.capture(self.source, excluded, exclude=["d"])
+        self.assertEqual(snap["omitted"], {"d": "requested exclusion",
+                                           "d/x.txt": "requested exclusion"})
+        self.assertEqual(set(snap["files"]), {"subject.py"})
+        self.assertEqual(sorted(path.name for path in excluded.rglob("*")), ["subject.py"])
+        self.assertEqual(workspace.freshness(snap)["state"], "unchanged")
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 directory anyway")
+    def test_git_scope_refuses_an_unreadable_tracked_path_not_a_deletion(self):
+        """lexists() is False on EACCES, so 1.3.3 silently dropped such a
+        path as a tracked deletion."""
+        (self.source / "locked").mkdir()
+        (self.source / "locked/f.txt").write_text("f")
+        self.init_git()
+        self.git("add", "locked")
+        self.git("commit", "-qm", "locked")
+        (self.source / "locked").chmod(0o000)
+        with self.assertRaises(PermissionError):
+            workspace.capture(self.source, self.baseline)
+        self.assertFalse(self.baseline.exists())
+
+    def test_explicit_include_through_a_linked_directory_names_the_fix(self):
+        """Not "[Errno 20] Not a directory: 'lnk'"; exclusions are matched
+        below the include path, so the fix is the include path."""
+        (self.source / "real").mkdir()
+        (self.source / "real/b.txt").write_text("b")
+        (self.source / "lnk").symlink_to("real", target_is_directory=True)
+        for name in ("lnk/b.txt", "real/b.txt/c"):
+            with self.subTest(include=name):
+                with self.assertRaisesRegex(
+                        workspace.WorkspaceError,
+                        "selected input or a directory in its path is a symlink or not "
+                        f"a directory: {name}; name it in include by a path through "
+                        "real directories"):
+                    workspace.capture(self.source, self.baseline, include=[name])
+                self.assertFalse(self.baseline.exists())
+        snap = workspace.capture(self.source, self.run / "real", include=["real/b.txt"])
+        self.assertEqual(set(snap["files"]), {"real/b.txt"})
+
+    def test_a_directory_holding_only_a_listed_link_is_not_empty(self):
+        """A recorded symlink or special file counts as found, so its
+        parent is not reported as an empty directory."""
+        (self.source / "bin").mkdir()
+        (self.source / "bin/git").symlink_to("/usr/bin/git")
+        (self.source / "pipes").mkdir()
+        os.mkfifo(self.source / "pipes/p")
+        special = {}
+        _, _, _, empty = workspace.inventory(self.source, ["."], [], special=special,
+                                             portable=False)
+        self.assertEqual(special, {"bin/git": "symlink", "pipes/p": "special-file"})
+        self.assertEqual(empty, [])
+
+    def test_explicit_scope_refusal_names_the_exclude_fix(self):
+        (self.source / "link").symlink_to("subject.py")
+        with self.assertRaisesRegex(
+                workspace.WorkspaceError,
+                "selected symlink or special file is not copied: link; "
+                r"add it to exclude in request\.json"):
+            self.capture()
+
+    def test_selected_input_reader_names_links_and_directories(self):
+        """Not '[Errno 21] Is a directory: 3' (a descriptor number) or a
+        bare ELOOP/ENOTDIR."""
+        (self.source / "dir").mkdir()
+        (self.source / "dir/value.txt").write_text("value")
+        (self.source / "link").symlink_to("subject.py")
+        (self.source / "jump").symlink_to("dir", target_is_directory=True)
+        for name, message in (
+                ("dir", "selected input is not a regular file: dir"),
+                ("link", "selected input or a directory in its path is a symlink or "
+                         "not a directory: link"),
+                ("jump/value.txt", "selected input or a directory in its path is a "
+                                   "symlink or not a directory: jump/value.txt"),
+                ("subject.py/value.txt", "selected input or a directory in its path "
+                                         "is a symlink or not a directory: "
+                                         r"subject\.py/value\.txt")):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(workspace.WorkspaceError, message):
+                    with workspace.regular(self.source, name):
+                        pass
 
     def test_created_directories_are_private_under_a_permissive_umask(self):
         (self.source / "a/b").mkdir(parents=True)
@@ -357,6 +535,18 @@ class CaptureTests(WorkspaceCase):
         with self.assertRaisesRegex(workspace.WorkspaceError, "input changed"):
             workspace.copy_workspace(self.baseline, self.run / "scratch", snap)
 
+    def test_a_link_planted_in_a_prepared_copy_has_no_request_hint(self):
+        """The link is not in the source, so editing request.json cannot
+        fix it; the check keeps its own wording."""
+        snap = self.capture()
+        target = self.run / "copy"
+        workspace.copy_workspace(self.baseline, target, snap)
+        (target / "planted").symlink_to("subject.py")
+        with self.assertRaises(workspace.WorkspaceError) as ctx:
+            workspace.verify_tree(target, snap["files"], snap["dirs"])
+        self.assertEqual(str(ctx.exception),
+                         "selected symlink or special file is not copied: planted")
+
     def test_added_baseline_control_directory_is_detected(self):
         snap = self.capture()
         self.baseline.chmod(0o700)
@@ -376,6 +566,34 @@ class CaptureTests(WorkspaceCase):
         (self.source / "new.txt").unlink()
         self.git("rm", "--cached", "subject.py")
         self.assertTrue(workspace.freshness(snap)["git_metadata_changed"])
+
+    def test_freshness_of_a_moved_git_source_says_the_source_is_missing(self):
+        """Not "non-Git inputs require explicit include paths"."""
+        self.init_git()
+        snap = workspace.capture(self.source, self.baseline)
+        self.source.rename(self.base / "moved")
+        self.assertEqual(workspace.freshness(snap), {
+            "state": "unknown",
+            "error": f"WorkspaceError: source_root is missing or not a directory: "
+                     f"{self.source}"})
+
+    def test_freshness_refusals_do_not_ask_for_a_request_edit(self):
+        """A prepared run cannot follow "add it to exclude in request.json"
+        (its request is bound), so freshness reports the path alone."""
+        self.init_git()
+        git_scope = workspace.capture(self.source, self.baseline)
+        explicit = workspace.capture(self.source, self.run / "explicit", include=["."])
+        (self.source / "newlink").symlink_to("subject.py")
+        for snap, message in (
+                (git_scope, "WorkspaceError: selected symlink is not copied: newlink"),
+                (explicit, "WorkspaceError: selected symlink or special file is not "
+                           "copied: newlink")):
+            with self.subTest(include=snap["include"]):
+                self.assertEqual(workspace.freshness(snap),
+                                 {"state": "unknown", "error": message})
+        with self.assertRaisesRegex(workspace.WorkspaceError,
+                                    r"newlink; add it to exclude in request\.json"):
+            workspace.capture(self.source, self.run / "again")
 
     def test_freshness_binds_selected_index_entries_not_the_whole_index(self):
         self.init_git()
@@ -419,6 +637,15 @@ class CaptureTests(WorkspaceCase):
         with self.assertRaises(workspace.WorkspaceError):
             workspace.read_json(path)
         self.assertEqual(workspace.read_json(path, private=False), {"a": 1})
+
+    def test_deeply_nested_json_is_refused_not_a_traceback(self):
+        path = self.run / "request.json"
+        depth = 1_000_000  # past every supported Python's parser limit
+        path.write_text("[" * depth + "]" * depth)
+        path.chmod(0o600)
+        with self.assertRaisesRegex(workspace.WorkspaceError,
+                                    "JSON nesting too deep: " + re.escape(str(path))):
+            workspace.read_json(path, private=False)
 
 
 class PolicyTests(unittest.TestCase):
@@ -718,6 +945,115 @@ class WorkflowTests(WorkspaceCase):
         self.assertEqual(bound[0].task_id, plan["task_id"])
         self.assertTrue((self.run / "evidence/experiment/execution-policy.json").exists())
 
+    def freshness(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = workflow.freshness_command(str(self.run))
+        return code, json.loads(output.getvalue())
+
+    def test_null_exclude_means_no_exclusions_at_every_step(self):
+        roles, body = self.stage()
+        request = json.loads((self.run / "request.json").read_text())
+        write_json(self.run / "request.json", {**request, "exclude": None})
+        plan = workflow.prepare(str(self.run), roles, body)
+        self.assertEqual(plan["snapshot"]["exclude"], [])
+        workflow.load_plan(self.run, roles, body, verify_inputs=True)
+        code, fresh = self.freshness()
+        self.assertEqual((code, fresh["state"]), (0, "unchanged"), fresh)
+
+    def test_freshness_keeps_input_detail_when_the_context_changed(self):
+        roles, body = self.stage()
+        workflow.prepare(str(self.run), roles, body)
+        self.file.write_text("value = 2\n")
+        (self.run / "context.md").write_text("A different objective.\n")
+        code, fresh = self.freshness()
+        self.assertEqual(code, 1)
+        self.assertEqual((fresh["state"], fresh["reason"], fresh["changed_paths"]),
+                         ("stale", "staged context changed", ["subject.py"]))
+        for key in ("git_metadata_changed", "omissions_changed", "scope"):
+            self.assertIn(key, fresh)
+
+    def test_unreadable_context_keeps_input_detail_and_a_stale_state(self):
+        roles, body = self.stage()
+        workflow.prepare(str(self.run), roles, body)
+        (self.run / "context.md").unlink()
+        code, fresh = self.freshness()
+        self.assertEqual((code, fresh["state"], fresh["reason"], fresh["changed_paths"]),
+                         (1, "unknown", "context unavailable", []))
+        self.file.write_text("value = 2\n")
+        code, fresh = self.freshness()
+        self.assertEqual((code, fresh["state"], fresh["reason"], fresh["changed_paths"]),
+                         (1, "stale", "context unavailable", ["subject.py"]))
+
+    def test_moved_source_is_unknown_freshness_and_still_refused_elsewhere(self):
+        roles, body = self.stage()
+        workflow.prepare(str(self.run), roles, body)
+        self.source.rename(self.base / "moved")
+        code, fresh = self.freshness()
+        self.assertEqual((code, fresh["state"]), (1, "unknown"), fresh)
+        self.assertIn("error", fresh)
+        # Every other step keeps requiring the source it captured.
+        with self.assertRaises(FileNotFoundError):
+            workflow.load_plan(self.run, roles, body)
+
+    def test_a_looping_source_root_is_a_contract_error_not_a_traceback(self):
+        """Python 3.12 raises RuntimeError for a symlink loop in resolve()."""
+        loop = self.base / "loop"
+        loop.symlink_to(loop)
+        roles, body = self.stage()
+        request = {**json.loads((self.run / "request.json").read_text()),
+                   "source_root": str(loop)}
+        write_json(self.run / "request.json", request)
+        with self.assertRaises((OSError, ValueError)):
+            workflow.prepare(str(self.run), roles, body)
+
+    def test_a_source_spelled_through_a_removed_link_is_unknown_freshness(self):
+        """Not "request changed after capture": request.json is unchanged,
+        but the link source_root was spelled through is gone."""
+        alias = self.base / "alias"
+        alias.symlink_to(self.source, target_is_directory=True)
+        roles, body = self.stage()
+        request = {**json.loads((self.run / "request.json").read_text()),
+                   "source_root": str(alias)}
+        write_json(self.run / "request.json", request)
+        plan = workflow.prepare(str(self.run), roles, body)
+        self.assertEqual(plan["snapshot"]["source_root"], str(self.source))
+        alias.unlink()  # the captured source itself is still there
+        code, fresh = self.freshness()
+        self.assertEqual((code, fresh["state"]), (1, "unknown"), fresh)
+        self.assertEqual(fresh["error"], "WorkspaceError: source_root is missing or "
+                                         f"not a directory: {alias}")
+        self.source.rename(self.base / "moved")
+        code, fresh = self.freshness()
+        self.assertEqual((code, fresh["state"]), (1, "unknown"), fresh)
+        # The rest of the request is still bound to the capture.
+        write_json(self.run / "request.json", {**request, "task_id": "another-task"})
+        with self.assertRaisesRegex(workspace.WorkspaceError, "request changed after capture"):
+            self.freshness()
+
+    def test_lifecycle_files_are_owner_readable_whatever_the_umask(self):
+        """A umask that clears owner read made 0600 requests come out 0200."""
+        roles, body = self.stage()
+        previous = os.umask(0o400)
+        try:
+            plan = workflow.prepare(str(self.run), roles, body)
+            directory = self.run / plan["roles"]["experiment"]["evidence"]
+            recorder = evidence.AttemptEvidence(directory, ["codex"], "goal")
+            meta = recorder.finish(returncode=0, state="exited")
+            evidence.collect_artifacts(self.baseline,
+                                       self.run / plan["roles"]["experiment"]["workspace"],
+                                       plan["snapshot"], directory)
+            target = self.run / "value.json"
+            workspace.atomic_json(target, {"a": 1})
+        finally:
+            os.umask(previous)
+        for path in (self.run / "prepare.lock", self.run / "run.json", target,
+                     directory / meta["stdout_file"], directory / meta["stderr_file"],
+                     directory / f"{recorder.key}.json", directory / "candidate.diff"):
+            self.assertEqual(stat.S_IMODE(path.lstat().st_mode), 0o600, path)
+        self.assertEqual(workspace.read_json(target), {"a": 1})
+        self.assertEqual(workflow.load_plan(self.run, roles, body)["run_id"], plan["run_id"])
+
 
 class EvidenceTests(WorkspaceCase):
     def test_records_raw_bytes_and_separates_tool_evidence_from_claims(self):
@@ -833,14 +1169,114 @@ class EvidenceTests(WorkspaceCase):
         self.assertIn("experiment:attempt-metadata-unreadable", result["coverage_gaps"])
         self.assertTrue((self.run / "result.json").exists())
 
-    def test_artifact_symlink_cannot_read_host_file(self):
+    def scratch(self):
         snap = self.capture()
         target, directory = self.run / "scratch", self.run / "evidence"
         directory.mkdir(mode=0o700)
         workspace.copy_workspace(self.baseline, target, snap)
-        (target / "escape").symlink_to(self.file)
-        with self.assertRaises((workspace.WorkspaceError, OSError)):
-            evidence.collect_artifacts(self.baseline, target, snap, directory)
+        return snap, target, directory
+
+    def test_artifact_symlink_cannot_read_host_file(self):
+        """Listed by path and kind; the target is never opened or hashed."""
+        host = self.base / "host-secret.txt"
+        host.write_text("HOST-SECRET-SENTINEL\n")
+        snap, target, directory = self.scratch()
+        (target / "escape").symlink_to(host)
+        result = evidence.collect_artifacts(self.baseline, target, snap, directory)
+        self.assertEqual(result["files"], [{"path": "escape", "kind": "symlink",
+                                            "before": None, "after": None,
+                                            "text_patch": False}])
+        manifest = json.dumps(result) + (directory / "candidate.diff").read_text()
+        self.assertNotIn("HOST-SECRET-SENTINEL", manifest)
+        self.assertNotIn(hashlib.sha256(host.read_bytes()).hexdigest(), manifest)
+
+    def test_artifact_fifo_is_listed_as_a_special_file_without_blocking(self):
+        snap, target, directory = self.scratch()
+        os.mkfifo(target / "pipe")
+        started = time.monotonic()
+        result = evidence.collect_artifacts(self.baseline, target, snap, directory)
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual([(row["path"], row["kind"]) for row in result["files"]],
+                         [("pipe", "special-file")])
+
+    def test_regular_edit_next_to_a_symlink_keeps_its_diff(self):
+        (self.source / "other.txt").write_text("other\n")
+        snap, target, directory = self.scratch()
+        (target / "subject.py").write_text("value = 2\n")
+        (target / "bin").mkdir()
+        (target / "bin/git").symlink_to("/usr/bin/git")
+        (target / "other.txt").unlink()
+        (target / "other.txt").symlink_to(self.file)  # a captured file replaced
+        result = evidence.collect_artifacts(self.baseline, target, snap, directory)
+        rows = {row["path"]: row for row in result["files"]}
+        self.assertEqual({name: row["kind"] for name, row in rows.items()},
+                         {"bin/git": "symlink", "other.txt": "symlink",
+                          "subject.py": "modified"})
+        self.assertEqual(rows["other.txt"]["before"], snap["files"]["other.txt"])
+        self.assertIsNone(rows["other.txt"]["after"])
+        self.assertEqual(len(result["files"]), 3)
+        diff = (directory / "candidate.diff").read_text()
+        self.assertIn("+value = 2", diff)
+        self.assertNotIn("other", diff)
+
+    def test_case_colliding_scratch_files_do_not_break_inspection(self):
+        """Scratch output is not a capture. A case-folding host can hold
+        only one of the names, so there the checker reports the pair."""
+        snap, target, directory = self.scratch()
+        upper, lower = target / "Out.txt", target / "out.txt"
+        upper.write_text("upper\n")
+        lower.write_text("lower\n")
+        distinct = upper.stat().st_ino != lower.stat().st_ino
+        with contextlib.ExitStack() as stack:
+            if not distinct:
+                stack.enter_context(patch.object(
+                    workspace, "portable_collision", return_value=("Out.txt", "out.txt")))
+            result = evidence.collect_artifacts(self.baseline, target, snap, directory)
+        self.assertEqual({row["path"] for row in result["files"]},
+                         {"Out.txt", "out.txt"} if distinct else {"Out.txt"})
+        self.assertIn("+lower", (directory / "candidate.diff").read_text())
+
+    def prepared(self):
+        roles = [RoleFixture()]
+        write_json(self.run / "request.json", {
+            "schema": workflow.REQUEST_SCHEMA, "task_id": "metadata-test",
+            "reason": "Check evidence integrity", "source_root": str(self.source),
+            "include": ["."]})
+        plan = workflow.prepare(str(self.run), roles, "Current evidence")
+        (self.run / "context.md").write_text("Current evidence")
+        return plan
+
+    def test_unreadable_attempt_metadata_is_also_a_role_coverage_gap(self):
+        plan = self.prepared()
+        directory = self.run / plan["roles"]["experiment"]["evidence"]
+        recorder = evidence.AttemptEvidence(directory, ["codex"], "goal")
+        recorder.feed("stdout", b'{"type":"turn.completed"}\n')
+        recorder.finish(returncode=0, state="exited")
+        write_json(directory / "attempt-corrupt.json", [])
+        result = evidence.write_result(self.run, plan, [])
+        role = result["roles"]["experiment"]
+        self.assertEqual(len(role["attempts"]), 1)
+        self.assertIn("attempt-metadata-unreadable", role["coverage_gaps"])
+        self.assertIn("experiment:attempt-metadata-unreadable", result["coverage_gaps"])
+
+    def test_context_change_keeps_input_detail_at_reconciliation(self):
+        plan = self.prepared()
+        self.file.write_text("value = 2\n")
+        (self.run / "context.md").write_text("A different objective.")
+        application = evidence.write_result(self.run, plan, [])["applicability"]
+        self.assertEqual((application["state"], application["reason"],
+                          application["changed_paths"]),
+                         ("stale", "context changed since capture", ["subject.py"]))
+        (self.run / "context.md").unlink()
+        result = evidence.write_result(self.run, plan, [])
+        self.assertEqual((result["applicability"]["state"], result["applicability"]["reason"],
+                          result["applicability"]["changed_paths"]),
+                         ("stale", "context unavailable", ["subject.py"]))
+        self.assertIn("context-unavailable-at-reconciliation", result["coverage_gaps"])
+        self.file.write_text("value = 1\n")
+        application = evidence.write_result(self.run, plan, [])["applicability"]
+        self.assertEqual((application["state"], application["changed_paths"]),
+                         ("unknown", []))
 
 
 if __name__ == "__main__":

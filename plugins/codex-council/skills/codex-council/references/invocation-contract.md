@@ -32,19 +32,24 @@ the runner reads their **current working bytes**, including staged/unstaged edit
 and deletions; a partially staged file is captured as its working version. Explicit
 includes also keep empty directories. A non-Git project requires `include`. `include: []` supports a
 pure question without filesystem inputs. Exclusions are case-sensitive
-shell-style patterns matched against relative names, not validated as paths.
-Explicit includes may select ignored fixtures.
+shell-style patterns matched against relative names, not validated as paths. An
+omitted or `null` `exclude` means no exclusions. Explicit includes may select
+ignored fixtures.
 
 Known credential, agent/VCS configuration, instruction and dependency-cache paths
 met during selection are excluded and recorded in `run.json.snapshot.omitted`.
 That list is neither a complete inventory of ignored paths (implicit Git scope never
 lists them) nor a secret scan; sanitize unusual sensitive inputs yourself and
-narrow the scope before capture. Submodules, symlinks, special files, and
-case/Unicode collisions among selected file paths, empty directories and every
-directory component are refused or recorded as gaps, not silently flattened. File
-bytes and an executable/non-executable flag are captured, not the full permission
-mode; ownership, ACLs, extended attributes, sparse layout and external services are
-not reproduced.
+narrow the scope before capture. A selected symlink or special file is refused by
+name, as are, with `include` omitted, a Git submodule (populated, empty or missing)
+and an untracked nested Git repository. Each refusal names the path and the fix:
+add it to `exclude` (it is then recorded in `snapshot.omitted`), or select a
+submodule's or nested repository's files with an explicit `include`. None is
+silently flattened or dropped. Collisions under Unicode canonical caseless matching
+among selected file paths, empty directories and every directory component are
+refused too. File bytes and an executable/non-executable flag are captured, not the
+full permission mode; ownership, ACLs, extended attributes, sparse layout and
+external services are not reproduced.
 
 `roles.json` is a nonempty array. This is an example, not a predefined role:
 
@@ -172,7 +177,10 @@ are distinct from applicability to current work and from verified task success.
 
 Artifact manifests cover added, removed and changed non-omitted regular files,
 executable-flag changes included; other permission changes and empty-directory
-changes are not recorded. Small text changes also produce a human-inspectable
+changes are not recorded. A non-omitted symlink or special file a role leaves is
+listed by path with kind `symlink` or `special-file` (and the captured `before`
+entry when it replaced a captured file); it is never followed, read or diffed, and
+is not a coverage gap. Small text changes also produce a human-inspectable
 `candidate.diff`; binary, large and executable-flag-only changes retain metadata
 and exact bytes in scratch. Nothing applies patches to the live source. Treat all
 artifacts as untrusted. Frozen-directory modes and digests detect mistakes, not
@@ -182,6 +190,9 @@ malicious same-user/bypass tampering.
 and 2 for an invalid contract. It checks selected file bytes and executable flags,
 empty directories, Git HEAD and the index entries of selected paths, the recorded
 omission list, and the staged context; staging an unrelated file does not make a
-capture stale. It does not check omitted file contents, changed user intent, or
+capture stale. A changed staged context adds its reason and keeps the file-level
+detail (changed paths, Git and omission flags), as `result.json` applicability
+does; a moved or deleted source root reports unknown (exit 1), not an invalid
+contract. It does not check omitted file contents, changed user intent, or
 unrecorded external dependencies. Claude must compare the current goal as well. A failed
 baseline due to unavailable dependencies is a blocked check, not a discovered bug.

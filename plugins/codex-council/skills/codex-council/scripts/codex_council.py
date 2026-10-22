@@ -27,10 +27,12 @@ See DESIGN.md and references/invocation-contract.md for limits and protocol.
 import argparse
 import asyncio
 import contextlib
+import errno
 import fcntl
 import hashlib
 import json
 import os
+import pwd
 import re
 import secrets
 import shlex
@@ -95,6 +97,7 @@ from council_failures import (  # noqa: E402
 )
 from council_liveness import (  # noqa: E402
     FOLLOW_START_SECS,
+    RUN_DIR_RECOVERY,
     STATUS_FILENAME,
     STATUS_TICK_SECS,
     TICK_GIVE_UP_SECS,
@@ -134,10 +137,27 @@ from council_workflow import (  # noqa: E402
 )
 sys.dont_write_bytecode = _DONT_WRITE_BYTECODE
 
-STATE_DIR = os.path.join(
-    os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
-    "codex-council",
-)
+def _state_home():
+    """$XDG_STATE_HOME when it is an absolute path, else ~/.local/state.
+
+    The XDG base-directory specification says a relative value (a literal
+    "~/..." included) is invalid and must be ignored; used as given it
+    would put the state directory under the current directory, usually the
+    user's project. A relative $HOME would do the same, so then the
+    account's home directory from the password database stands in for it.
+    """
+    home = os.environ.get("XDG_STATE_HOME", "")
+    if os.path.isabs(home):
+        return home
+    state = os.path.expanduser("~/.local/state")
+    if not os.path.isabs(state):
+        with contextlib.suppress(KeyError):
+            state = os.path.join(pwd.getpwuid(os.geteuid()).pw_dir,
+                                 ".local", "state")
+    return state
+
+
+STATE_DIR = os.path.join(_state_home(), "codex-council")
 
 # The reliable session scope. CLAUDE_CODE_SESSION_ID is only a best-effort
 # fallback: it can keep the startup id after --resume or --continue.
@@ -464,14 +484,25 @@ def _ensure_state_dir():
 
     Missing components are created 0700 (as the XDG base-directory
     specification asks of a missing $XDG_STATE_HOME); existing ancestors are
-    never touched. An existing state directory must be a real directory
-    (not a symlink) owned by the effective uid; when it is group- or
-    other-accessible, as one created under an earlier umask-dependent
-    release can be, it is tightened to 0700 through a descriptor opened
-    without following links and re-checked to be the same owned directory.
-    Anything else raises StateDirError and nothing is chmodded.
+    never touched. The path is checked as spelled, without lexical
+    normalization, so the directory checked is the one _state_path and the
+    role locks use (a "link/.." component resolves the same way for both).
+    An existing state directory must be a real directory (not a symlink)
+    owned by the effective uid; when its mode is anything but 0700 (group-
+    or other-accessible, as one created under an earlier umask-dependent
+    release can be, or missing owner bits, as 0500, 000, or one a
+    concurrent council created under an owner-clearing umask), it is reset
+    to 0700 through a descriptor opened without following links and
+    re-checked to be the same owned directory (one without an owner read
+    bit cannot be opened, so it is reset by name without following a link
+    and re-checked afterwards). Anything else raises StateDirError and
+    nothing is chmodded.
     """
-    path = os.path.normpath(os.path.abspath(STATE_DIR))
+    # Joined to the cwd only when relative, and never normalized; a deleted
+    # cwd then cannot fail an absolute state directory.
+    path = STATE_DIR
+    if not os.path.isabs(path):
+        path = os.path.join(os.getcwd(), path)
     missing = []
     current = path
     while not os.path.lexists(current):
@@ -485,16 +516,22 @@ def _ensure_state_dir():
         os.chmod(directory, 0o700)
     st = os.lstat(path)
     problem = _private_stat_problem(st, directory=True)
-    if problem is None:
+    if problem is None and stat.S_IMODE(st.st_mode) == 0o700:
         return path
-    kind, fragment = problem
-    if kind != "mode":
-        raise StateDirError(
-            f"saved-thread state directory {path!r} {fragment}; it is not "
-            "changed or used. Move it aside or point XDG_STATE_HOME at an "
-            "owned private directory, then start over in a new run directory")
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-                 | os.O_CLOEXEC)
+    if problem is not None:
+        kind, fragment = problem
+        if kind != "mode":
+            raise StateDirError(
+                f"saved-thread state directory {path!r} {fragment}; it is "
+                "not changed or used. Move it aside or point XDG_STATE_HOME "
+                "at an owned private directory, then start over in a new run "
+                "directory")
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                     | os.O_CLOEXEC)
+    except PermissionError:
+        _reset_unreadable_state_dir(path, st)
+        return path
     try:
         opened = os.fstat(fd)
         if ((opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino)
@@ -508,12 +545,57 @@ def _ensure_state_dir():
     return path
 
 
+def _reset_unreadable_state_dir(path, st):
+    """Reset the owned state directory `st` describes, which has no owner
+    read bit (so no descriptor can be opened on it), to 0700 by name
+    without following a link; then re-check that `path` is still that
+    directory, owned and 0700. Anything else raises StateDirError."""
+    try:
+        os.chmod(path, 0o700, follow_symlinks=False)
+    except NotImplementedError:
+        raise StateDirError(
+            f"saved-thread state directory {path!r} is mode "
+            f"{stat.S_IMODE(st.st_mode):04o} and cannot be reset here without "
+            "following a link; it is not used. Move it aside or point "
+            "XDG_STATE_HOME at an owned private directory, then start over in "
+            "a new run directory") from None
+    after = os.lstat(path)
+    if ((after.st_dev, after.st_ino) != (st.st_dev, st.st_ino)
+            or not stat.S_ISDIR(after.st_mode)
+            or after.st_uid != os.geteuid()
+            or stat.S_IMODE(after.st_mode) != 0o700):
+        raise StateDirError(
+            f"saved-thread state directory {path!r} changed while being "
+            "checked; it is not used")
+
+
+# What os.open of a role lock reports for a symlink final component (ELOOP;
+# EMLINK or EFTYPE on some BSDs), a directory, a socket (EOPNOTSUPP on
+# macOS, ENXIO on Linux), or a file this user cannot open: the lock is
+# refused like any other non-private lock file.
+_LOCK_OPEN_REFUSALS = frozenset(
+    code for code in (errno.ELOOP, errno.EMLINK,
+                      getattr(errno, "EFTYPE", None), errno.EISDIR,
+                      errno.EOPNOTSUPP, errno.ENXIO, errno.EACCES,
+                      errno.EPERM)
+    if code is not None)
+
+
 def _open_private_lock(lock_path):
     """Open (creating 0600) one owned regular lock file without following a
     link; an existing owned lock file with group/other bits is tightened to
-    0600 through its descriptor. Anything else raises StateDirError."""
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
-                 | os.O_CLOEXEC | os.O_NONBLOCK, 0o600)
+    0600 through its descriptor. Anything else, including a symlink,
+    directory, socket, or file this user cannot open there, raises
+    StateDirError."""
+    try:
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
+                     | os.O_CLOEXEC | os.O_NONBLOCK, 0o600)
+    except OSError as e:
+        if e.errno not in _LOCK_OPEN_REFUSALS:
+            raise
+        raise StateDirError(
+            f"role lock {lock_path!r} is not an owned regular file this user "
+            "can open; it is not changed or used") from None
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
@@ -552,10 +634,21 @@ def _release_role_state_lock(lock_file):
 
 
 def load_session(role_id):
-    """Return (session_id, meta) for this role's stored thread, or (None, None)."""
+    """Return (session_id, meta) for this role's stored thread, or (None, None).
+
+    The state file is opened without following a link or blocking (a FIFO
+    there would otherwise hang a resume role while it holds its continuity
+    lock); anything but an owned regular file reads as no saved thread,
+    like corrupt state.
+    """
     try:
-        with open(_state_path(role_id)) as f:
-            meta = json.load(f)
+        fd = os.open(_state_path(role_id), os.O_RDONLY | os.O_NOFOLLOW
+                     | os.O_NONBLOCK | os.O_CLOEXEC)
+        with os.fdopen(fd, "rb") as f:
+            st = os.fstat(f.fileno())
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
+                return None, None
+            meta = json.loads(f.read())
     except (OSError, ValueError, RecursionError):
         return None, None
     # Corrupt state that is valid JSON but not an object (e.g. "[]") must
@@ -1911,7 +2004,9 @@ def _parse_args(argv):
             "for that record, then exits 0 with one "
             "'started' line, a note when the record is not written yet or "
             "the runner already ended, and the --follow, --status, and "
-            "--cancel commands; exits 1 when the supervisor could not be "
+            "--cancel commands (when its own stdout is unavailable, still "
+            "exit 0, with one stderr line naming the pid and directory); "
+            "exits 1 when the supervisor could not be "
             "spawned or exited before writing its record (read err.log; "
             "the directory is used up). Run it as an ordinary "
             "foreground command, never in a background task and never "
@@ -1943,7 +2038,9 @@ def _parse_args(argv):
             "whose leader is still this run's codex, and the process groups "
             "and processes that codex started, then print what was done "
             "(exit 0). Refused with exit 1 otherwise; invalid arguments or "
-            "run directory exit 2. Never touches saved threads or files."
+            "run directory exit 2; interrupted (Ctrl-C), it still sends "
+            "SIGKILL to the group it was ending and exits 130. Never "
+            "touches saved threads or files."
         ),
     )
     parser.add_argument(
@@ -2610,7 +2707,9 @@ def _start_command(run_dir):
        ended; one that exits without writing it, or a spawn failure, is
        exit 1 (read err.log; the directory is used up). When the wait
        runs out with the child still running and no record, it is also
-       exit 0, with a note to run --status.
+       exit 0, with a note to run --status. A start whose own stdout is
+       closed or broken is exit 0 too, with one stderr line naming the pid
+       and directory instead.
     """
     prefix = "--start: "
     _fill_closed_standard_fds()
@@ -2638,6 +2737,12 @@ def _start_command(run_dir):
     except OSError as e:
         refuse(SUPERVISOR_LOCK_FILENAME, e)
     claimed.append(lock_fd)
+    # Each claimed file is set to 0600 as soon as it exists: a umask can
+    # clear owner bits too (0o400 would leave it 0200, unreadable).
+    try:
+        os.fchmod(lock_fd, 0o600)
+    except OSError as e:
+        refuse(SUPERVISOR_LOCK_FILENAME, e)
     # A reader's momentary shared lock (--status, --follow) may be in the
     # way for an instant; nobody else can hold a file this call created.
     lock_deadline = time.monotonic() + 1
@@ -2661,6 +2766,7 @@ def _start_command(run_dir):
         try:
             claimed.append(os.open(os.path.join(abs_dir, name),
                                    mode | flags, 0o600))
+            os.fchmod(claimed[-1], 0o600)
         except OSError as e:
             refuse(name, e)
     _, err_fd, out_fd = claimed
@@ -2689,6 +2795,22 @@ def _start_command(run_dir):
         for fd in claimed:
             os.close(fd)
     sup_path = os.path.join(abs_dir, SUPERVISOR_FILENAME)
+
+    def recorded():
+        record = read_supervisor(sup_path)
+        return record is not None and record.pid == proc.pid
+
+    def start_failed(code):
+        print(
+            f"[codex-council] start failed: the supervisor (pid "
+            f"{proc.pid}) exited with status {code} before the council "
+            f"was running; read {_report_inline(abs_dir)}/err.log. Do "
+            "not retry --start in this directory: it is used up. "
+            f"{LAUNCHED_DIR_RECOVERY}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     deadline = time.monotonic() + START_WAIT_SECS
     ready = False
     while True:
@@ -2697,39 +2819,53 @@ def _start_command(run_dir):
         # already finished (a quick council, or a slow launcher) is a
         # start, never a failure.
         code = proc.poll()
-        record = read_supervisor(sup_path)
-        if record is not None and record.pid == proc.pid:
+        if recorded():
             ready = True
             break
         if code is not None:
-            print(
-                f"[codex-council] start failed: the supervisor (pid "
-                f"{proc.pid}) exited with status {code} before the council "
-                f"was running; read {_report_inline(abs_dir)}/err.log. Do "
-                "not retry --start in this directory: it is used up. "
-                f"{LAUNCHED_DIR_RECOVERY}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+            start_failed(code)
         if time.monotonic() >= deadline:
             break
         time.sleep(START_POLL_SECS)
     ended = proc.poll()
+    if not ready and ended is not None:
+        # It ended after the last look: still a start only if its record
+        # was written before that exit.
+        ready = recorded()
+        if not ready:
+            start_failed(ended)
     command = (f"{shlex.quote(sys.executable)} "
                f"{shlex.quote(os.path.realpath(__file__))}")
     quoted = shlex.quote(abs_dir)
     contract = f"--skill-contract {SKILL_CONTRACT_EPOCH}"
-    print(f"[codex-council] started: pid={proc.pid} "
-          f"dir={_report_inline(abs_dir)} version={_plugin_version()}")
-    if not ready:
-        print(f"note: {SUPERVISOR_FILENAME} is not written yet; the "
-              "supervisor is still starting; run --status")
-    elif ended is not None:
-        print(f"note: the runner has already ended (exit {ended}); run "
-              "--status, then read out.md")
-    print(f"follow: {command} --follow {quoted} {contract}")
-    print(f"status: {command} --status {quoted} {contract}")
-    print(f"cancel: {command} --cancel {quoted} {contract}")
+    try:
+        if sys.stdout is None:  # descriptor 1 was closed at startup
+            raise ValueError("stdout is closed")
+        print(f"[codex-council] started: pid={proc.pid} "
+              f"dir={_report_inline(abs_dir)} version={_plugin_version()}")
+        if not ready:
+            print(f"note: {SUPERVISOR_FILENAME} is not written yet; the "
+                  "supervisor is still starting; run --status")
+        elif ended is not None:
+            print(f"note: the runner has already ended (exit {ended}); run "
+                  "--status, then read out.md")
+        print(f"follow: {command} --follow {quoted} {contract}")
+        print(f"status: {command} --status {quoted} {contract}")
+        print(f"cancel: {command} --cancel {quoted} {contract}")
+        sys.stdout.flush()
+    except (OSError, ValueError):
+        # The council is running (and spending) whatever happened to this
+        # stdout, so this is still a start: close the dead stream so an
+        # interpreter-shutdown flush cannot rewrite the exit code (never
+        # exit 120), and say once on stderr where the run is.
+        with contextlib.suppress(Exception):
+            sys.stdout.close()
+        _diag(f"[codex-council] started pid={proc.pid} "
+              f"dir={_report_inline(abs_dir)}, but stdout is unavailable "
+              "and the follow, status, and cancel commands were not "
+              f"printed; run --status: {command} --status {quoted} "
+              f"{contract}")
+        sys.exit(0)
 
 
 def _become_supervisor(run_dir, lock_fd):
@@ -2796,7 +2932,10 @@ def _claim_execution(run_dir):
     except FileExistsError:
         raise WorkspaceError("this prepared run was already executed; "
                              "prepare a new run directory") from None
-    os.close(fd)
+    try:
+        os.fchmod(fd, 0o600)  # a umask can clear owner bits too
+    finally:
+        os.close(fd)
 
 
 def _force_utf8_streams():
@@ -2837,14 +2976,18 @@ def main():
             plan = prepare(directory, roles, body)
         except (OSError, ValueError) as exc:
             _usage_exit("--prepare: " + _report_inline(exc)
-                        + "; pause overlapping writers and start over in a new private directory.")
+                        + "; start over in a new private directory (if the "
+                        "inputs changed during capture, pause overlapping "
+                        "writers first).")
         print(f"[codex-council] captured snapshot={plan['snapshot']['snapshot_id']} "
               f"files={len(plan['snapshot']['files'])} roles={len(roles)} "
               f"omitted={len(plan['snapshot']['omitted'])} version={_plugin_version()}")
         return
     if args.freshness is not None:
+        directory = _check_private_dir(args.freshness, prefix="--freshness: ",
+                                       recovery=RUN_DIR_RECOVERY)
         try:
-            code = freshness_command(args.freshness)
+            code = freshness_command(directory)
         except (OSError, ValueError) as exc:
             _usage_exit("--freshness: " + _report_inline(exc))
         sys.exit(code)
@@ -2903,7 +3046,15 @@ def main():
             code = 130
         sys.exit(code)
     if args.reap is not None:
-        sys.exit(reap_command(args.reap))
+        try:
+            code = reap_command(args.reap)
+        except KeyboardInterrupt:
+            # Every group it was ending already got its SIGKILL (see
+            # _terminate_group).
+            _diag("[codex-council] --reap interrupted by user; run --status, "
+                  "then --reap again if live codex groups remain")
+            code = 130
+        sys.exit(code)
 
     if args.supervisor_lock_fd is None:
         _usage_exit(

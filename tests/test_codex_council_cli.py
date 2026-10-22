@@ -40,8 +40,8 @@ from fake_codex import EXEC_SENTINELS  # noqa: E402
 # fails on stderr alone, fails with JSONL errors only (an HTTP 429, or a
 # status-400 body whose text holds "429", which must NOT be tagged
 # retriable), replies with a body embedding a forged CODEX_COUNCIL_DONE
-# line, fails with a 503 on its first invocation only, makes the council
-# state directory read-only before replying, hangs byte-silent, or writes
+# line, fails with a 503 on its first invocation only, makes the council's
+# state save fail before replying, hangs byte-silent, or writes
 # stdout lines the Python decoder rejects (then, with a sleep, goes silent).
 FAIL_SENTINEL = EXEC_SENTINELS["fail"]
 STDOUT_ERROR_SENTINEL = EXEC_SENTINELS["stdout_error"]
@@ -696,6 +696,46 @@ class VersionVisibilityTests(CouncilCLITestCase):
         self.assertRegex(launch.stderr, r"CODEX_COUNCIL_DONE .*version=\S+")
 
 
+class PrepareAndFreshnessRefusalTests(CouncilCLITestCase):
+    """Refusal text the caller acts on: a failed --prepare starts over in a
+    new directory first, and --freshness on a directory that is not
+    private names the real run directory, never a chmod."""
+
+    def test_a_prepare_failure_starts_over_before_pausing_writers(self):
+        self._write_roles([
+            _role("architect", "Architect", _instruction("Review")),
+        ])
+        self._write_context("please review\n")
+        proc = self._run(input="", args=("--prepare", self.workdir.name))
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertTrue(proc.stderr.startswith("--prepare: "), proc.stderr)
+        self.assertTrue(proc.stderr.endswith(
+            "; start over in a new private directory (if the inputs "
+            "changed during capture, pause overlapping writers first).\n"),
+            proc.stderr)
+        self.assertNotIn("pause overlapping writers and start over",
+                         proc.stderr)
+        self.assertEqual(proc.stdout, "")
+
+    def test_freshness_refuses_a_public_directory_without_a_chmod(self):
+        self._write_roles([
+            _role("architect", "Architect", _instruction("Review")),
+        ])
+        self._write_context("please review\n")
+        self._prepare()
+        os.chmod(self.workdir.name, 0o755)
+        self.addCleanup(os.chmod, self.workdir.name, 0o700)
+        proc = self._run(input="", args=("--freshness", self.workdir.name))
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        flat = " ".join(proc.stderr.split())
+        self.assertIn(f"--freshness: {self.workdir.name!r} is mode 0755",
+                      flat)
+        self.assertIn("pass the exact absolute mktemp directory", flat)
+        self.assertIn("--freshness only reads the capture records", flat)
+        self.assertIn("do not chmod or mkdir anything for them", flat)
+        self.assertEqual(proc.stdout, "")
+
+
 class LaunchPrivacyGateTests(CouncilCLITestCase):
     """The supervised child re-validates each staged input's LEXICAL parent
     for privacy before any content read or trust in its descriptor —
@@ -829,9 +869,9 @@ class StallWatchdogCliTests(CouncilCLITestCase):
 
 class ReadOnlyStateDirTests(CouncilCLITestCase):
     def test_reply_survives_unwritable_state_dir_with_warning(self):
-        """The fake codex flips the state dir read-only mid-run, so the
-        post-success save fails: the reply must still land in the report,
-        the role stays ok, and the council exits 0."""
+        """The fake codex makes the role's state file path unusable
+        mid-run, so the post-success save fails: the reply must still land
+        in the report, the role stays ok, and the council exits 0."""
         state_root = os.path.join(self.statedir.name, "codex-council")
         self.addCleanup(lambda: os.path.isdir(state_root)
                         and os.chmod(state_root, 0o700))

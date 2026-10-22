@@ -65,6 +65,7 @@ class AttemptEvidence:
                 fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                              0o600)
                 self.streams[name] = os.fdopen(fd, "wb", buffering=0)
+                os.fchmod(fd, 0o600)  # 0600 whatever the umask
                 self.meta[f"{name}_file"] = path.name
             atomic_json(directory / f"{self.key}.json", {**self.meta, "state": "running"})
         except BaseException:
@@ -206,13 +207,22 @@ def collect_artifacts(baseline: Path, workspace: Path, snapshot: dict[str, Any],
     executable-flag changes included; other permission changes and
     empty-directory changes are not recorded. Large, binary and
     executable-flag-only changes stay in the manifest, not a lossy text patch.
+    A symlink or special file the role left is listed by path and kind, with
+    the captured entry it replaced; it is never opened, followed or diffed.
+    Scratch output is not a capture, so names that collide are not refused.
     """
-    files, _, omitted, _ = inventory(workspace, ["."], [])
-    changed = sorted(name for name in set(files) | set(snapshot["files"])
-                     if files.get(name) != snapshot["files"].get(name))
+    special: dict[str, str] = {}
+    files, _, omitted, _ = inventory(workspace, ["."], [], special=special,
+                                     portable=False)
+    changed = sorted({*special, *(name for name in set(files) | set(snapshot["files"])
+                                  if files.get(name) != snapshot["files"].get(name))})
     artifacts, patches = [], []
     for name in changed:
         before, after = snapshot["files"].get(name), files.get(name)
+        if name in special:
+            artifacts.append({"path": name, "kind": special[name], "before": before,
+                              "after": None, "text_patch": False})
+            continue
         entry = {"path": name, "before": before, "after": after,
                  "kind": "added" if before is None else "deleted" if after is None
                  else "modified", "text_patch": False}
@@ -245,6 +255,7 @@ def collect_artifacts(baseline: Path, workspace: Path, snapshot: dict[str, Any],
     path = evidence_dir / "candidate.diff"
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8", newline="") as stream:
+        os.fchmod(fd, 0o600)  # 0600 whatever the umask
         stream.writelines(patches)
     return {"files": artifacts, "omitted": omitted, "candidate_diff": path.name,
             "application": "never automatic; inspect exact workspace bytes"}
@@ -261,18 +272,22 @@ def write_result(run_dir: Path, plan: dict[str, Any], results: list[Any],
     except (OSError, ValueError):
         baseline_intact = False
         gaps.append("baseline-integrity-not-established")
+    # The context check refines the input comparison; it never discards its
+    # file-level detail.
     application = freshness(manifest)
     try:
         if hashlib.sha256((run_dir / "context.md").read_bytes()).hexdigest() != plan["context_sha256"]:
-            application = {"state": "stale", "reason": "context changed since capture"}
+            application.update(state="stale", reason="context changed since capture")
     except OSError:
-        application = {"state": "unknown", "reason": "context unavailable"}
+        application["reason"] = "context unavailable"
+        if application["state"] != "stale":
+            application["state"] = "unknown"
         gaps.append("context-unavailable-at-reconciliation")
     roles = {}
     for role_id, binding in plan["roles"].items():
         result = by_id.get(role_id)
         directory = run_dir / binding["evidence"]
-        attempts = []
+        attempts, role_gaps = [], []
         for path in sorted(directory.glob("attempt-*.json")):
             try:
                 attempt = read_json(path)
@@ -281,7 +296,7 @@ def write_result(run_dir: Path, plan: dict[str, Any], results: list[Any],
                 attempts.append(attempt)
             except (OSError, ValueError):
                 gaps.append(f"{role_id}:attempt-metadata-unreadable")
-        role_gaps = []
+                role_gaps.append("attempt-metadata-unreadable")
         if not attempts:
             role_gaps.append("no-attempt-evidence")
         if any(not attempt.get("evidence_complete") for attempt in attempts):

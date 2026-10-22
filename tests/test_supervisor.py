@@ -345,6 +345,64 @@ class StartCommandTests(StartCase):
                           encoding="utf-8") as f:
                     self.assertIn("1/1 roles responded", f.read())
 
+    def test_a_start_whose_stdout_is_broken_is_still_a_start(self):
+        """The council runs (and spends) whatever happened to --start's
+        own stdout: a broken pipe there is exit 0 with one stderr line
+        naming the pid and directory, never exit 120 or a traceback, and
+        --status then reports the run."""
+        reader, writer = os.pipe()
+        os.close(reader)
+        try:
+            proc = subprocess.run(
+                [sys.executable, SCRIPT, "--start", self.run_dir,
+                 "--skill-contract", EPOCH],
+                stdout=writer, stderr=subprocess.PIPE, text=True,
+                env=self.env, cwd=self.base, stdin=subprocess.DEVNULL,
+                timeout=60)
+        finally:
+            os.close(writer)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        pid = self.record()["pid"]
+        lines = proc.stderr.splitlines()
+        self.assertEqual(len(lines), 1, proc.stderr)
+        self.assertIn(f"pid={pid} dir={self.run_dir}", lines[0])
+        self.assertIn("stdout is unavailable", lines[0])
+        self.assertIn(f"--status {self.run_dir} --skill-contract {EPOCH}",
+                      lines[0])
+        status = self.run_cli("--status", self.run_dir,
+                              "--skill-contract", EPOCH)
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertTrue(status.stdout.startswith("runner: "), status.stdout)
+        # The quick fake council may already be done; a live one names its pid.
+        if not status.stdout.startswith("runner: done"):
+            self.assertIn(str(pid), status.stdout)
+        self.wait_end()
+        with open(os.path.join(self.run_dir, "out.md"),
+                  encoding="utf-8") as f:
+            self.assertIn("1/1 roles responded", f.read())
+
+    def test_claimed_files_are_0600_under_an_owner_clearing_umask(self):
+        """A umask can clear owner bits too (0o400 turns 0600 into 0200):
+        supervisor.lock, err.log, and out.md, and the supervisor's own
+        private writes, are still 0600, and the launch completes."""
+        proc = subprocess.run(
+            [sys.executable, SCRIPT, "--start", self.run_dir,
+             "--skill-contract", EPOCH],
+            capture_output=True, text=True, env=self.env, cwd=self.base,
+            stdin=subprocess.DEVNULL, timeout=60, umask=0o400)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.wait_end()
+        for name in ("supervisor.lock", "err.log", "out.md",
+                     "supervisor.json", "status.json",
+                     codex_council.EXECUTION_CLAIM_FILENAME):
+            with self.subTest(file=name):
+                st = os.lstat(os.path.join(self.run_dir, name))
+                self.assertTrue(stat.S_ISREG(st.st_mode))
+                self.assertEqual(stat.S_IMODE(st.st_mode), 0o600)
+        with open(os.path.join(self.run_dir, "out.md"),
+                  encoding="utf-8") as f:
+            self.assertIn("1/1 roles responded", f.read())
+
     def test_a_supervisor_that_exits_at_once_is_exit_1(self):
         real_popen = subprocess.Popen
 
@@ -370,6 +428,37 @@ class StartCommandTests(StartCase):
         self.assertEqual(council_liveness.lock_state(self.run_dir), "free")
         again = self.start()
         self.assertEqual(again.returncode, 2)
+
+    def test_a_supervisor_that_exits_as_the_wait_ends_is_exit_1(self):
+        """The wait can run out between a look that saw the child running
+        and its exit: with no record written, that is still 'start
+        failed' (exit 1), never 'started' with a note to run --status."""
+        real_popen = subprocess.Popen
+
+        def late_failing_child(argv, **kwargs):
+            proc = real_popen([sys.executable, "-c",
+                               "import sys; sys.exit(3)"], **kwargs)
+            proc.wait()
+            looks = [None]  # the last look inside the wait: still running
+            real_poll = proc.poll
+            proc.poll = lambda: looks.pop() if looks else real_poll()
+            return proc
+
+        err, out = io.StringIO(), io.StringIO()
+        with patch.dict(os.environ, self.env, clear=True), \
+                patch.object(codex_council.subprocess, "Popen",
+                             late_failing_child), \
+                patch.object(codex_council, "START_WAIT_SECS", 0), \
+                contextlib.redirect_stderr(err), \
+                contextlib.redirect_stdout(out), \
+                self.assertRaises(SystemExit) as ctx:
+            codex_council._start_command(self.run_dir)
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertEqual(out.getvalue(), "")
+        self.assertIn("exited with status 3 before the council was running",
+                      err.getvalue())
+        self.assertFalse(os.path.exists(
+            os.path.join(self.run_dir, "supervisor.json")))
 
 
 class SignalLatchCliTests(StartCase):

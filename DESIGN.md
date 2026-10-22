@@ -23,9 +23,11 @@ host-session and role key for continuity. A new scratch directory does
 not accidentally create a new logical project. Fresh is the prepared default;
 resume is explicit and history is subordinate to the complete current brief.
 Saved-thread state lives in a 0700 directory with 0600 lock and state files
-whatever the umask; an owned, too-open state directory is tightened, while a
-symlinked or foreign-owned one is refused by the pre-flight and again at
-launch, and is never changed.
+whatever the umask, under `$XDG_STATE_HOME` when that is an absolute path (a
+relative value is ignored, as the XDG base-directory specification requires) or
+else `~/.local/state`; an owned state directory with any other mode is reset to
+0700, while a symlinked or foreign-owned one is refused by the pre-flight and
+again at launch, and is never changed.
 
 The staged request, context and role capability/lens contracts are frozen by
 preparation. Model/effort/selection stay fillable after discovery. Context changes,
@@ -44,8 +46,12 @@ mutation. This is not an atomic filesystem snapshot: coordinate overlapping writ
 briefly and report limitations around uncooperative external writers.
 
 Copies do not share writable inodes or Git control directories with the live tree.
-Selected symbolic links and special files are refused, as are case/Unicode
-collisions among selected file paths, empty directories and every directory
+Selected symbolic links and special files are refused by name; so, in implicit Git
+scope, are a submodule (populated, empty or missing) and an untracked nested
+repository. Each refusal names the path and the fix (exclude it, or select a
+submodule's or nested repository's files with include), so none is silently
+flattened or dropped. Collisions under Unicode canonical caseless matching are
+refused among selected file paths, empty directories and every directory
 component (`Foo/` and `foo/`, or `Foo/a.txt` and `foo/b.txt`). Known credential,
 agent-config, instruction and cache paths met during selection are omitted and
 recorded; the list is not a complete inventory of ignored paths and not a secret
@@ -115,12 +121,13 @@ Report values describe what was sent, not an attestation of what served a turn.
 The POSIX supervisor is authoritative. --start exclusively claims a private
 directory, passes its held lock into a new session, and waits up to ten seconds for
 the child's supervisor record: exit 0 can mean starting, running or already ended
-(its note and --status say which), and exit 1 is a spawn failure or a child that
-exited before writing its record. Only the supervisor holds that lock; Codex
-children do not inherit it. Both lock identity/token and process-start identity are
-checked. Directories are one-use and unknown states are conservative. Signals go
-only to verified recorded identities while the lock state agrees; the check and
-the signal are separate operations, not an atomic guarantee.
+(its note and --status say which), even when --start's own stdout is closed or
+broken, and exit 1 is a spawn failure or a child that exited before writing its
+record. Only the supervisor holds that lock; Codex children do not inherit it. Both
+lock identity/token and process-start identity are checked. Directories are one-use
+and unknown states are conservative. Signals go only to verified recorded
+identities while the lock state agrees; the check and the signal are separate
+operations, not an atomic guarantee.
 
 Bounded fan-out and nonblocking per-continuity-key locks serialize runs with the
 same logical source, task, host-session scope and role; a role waiting on its key
@@ -236,9 +243,10 @@ raw spooling alone does not make total runner memory bounded.
 The result envelope separates runner observations, Codex-reported protocol data,
 and collaborator interpretation. It includes exact input/context identity, baseline
 integrity, required contribution coverage and current applicability. Text patches
-are convenience artifacts; exact bytes remain in scratch. No artifact is applied,
-committed or published automatically. Reconciliation checks evidence and current
-requirements, not vote counts or a clean transport exit.
+are convenience artifacts; exact bytes remain in scratch. A symlink or special file
+a role leaves is listed by path and kind, never followed or diffed. No artifact is
+applied, committed or published automatically. Reconciliation checks evidence and
+current requirements, not vote counts or a clean transport exit.
 
 Exit 0 requires a delivered report, at least one successful role, and complete
 required contributions, each with an observed completed turn.

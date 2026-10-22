@@ -79,10 +79,10 @@ class WorkflowCliTests(unittest.TestCase):
                     path.chmod(0o600)
         self.temp.cleanup()
 
-    def cli(self, *args, timeout=60):
+    def cli(self, *args, timeout=60, cwd=None):
         return subprocess.run([sys.executable, str(RUNNER), *map(str, args),
                                "--skill-contract", str(codex_council.SKILL_CONTRACT_EPOCH)],
-                              cwd=self.source, env=self.env, stdin=subprocess.DEVNULL,
+                              cwd=cwd or self.source, env=self.env, stdin=subprocess.DEVNULL,
                               capture_output=True, text=True, timeout=timeout)
 
     def stage(self, instruction="Inspect the current contribution.", *, roles=None,
@@ -140,6 +140,30 @@ class WorkflowCliTests(unittest.TestCase):
         self.assertIn("result.json", proc.stdout)
         self.assertEqual(self.execs()[0]["cwd"], str(directory / "workspaces/contribution"))
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", self.execs()[0]["argv"])
+
+    def test_links_and_pipes_a_role_leaves_are_listed_not_followed(self):
+        """A shim symlink or FIFO in scratch once cost the role its whole
+        artifact manifest and required coverage."""
+        directory = self.stage("SYMLINK_FIXTURE: edit beside a tool shim and a pipe.")
+        proc = self.launch(directory)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        result = self.result(directory)
+        self.assertTrue(result["required_contributions_complete"], result)
+        contribution = result["roles"]["contribution"]
+        self.assertEqual(contribution["coverage_gaps"], [])
+        self.assertEqual({row["path"]: row["kind"]
+                          for row in contribution["artifacts"]["files"]},
+                         {"subject.py": "modified", "bin/git": "symlink",
+                          "test.fifo": "special-file"})
+        diff = directory / "evidence/contribution/candidate.diff"
+        self.assertIn("+value = 2", diff.read_text())
+
+    def test_moved_source_freshness_is_unknown_not_a_contract_error(self):
+        directory = self.stage()
+        self.source.rename(self.base / "moved")
+        proc = self.cli("--freshness", directory, cwd=self.base)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertEqual(json.loads(proc.stdout)["state"], "unknown")
 
     def test_empty_source_directory_exists_in_scratch_and_its_deletion_is_stale(self):
         (self.source / "output").mkdir()

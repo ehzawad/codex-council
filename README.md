@@ -149,7 +149,7 @@ file is captured as its working version. Non-Git capture uses explicit include p
 and keeps empty directories; a context-only question may select no files. Pause
 overlapping writers during capture: the runner refuses observed changes but does
 not claim an atomic snapshot of arbitrary external writers. Paths that collide
-after case folding or Unicode normalization, whether files, empty directories or
+under Unicode canonical caseless matching, whether files, empty directories or
 directory components such as `Foo/` and `foo/`, refuse the capture.
 
 Every contribution receives an independent copy of the same baseline, so Claude may
@@ -239,15 +239,17 @@ The runner never infers substantive correctness from a clean exit or agreement.
 Artifact manifests cover added, removed and changed regular files, executable-flag
 changes included; small text changes also get a candidate diff, while binary or
 large changes stay in scratch. Other permission changes and empty-directory changes
-are not recorded. **Nothing automatically applies, commits, or publishes a
-candidate change to the live source.** Claude checks current intent, freshness,
-evidence and integration results before accepting it.
+are not recorded. A symlink or special file a role leaves is listed by path and
+kind, never followed or diffed. **Nothing automatically applies, commits, or
+publishes a candidate change to the live source.** Claude checks current intent,
+freshness, evidence and integration results before accepting it.
 
 Exit 0 requires a delivered report, at least one successful role and complete
 required contributions. Exit 1 covers no successful role, undelivered output, or
 incomplete required coverage/evidence; exit 2 is invalid input or refused policy.
-`--freshness` exits 0 unchanged, 1 stale/unknown, 2 invalid contract. Workers start
-only from `--start` on a completed capture, once per run directory.
+`--freshness` exits 0 unchanged, 1 stale/unknown (a moved or deleted source is
+unknown), 2 invalid contract. Workers start only from `--start` on a completed
+capture, once per run directory.
 
 ## Continuity and failures
 
@@ -293,10 +295,11 @@ authentication and model rejection are terminal and keep valid continuity.
 Settings: `CODEX_COUNCIL_MAX_PARALLEL` defaults to 6,
 `CODEX_COUNCIL_STALL_SECS` to 1800 (0 disables), `CODEX_COUNCIL_MODEL_ROUTING` to
 auto (off disables automatic choices), and state under
-`$XDG_STATE_HOME/codex-council` or `~/.local/state/codex-council` (a 0700
-directory with 0600 lock files whatever the umask; an unsafe existing state path
-refuses the launch). There is no
-run-level deadline. Detached work keeps running and spending until completion or
+`$XDG_STATE_HOME/codex-council` when that is an absolute path, otherwise
+`~/.local/state/codex-council` (a 0700 directory with 0600 lock files whatever the
+umask; an owned state directory with any other mode is reset to 0700, while a
+symlinked, foreign-owned or non-directory state path refuses the launch). There is
+no run-level deadline. Detached work keeps running and spending until completion or
 cancellation; do not abandon observation. See
 [runtime recovery](plugins/codex-council/skills/codex-council/references/runtime-behavior.md).
 
@@ -314,8 +317,10 @@ not recreated. `--freshness` compares selected file bytes and executable flags,
 empty directories, Git HEAD and selected index entries, the recorded omission list
 and the staged context; it does not check omitted file contents, user intent or
 external dependencies. Raw logs may hold sensitive tool output; keep them private.
-The exec reader holds each attempt's protocol output in memory, so runner RAM is
-not bounded for arbitrarily chatty workers.
+Private means POSIX mode bits only: an ACL inherited from a parent directory, as
+macOS allows, can still grant another user access, and the runner does not strip
+ACLs. The exec reader holds each attempt's protocol output in memory, so runner
+RAM is not bounded for arbitrarily chatty workers.
 
 ## Testing
 
