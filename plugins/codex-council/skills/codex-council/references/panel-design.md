@@ -1,9 +1,12 @@
 # Task-shaped contributions and model selection
 
 Identify what is uncertain, what evidence would decide it, and which independent
-contribution could materially improve the next step. One contribution is enough
-when it covers the question. Add another only for distinct useful work, not to fill
-a persona roster or manufacture a majority. No fixed roles or model ranking exists.
+contribution could materially improve the next step. The role count is dynamic,
+usually one to six, set by the task's demand, complexity, urgency, implementation
+and quality needs, and how the user asked; an explicit user request for particular
+roles or a count wins. One contribution is enough when it covers the question. Add
+another only for distinct useful work, not to fill a persona roster or manufacture
+a majority. No fixed roles or model ranking exists.
 
 A collaborator may investigate, reproduce, test, compare alternatives, research,
 or build an authorized candidate. Frame its objective, likely failure modes,
@@ -42,34 +45,34 @@ The selection JSON shapes are:
 ```
 
 User mode needs model, effort, or service_tier. Routed mode needs model and effort;
-native_effort needs only effort and the runner pins the proven native model. Model and effort values
-must fully match `[A-Za-z0-9][A-Za-z0-9._:/@+-]*`; the model values `inherit` and
-`default` (any case) are rejected. Routed choices must not name a model whose
-advertised retirement has passed, and native_effort is refused when the proven
-native model's advertised retirement has passed. These examples illustrate
-shapes; copy the actual role-specific snapshot_id and advertised values at runtime.
-Inheritance is omission, never literal inherit/default placeholders. Source `.codex`
-configuration is not copied into scratch, so inspect the actual native
-configuration rather than assuming source-layer defaults survived relocation.
+native_effort needs only effort and the runner pins the proven native model. Model,
+effort and service_tier values must fully match `[A-Za-z0-9][A-Za-z0-9._:/@+-]*`;
+the model values `inherit` and `default` (any case) are rejected. Routed choices
+must not name a model whose advertised retirement has passed, and native_effort is
+refused when the proven native model's advertised retirement has passed. These
+examples illustrate shapes; copy the actual role-specific snapshot_id and advertised
+values at runtime. Inheritance is omission, never literal inherit/default
+placeholders. Source `.codex` configuration is not copied into scratch, so inspect
+the actual native configuration rather than assuming source-layer defaults survived
+relocation.
 
-Fast mode is an independent, explicit user request: add `"service_tier": "fast"`
-to the role only when asked. It can accompany any model-selection mode, or stand
-alone with no model/effort/selection to preserve the native model settings. A
-routed model/effort never authorizes a tier change. Omission preserves the user's
-native service tier; Fast consumes more usage, subject to model/account availability.
+Fast mode is a separate, explicit user request: add `"service_tier": "fast"` to a
+role only when the user asks. It may join any selection mode, or stand alone (no
+model, effort or selection) to keep the native model settings. Routing never sets or
+changes a tier; omission keeps the user's own tier. Fast costs more usage and
+depends on the model and account.
 
-Tier values use the same safe grammar as model/effort. The runner checks exact
-advertised tier ids in that role's snapshot; Codex's config value `fast` maps to
-the request id `priority` (display names such as `Fast` are not ids). Missing tier
-metadata proves no support. Unlike a model-only user pin, a tier request needs
-a catalog entry for the resolved model, or a proven native model when no model
-override is sent. Preflight and launch refuse unsupported or unprovable requests
-with exit 2, including when routing falls back. Launch also reads effective
-configuration with the worker's overrides to detect managed layers that replace
-its model or tier. These checks observe configuration, not the tier that serves
-the eventual turn. Reply headers and reports record the literal sent value
-(`fast`, not `priority`); `result.json` uses `sent_service_tier`. All overrides are
-per invocation, including resume, and never change the user's `config.toml`.
+The runner matches exact tier ids in the role's snapshot: `fast` maps to request id
+`priority`, and a display name such as `Fast` is not an id. Unlike an explicit model
+pin, a tier needs a catalog entry for the resolved model, or a proven native model
+when no model is sent. Preflight and launch refuse an unadvertised or unprovable
+tier with exit 2, also after a routing fallback; a snapshot without tier metadata
+needs a fresh `--discover`. Both also read the effective configuration with the
+worker's overrides to catch a managed layer replacing its model or tier. That is
+configuration evidence, not the tier that serves the turn. Replies and reports
+record the sent value (`fast`, not `priority`); `result.json` has
+`sent_service_tier`. Overrides are per invocation, resume included, and never change
+`config.toml`.
 
 See [invocation-contract.md](invocation-contract.md) for full input/capability fields
 and [runtime-behavior.md](runtime-behavior.md) for refusals and recovery. The user

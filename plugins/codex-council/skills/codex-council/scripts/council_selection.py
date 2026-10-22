@@ -620,9 +620,14 @@ def _validate_service_tier(role, decision, evidence, problem=None):
     Catalog gaps elsewhere and routing=off do not prevent this exact check.
     A pin suppresses managed new-thread defaults; effective-config inspection
     separately verifies that higher-precedence layers let its model/tier hold.
+    A snapshot from before tiers were recorded has no service_tiers key: that
+    is missing evidence, so it asks for a new --discover. A launch snapshot
+    is not retained on this exit, so the refusal names discovery's problems.
     """
     if evidence is None or evidence["status"] != "ok":
-        gap = f"discovery unavailable ({problem or 'see per-role snapshot'})"
+        if evidence is not None:
+            problem = ", ".join(evidence["problems"])
+        gap = f"discovery unavailable ({problem or 'no detail recorded'})"
     else:
         blockers = [reason for reason in evidence["routing"]["reasons"]
                     if reason != ROUTING_OFF_NOTE and not reason.startswith((
@@ -636,8 +641,18 @@ def _validate_service_tier(role, decision, evidence, problem=None):
             gap = ("model cannot be established: "
                    + (evidence["native"]["reason"] or "native model unproven"))
         elif entry is None:
-            gap = f"model '{model}' has no advertised tier metadata"
-        elif _service_tier_id(role.service_tier) not in entry.get("service_tiers", []):
+            alias = _catalog_alias(evidence, model)
+            hint = f"; use the execution id '{alias[1]}'" if alias else ""
+            gap = (f"model '{model}' is not an advertised execution id in "
+                   f"this role's discovered catalog{hint}")
+            if not evidence["catalog"]["complete"]:
+                # A dropped malformed record looks absent; name the cause.
+                gap += "".join(f" ({reason})" for reason in evidence["routing"]["reasons"]
+                               if reason.startswith("catalog incomplete: "))
+        elif "service_tiers" not in entry:
+            gap = ("this role's model snapshot has no service-tier metadata; "
+                   "rerun --discover on this run directory")
+        elif _service_tier_id(role.service_tier) not in entry["service_tiers"]:
             gap = (f"not advertised for model '{model}' "
                    f"(request tier '{_service_tier_id(role.service_tier)}')")
         else:
@@ -770,19 +785,21 @@ def _sent_values(model, effort, service_tier=None):
 
 
 def _selection_summary_note(decision):
-    """The Summary-line note for what one role sent ("" = inherited)."""
+    """The Summary-line note for what one role sent ("" = nothing sent)."""
     sent = _sent_values(decision.dispatch_model, decision.dispatch_effort,
                         decision.dispatch_service_tier)
+    tier = (f"; service tier {decision.dispatch_service_tier}"
+            if decision.dispatch_service_tier else "")
     if decision.provenance == "user":
         return f" (explicit: {sent})"
     if decision.provenance == "routed":
         return f" (routed: {sent})"
     if decision.provenance == "native_effort":
         return (f" (routed effort: {decision.dispatch_effort} on native "
-                f"model {decision.dispatch_model})")
+                f"model {decision.dispatch_model}{tier})")
     if decision.provenance == "fallback":
-        return " (native inheritance; routing fell back)"
-    return ""
+        return f" (native inheritance; routing fell back{tier})"
+    return f" (native model/effort inheritance{tier})" if tier else ""
 
 
 def _selection_section_text(decision):
@@ -817,8 +834,10 @@ def _selection_section_text(decision):
 def _selection_plan_text(decision):
     text = _model_selection_plan_text(decision)
     if decision.dispatch_service_tier:
-        text += (f"; explicit service tier {decision.dispatch_service_tier}; "
-                 "revalidated at launch")
+        revalidated = text.endswith("revalidated at launch")
+        text += f"; explicit service tier {decision.dispatch_service_tier}"
+        if not revalidated:
+            text += "; revalidated at launch"
     return text
 
 

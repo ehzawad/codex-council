@@ -130,7 +130,7 @@ from council_selection import (  # noqa: E402
 )
 from council_workspace import WorkspaceError  # noqa: E402
 from council_policy import (  # noqa: E402
-    command_options, effects_possible, parse_policy, policy_dict)
+    ServiceTierOverridden, command_options, effects_possible, parse_policy, policy_dict)
 from council_evidence import AttemptEvidence, write_result  # noqa: E402
 from council_workflow import (  # noqa: E402
     prepare, load_plan, discover_prepared, resolve_selections, plan_lines,
@@ -378,8 +378,12 @@ def _workflow_selection(roles, run_dir, routing_mode, at_launch, body, probe_pol
             _finish_evidence(state="refused")
             _RUN.finish("aborted", 2)
             _diag("[codex-council] runner aborted exit=2: captured invocation refused before workers")
-        _usage_exit("invocation contract: " + _report_inline(exc)
-                    + "; prepare a fresh run directory; never enable bypass to recover.")
+        if isinstance(exc, ServiceTierOverridden):
+            recovery = ("a managed configuration layer overrides the requested model "
+                        "or tier; report this to the user rather than dropping the request.")
+        else:
+            recovery = "prepare a fresh run directory; never enable bypass to recover."
+        _usage_exit("invocation contract: " + _report_inline(exc) + "; " + recovery)
 
 
 def _finish_evidence(results=None, state="done"):

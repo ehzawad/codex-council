@@ -30,6 +30,11 @@ DISABLED_FEATURES = ("apps", "plugins", "browser_use", "browser_use_external",
 MCP_NAME = re.compile(r"[A-Za-z0-9_-]+")
 
 
+class ServiceTierOverridden(WorkspaceError):
+    """A higher-precedence configuration layer changes the checked model
+    or tier; a fresh run directory cannot fix that."""
+
+
 @dataclass(frozen=True)
 class ExecutionPolicy:
     sandbox: str = "read-only"
@@ -242,12 +247,14 @@ def inspect_service_tier(root: str, overrides: tuple[str, ...], *,
     observed, _ = _read_config(root, tuple(settings))
     expected_model = model or native_model
     if expected_model is None or observed.get("model") != expected_model:
-        raise WorkspaceError("requested service tier cannot be established: "
-                             "effective model differs from the checked catalog model")
+        raise ServiceTierOverridden(
+            "requested service tier cannot be established: "
+            "effective model differs from the checked catalog model")
     actual = observed.get("service_tier")
     if not isinstance(actual, str) or _service_tier_id(actual) != _service_tier_id(tier):
-        raise WorkspaceError("requested service tier cannot be established: "
-                             "effective service_tier differs from the sent override")
+        raise ServiceTierOverridden(
+            "requested service tier cannot be established: "
+            "effective service_tier differs from the sent override")
     return {"sent_service_tier": tier, "request_tier": _service_tier_id(tier),
             "checked_model": expected_model, "cwd": root, "checked_at": time.time(),
             "attestation": "configuration-observed-not-exec-attested"}

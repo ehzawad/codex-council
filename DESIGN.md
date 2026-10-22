@@ -30,9 +30,10 @@ else `~/.local/state`; an owned state directory with any other mode is reset to
 again at launch, and is never changed.
 
 The staged request, context and role capability/lens contracts are frozen by
-preparation. Model/effort/selection stay fillable after discovery. Context changes,
-new requirements or a different contribution require recapture rather than quietly
-reusing stale input identity. Hashes bind artifacts, not semantic correctness.
+preparation. Model/effort/selection/service_tier stay fillable after discovery.
+Context changes, new requirements or a different contribution require recapture
+rather than quietly reusing stale input identity. Hashes bind artifacts, not
+semantic correctness.
 
 ## Capture backend
 
@@ -106,13 +107,18 @@ Discovery reads account, configuration, managed requirements and the model catal
 through one adapter, with strict value grammar, authoring validation, launch-time
 revalidation, explicit pins, native fallback and per-role provenance. Each role owns
 its planning snapshot in `catalogs/<key>/`; at launch each automatically selected
-role gets a fresh discovery in its own cwd, kept as
-`evidence/<key>/launch-model-snapshot.json`. Inherited and pinned roles skip that
-catalog discovery; execution-policy probes still run. Routed and native-effort
-choices both reject an advertised retirement that has passed (for native effort,
-the proven native model's), and the discovery summary marks native-effort
-adjustment unavailable on a retired native model. No thread or turn starts during
-model or policy discovery.
+role, and each role that requests a service tier, gets a fresh discovery in its
+own cwd, kept as `evidence/<key>/launch-model-snapshot.json`. Other inherited and
+pinned roles skip that catalog discovery; execution-policy probes still run.
+Routed and native-effort choices both reject an advertised retirement that has
+passed (for native effort, the proven native model's), and the discovery summary
+marks native-effort adjustment unavailable on a retired native model. No thread or
+turn starts during model or policy discovery.
+A service tier (fast mode) is set only on an explicit user request, never by
+routing. Preflight and launch check it against the tiers advertised for the
+resolved model, or the proven native model when no model is sent, and refuse with
+exit 2 when it is not advertised or cannot be proven; both also read effective
+configuration with the worker's overrides to confirm the model and tier hold.
 Nothing ranks ids, versions, recommended markers, or reputation.
 Report values describe what was sent, not an attestation of what served a turn.
 
@@ -150,41 +156,60 @@ unattended host must continue observing or cancel before returning.
 `--status` combines the supervisor lock, supervisor.json, status.json and the
 process table into one state for a detached run:
 
-```mermaid
-stateDiagram-v2
-    state "starting: lock held, no status.json yet" as Starting
-    state "running: lock held, fresh tick" as Running
-    state "not responding: tick 120s or older" as Stale
-    state "still exiting: terminal state, lock held" as Exiting
-    state "ended: done, interrupted or aborted" as Ended
-    state "ended before dispatch: lock free" as EarlyEnd
-    state "gone: lock free, no terminal state" as Gone
-    state "unknown: lock and records disagree" as Unknown
-
-    [*] --> Starting: --start spawns the supervisor
-    Starting --> Running: status.json published
-    Starting --> EarlyEnd: exits before status.json
-    Running --> Stale: no tick for 120s
-    Stale --> Running: ticks again
-    Running --> Exiting: finished, or --cancel SIGTERM
-    Stale --> Exiting: --cancel SIGTERM
-    Exiting --> Ended: lock free, identity gone
-    Running --> Gone: killed without a terminal state
-    Stale --> Gone: SIGKILL
-    Running --> Unknown: unreadable or replaced records
-    Unknown --> Running: records agree again
-    Gone --> [*]: --reap any verified groups
-    Ended --> [*]
-    EarlyEnd --> [*]
-
-    classDef runner fill:#ede9fe,stroke:#6d28d9,color:#1e1037
-    classDef observer fill:#cffafe,stroke:#0e7490,color:#062a33
-    classDef evidence fill:#fef3c7,stroke:#b45309,color:#3b1d02
-    classDef failure fill:#fee2e2,stroke:#b91c1c,color:#3f0a0a
-    class Starting,Running,Exiting runner
-    class Ended evidence
-    class Stale,Unknown observer
-    class EarlyEnd,Gone failure
+```
+ --start spawns the supervisor
+   |
+   v
+ +-------------------+               +------------------+
+ | starting          | exits before  | ended before     |
+ | lock held, no     |-------------->| dispatch         |
+ | status.json yet   | status.json   | lock free        |
+ +-------------------+               +------------------+
+   |                                   |
+   | status.json published             v
+   v                                  end
+ +-------------------+               +------------------+
+ | running           | unreadable or | unknown          |
+ | lock held,        | replaced      | lock and records |
+ | fresh tick        | records       | disagree         |
+ |                   |-------------->|                  |
+ |                   |<--------------|                  |
+ |                   | records agree +------------------+
+ |                   | again
+ |                   |
+ |                   | killed        +------------------+
+ |                   | without a     | gone             |
+ |                   |-------------->| lock free, no    |
+ |                   | terminal      | terminal state   |
+ |                   | state         +------------------+
+ |                   |                 |              ^
+ |                   |                 | --reap any   |
+ |                   |                 | verified     |
+ |                   |                 v groups       |
+ |                   |                end     SIGKILL |
+ |                   | no tick for   +------------------+
+ |                   | 120s          | not responding   |
+ |                   |-------------->| tick 120s or     |
+ |                   |<--------------| older            |
+ |                   | ticks again   +------------------+
+ +-------------------+                 |
+   |                                   | --cancel
+   | finished, or                      | SIGTERM
+   | --cancel SIGTERM                  |
+   v                                   |
+ +-------------------+                 |
+ | still exiting     |<----------------+
+ | terminal state,   |
+ | lock held         |
+ +-------------------+
+   |
+   | lock free, identity gone
+   v
+ +-------------------+
+ | ended             |
+ | done, interrupted |--> end
+ | or aborted        |
+ +-------------------+
 ```
 
 ## Replay, evidence and result semantics
@@ -201,31 +226,35 @@ by a five-second backoff, and a replay-safe stale resume can additionally restar
 fresh within an attempt. The old thread and partial artifacts remain available for
 deliberate recovery.
 
-```mermaid
-flowchart TD
-    Attempt["Logical attempt n of 2"] --> Exec["codex exec, fresh or resume,<br/>in the role's scratch cwd"]
-    Exec --> Outcome{"Outcome"}
-    Outcome -- "turn completed with a reply" --> Ok["Role ok; thread saved"]
-    Outcome -- "auth, quota, model rejected,<br/>or exit 0 without a reply" --> Terminal["Terminal failure"]
-    Outcome -- "saved thread missing" --> StaleSafe{"Replay-safe?"}
-    StaleSafe -- "yes" --> FreshRun["Fresh run within this attempt,<br/>continuity-lost warning"]
-    FreshRun --> Outcome
-    StaleSafe -- "no" --> BlockedStale["replay-blocked:stale"]
-    Outcome -- "429/5xx or a stall" --> Safe{"Replay-safe?"}
-    Safe -- "no" --> Blocked["replay-blocked or stall:<br/>inspect partial effects"]
-    Safe -- "yes" --> Budget{"Attempt left?"}
-    Budget -- "yes" --> Backoff["Wait 5 seconds"]
-    Backoff --> Attempt
-    Budget -- "no" --> Final["Final transient error"]
-
-    classDef runner fill:#ede9fe,stroke:#6d28d9,color:#1e1037
-    classDef worker fill:#dcfce7,stroke:#15803d,color:#052e16
-    classDef evidence fill:#fef3c7,stroke:#b45309,color:#3b1d02
-    classDef failure fill:#fee2e2,stroke:#b91c1c,color:#3f0a0a
-    class Attempt,Outcome,StaleSafe,Safe,Budget,Backoff runner
-    class Exec,FreshRun worker
-    class Ok evidence
-    class Terminal,BlockedStale,Blocked,Final failure
+```
+ Logical attempt n of 2 <-----------------------------+
+   |                                                  |
+   v                                                  |
+ codex exec, fresh or resume,                         |
+ in the role's scratch cwd                            |
+   |                                                  |
+   v                                                  |
+ Outcome <------------------------------------+       |
+   |                                          |       |
+   +-- turn completed with a reply            |       |
+   |   --> Role ok; thread saved              |       |
+   |                                          |       |
+   +-- auth, quota, model rejected,           |       |
+   |   or exit 0 without a reply              |       |
+   |   --> Terminal failure                   |       |
+   |                                          |       |
+   +-- saved thread missing --> Replay-safe?  |       |
+   |     yes --> Fresh run within this        |       |
+   |             attempt, continuity-lost ----+       |
+   |             warning                              |
+   |     no  --> replay-blocked:stale                 |
+   |                                                  |
+   '-- 429/5xx or a stall --> Replay-safe?            |
+         no  --> replay-blocked or stall:             |
+                 inspect partial effects              |
+         yes --> Attempt left?                        |
+                   yes --> Wait 5 seconds ------------+
+                   no  --> Final transient error
 ```
 
 Replay-safe means a read-only role with external tools denied whose attempt showed
@@ -273,52 +302,27 @@ checks changed intent and external conditions separately.
 | council_evidence | Raw attempts, protocol summaries, candidate artifacts and result envelope. |
 | council_workflow | Versioned invocation contracts, bindings and per-role discovery orchestration. |
 
-```mermaid
-flowchart TD
-    Entry["codex_council<br/>CLI and supervisor"]
-    Workflow["council_workflow"]
-    Liveness["council_liveness"]
-    Failures["council_failures"]
-    Evidence["council_evidence"]
-    Policy["council_policy"]
-    Selection["council_selection"]
-    Discovery["council_discovery"]
-    Workspace["council_workspace"]
-    Common["council_common"]
-
-    Entry --> Workflow
-    Entry --> Liveness
-    Entry --> Failures
-    Entry --> Evidence
-    Entry --> Common
-    Workflow --> Policy
-    Workflow --> Selection
-    Workflow --> Workspace
-    Workflow --> Discovery
-    Policy --> Discovery
-    Policy --> Workspace
-    Selection --> Discovery
-    Evidence --> Workspace
-    Discovery --> Common
-    Failures --> Common
-    Liveness --> Common
-    Selection --> Common
-
-    classDef runner fill:#ede9fe,stroke:#6d28d9,color:#1e1037
-    classDef evidence fill:#fef3c7,stroke:#b45309,color:#3b1d02
-    classDef observer fill:#cffafe,stroke:#0e7490,color:#062a33
-    classDef failure fill:#fee2e2,stroke:#b91c1c,color:#3f0a0a
-    class Entry,Workflow,Selection,Discovery,Policy,Common runner
-    class Workspace,Evidence evidence
-    class Liveness observer
-    class Failures failure
+```
+ codex_council (CLI and supervisor)
+   +-> council_workflow
+   |     +-> council_policy
+   |     |     +-> council_discovery -> council_common
+   |     |     '-> council_workspace
+   |     +-> council_selection
+   |     |     +-> council_discovery
+   |     |     '-> council_common
+   |     +-> council_workspace
+   |     '-> council_discovery
+   +-> council_liveness -> council_common
+   +-> council_failures -> council_common
+   +-> council_evidence -> council_workspace
+   '-> council_common
 ```
 
-All of these modules run inside the runner process, so they share the runner
-colour; evidence-owning modules, the observer and failure classification keep
-their own. The entrypoint also imports the discovery, selection, policy and
-workspace modules directly; those edges are left out above for legibility. The
-workflow-to-discovery and policy-to-discovery edges are lazy, function-level
+Each arrow is an import, and all of these modules run inside the runner process.
+The entrypoint also imports the discovery, selection, policy and workspace modules
+directly; those edges are left out above for legibility. The workflow-to-discovery,
+workflow-to-selection and policy-to-discovery edges are lazy, function-level
 imports.
 
 Imports form a DAG; production siblings do not import the entrypoint. The runner
@@ -343,7 +347,8 @@ on fake-suite success.
 
 Documentation tests validate executable command/schema contracts and packaging,
 plus a few literal skill instructions. Markdown is the only source, with diagrams
-as Mermaid blocks. [README Testing](README.md#testing) gives the commands.
+as plain-text drawings at most 60 columns wide. [README Testing](README.md#testing)
+gives the commands.
 
 Non-goals are automatic invocation, automatic patch integration, a second agent
 loop replacing Codex exec, and a generic cluster scheduler.

@@ -775,9 +775,10 @@ def _normalize_model_entry(item):
     """One wire model record -> (entry, None) or (None, first bad field).
 
     Additive fields are ignored; wrong types are rejected, never coerced
-    (hidden "false" or a boolean retirementAt make the entry unusable). The
-    dispatch identity is `model` — what `-m` receives — kept distinct from
-    the picker `id`, which is recorded as catalog_id.
+    (hidden "false" or a boolean retirementAt make the entry unusable; bad
+    serviceTiers drop only the tier metadata). The dispatch identity is
+    `model` — what `-m` receives — kept distinct from the picker `id`,
+    which is recorded as catalog_id.
     """
     if not isinstance(item, dict):
         return None, "entry"
@@ -796,18 +797,21 @@ def _normalize_model_entry(item):
     upgrade, bad_field = _normalize_upgrade(item.get("upgradeInfo"))
     if bad_field:
         return None, bad_field
-    # Older CLIs omit this additive field. Absence advertises no tiers and
-    # must not disable ordinary model/effort selection.
+    # Older CLIs omit this additive field: absence advertises no tiers. Tier
+    # metadata must not disable ordinary model/effort selection, so malformed
+    # tiers leave the entry usable without a service_tiers key; an opt-in tier
+    # request then refuses for missing metadata.
     tiers = item.get("serviceTiers", [])
-    if not isinstance(tiers, list) or not all(
+    if isinstance(tiers, list) and all(
         isinstance(tier, dict) and _nonempty_str(tier.get("id"))
         for tier in tiers
     ):
-        return None, "serviceTiers"
-    tiers = [tier["id"] for tier in tiers]
-    if len(set(tiers)) != len(tiers):
-        return None, "serviceTiers"
-    return {
+        tiers = [tier["id"] for tier in tiers]
+        if len(set(tiers)) != len(tiers):
+            tiers = None
+    else:
+        tiers = None
+    entry = {
         "model": item["model"],
         "catalog_id": item["id"],
         "display_name": item["displayName"],
@@ -818,7 +822,10 @@ def _normalize_model_entry(item):
         "efforts": efforts,
         "service_tiers": tiers,
         "upgrade": upgrade,
-    }, None
+    }
+    if tiers is None:
+        del entry["service_tiers"]
+    return entry, None
 
 
 def _normalize_model_page(result):

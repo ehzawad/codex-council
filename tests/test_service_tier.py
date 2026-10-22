@@ -113,13 +113,15 @@ class ServiceTierDiscoveryTests(unittest.TestCase):
             item.pop("service_tiers", None)
         self.assertIsNone(discovery._snapshot_shape_problem(snap))
 
-    def test_malformed_or_duplicate_tier_ids_are_rejected(self):
+    def test_malformed_or_duplicate_tier_ids_drop_only_the_tier_metadata(self):
         for value in (None, {}, ["priority"], [{"id": ""}], [{"id": 1}],
                       TIERS + TIERS):
             with self.subTest(value=value):
                 raw = fake_codex.model_entry(NATIVE, serviceTiers=value)
-                self.assertEqual(discovery._normalize_model_entry(raw),
-                                 (None, "serviceTiers"))
+                entry, problem = discovery._normalize_model_entry(raw)
+                self.assertIsNone(problem)
+                self.assertEqual(entry["model"], NATIVE)
+                self.assertNotIn("service_tiers", entry)
         snap = council_testlib.snapshot()
         for value in (None, "priority", [None], [""], ["priority", "priority"]):
             with self.subTest(snapshot=value):
@@ -228,7 +230,7 @@ class ServiceTierWorkflowTests(unittest.TestCase):
         self.write_roles(directory, [role_json(service_tier="fast")])
         preflight = self.cli("--check-staging-dir", directory)
         self.assertEqual(preflight.returncode, 0, preflight.stderr)
-        self.assertIn("service tier fast", preflight.stdout)
+        self.assertIn("explicit service tier fast; revalidated at launch", preflight.stdout)
         roles, _ = self.launch_workers(directory)
         self.assertEqual((directory / "run.json").read_bytes(), plan_before)
         self.assertEqual(roles[0].decision.dispatch_service_tier, "fast")
@@ -237,6 +239,9 @@ class ServiceTierWorkflowTests(unittest.TestCase):
         self.assertEqual(council_testlib.config_values(argv)["service_tier"], "fast")
         self.assertIn("service_tier=fast", (directory / "replies/worker.md").read_text())
         self.assertIn("sent fast", (directory / "out.md").read_text())
+        # The Summary line names a sent tier even when model/effort inherit.
+        self.assertIn("[worker]: ok (native model/effort inheritance; "
+                      "service tier fast)", (directory / "out.md").read_text())
         result = json.loads((directory / "result.json").read_text())
         self.assertEqual(result["roles"]["worker"]["sent_service_tier"], "fast")
         self.assertIn("not serving-tier attestation",
@@ -299,6 +304,11 @@ class ServiceTierWorkflowTests(unittest.TestCase):
                 self.assertEqual(roles[0].decision.dispatch_service_tier, "fast")
                 self.assertEqual(roles[0].decision.dispatch_model,
                                  OTHER if mode == "routed" else NATIVE)
+                self.assertIn("service tier fast",
+                              runner._selection_summary_note(roles[0].decision))
+                plan = runner._selection_plan_text(roles[0].decision)
+                self.assertTrue(plan.endswith("; explicit service tier fast"), plan)
+                self.assertEqual(plan.count("revalidated at launch"), 1, plan)
 
     def test_routing_off_does_not_discard_an_explicit_tier(self):
         directory = self.stage([role_json(service_tier="fast")])
@@ -323,6 +333,8 @@ class ServiceTierWorkflowTests(unittest.TestCase):
         self.assertEqual(roles[0].decision.provenance, "fallback")
         self.assertIsNone(roles[0].decision.dispatch_model)
         self.assertEqual(roles[0].decision.dispatch_service_tier, "fast")
+        self.assertEqual(runner._selection_summary_note(roles[0].decision),
+                         " (native inheritance; routing fell back; service tier fast)")
         for entry in current["methods"]["model/list"]["pages"][""]["data"]:
             if entry["model"] == NATIVE:
                 entry["serviceTiers"] = []
@@ -369,10 +381,79 @@ class ServiceTierWorkflowTests(unittest.TestCase):
                     current["methods"]["model/list"] = {
                         "error": {"code": -32601, "message": "No catalog."}}
                 self.set_scenario(current)
-                council_testlib.assert_usage_exit(
+                text = council_testlib.assert_usage_exit(
                     self, lambda: self.resolve(directory, launch=True),
                     expect_in_stderr="service tier")
+                if change == "failed":
+                    # The launch snapshot is never retained on this exit, so
+                    # the refusal itself must name why discovery failed.
+                    self.assertIn("model/list", text)
+                    self.assertNotIn("see per-role snapshot", text)
         self.assertEqual(self.argvs(), [])
+
+    def test_snapshot_without_tier_metadata_asks_for_rediscovery(self):
+        # A snapshot written before tiers were recorded has no service_tiers
+        # key; that is missing evidence, not a model that lacks the tier.
+        directory = self.stage([role_json(service_tier="fast")])
+        path = directory / "catalogs/worker/model-snapshot.json"
+        snap = json.loads(path.read_text())
+        for entry in snap["catalog"]["models"]:
+            del entry["service_tiers"]
+        path.write_text(json.dumps(snap))
+        proc = self.cli("--check-staging-dir", directory)
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        for text in (proc.stderr, council_testlib.assert_usage_exit(
+                self, lambda: self.resolve(directory, launch=True),
+                expect_in_stderr="service tier")):
+            self.assertIn("no service-tier metadata", text)
+            self.assertIn("rerun --discover", text)
+            self.assertNotIn("not advertised", text)
+        self.assertEqual(self.argvs(), [])
+
+    def test_malformed_tier_metadata_keeps_ordinary_selection_working(self):
+        current = scenario()
+        for entry in current["methods"]["model/list"]["pages"][""]["data"]:
+            if entry["model"] == NATIVE:
+                entry["serviceTiers"] = None
+        self.set_scenario(current)
+        directory = self.stage()
+        snap = json.loads((directory / "catalogs/worker/model-snapshot.json").read_text())
+        self.assertTrue(snap["routing"]["eligible"], snap["routing"]["reasons"])
+        self.assertEqual(snap["native"]["resolution"], "proven")
+        self.write_roles(directory, [role_json(
+            effort="brisk", selection={"mode": "native_effort",
+                                       "snapshot_id": snap["snapshot_id"],
+                                       "reason": "The advertised effort fits."})])
+        proc = self.cli("--check-staging-dir", directory)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.write_roles(directory, [role_json(service_tier="fast")])
+        proc = self.cli("--check-staging-dir", directory)
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn("no service-tier metadata", proc.stderr)
+        self.assertEqual(self.argvs(), [])
+
+    def test_pin_whose_record_was_malformed_names_the_catalog_gap(self):
+        current = scenario()
+        for entry in current["methods"]["model/list"]["pages"][""]["data"]:
+            if entry["model"] == OTHER:
+                entry["hidden"] = "false"
+        self.set_scenario(current)
+        directory = self.stage([role_json(model=OTHER, service_tier="fast",
+                                         selection={"mode": "user"})])
+        text = council_testlib.assert_usage_exit(
+            self, lambda: self.resolve(directory),
+            expect_in_stderr="not an advertised execution id")
+        self.assertIn("catalog incomplete: malformed entries (hidden)", text)
+
+    def test_pin_missing_from_the_catalog_is_named_as_such(self):
+        # "Orion" is the native entry's display name, not its execution id.
+        directory = self.stage([role_json(model="Orion", service_tier="fast",
+                                         selection={"mode": "user"})])
+        text = council_testlib.assert_usage_exit(
+            self, lambda: self.resolve(directory),
+            expect_in_stderr="'Orion' is not an advertised execution id")
+        self.assertIn(f"use the execution id '{NATIVE}'", text)
+        self.assertNotIn("tier metadata", text)
 
     def test_changed_native_model_is_checked_for_tier_only_requests(self):
         directory = self.stage([role_json(service_tier="fast")])
@@ -410,6 +491,10 @@ class ServiceTierWorkflowTests(unittest.TestCase):
                 proc = self.cli("--check-staging-dir", directory)
                 self.assertEqual(proc.returncode, 2, proc.stderr)
                 self.assertIn("service tier", proc.stderr)
+                # A fresh run directory cannot beat a managed layer.
+                self.assertIn("managed configuration layer overrides", proc.stderr)
+                self.assertIn("report this to the user", proc.stderr)
+                self.assertNotIn("fresh run directory", proc.stderr)
                 with self.assertRaisesRegex(ValueError, "service tier"):
                     self.resolve(directory, launch=True)
         self.assertEqual(self.argvs(), [])

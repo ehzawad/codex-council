@@ -26,8 +26,8 @@ Pause overlapping managed writers only during preparation. Capture refuses obser
 changes, but cannot make arbitrary external writers atomic. After preparation,
 Claude can continue independent live work while roles experiment in their copies.
 The baseline and role contracts are frozen; changing the context or authorization
-requires another invocation. Model selection fields alone can be filled after
-actual-cwd discovery.
+requires another invocation. Model, effort, selection and service_tier fields
+alone can be filled after actual-cwd discovery.
 
 At reconciliation, --freshness checks the captured filesystem scope, the recorded
 omission list and the staged context, not the user's current intention or external

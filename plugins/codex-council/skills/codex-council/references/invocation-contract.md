@@ -30,11 +30,12 @@ without `..`, absolute names, backslashes, or traversed symbolic links.
 With `include` omitted, Git supplies tracked and non-ignored untracked filenames;
 the runner reads their **current working bytes**, including staged/unstaged edits
 and deletions; a partially staged file is captured as its working version. Explicit
-includes also keep empty directories. A non-Git project requires `include`. `include: []` supports a
-pure question without filesystem inputs. Exclusions are case-sensitive
-shell-style patterns matched against relative names, not validated as paths. An
-omitted or `null` `exclude` means no exclusions. Implicit Git scope lists files, so
-exclude a directory there as `dir/*`. Explicit includes may select ignored fixtures.
+includes also keep empty directories. A non-Git project requires `include`.
+`include: []` supports a pure question without filesystem inputs. Exclusions are
+case-sensitive shell-style patterns matched against relative names, not validated as
+paths. An omitted or `null` `exclude` means no exclusions. Implicit Git scope lists
+files, so exclude a directory there as `dir/*`. Explicit includes may select ignored
+fixtures.
 
 Known credential, agent/VCS configuration, instruction and dependency-cache paths
 met during selection are excluded and recorded in `run.json.snapshot.omitted`.
@@ -77,10 +78,12 @@ external services are not reproduced.
 
 Ids must fully match `[a-z0-9_-]+`, with no trailing newline; ids longer than 32
 characters use a hashed key in file and directory names. Labels are single-line.
-Instructions are arrays of nonempty strings. The runner supplies common framing;
-Claude need not reproduce a literal phrase or closing sentence. Unknown/duplicate
-JSON keys and non-finite numbers remain errors. Context is nonempty UTF-8, never
-silently truncated. Preflight displays its byte count, not a fabricated token bill.
+Instructions are arrays of nonempty strings. Optional fields are `model`, `effort`,
+`selection`, `service_tier` and `execution`, described below. The runner supplies
+common framing; Claude need not reproduce a literal phrase or closing sentence.
+Unknown/duplicate JSON keys and non-finite numbers remain errors. Context is
+nonempty UTF-8, never silently truncated. Preflight displays its byte count, not a
+fabricated token bill.
 
 ## Capabilities and trust
 
@@ -150,16 +153,28 @@ Each role gets its own `model-snapshot.json` under the catalog path recorded in
 native_effort, or omission for native inheritance; the shapes and value grammar
 are in [panel-design.md](panel-design.md). Automatic choices name that role's
 snapshot_id. Model and effort descriptions guide Claude; the runner validates
-membership and provenance, never ranks. At launch each automatically selected role
-and each role with an explicit service-tier request
-gets a fresh discovery in the same cwd, retained as
-`evidence/<key>/launch-model-snapshot.json`.
-Reports describe values **sent**, not an attestation of a serving model.
+membership and provenance, never ranks.
 
-Only model/effort/selection/service_tier may change after prepare. Changes to context, task,
-panel, instructions or execution policy require a fresh run directory. The logical
-source root and task id scope saved threads, not the scratch path. Session scope
-still follows CODEX_COUNCIL_SESSION_KEY, then host ids, then project scope.
+`service_tier` is an optional role field, not a selection mode. Set it only on an
+explicit user request (`"fast"` for fast mode); it takes the model/effort value
+grammar and may stand alone. Preflight and launch check it per role against the
+resolved model, or the proven native model when no model is sent, and refuse an
+unadvertised or unprovable tier with exit 2 (rules in
+[panel-design.md](panel-design.md)). It is sent as `-c service_tier="<value>"` on
+every invocation, resume included, and recorded as the sent value: `service_tier=`
+in the reply header, `sent_service_tier` in `result.json`. The launch's
+effective-configuration check is retained as `evidence/<key>/service-tier.json`.
+
+At launch each automatically selected role and each role with a `service_tier`
+gets a fresh discovery in the same cwd, retained as
+`evidence/<key>/launch-model-snapshot.json`. Reports describe values **sent**, not
+an attestation of a serving model or tier.
+
+Only model/effort/selection/service_tier may change after prepare. Changes to
+context, task, panel, instructions or execution policy require a fresh run
+directory. The logical source root and task id scope saved threads, not the scratch
+path. Session scope still follows CODEX_COUNCIL_SESSION_KEY, then host ids, then
+project scope.
 
 ## Evidence and reconciliation
 
@@ -174,9 +189,10 @@ protocol output in memory, so total runner RAM is not bounded.
 
 Command/exit/output fields in JSONL are **Codex-reported observations**, not an
 independent OS audit, and they can be incomplete: a sandbox-denied code-mode command
-emits no `command_execution` item, although it may already have had effects. Collaborator prose is stored separately as interpretation.
-No parser declares substantive claims true. Required coverage and execution success
-are distinct from applicability to current work and from verified task success.
+emits no `command_execution` item, although it may already have had effects.
+Collaborator prose is stored separately as interpretation. No parser declares
+substantive claims true. Required coverage and execution success are distinct from
+applicability to current work and from verified task success.
 
 Artifact manifests cover added, removed and changed non-omitted regular files,
 executable-flag changes included; other permission changes and empty-directory
