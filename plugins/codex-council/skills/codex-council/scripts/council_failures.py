@@ -19,20 +19,9 @@ from dataclasses import dataclass
 
 from council_common import _dedupe_preserve_order, _iter_json_objects
 
-# Substring markers (matched case-insensitively) classifying failure modes.
-# These are the FALLBACK signal; the primary signal is the numeric HTTP status
-# parsed out of the JSONL error body (see _extract_statuses) and, for quota
-# and model rejection, the structured failure records (_failure_records).
-# Order of check, identical on the fresh and resume paths (see
-# _failure_verdict): auth first (never clear state; a structured 401 or
-# authentication code, or the prose below), then quota (terminal,
-# even when it carries HTTP 429), then ANCHORED-status retriable (a real API
-# 429/5xx — by JSON status, `HTTP NNN`, or a reason phrase — beats a
-# stale-looking message), then model rejection (terminal; never clears
-# state), then stale-resume (resume only: clear and restart), then the
-# SUBSTRING retriable fallback — kept last so a stale error that merely
-# contains a bare digit run (e.g. "...stale-429-sid") still restarts fresh
-# instead of being mistaken for a rate limit.
+# Case-insensitive substring markers: the fallback behind anchored statuses
+# (_extract_statuses) and structured records (_failure_records). Check
+# order: _failure_verdict.
 AUTH_ERROR_MARKERS = (
     "401 unauthorized",
     "incorrect api key",
@@ -64,14 +53,8 @@ RATE_LIMIT_MARKERS = (
     # ("stream disconnected before completion: Request was throttled").
     # Deliberately NOT bare "throttled" — quota/policy prose could collide.
     "request was throttled",
-    # NB: "quota exceeded" / usage caps are deliberately NOT retriable markers —
-    # a plan/usage cap does not clear within a 5s backoff, so it is surfaced
-    # terminal (see "Failures and safe replay" in references/runtime-behavior.md
-    # and "Replay, evidence and result semantics" in DESIGN.md); the
-    # recognized quota forms are tagged [quota] ahead of the anchored parser
-    # (QUOTA_ERROR_CODES).
-    # Genuine transient 429s are caught by the anchored parser or the
-    # rate-limit phrases above.
+    # Usage caps are deliberately absent: they outlast a 5s backoff, so
+    # their recognized forms are tagged [quota] (terminal) first.
 )
 TRANSIENT_5XX_MARKERS = (
     "500 internal",
@@ -80,15 +63,8 @@ TRANSIENT_5XX_MARKERS = (
     "504 gateway timeout",
     "internal server error",
     "service unavailable",
-    # codex-cli rewrites some upstream 5xx/overload errors to prose that
-    # carries no status code (HTTP 500 -> "...experiencing high demand...";
-    # overload -> "...server overloaded..."; HTTP 503
-    # server_is_overloaded/slow_down -> "Selected model is at capacity. Please
-    # try a different model."). These phrases cover only the code-less case;
-    # the anchored status range (_anchored_retriable_class) handles every 5xx
-    # that DOES carry a status. The overload marker is intentionally specific
-    # (not bare "overloaded") so unrelated text like "operator overloaded" is
-    # not matched.
+    # codex-cli's code-less rewrites of 5xx/overload errors (a 5xx with a
+    # status is anchored); not bare "overloaded" ("operator overloaded").
     "server overloaded",
     "experiencing high demand",
     "selected model is at capacity",
@@ -351,24 +327,11 @@ def _is_stale_resume_error(text):
     return _text_contains(text, STALE_RESUME_MARKERS)
 
 
-# Numeric HTTP status as codex surfaces it. codex-cli does NOT put a
-# status on the top-level JSONL event, so we scan the combined failure text for
-# an ANCHORED status — one in a recognizable status context, so a bare digit run
-# (e.g. "429" inside a thread id like "stale-429-sid") is never mistaken for one.
-# Two anchors are accepted:
-#   * keyword-prefixed: `"status": 429`, `status 529`, `status code 429`,
-#     `status_code: 400`, `statusCode: 503`, `HTTP 429`, `last status: 429`
-#     (the JSON key spellings and the prose forms);
-#   * reason-phrase-suffixed: `429 Too Many Requests`, `503 Service Unavailable`,
-#     `502 Bad Gateway`, `504 Gateway Timeout`, `500 Internal Server Error`,
-#     `529 <unknown status code>` (codex's "unexpected status N" form).
-# Anchored detection is the PRIMARY retriable signal and (unlike a bare
-# substring) is trusted ahead of the stale check on the resume path.
-# The separator class excludes "/" so a URL like `http://127.0.0.1:8080/...`
-# is NOT read as "http" + status 127; only real `HTTP 429` / `status: 429`
-# forms match. At least one separator is required, so an identifier such as
-# `future-status401` or `custom/http401` never names a status; the classifier
-# also masks the requested model id before any status scan (_mask_model).
+# Anchored statuses (codex puts none on the top-level event): a `status` /
+# `HTTP` keyword plus at least one separator, never "/" (`http://127.0.0.1`
+# names no status 127, nor does `future-status401`), or a reason phrase after
+# the code, codex's `529 <unknown status code>` included. A bare digit run
+# ("stale-429-sid") never names one.
 _STATUS_KEYWORD_RE = re.compile(
     r"(?:^|[^0-9a-z_])(?:http|status(?:[\s_-]*code)?)[\s:=\"']+([0-9]{3})(?![0-9])",
     re.IGNORECASE,
@@ -606,18 +569,8 @@ def _mask_model(text, model):
 
 # ---------- failure tags ----------
 
-# The recovery action for a refused model ([model-rejected], or a [quota]
-# usage limit Codex names for one model) depends on WHICH model was sent,
-# not on how the role chose it. A routed model or an explicit model pin can
-# be dropped. The natively configured model (sent by a native_effort role,
-# or inherited, as by an effort-only pin) is what an inheriting re-run
-# would send again, so only a configuration change or an explicit pin
-# avoids it, and both are the user's decision: the action addresses the
-# user, never the orchestrator, which must not edit Codex configuration or
-# pick a model on the user's behalf. A routed or pinned model that the
-# resolving discovery proved IS the native model counts as the native one:
-# dropping it would send the same refused model again. The runner never
-# substitutes or replays: the host re-runs the role.
+# Refused-model actions (_refused_model_action). Avoiding the native model
+# is the user's decision: Claude never edits Codex config or picks for them.
 _INHERIT_ACTION = (
     "Re-run this role with model, effort, and selection omitted to inherit "
     "native configuration."

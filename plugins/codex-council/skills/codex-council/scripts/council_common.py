@@ -1,17 +1,11 @@
 """Shared primitives for the codex-council runner (see codex_council.py).
 
-Nothing here imports a sibling module. It supplies the shared diagnostics,
-path, serialization and discovery helpers the runner modules use
-(council_workspace keeps its own capture-specific path and JSON primitives):
-single-line, control-free escaping for report and progress text
-(_report_inline, and _log_inline for err.log diagnostics), the advisory
-stderr sink (_diag), stdout output that ends quietly when nobody reads it
-any more (_print_stdout), usage exits with the uniform recovery texts, the
-private-path policy (_private_stat_problem) and the private-directory gate
-built on it, the one-launch-per-directory gate, atomic 0600 writes,
-strict JSON loading, JSONL record iteration, the UTC timestamp format (_utc_iso), the project root (a
-bounded, cached git lookup), and the plugin version. Its module-level state
-(the diagnostics sink and the cached project root) exists only here.
+Imports no sibling module (council_workspace keeps its own capture
+primitives). Holds diagnostics and stdout output, single-line escaping,
+usage exits with their recovery texts, the private-path and one-launch
+gates, atomic 0600 writes, strict JSON and JSONL reading, the UTC timestamp
+format, the cached project root, and the plugin version. Its module-level
+state (diagnostics sink, project-root cache) lives only here.
 """
 
 import contextlib
@@ -51,11 +45,8 @@ NEW_DIR_SEQUENCE = (
     "run --prepare and then --discover there, update roles.json "
     f"({NEW_DIR_SNAPSHOT_CLAUSE}), and run --check-staging-dir on it."
 )
-# Action-first recovery text for a rejected staging DIRECTORY. The orchestrator
-# is an LLM; the cheapest literal reading of "create it with mktemp -d" is
-# satisfiable by mkdir/chmod on the same predictable path, so the recovery must
-# forbid exactly those moves and demand a NEW path, then give the complete
-# sequence there: discovery, both files, the pre-flight.
+# Recovery for a rejected staging directory: forbid the cheap mkdir/chmod
+# repair of the same path, demand a NEW one, and give the full sequence.
 STAGING_DIR_RECOVERY = (
     "Recovery: abandon this directory — do not chmod it, do not mkdir it, "
     "and do not reuse its name. Run `mktemp -d` again and copy the NEW "
@@ -388,15 +379,9 @@ def _check_private_dir(path, prefix="--check-staging-dir: ",
     must use it for any subsequent joins so the validated path and the
     used path cannot diverge.
 
-    lstat (not stat) so a symlink final component is rejected instead of
-    silently followed, and ownership is checked so a foreign-owned dir
-    that happens to be mode 0700 does not pass. Every rejection carries
-    action-first recovery text: the caller is an LLM, and for a staging
-    rejection the one correct move is always a NEW `mktemp -d` directory —
-    never chmod, mkdir, or reuse of the rejected path (for --follow it is
-    pointing at the real run directory). `prefix` names the actual
-    entrypoint (a direct-launch rejection must not claim it came from
-    --check-staging-dir) and `recovery` is mode-specific.
+    lstat (not stat) so a symlink final component is rejected, and the
+    owner is checked so a foreign 0700 dir does not pass. `prefix` names
+    the refusing command and `recovery` is its action-first fix.
     """
     # normpath strips trailing slashes first: lstat("link/") follows the
     # final symlink (the slash demands a directory target), so an

@@ -6,9 +6,6 @@ siblings resolve even when Python leaves the script's directory off
 sys.path (python3 -P, PYTHONSAFEPATH=1), that a run caches no bytecode in
 the installed scripts directory, that the import graph is acyclic and
 layered, and that module-level state has exactly one owner.
-
-Run from repo root:
-    python3 -m unittest discover -s tests -p 'test_*.py'
 """
 
 import ast

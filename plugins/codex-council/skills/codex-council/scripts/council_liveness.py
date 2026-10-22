@@ -80,33 +80,25 @@ PS_TIMEOUT_SECS = 2
 # runner and a later reader always print the same start identity.
 _PS_ENV = {"LC_ALL": "C", "TZ": "UTC0"}
 
-# --follow timing: read err.log every FOLLOW_POLL_SECS, look at the runner
-# and the follower's own parent every FOLLOW_CHECK_SECS; neither a preparing
-# nor a dispatch line within FOLLOW_START_SECS means no council activity. No usable status.json
-# for STATUS_UNUSABLE_WARN_SECS after dispatch (or after its last usable
-# read) is reported once. A tick older than TICK_WARN_SECS while the runner
-# is present is reported once; at TICK_GIVE_UP_SECS the follower stops
-# (exit 4).
-FOLLOW_POLL_SECS = 0.5
-FOLLOW_CHECK_SECS = 2
-FOLLOW_START_SECS = 120
+# --follow timing.
+FOLLOW_POLL_SECS = 0.5  # err.log reads
+FOLLOW_CHECK_SECS = 2  # runner and own-parent checks
+FOLLOW_START_SECS = 120  # no preparing/dispatch line by then: no activity
+# No usable status.json this long after dispatch or its last usable read:
+# reported once.
 STATUS_UNUSABLE_WARN_SECS = 30
-TICK_WARN_SECS = 120
-TICK_GIVE_UP_SECS = 300
-# A wall-clock jump this much larger than the monotonic advance between two
-# follower polls is a system suspend: tick age then counts from the resume.
+TICK_WARN_SECS = 120  # stale tick while present: reported once
+TICK_GIVE_UP_SECS = 300  # then exit 4
+# A wall-clock jump this much past the monotonic advance between polls is a
+# suspend: tick age counts from the resume.
 FOLLOW_SUSPEND_SLACK_SECS = 60
-# Follower exit codes: 0 = a terminal line (or terminal status) was seen,
-# 1 = stdout is gone, 2 = usage error, 3 = no council activity, 4 = the
-# runner is gone or stopped ticking, 5 = the follower's own parent is gone.
+# Follower exits: 0 terminal seen, 2 usage error, and these.
 FOLLOW_EXIT_STDOUT_GONE = 1
 FOLLOW_EXIT_NO_ACTIVITY = 3
-FOLLOW_EXIT_RUNNER_GONE = 4
+FOLLOW_EXIT_RUNNER_GONE = 4  # gone or stopped ticking
 FOLLOW_EXIT_PARENT_GONE = 5
-# After dispatch, while the runner is alive and ticking, a follower that has
-# relayed nothing for FOLLOW_KEEPALIVE_SECS prints one `still running` line
-# naming at most KEEPALIVE_ROLES active roles. Each line is a Monitor event
-# that wakes Claude, so a long, quiet council still shows progress.
+# Quiet this long after dispatch (runner alive and ticking): one `still
+# running` line naming at most KEEPALIVE_ROLES roles, so Monitor wakes Claude.
 FOLLOW_KEEPALIVE_SECS = 600
 KEEPALIVE_ROLES = 5
 # The runner's role-id grammar (codex_council.ROLE_ID_PATTERN): only ids of

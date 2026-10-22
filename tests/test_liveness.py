@@ -4,9 +4,6 @@
 Unit tests drive council_liveness and the runner's subprocess lifecycle
 directly; LivenessScenarioTests runs every scenario of
 tests/liveness_scenarios.py (the real runner CLI against the fake codex).
-
-Run from repo root:
-    python3 -m unittest discover -s tests -p 'test_*.py'
 """
 
 import asyncio

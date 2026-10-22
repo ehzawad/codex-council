@@ -9,10 +9,6 @@ directory, so no real council state is touched.
 
 Asserts exit codes AND stream contents (stdout = the report only; stderr =
 dispatch line, per-role progress, and the final CODEX_COUNCIL_DONE sentinel).
-
-Lives outside the plugin subtree so end-user installs don't bundle it.
-Run from repo root:
-    python3 -m unittest discover -s tests -p 'test_*.py'
 """
 
 import contextlib

@@ -7,10 +7,6 @@ report renderers directly with synthetic snapshots. End-to-end tests run the
 REAL script (--discover, --check-staging-dir, launch, --follow) as a
 subprocess with the fake `codex` from tests/fake_codex.py on PATH (no
 network, no real Codex). Model ids and efforts are synthetic only.
-
-Lives outside the plugin subtree so end-user installs don't bundle it.
-Run from repo root:
-    python3 -m unittest discover -s tests -p 'test_*.py'
 """
 
 import calendar

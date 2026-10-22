@@ -6,9 +6,6 @@ in liveness_scenarios.py; this module pins the command's contract: what
 it refuses before creating anything, what it creates and with which mode,
 what it prints, what the supervisor's command line carries, and how the
 hidden supervisor entry refuses anything but --start's own handoff.
-
-Run from repo root:
-    python3 -m unittest discover -s tests -p 'test_*.py'
 """
 
 import contextlib

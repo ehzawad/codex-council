@@ -10,10 +10,6 @@ tests/test_replies_and_overrides.py; --follow, --status, and --reap in
 tests/test_liveness.py; model discovery and the selection contract in
 tests/test_model_discovery.py and tests/test_model_selection.py; the module
 layout in tests/test_module_layout.py.
-
-Lives outside the plugin subtree so end-user installs don't bundle it.
-Run from repo root:
-    python3 -m unittest discover -s tests -p 'test_*.py'
 """
 
 import asyncio

@@ -498,15 +498,10 @@ def _ensure_state_dir():
     normalization, so the directory checked is the one _state_path and the
     role locks use (a "link/.." component resolves the same way for both).
     An existing state directory must be a real directory (not a symlink)
-    owned by the effective uid; when its mode is anything but 0700 (group-
-    or other-accessible, as one created under an earlier umask-dependent
-    release can be, or missing owner bits, as 0500, 000, or one a
-    concurrent council created under an owner-clearing umask), it is reset
-    to 0700 through a descriptor opened without following links and
-    re-checked to be the same owned directory (one without an owner read
-    bit cannot be opened, so it is reset by name without following a link
-    and re-checked afterwards). Anything else raises StateDirError and
-    nothing is chmodded.
+    owned by the effective uid; any mode but 0700 is reset to 0700 through
+    a no-follow descriptor and re-checked (without an owner read bit, by
+    name: _reset_unreadable_state_dir). Anything else raises StateDirError
+    and nothing is chmodded.
     """
     # Never normalized, and never resolved under the cwd (usually the
     # user's project): a relative one means no usable home directory.
@@ -846,26 +841,11 @@ def _fresh_cmd(root, model=None, effort=None, execution_options=None, service_ti
 class _EventFlagScanner:
     """Derive replay-safety flags from the stdout JSONL as chunks arrive.
 
-    Splits strictly on b"\\n" (JSONL's record separator) for the same reason
-    as _iter_json_objects: U+2028/U+2029/U+0085 are legal unescaped inside a
-    JSON string. Only items that do no work are replay-safe: the pure-text
-    agent_message and reasoning, and Codex's own `error` notices (message
-    only — for example the advisory that a resumed thread was recorded
-    with another model, routine once roles are routed). Every other type
-    (command executions, MCP tool calls, file changes, web searches, to-do
-    lists, collab tool calls, any unknown/future type, and a type that is
-    not a string) marks the attempt unsafe to replay — conservative by
-    default, since replaying such a turn could duplicate side effects. The
-    stream is not a complete record of tool calls (codex exec --json emits no
-    item for a sandbox-denied code-mode command), so _run_role_once also
-    treats every attempt of a role whose tools can leave effects as unsafe. A
-    non-blank line that is not a JSON object (Python's decoder rejects it,
-    for example for excessive nesting or the integer-digit limit, or it is
-    another JSON value) could hide such an item, so it marks the attempt
-    unsafe to replay too, and so does anything else scanning a line raises:
-    feed() and finish() never raise, so scanning never stops the stdout
-    pump. Only item.started and item.completed events are checked against
-    the safe-item allowlist; other top-level event types are accepted.
+    Splits strictly on b"\\n", as _iter_json_objects does. Only item events
+    are checked: an item type outside _SAFE_ITEM_TYPES, a non-object line,
+    or any scanning error marks the attempt unsafe to replay; feed() and
+    finish() never raise. The stream omits some tool calls, so
+    _run_role_once also treats every effect-capable role as unsafe.
     """
 
     _SAFE_ITEM_TYPES = frozenset({"agent_message", "reasoning", "error"})
@@ -1338,20 +1318,10 @@ async def _run_role_invocation(role, attempt, run_codex):
         failure_text = _failure_text(run.stdout, run.stderr)
 
         if run.returncode == 0:
-            # Resume-footgun mitigation. `codex exec resume <id>` parses <id>
-            # as a UUID first (UUIDs take precedence if it parses). On current
-            # codex-cli a valid-but-unknown UUID ERRORS ("no rollout found ...
-            # -32600", exit 1) and is handled by the stale-resume branch below;
-            # only a value that is NOT a valid UUID is treated as a thread NAME
-            # and silently starts a NEW thread (rc==0, fresh thread.started).
-            # The runner stores whatever non-empty id thread.started emitted
-            # and does not check that it is a UUID; Codex emits UUIDs, so
-            # silent-spawn needs an unexpected id or a hand-edited state
-            # file. Detect it by comparing a non-empty emitted
-            # thread.started.thread_id to what we asked to resume; if it
-            # differs, adopt the new id (no benefit re-running an
-            # already-completed turn) and warn — the role lost its prior
-            # accumulated framing.
+            # `codex exec resume <id>` treats a non-UUID <id> as a thread
+            # NAME and silently starts a new thread (rc 0); an unknown UUID
+            # errors into the stale branch below. A different emitted
+            # thread_id is adopted with a continuity-lost warning.
             # The reply is extracted BEFORE any state write so persistence
             # failures can never cost a completed reply.
             msg = extract_final_message(run.stdout)
@@ -1412,18 +1382,8 @@ async def _run_role_invocation(role, attempt, run_codex):
                 elapsed_seconds=elapsed, attempts=attempt, warning=warning,
             )
 
-        # rc != 0 on resume. Order (_failure_verdict): auth (never clear
-        # state) -> quota (terminal even with HTTP 429) -> ANCHORED-status
-        # retriable (a real API 429/5xx, by JSON status / `HTTP NNN` / reason
-        # phrase, beats a stale-looking message) -> model rejected (terminal;
-        # keeps state even when its text also looks stale) -> stale-resume
-        # (clear + restart fresh) -> SUBSTRING retriable fallback. The
-        # substring fallback sits after the stale check so a stale error that
-        # merely contains a bare digit run (e.g. "...thread id stale-429-sid")
-        # still restarts fresh. The verdict is computed once and formatted
-        # as-is, so the tag always matches the branch taken here; the verdict
-        # marks a transient class, and replay safety and the attempt budget
-        # decide the retry.
+        # rc != 0 on resume: one verdict (order in _failure_verdict),
+        # formatted as-is, so the tag matches the branch taken here.
         records = _failure_records(run.stdout)
         verdict = _failure_verdict(failure_text, records, model, resume=True)
         if verdict.kind != "stale":
@@ -2711,34 +2671,13 @@ def _fill_closed_standard_fds():
 
 
 def _start_command(run_dir):
-    """--start RUNDIR: launch the staged council detached; exit 0, 1, or 2.
+    """--start RUNDIR: launch the staged council detached (contract: --help).
 
-    1. Repeat the pre-flight's local contract, capture and selection-
-       authoring checks (execution-policy probes are left to the child,
-       which reobserves policy and revalidates automatic choices before
-       dispatch); a refusal exits 2 before anything is created, so the
-       directory stays untouched.
-    2. Claim the directory, in this order and each exclusively (O_EXCL,
-       O_NOFOLLOW, 0600): supervisor.lock, locked with flock(LOCK_EX), then
-       err.log and out.md. A concurrent --start that got there first makes
-       this one exit 2 having created and truncated nothing; an err.log or
-       out.md that appeared after step 1 makes it exit 2 truncating
-       nothing, though the lock file it created stays. The lock file is
-       never removed or replaced.
-    3. Start this script's supervised child (the only launch path), in its own
-       session, with stdout on out.md, stderr on err.log, stdin on
-       /dev/null, the same cwd and environment, and the locked descriptor
-       as its only extra one (--supervisor-lock-fd). The context stays in
-       its file; the command line carries only paths.
-    4. Close this process's copies (the lock stays held by the child) and
-       wait up to START_WAIT_SECS for the child to write supervisor.json.
-       A child that wrote it is a start (exit 0) even if it has already
-       ended; one that exits without writing it, or a spawn failure, is
-       exit 1 (read err.log; the directory is used up). When the wait
-       runs out with the child still running and no record, it is also
-       exit 0, with a note to run --status. A start whose own stdout is
-       closed or broken is exit 0 too, with one stderr line naming the pid
-       and directory instead.
+    Claims supervisor.lock (flock LOCK_EX), err.log, then out.md, each
+    O_EXCL|O_NOFOLLOW and 0600; a lost race truncates nothing, and the lock
+    file is never removed or replaced.
+    The supervised child gets the locked descriptor as its only extra one
+    (--supervisor-lock-fd) and only paths on its command line.
     """
     prefix = "--start: "
     _fill_closed_standard_fds()

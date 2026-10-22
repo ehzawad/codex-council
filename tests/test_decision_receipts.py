@@ -1,19 +1,23 @@
-"""Checkout-only receipt prototype: real files/processes, no paid inference.
+"""Checkout-only receipt helper: real files and processes, no paid inference.
 
-Unit fixtures use synthetic protocol records. The integration case runs real
-local checks with fake Codex; neither proves sandbox enforcement or model quality.
-The production plugin remains unchanged.
+Unit fixtures are synthetic protocol records; the integration case runs real
+local checks with fake Codex. Neither proves sandbox enforcement or model quality.
 """
+import contextlib
 import copy
 import dataclasses
 import fcntl
+import hashlib
+import io
 import json
 import os
+import secrets
 import subprocess
 import sys
 import tempfile
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -82,22 +86,35 @@ class ReceiptTests(unittest.TestCase):
     def declare(self, runs=None):
         return receipts.declare(self.store, self.spec, runs or [self.run])
 
-    def finish(self, run=None, plan=None):
+    def finish(self, run=None, plan=None, codes=(0, 1), reported=None):
         run, plan = run or self.run, plan or self.plan
         spool = AttemptEvidence(run / "evidence/batch", ["fixture"], "two checks")
-        for code in (0, 1):
-            # Receipt validation is a pure protocol consumer. Real command
-            # execution is exercised once by ReceiptRunnerIntegrationTests.
+        for code in codes:
+            # A pure protocol consumer; ReceiptRunnerIntegrationTests runs real commands.
             event = {"type": "item.completed", "item": {"type": "command_execution",
                      "command": f"fixture-check-{code}", "exit_code": code,
                      "aggregated_output": ""}}
             spool.feed("stdout", canonical(event) + b"\n")
         spool.feed("stdout", b'{"type":"turn.completed"}\n')
-        spool.finish(returncode=0, state="completed", unsafe_to_replay=True)
-        (run / "supervisor.lock").touch(mode=0o600)
+        meta = spool.finish(returncode=0, state="completed", unsafe_to_replay=True)
+        if reported:  # a summary that disagrees with its raw events
+            for command, code in zip(meta["commands"], reported):
+                command["reported_exit_code"] = code
+            write(run / "evidence/batch" / f"{spool.key}.json", meta)
+        self.supervise(run)
         (run / "execution.claim").touch(mode=0o600)
         write_result(run, plan, [Result(role=self.roles[0])])
         return spool.key + ".json"
+
+    def supervise(self, run):
+        """A finished runner's tokened supervisor.lock and the supervisor.json naming it."""
+        token = secrets.token_hex(16)
+        fd = os.open(run / "supervisor.lock", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.write(fd, token.encode())
+        st = os.fstat(fd)
+        os.close(fd)
+        write(run / "supervisor.json", {"pid": os.getpid(), "lock": {
+            "dev": st.st_dev, "ino": st.st_ino, "token": token}})
 
     def decision(self, attempt, host_position="use_for_now", run=None, plan=None):
         plan = plan or self.plan
@@ -113,6 +130,54 @@ class ReceiptTests(unittest.TestCase):
         decision = self.decision(self.finish())
         receipts.record(self.store, decision, self.spec)
         return decision
+
+    def one_check(self, **finish):
+        """Declare only the positive criterion; return its decision."""
+        self.spec["criteria"] = self.spec["criteria"][:1]
+        self.declare()
+        decision = self.decision(self.finish(**finish))
+        decision["outcomes"] = decision["outcomes"][:1]
+        return decision
+
+    def cli_args(self, command, decision=None):
+        spec = self.root / "contract.json"
+        write(spec, self.spec)
+        argv = [command, "--store", self.store, "--contract", spec]
+        if decision is not None:
+            write(self.root / "decision.json", decision)
+            argv += ["--decision", self.root / "decision.json"]
+        return argv
+
+    def main(self, *argv):
+        """In-process main(): (exit code, stdout bytes, stderr text)."""
+        out, err = io.BytesIO(), io.StringIO()
+        with patch.object(sys, "stdout", SimpleNamespace(buffer=out)), contextlib.redirect_stderr(err):
+            code = receipts.main([str(item) for item in argv])
+        return code, out.getvalue(), err.getvalue()
+
+    @contextlib.contextmanager
+    def racing(self, name, forged, at=1):
+        """A concurrent writer swaps `name` in just before the helper's at-th open of it."""
+        real, opens, swapped = receipts.regular, [], {}
+
+        def regular(root, relative):
+            if PurePosixPath(relative).name == name:
+                opens.append(relative)
+                if len(opens) == at:
+                    path = Path(root) / relative
+                    swapped[path] = path.read_bytes()
+                    temp = path.with_name(name + ".race")
+                    temp.write_bytes(forged)
+                    temp.chmod(0o600)
+                    os.replace(temp, path)
+            return real(root, relative)
+
+        try:
+            with patch.object(receipts, "regular", regular):
+                yield
+        finally:
+            for path, data in swapped.items():
+                path.write_bytes(data)
 
     def test_one_worker_supports_multiple_chunks_and_expected_failure(self):
         self.use_for_now()
@@ -153,9 +218,36 @@ class ReceiptTests(unittest.TestCase):
         receipts.record(self.store, decision, self.spec)
         self.assertEqual(receipts.status(self.store, self.spec)["binding_status"], "match")
 
-    def test_no_current_contract_is_unknown(self):
+    def test_no_current_contract_is_unknown_and_stale_inputs_outrank_it(self):
         self.use_for_now()
         self.assertEqual(receipts.status(self.store)["binding_status"], "unknown")
+        (self.source / "subject.py").write_text("value = 2\n")
+        summary = receipts.status(self.store)
+        self.assertEqual(summary["binding_status"], "stale")
+        self.assertLessEqual({"current-contract-not-supplied", "captured-inputs-stale"}, set(summary["gaps"]))
+
+    def test_status_exits_0_only_for_matching_use_for_now(self):
+        self.declare()
+        attempt = self.finish()
+        argv = self.cli_args("status")
+        code, out, _ = self.main(*argv)
+        summary = json.loads(out)
+        self.assertEqual((code, summary["binding_status"], summary["gaps"]), (1, "match", ["no-recorded-position"]))
+        partial = self.decision(attempt, "needs_evidence")
+        partial["outcomes"][1] = {"criterion_id": "negative", "outcome": "unassessed"}
+        receipts.record(self.store, partial, self.spec)
+        code, out, _ = self.main(*argv)
+        self.assertEqual((code, json.loads(out)["gaps"]), (1, ["criteria-without-evidence"]))
+        for revision, position in enumerate(("revisit", "use_for_now", "set_aside"), 1):
+            decision = self.decision(attempt, position)
+            decision["expected_revision"] = revision
+            if position == "set_aside":
+                decision["outcomes"] = []
+            receipts.record(self.store, decision, self.spec)
+            code, out, _ = self.main(*argv)
+            summary = json.loads(out)
+            self.assertEqual((code, summary["binding_status"], summary["recorded_host_position"]),
+                             (0 if position == "use_for_now" else 1, "match", position))
 
     def test_current_requirements_override_old_position(self):
         self.use_for_now()
@@ -206,6 +298,15 @@ class ReceiptTests(unittest.TestCase):
         with self.assertRaisesRegex(WorkspaceError, "captured final-state"):
             receipts.record(self.store, self.decision(self.finish()), self.spec)
 
+    def test_resumed_contribution_is_not_reusable_evidence(self):
+        self.roles = [RoleFixture(id="batch", execution={"sandbox": "read-only", "continuity": "resume"})]
+        self.run = self.root / "resumed"
+        self.run.mkdir(mode=0o700)
+        self.plan = self.stage(self.run)
+        self.declare()
+        with self.assertRaisesRegex(WorkspaceError, "fresh"):
+            receipts.record(self.store, self.decision(self.finish()), self.spec)
+
     def test_no_posthoc_criteria_declaration(self):
         self.finish()
         with self.assertRaisesRegex(WorkspaceError, "before launch"):
@@ -247,6 +348,17 @@ class ReceiptTests(unittest.TestCase):
         with self.assertRaisesRegex(WorkspaceError, "every declared"):
             receipts.record(self.store, decision, self.spec)
 
+    def test_unknown_schema_or_position_is_refused(self):
+        self.declare()
+        decision = self.decision(self.finish(), "approved")
+        with self.assertRaisesRegex(WorkspaceError, "invalid host_position"):
+            receipts.record(self.store, decision, self.spec)
+        state = receipts.read(self.store)
+        state["schema"] = "unknown"
+        receipts.save(self.store, state)
+        with self.assertRaisesRegex(WorkspaceError, "schema mismatch"):
+            receipts.status(self.store, self.spec)
+
     def test_stale_revision_cannot_overwrite_and_setting_aside_preserves_history(self):
         decision = self.use_for_now()
         with self.assertRaisesRegex(WorkspaceError, "revision conflict"):
@@ -267,13 +379,43 @@ class ReceiptTests(unittest.TestCase):
                 receipts.record(self.store, withdraw, self.spec)
         self.assertEqual((self.store / "receipt.json").read_bytes(), before)
 
-    def test_active_supervisor_cannot_be_used_for_now(self):
+    def test_accepted_save_stays_readable(self):
+        self.declare()
+        state = receipts.read(self.store)
+        size = len(canonical(state))
+        with patch.object(receipts, "MAX_STATE_BYTES", size):
+            with self.assertRaisesRegex(WorkspaceError, "history full"):
+                receipts.save(self.store, state)
+        with patch.object(receipts, "MAX_STATE_BYTES", size + 1):
+            receipts.save(self.store, state)
+            self.assertEqual(receipts.read(self.store), state)
+
+    def test_supervisor_lock_must_be_the_recorded_free_lock(self):
         self.declare()
         decision = self.decision(self.finish())
-        with open(self.run / "supervisor.lock", "rb") as stream:
-            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            with self.assertRaises(BlockingIOError):
+        lock, record = self.run / "supervisor.lock", self.run / "supervisor.json"
+        token, saved = lock.read_bytes(), record.read_bytes()
+
+        def refused():
+            with self.assertRaisesRegex(WorkspaceError, "supervisor"):
                 receipts.record(self.store, decision, self.spec)
+
+        with open(lock, "rb") as stream:  # still running
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            refused()
+        lock.write_bytes(b"0" * 32)  # same file, another token
+        refused()
+        lock.write_bytes(token)
+        record.unlink()  # no supervisor record
+        refused()
+        record.write_bytes(saved)
+        record.chmod(0o600)
+        temp = self.run / "lock.new"  # same token, another file (a new inode)
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.write(fd, token)
+        os.close(fd)
+        os.replace(temp, lock)
+        refused()
 
     def test_receipt_lock_conflict_is_bounded(self):
         self.declare()
@@ -295,6 +437,62 @@ class ReceiptTests(unittest.TestCase):
         next((self.run / "evidence/batch").glob("*.stdout.jsonl")).write_text("forged")
         with self.assertRaisesRegex(WorkspaceError, "checksum mismatch"):
             receipts.record(self.store, decision, self.spec)
+
+    def test_recorded_hashes_are_of_the_validated_bytes(self):
+        decision = self.one_check()
+        attempt = decision["outcomes"][0]["evidence"]["attempt_file"]
+        for name, message in (("result.json", "invalid result"), (attempt, "not in recorded attempt")):
+            with self.subTest(name), self.racing(name, b"{}\n"):
+                with self.assertRaisesRegex(WorkspaceError, message):
+                    receipts.record(self.store, decision, self.spec)
+
+    def test_raw_event_is_scanned_from_the_hashed_bytes(self):
+        decision = self.one_check(codes=(1, 1), reported=(0, 1))  # raw exit 1; summary claims 0
+        log = next((self.run / "evidence/batch").glob("*.stdout.jsonl"))
+        forged = log.read_bytes().replace(b'"exit_code":1', b'"exit_code":0', 1)
+        with self.racing(log.name, forged, at=2):
+            with self.assertRaisesRegex(WorkspaceError, "differs from raw event"):
+                receipts.record(self.store, decision, self.spec)
+
+    def test_malformed_evidence_or_history_exits_2(self):
+        self.declare()
+        attempt = self.finish()
+        evidence = self.run / "evidence/batch"
+        log = next(evidence.glob("*.stdout.jsonl"))
+        paths = (self.run / "result.json", evidence / attempt, log)
+        saved = [path.read_bytes() for path in paths]
+        argv = self.cli_args("record", self.decision(attempt))
+
+        def raw_item(result, mirror):
+            lines = saved[2].split(b"\n")
+            lines[0] = b'{"type":"item.completed","item":"x"}'
+            log.write_bytes(b"\n".join(lines))
+            mirror["sha256"]["stdout"] = hashlib.sha256(b"\n".join(lines)).hexdigest()
+
+        cases = {"roles-array": lambda result, mirror: result.update(roles=[]),
+                 "null-attempt": lambda result, mirror: result["roles"]["batch"]["attempts"].insert(0, None),
+                 "non-object-command": lambda result, mirror: mirror["commands"].__setitem__(0, "x"),
+                 "non-object-raw-item": raw_item}
+        for label, change in cases.items():
+            with self.subTest(label):
+                for path, data in zip(paths, saved):
+                    path.write_bytes(data)
+                result = json.loads(saved[0])
+                mirror = result["roles"]["batch"]["attempts"][0]  # written back as the attempt file
+                change(result, mirror)
+                write(paths[1], mirror)
+                result["result_digest"] = receipts.digest(
+                    {key: value for key, value in result.items() if key != "result_digest"})
+                write(paths[0], result)
+                code, _, err = self.main(*argv)
+                self.assertEqual(code, 2, err)
+        for path, data in zip(paths, saved):
+            path.write_bytes(data)
+        self.assertEqual(self.main(*argv)[0], 0)
+        state = receipts.read(self.store)
+        state["history"][0]["evidence"][0]["files"] = []
+        receipts.save(self.store, state)
+        self.assertEqual(self.main(*self.cli_args("status"))[0], 2)
 
     def test_changed_plan_or_context_is_unknown(self):
         self.use_for_now()
@@ -354,11 +552,14 @@ class ReceiptTests(unittest.TestCase):
         with self.assertRaises(WorkspaceError):
             receipts.contract(changed)
 
-    def test_strict_json_does_not_accept_duplicate_keys(self):
+    def test_strict_json_refuses_duplicate_keys_and_non_finite_numbers(self):
         path = self.root / "spec.json"
         path.write_text('{"schema":"a","schema":"b"}')
         with self.assertRaises(WorkspaceError):
             receipts.read_json(path, private=False)
+        for data in (b'{"a":1,"a":2}', b'{"a":NaN}', b'{"a":1e999}'):
+            with self.subTest(data), self.assertRaises(WorkspaceError):
+                receipts.strict(data)
 
     def test_cli_exit_codes_and_no_automatic_inference(self):
         spec = self.root / "contract.json"
@@ -458,24 +659,6 @@ class ReceiptTests(unittest.TestCase):
         self.assertLessEqual(len(canonical(summary)) + 1, 512)
         self.assertNotIn("next_action", summary)
 
-    def test_old_final_sounding_positions_are_not_silently_reinterpreted(self):
-        self.declare()
-        decision = self.decision(self.finish())
-        for old in ("accepted", "rejected", "blocked", "withdrawn"):
-            with self.subTest(old=old):
-                decision["host_position"] = old
-                with self.assertRaisesRegex(WorkspaceError, "invalid host_position"):
-                    receipts.record(self.store, decision, self.spec)
-        self.assertEqual(receipts.read(self.store)["history"], [])
-
-    def test_legacy_receipt_schema_is_not_silently_migrated(self):
-        self.use_for_now()
-        state = receipts.read(self.store)
-        state["schema"] = "codex-council/decision-receipt@1"
-        receipts.save(self.store, state)
-        with self.assertRaisesRegex(WorkspaceError, "schema mismatch"):
-            receipts.status(self.store, self.spec)
-
     def test_restored_bytes_do_not_restore_a_set_aside_host_position(self):
         self.use_for_now()
         subject = self.source / "subject.py"
@@ -502,22 +685,24 @@ class ReceiptTests(unittest.TestCase):
 
 class ReceiptRunnerIntegrationTests(unittest.TestCase):
     def test_real_runner_one_worker_multiple_checks(self):
-        # Reuse the current real-runner fixture through composition, without
-        # importing its TestCase into this module's unittest discovery.
+        # Compose the real-runner fixture without importing its TestCase into
+        # this module's discovery; the default "runTest" names no test method.
         import test_workflow_cli as workflow_tests
-        case = workflow_tests.WorkflowCliTests("test_experiment_records_red_green_evidence_without_live_edits")
+        case = workflow_tests.WorkflowCliTests()
         case.setUp()
         self.addCleanup(case.doCleanups)
         executable = case.bin / "codex"
-        # Isolate child Python from host site hooks and bytecode caches;
-        # this fixture uses only stdlib and tests no interpreter startup SLA.
-        original = executable.read_text().replace(
-            'argv = [sys.executable, "-c", code]',
-            'argv = [sys.executable, "-I", "-S", "-B", "-c", code]')
-        insertion = ("    if \"RECEIPT_PROBE\" in body:\n"
-                     "        command(\"from pathlib import Path; scope={}; exec(Path('subject.py').read_text(),scope); assert scope['value']==1\", cwd)\n"
-                     "        command(\"from pathlib import Path; scope={}; exec(Path('subject.py').read_text(),scope); assert scope['value']!=1\", cwd)\n")
-        executable.write_text(original.replace('    if "HANG_FIXTURE" in body:', insertion + '    if "HANG_FIXTURE" in body:'))
+        anchor = '    if "HANG_FIXTURE" in body:'
+        probe = ("    if \"RECEIPT_PROBE\" in body:\n"
+                 "        command(\"from pathlib import Path; scope={}; exec(Path('subject.py').read_text(),scope); assert scope['value']==1\", cwd)\n"
+                 "        command(\"from pathlib import Path; scope={}; exec(Path('subject.py').read_text(),scope); assert scope['value']!=1\", cwd)\n")
+        fake = executable.read_text()
+        # Isolated child Python (no site hooks or bytecode); fail loudly if the fake drifts.
+        for old, new in (('argv = [sys.executable, "-c", code]', 'argv = [sys.executable, "-I", "-S", "-B", "-c", code]'),
+                         (anchor, probe + anchor)):
+            self.assertIn(old, fake, "tests/fake_workflow_codex.py changed; update this probe")
+            fake = fake.replace(old, new)
+        executable.write_text(fake)
         run = case.stage("RECEIPT_PROBE", execution={"sandbox": "read-only"})
         plan = json.loads((run / "run.json").read_text())
         store = case.base / "receipt"

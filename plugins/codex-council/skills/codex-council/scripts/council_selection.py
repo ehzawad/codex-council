@@ -40,14 +40,9 @@ from council_discovery import (
     _service_tier_id,
 )
 
-# One grammar for model and effort values. Shape checks only: no value list
-# is hardcoded — whether an automatic choice is advertised comes from this
-# run's discovery snapshot, and an explicit pin reaches Codex unchanged. No
-# leading "-" and no whitespace, control characters, quotes, backslashes,
-# or angle brackets, so argv, the TOML string in
-# -c model_reasoning_effort="<effort>", report lines, and reply-file headers
-# are safe by construction. Case is preserved, never folded. \Z (not $) for
-# the same trailing-newline reason as ROLE_ID_PATTERN in codex_council.py.
+# Shape only (no value list; the snapshot decides membership): safe in argv,
+# the -c TOML string, reports and reply headers; case preserved. \Z (not $)
+# for the same trailing-newline reason as ROLE_ID_PATTERN in codex_council.py.
 SELECTION_VALUE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]*\Z")
 # Model values a human might mean as "inherit", but which Codex would
 # receive as a literal model id (compared case-insensitively). Inheritance
@@ -714,29 +709,13 @@ def _model_selection_lines(roles, routing_mode, state, reason):
 
 
 def _resolve_run_selections(roles, run_dir, routing_mode, at_launch, project_root=None):
-    """Validate authoring and attach every role's decision: the one
-    orchestration behind the preflight plan and the launch.
+    """Validate authoring, then attach every role's decision, for the
+    preflight plan and the launch; returns (roles, launch snapshot or None).
+    Callers pass one role, with its catalog directory as `run_dir`.
 
-    Reads this run's planning snapshot from `run_dir`; an authoring defect
-    exits 2 before any discovery. Returns (roles with `decision` set, the
-    launch snapshot or None). The caller passes one role and that role's
-    catalog directory. Only the launch (`at_launch`) discovers, in the
-    role's own scratch cwd (`project_root`), and only when the role carries
-    an automatic selection and routing is on, or an explicit tier request:
-    inherited and explicit-pin roles without a tier skip launch model-catalog
-    discovery (execution-policy metadata probes still run). The caller retains the launch snapshot separately as
-    evidence/<key>/launch-model-snapshot.json; it never overwrites the
-    planning snapshot. The preflight passes the resolver no launch
-    snapshot, so its decisions are the plan.
-
-    The preflight judges authoring, and resolves, at the current time. The
-    launch judges authoring as of the planning snapshot's creation, so an
-    automatic choice (a routed model, or the native model of a native_effort
-    choice) already retired at discovery stays an exit-2 defect, while a
-    retirement that passes after discovery is changed evidence: the
-    resolver falls back to inheritance. Its clock is read only after launch
-    discovery has finished, so a retirement that passes while discovery
-    runs is already in effect when the evidence is judged.
+    The launch judges authoring as of the planning snapshot's creation (a
+    retirement already passed then stays exit 2; a later one falls back to
+    inheritance) and reads its resolve clock only after launch discovery.
     """
     planning, planning_problem = _read_snapshot(run_dir)
     if at_launch:

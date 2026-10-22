@@ -34,8 +34,6 @@ $CODEX_HOME/sessions like any other codex exec run. The codex --version
 line, the account type, the chosen models, and the report lines Codex's
 own messages produced are printed as `[live]` notes, never asserted; no
 email address or token is ever printed.
-
-Lives outside the plugin subtree so end-user installs don't bundle it.
 """
 
 import collections
