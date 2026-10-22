@@ -33,8 +33,8 @@ and deletions; a partially staged file is captured as its working version. Expli
 includes also keep empty directories. A non-Git project requires `include`. `include: []` supports a
 pure question without filesystem inputs. Exclusions are case-sensitive
 shell-style patterns matched against relative names, not validated as paths. An
-omitted or `null` `exclude` means no exclusions. Explicit includes may select
-ignored fixtures.
+omitted or `null` `exclude` means no exclusions. Implicit Git scope lists files, so
+exclude a directory there as `dir/*`. Explicit includes may select ignored fixtures.
 
 Known credential, agent/VCS configuration, instruction and dependency-cache paths
 met during selection are excluded and recorded in `run.json.snapshot.omitted`.
@@ -43,9 +43,11 @@ lists them) nor a secret scan; sanitize unusual sensitive inputs yourself and
 narrow the scope before capture. A selected symlink or special file is refused by
 name, as are, with `include` omitted, a Git submodule (populated, empty or missing)
 and an untracked nested Git repository. Each refusal names the path and the fix:
-add it to `exclude` (it is then recorded in `snapshot.omitted`), or select a
-submodule's or nested repository's files with an explicit `include`. None is
-silently flattened or dropped. Collisions under Unicode canonical caseless matching
+add it to `exclude` (it is then recorded in `snapshot.omitted`; a name with glob
+characters such as `[id].js` is given as the escaped pattern), or select a
+submodule's or nested repository's files with an explicit `include`. Excluding a
+symlink also omits the tracked paths below it. None is silently flattened or
+dropped. Collisions under Unicode canonical caseless matching
 among selected file paths, empty directories and every directory component are
 refused too. File bytes and an executable/non-executable flag are captured, not the
 full permission mode; ownership, ACLs, extended attributes, sparse layout and
@@ -189,10 +191,12 @@ malicious same-user/bypass tampering.
 `--freshness RUNDIR` returns 0 for unchanged captured scope, 1 for stale/unknown,
 and 2 for an invalid contract. It checks selected file bytes and executable flags,
 empty directories, Git HEAD and the index entries of selected paths, the recorded
-omission list, and the staged context; staging an unrelated file does not make a
-capture stale. A changed staged context adds its reason and keeps the file-level
-detail (changed paths, Git and omission flags), as `result.json` applicability
-does; a moved or deleted source root reports unknown (exit 1), not an invalid
-contract. It does not check omitted file contents, changed user intent, or
-unrecorded external dependencies. Claude must compare the current goal as well. A failed
-baseline due to unavailable dependencies is a blocked check, not a discovered bug.
+omission list, and the staged context; restaging an unrelated, excluded or omitted
+file does not make a capture stale (adding an excluded path to the index, or
+removing one, changes the omission list, which does). A changed staged context adds
+its reason and keeps the file-level detail (changed paths, Git and omission flags),
+as `result.json` applicability does; a moved or deleted source root reports unknown
+(exit 1), not an invalid contract. It does not check omitted file contents, changed
+user intent, or unrecorded external dependencies. Claude must compare the current
+goal as well. A failed baseline due to unavailable dependencies is a blocked check,
+not a discovered bug.

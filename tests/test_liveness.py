@@ -413,6 +413,17 @@ class ReadSupervisorTests(unittest.TestCase):
         os.remove(self.path)
         self.assertIsNone(council_liveness.read_supervisor(self.path))
 
+    def test_a_directory_record_reads_as_none_without_leaking(self):
+        """Both records are polled; fdopen of a directory raises with its
+        descriptor still open, so each look used to leak one."""
+        os.mkdir(self.path)
+        os.mkdir(os.path.join(self.run_dir, council_liveness.STATUS_FILENAME))
+        before = len(os.listdir("/dev/fd"))
+        for _ in range(20):
+            self.assertIsNone(council_liveness.read_supervisor(self.path))
+            self.assertIsNone(council_liveness.read_status(self.run_dir))
+        self.assertEqual(len(os.listdir("/dev/fd")), before)
+
 
 class SupervisorStateTests(unittest.TestCase):
     """Combined liveness: the lock decides, every disagreement is

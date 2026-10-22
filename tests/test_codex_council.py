@@ -506,14 +506,15 @@ class StatePrivacyTests(unittest.TestCase):
 
     def test_a_relative_home_is_not_used_either(self):
         """A relative $HOME would put ~/.local/state under the current
-        directory too; the account's home directory stands in for it."""
+        directory too, and an empty one at /.local/state; the account's home
+        directory stands in for both."""
         account = os.path.join(self.tmp.name, "account")
 
         class Entry:
             pw_dir = account
 
         os.environ.pop("XDG_STATE_HOME", None)
-        for home in ("relhome", "./relhome"):
+        for home in ("relhome", "./relhome", ""):
             with self.subTest(HOME=home), \
                     patch.dict(os.environ, {"HOME": home}), \
                     patch.object(codex_council.pwd, "getpwuid",
@@ -526,6 +527,22 @@ class StatePrivacyTests(unittest.TestCase):
             self.assertEqual(codex_council._state_home(),
                              os.path.join(account, ".local", "state"))
             lookup.assert_not_called()
+        # No passwd entry either: a relative state directory, which is
+        # refused rather than created under the current directory.
+        with patch.dict(os.environ, {"HOME": ""}), \
+                patch.object(codex_council.pwd, "getpwuid", side_effect=KeyError):
+            self.assertFalse(os.path.isabs(codex_council._state_home()))
+        cwd = os.getcwd()
+        os.chdir(self.tmp.name)
+        try:
+            with patch.object(codex_council, "STATE_DIR",
+                              os.path.join(".local", "state", "codex-council")), \
+                    self.assertRaisesRegex(codex_council.StateDirError,
+                                           "no absolute saved-thread state directory"):
+                codex_council._ensure_state_dir()
+            self.assertFalse(os.path.lexists(".local"))
+        finally:
+            os.chdir(cwd)
 
     def test_the_state_dir_checked_is_the_one_used(self):
         """A "link/.." spelling is checked where the I/O resolves it, never
@@ -707,6 +724,17 @@ class StateIOTests(unittest.TestCase):
                 worker.join(10)
                 self.fail("load_session blocked on a FIFO state file")
         self.assertEqual(loaded, [(None, None)])
+
+    def test_a_directory_state_path_leaks_no_descriptor(self):
+        """fdopen of a directory raises with its descriptor still open, so
+        each such read used to leak one."""
+        with patch.dict(os.environ, _env_without_session_key(), clear=True):
+            os.mkdir(codex_council._state_path("architect"))
+            before = len(os.listdir("/dev/fd"))
+            for _ in range(20):
+                self.assertEqual(codex_council.load_session("architect"),
+                                 (None, None))
+            self.assertEqual(len(os.listdir("/dev/fd")), before)
 
     def test_a_symlinked_or_foreign_state_file_is_not_used(self):
         """The state file is never read through a symlink, and only an

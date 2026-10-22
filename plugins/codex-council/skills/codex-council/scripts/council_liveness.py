@@ -490,9 +490,12 @@ def read_status(path):
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
                      | os.O_CLOEXEC)
+        # Before fdopen, which raises on a directory and leaves the
+        # descriptor open (this is polled).
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            return None
         with os.fdopen(fd, "rb") as f:
-            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
-                return None
             data = json.loads(f.read())
     except (OSError, ValueError, RecursionError):
         return None
@@ -594,10 +597,11 @@ def read_supervisor(path):
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
                      | os.O_CLOEXEC)
+        # Before fdopen, as in read_status.
+        if _private_stat_problem(os.fstat(fd), directory=False) is not None:
+            os.close(fd)
+            return None
         with os.fdopen(fd, "rb") as f:
-            if _private_stat_problem(os.fstat(f.fileno()),
-                                     directory=False) is not None:
-                return None
             data = json.loads(f.read())
     except (OSError, ValueError, RecursionError):
         return None
