@@ -1,0 +1,466 @@
+"""Checkout-only receipt prototype: real files/processes, no paid inference.
+
+Unit fixtures use synthetic protocol records. The integration case runs real
+local checks with fake Codex; neither proves sandbox enforcement or model quality.
+The production plugin remains unchanged.
+"""
+import copy
+import dataclasses
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "experiments"))
+sys.path.insert(0, str(ROOT / "tests"))
+import decision_receipts as receipts  # noqa: E402
+from council_evidence import AttemptEvidence, write_result  # noqa: E402
+from council_workflow import prepare  # noqa: E402
+from council_workspace import WorkspaceError, atomic_json, canonical  # noqa: E402
+from test_invocation_workflow import RoleFixture  # noqa: E402
+
+
+def write(path, value):
+    atomic_json(path, value)
+
+
+@dataclasses.dataclass
+class Result:
+    role: object
+    ok: bool = True
+    text: str = "The expected behaviors were observed in the captured inputs."
+    error: str | None = None
+
+
+class ReceiptTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name).resolve()
+        self.source = self.root / "source"
+        self.run = self.root / "run"
+        self.store = self.root / "receipt"
+        for path in (self.source, self.run, self.store):
+            path.mkdir(mode=0o700)
+        (self.source / "subject.py").write_text("value = 1\n")
+        (self.source / "requirements.txt").write_text("Keep the current value.\n")
+        self.spec = {"schema": receipts.CONTRACT, "task_id": "boundary-task",
+                     "decision_id": "value-contract", "question": "Does this candidate meet the value contract?",
+                     "assumptions": ["No external service is part of this check."],
+                     "criteria": [{"id": "positive", "expectation": "The value remains 1.",
+                                   "kind": "command", "expected_exit": 0},
+                                  {"id": "negative", "expectation": "The contradictory assertion fails.",
+                                   "kind": "command", "expected_exit": 1}]}
+        self.roles = [RoleFixture(id="batch", execution={"sandbox": "read-only"})]
+        self.plan = self.stage(self.run)
+        self.addCleanup(self.cleanup)
+
+    def cleanup(self):
+        for directory, dirs, files in os.walk(self.root):
+            for name in dirs:
+                path = Path(directory) / name
+                if not path.is_symlink():
+                    path.chmod(0o700)
+            for name in files:
+                path = Path(directory) / name
+                if not path.is_symlink() and path.is_file():
+                    path.chmod(0o600)
+        self.temp.cleanup()
+
+    def stage(self, run):
+        write(run / "request.json", {"schema": "codex-council/request@1", "task_id": "boundary-task",
+                                    "reason": "Check the value contract.", "source_root": str(self.source),
+                                    "include": ["."]})
+        (run / "context.md").write_text("Check two properties in one contribution.")
+        return prepare(str(run), self.roles, (run / "context.md").read_text())
+
+    def declare(self, runs=None):
+        return receipts.declare(self.store, self.spec, runs or [self.run])
+
+    def finish(self, run=None, plan=None):
+        run, plan = run or self.run, plan or self.plan
+        spool = AttemptEvidence(run / "evidence/batch", ["fixture"], "two checks")
+        for code in (0, 1):
+            # Receipt validation is a pure protocol consumer. Real command
+            # execution is exercised once by ReceiptRunnerIntegrationTests.
+            event = {"type": "item.completed", "item": {"type": "command_execution",
+                     "command": f"fixture-check-{code}", "exit_code": code,
+                     "aggregated_output": ""}}
+            spool.feed("stdout", canonical(event) + b"\n")
+        spool.feed("stdout", b'{"type":"turn.completed"}\n')
+        spool.finish(returncode=0, state="completed", unsafe_to_replay=True)
+        (run / "supervisor.lock").touch(mode=0o600)
+        (run / "execution.claim").touch(mode=0o600)
+        write_result(run, plan, [Result(role=self.roles[0])])
+        return spool.key + ".json"
+
+    def decision(self, attempt, disposition="accepted", run=None, plan=None):
+        plan = plan or self.plan
+        return {"expected_revision": 0, "actor": "test-host", "disposition": disposition,
+                "rationale": "Both declared predicates match the observed exits.",
+                "outcomes": [{"criterion_id": name, "outcome": "supported",
+                              "evidence": {"run_id": plan["run_id"], "role_id": "batch",
+                                           "attempt_file": attempt, "command_index": index}}
+                             for index, name in enumerate(("positive", "negative"))]}
+
+    def accepted(self):
+        self.declare()
+        decision = self.decision(self.finish())
+        receipts.decide(self.store, decision, self.spec)
+        return decision
+
+    def test_one_worker_supports_multiple_chunks_and_expected_failure(self):
+        self.accepted()
+        summary = receipts.status(self.store, self.spec)
+        self.assertEqual(summary["recorded_disposition"], "accepted")
+        self.assertEqual(summary["binding_status"], "match")
+        self.assertEqual(len(summary["criterion_outcomes"]), 2)
+        self.assertLessEqual(len(canonical(summary)) + 1, 2048)
+
+    def test_nongit_data_question_uses_same_protocol(self):
+        (self.source / "measurements.csv").write_text("x,y\n1,1\n2,2\n")
+        self.run = self.root / "data-run"
+        self.run.mkdir(mode=0o700)
+        self.plan = self.stage(self.run)
+        self.spec["question"] = "Does the preserved table support the comparison?"
+        self.spec["criteria"] = [{"id": "comparison", "kind": "judgment",
+                                  "expectation": "The two columns agree in this captured table."}]
+        self.declare()
+        self.finish()
+        decision = {"expected_revision": 0, "actor": "host", "disposition": "accepted",
+                    "rationale": "Reviewed the comparison; no extrapolation beyond these rows.",
+                    "outcomes": [{"criterion_id": "comparison", "outcome": "supported",
+                                  "evidence": {"run_id": self.plan["run_id"], "role_id": "batch"}}]}
+        receipts.decide(self.store, decision, self.spec)
+        state = receipts.read(self.store)
+        self.assertEqual(state["history"][0]["evidence"][0]["provenance"],
+                         "host-judgment-of-collaborator-text")
+        self.assertFalse((self.source / ".git").exists())
+
+    def test_multiple_runs_one_decision(self):
+        other = self.root / "other"
+        other.mkdir(mode=0o700)
+        second = self.stage(other)
+        self.declare([self.run, other])
+        a, b = self.finish(), self.finish(other, second)
+        decision = self.decision(a)
+        decision["outcomes"][1]["evidence"].update(run_id=second["run_id"], attempt_file=b)
+        receipts.decide(self.store, decision, self.spec)
+        self.assertEqual(receipts.status(self.store, self.spec)["binding_status"], "match")
+
+    def test_no_current_contract_is_unknown(self):
+        self.accepted()
+        self.assertEqual(receipts.status(self.store)["binding_status"], "unknown")
+
+    def test_current_requirements_override_old_acceptance(self):
+        self.accepted()
+        changed = copy.deepcopy(self.spec)
+        changed["criteria"][0]["expected_exit"] = 1
+        self.assertEqual(receipts.status(self.store, changed)["binding_status"], "stale")
+        self.assertEqual(receipts.status(self.store, changed)["recorded_disposition"], "accepted")
+
+    def test_source_and_fixture_edits_invalidate_receipt(self):
+        self.accepted()
+        for name in ("subject.py", "requirements.txt"):
+            path = self.source / name
+            old = path.read_bytes()
+            path.write_text("changed\n")
+            self.assertEqual(receipts.status(self.store, self.spec)["binding_status"], "stale")
+            path.write_bytes(old)
+
+    def test_old_rejection_is_not_a_permanent_veto(self):
+        self.declare()
+        decision = self.decision(self.finish(), "rejected")
+        decision["outcomes"][0]["outcome"] = "contradicted"
+        decision["outcomes"][0]["evidence"]["command_index"] = 1
+        receipts.decide(self.store, decision, self.spec)
+        (self.source / "subject.py").write_text("value = 2\n")
+        summary = receipts.status(self.store, self.spec)
+        self.assertEqual((summary["recorded_disposition"], summary["binding_status"]), ("rejected", "stale"))
+
+    def test_refuses_stale_candidate_at_acceptance(self):
+        self.declare()
+        decision = self.decision(self.finish())
+        (self.source / "subject.py").write_text("value = 2\n")
+        with self.assertRaisesRegex(WorkspaceError, "stale or unknown"):
+            receipts.decide(self.store, decision, self.spec)
+
+    def test_candidate_changed_after_checks_is_not_accepted(self):
+        self.declare()
+        decision = self.decision(self.finish())
+        (self.run / "workspaces/batch/subject.py").write_text("value = 2\n")
+        with self.assertRaisesRegex(WorkspaceError, "captured input changed"):
+            receipts.decide(self.store, decision, self.spec)
+
+    def test_writable_experiment_is_not_final_candidate_proof(self):
+        self.roles = [RoleFixture(id="batch", execution={"sandbox": "workspace-write"})]
+        self.run = self.root / "writable"
+        self.run.mkdir(mode=0o700)
+        self.plan = self.stage(self.run)
+        self.declare()
+        with self.assertRaisesRegex(WorkspaceError, "captured final-state"):
+            receipts.decide(self.store, self.decision(self.finish()), self.spec)
+
+    def test_no_posthoc_criteria_declaration(self):
+        self.finish()
+        with self.assertRaisesRegex(WorkspaceError, "before launch"):
+            self.declare()
+
+    def test_declaration_is_one_use(self):
+        self.declare()
+        with self.assertRaisesRegex(WorkspaceError, "already declared"):
+            self.declare()
+
+    def test_changed_criteria_require_new_declaration(self):
+        self.declare()
+        decision = self.decision(self.finish())
+        changed = copy.deepcopy(self.spec)
+        changed["question"] = "New question"
+        with self.assertRaisesRegex(WorkspaceError, "contract changed"):
+            receipts.decide(self.store, decision, changed)
+
+    def test_blocked_check_cannot_be_accepted(self):
+        self.declare()
+        decision = self.decision("missing")
+        decision["outcomes"] = [{"criterion_id": key, "outcome": "blocked"} for key in ("positive", "negative")]
+        with self.assertRaisesRegex(WorkspaceError, "every criterion supported"):
+            receipts.decide(self.store, decision, self.spec)
+        decision["disposition"] = "blocked"
+        receipts.decide(self.store, decision, self.spec)
+
+    def test_wrong_expected_exit_does_not_pass(self):
+        self.declare()
+        decision = self.decision(self.finish())
+        decision["outcomes"][0]["evidence"]["command_index"] = 1
+        with self.assertRaisesRegex(WorkspaceError, "contradicts"):
+            receipts.decide(self.store, decision, self.spec)
+
+    def test_unknown_or_missing_criterion_does_not_pass(self):
+        self.declare()
+        decision = self.decision(self.finish())
+        decision["outcomes"].pop()
+        with self.assertRaisesRegex(WorkspaceError, "every declared"):
+            receipts.decide(self.store, decision, self.spec)
+
+    def test_stale_revision_cannot_overwrite_and_withdrawal_preserves_history(self):
+        decision = self.accepted()
+        with self.assertRaisesRegex(WorkspaceError, "revision conflict"):
+            receipts.decide(self.store, decision, self.spec)
+        withdraw = {"expected_revision": 1, "actor": "host", "disposition": "withdrawn",
+                    "rationale": "The previous conclusion used an incomplete requirement.", "outcomes": []}
+        receipts.decide(self.store, withdraw, self.spec)
+        state = receipts.read(self.store)
+        self.assertEqual([item["disposition"] for item in state["history"]], ["accepted", "withdrawn"])
+
+    def test_failed_atomic_write_keeps_previous_record(self):
+        self.accepted()
+        before = (self.store / "receipt.json").read_bytes()
+        withdraw = {"expected_revision": 1, "actor": "host", "disposition": "withdrawn",
+                    "rationale": "Withdraw for review", "outcomes": []}
+        with patch("council_workspace.os.replace", side_effect=OSError("fixture disk failure")):
+            with self.assertRaises(OSError):
+                receipts.decide(self.store, withdraw, self.spec)
+        self.assertEqual((self.store / "receipt.json").read_bytes(), before)
+
+    def test_active_supervisor_cannot_be_accepted(self):
+        self.declare()
+        decision = self.decision(self.finish())
+        with open(self.run / "supervisor.lock", "rb") as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaises(BlockingIOError):
+                receipts.decide(self.store, decision, self.spec)
+
+    def test_receipt_lock_conflict_is_bounded(self):
+        self.declare()
+        with receipts.locked(self.store):
+            with self.assertRaises(BlockingIOError):
+                receipts.status(self.store, self.spec)
+
+    def test_changed_or_missing_evidence_is_unknown(self):
+        self.accepted()
+        log = next((self.run / "evidence/batch").glob("*.stdout.jsonl"))
+        log.write_text("changed")
+        self.assertEqual(receipts.status(self.store, self.spec)["binding_status"], "unknown")
+        log.unlink()
+        self.assertEqual(receipts.status(self.store, self.spec)["binding_status"], "unknown")
+
+    def test_raw_evidence_change_blocks_recording(self):
+        self.declare()
+        decision = self.decision(self.finish())
+        next((self.run / "evidence/batch").glob("*.stdout.jsonl")).write_text("forged")
+        with self.assertRaisesRegex(WorkspaceError, "checksum mismatch"):
+            receipts.decide(self.store, decision, self.spec)
+
+    def test_changed_plan_or_context_is_unknown(self):
+        self.accepted()
+        (self.run / "context.md").write_text("other context")
+        self.assertEqual(receipts.status(self.store, self.spec)["binding_status"], "unknown")
+
+    def test_summary_bounds_never_hide_staleness(self):
+        self.accepted()
+        changed = copy.deepcopy(self.spec)
+        changed["question"] = "changed"
+        summary = receipts.status(self.store, changed, max_bytes=512)
+        self.assertEqual(summary["binding_status"], "stale")
+        self.assertTrue(summary["details_omitted"])
+        self.assertLessEqual(len(canonical(summary)) + 1, 512)
+
+    def test_status_is_read_only(self):
+        self.accepted()
+        before = {p.name: p.read_bytes() for p in self.store.iterdir() if p.is_file()}
+        receipts.status(self.store, self.spec)
+        self.assertEqual({p.name: p.read_bytes() for p in self.store.iterdir() if p.is_file()}, before)
+
+    def test_store_symlink_and_public_directory_refused(self):
+        link = self.root / "link"
+        link.symlink_to(self.store, target_is_directory=True)
+        with self.assertRaises(WorkspaceError):
+            receipts.declare(link, self.spec, [self.run])
+        self.store.chmod(0o755)
+        with self.assertRaises(WorkspaceError):
+            self.declare()
+
+    def test_symlinked_evidence_never_followed(self):
+        self.declare()
+        decision = self.decision(self.finish())
+        log = next((self.run / "evidence/batch").glob("*.stdout.jsonl"))
+        log.unlink()
+        log.symlink_to(self.source / "subject.py")
+        with self.assertRaises((OSError, WorkspaceError)):
+            receipts.decide(self.store, decision, self.spec)
+
+    def test_no_receipts_in_plugin_and_no_production_import(self):
+        for path in (ROOT / "plugins").rglob("*.py"):
+            self.assertNotIn("decision_receipts", path.read_text())
+        skill = ROOT / "plugins/codex-council/skills/codex-council/SKILL.md"
+        self.assertNotIn("decision_receipts", skill.read_text())
+
+    def test_unknown_fields_cannot_grant_permissions(self):
+        changed = copy.deepcopy(self.spec)
+        changed["sandbox"] = "bypass"
+        with self.assertRaises(WorkspaceError):
+            receipts.contract(changed)
+
+    def test_duplicate_criteria_refused(self):
+        changed = copy.deepcopy(self.spec)
+        changed["criteria"].append(changed["criteria"][0])
+        with self.assertRaises(WorkspaceError):
+            receipts.contract(changed)
+
+    def test_strict_json_does_not_accept_duplicate_keys(self):
+        path = self.root / "spec.json"
+        path.write_text('{"schema":"a","schema":"b"}')
+        with self.assertRaises(WorkspaceError):
+            receipts.read_json(path, private=False)
+
+    def test_cli_exit_codes_and_no_automatic_inference(self):
+        spec = self.root / "contract.json"
+        write(spec, self.spec)
+        command = [sys.executable, "-P", str(ROOT / "experiments/decision_receipts.py")]
+        declared = subprocess.run(command + ["declare", "--store", str(self.store), "--contract", str(spec),
+                                            "--run", str(self.run)], capture_output=True, timeout=20)
+        self.assertEqual(declared.returncode, 0, declared.stderr)
+        unknown = subprocess.run(command + ["status", "--store", str(self.store)], capture_output=True, timeout=20)
+        self.assertEqual(unknown.returncode, 1, unknown.stderr)
+        self.assertFalse((self.run / "execution.claim").exists())
+
+    def test_two_processes_cannot_overwrite_same_revision(self):
+        self.accepted()
+        spec = self.root / "contract.json"
+        instruction = self.root / "decision.json"
+        write(spec, self.spec)
+        write(instruction, {"expected_revision": 1, "actor": "host", "disposition": "withdrawn",
+                            "rationale": "Withdraw pending inspection.", "outcomes": []})
+        argv = [sys.executable, "-B", str(ROOT / "experiments/decision_receipts.py"),
+                "decide", "--store", str(self.store), "--contract", str(spec),
+                "--decision", str(instruction)]
+        processes = [subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE) for _ in range(2)]
+        try:
+            for process in processes:
+                process.communicate(timeout=30)
+            self.assertEqual(sorted(process.returncode for process in processes), [0, 2])
+            self.assertEqual(len(receipts.read(self.store)["history"]), 2)
+        finally:
+            for process in processes:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
+
+    def test_late_scratch_change_does_not_keep_matching_bindings(self):
+        self.accepted()
+        (self.run / "workspaces/batch/subject.py").write_text("value = 99\n")
+        self.assertEqual(receipts.status(self.store, self.spec)["binding_status"], "unknown")
+
+    def test_source_loss_is_unknown_not_accepted_current(self):
+        self.accepted()
+        self.source.rename(self.root / "gone")
+        self.assertEqual(receipts.status(self.store, self.spec)["binding_status"], "unknown")
+
+    def test_replaced_lock_with_link_is_refused(self):
+        self.declare()
+        lock = self.store / "receipt.lock"
+        lock.unlink()
+        lock.symlink_to(self.source / "subject.py")
+        with self.assertRaises(OSError):
+            receipts.status(self.store, self.spec)
+
+    def test_forged_result_digest_is_refused(self):
+        self.declare()
+        decision = self.decision(self.finish())
+        path = self.run / "result.json"
+        data = json.loads(path.read_text())
+        data["roles"]["batch"]["interpretation"]["text"] = "different"
+        write(path, data)
+        with self.assertRaisesRegex(WorkspaceError, "result checksum"):
+            receipts.decide(self.store, decision, self.spec)
+
+
+class ReceiptRunnerIntegrationTests(unittest.TestCase):
+    def test_real_runner_one_worker_multiple_checks(self):
+        # Reuse the current real-runner fixture through composition, without
+        # importing its TestCase into this module's unittest discovery.
+        import test_workflow_cli as workflow_tests
+        case = workflow_tests.WorkflowCliTests("test_experiment_records_red_green_evidence_without_live_edits")
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        executable = case.bin / "codex"
+        # Isolate child Python from host site hooks and bytecode caches;
+        # this fixture uses only stdlib and tests no interpreter startup SLA.
+        original = executable.read_text().replace(
+            'argv = [sys.executable, "-c", code]',
+            'argv = [sys.executable, "-I", "-S", "-B", "-c", code]')
+        insertion = ("    if \"RECEIPT_PROBE\" in body:\n"
+                     "        command(\"from pathlib import Path; scope={}; exec(Path('subject.py').read_text(),scope); assert scope['value']==1\", cwd)\n"
+                     "        command(\"from pathlib import Path; scope={}; exec(Path('subject.py').read_text(),scope); assert scope['value']!=1\", cwd)\n")
+        executable.write_text(original.replace('    if "HANG_FIXTURE" in body:', insertion + '    if "HANG_FIXTURE" in body:'))
+        run = case.stage("RECEIPT_PROBE", execution={"sandbox": "read-only"})
+        plan = json.loads((run / "run.json").read_text())
+        store = case.base / "receipt"
+        store.mkdir(mode=0o700)
+        spec = {"schema": receipts.CONTRACT, "task_id": "task-one", "decision_id": "two-properties",
+                "question": "Do both properties hold?", "assumptions": [], "criteria": [
+                    {"id": "a", "kind": "command", "expected_exit": 0, "expectation": "Value is 1."},
+                    {"id": "b", "kind": "command", "expected_exit": 1, "expectation": "Contrary assertion fails."}]}
+        receipts.declare(store, spec, [run])
+        launched = case.launch(run)
+        self.assertEqual(launched.returncode, 0, launched.stdout + launched.stderr)
+        self.assertEqual(len(case.execs()), 1)
+        attempt = next((run / "evidence/contribution").glob("attempt-*.json")).name
+        decision = {"expected_revision": 0, "actor": "fixture-host", "disposition": "accepted",
+                    "rationale": "Two checks in the same worker; no separate role per chunk.",
+                    "outcomes": [{"criterion_id": name, "outcome": "supported", "evidence": {
+                        "run_id": plan["run_id"], "role_id": "contribution", "attempt_file": attempt,
+                        "command_index": i}} for i, name in enumerate(("a", "b"))]}
+        receipts.decide(store, decision, spec)
+        self.assertEqual(receipts.status(store, spec)["binding_status"], "match")
+        self.assertEqual((case.source / "subject.py").read_text(), "value = 1\n")
+        self.assertEqual(len(case.execs()), 1, "recording and recall must not start another worker")
+
+
+if __name__ == "__main__":
+    unittest.main()
