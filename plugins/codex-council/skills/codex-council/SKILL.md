@@ -59,11 +59,11 @@ skipping steps.
 ## Capture once, then discover
 
 Read [invocation-contract.md](references/invocation-contract.md) for exact input
-formats, capture scope, and execution capabilities. Create each council's fresh
-private run directory (it persists) with
+formats, capture scope, and execution capabilities. Create each council's private
+run directory (it persists) with
 `python3 "${CLAUDE_PLUGIN_ROOT}/skills/codex-council/scripts/codex_council.py" --new-run --skill-contract 6`
-and use its printed absolute path literally (shell variables do not persist between
-calls). `--prune-runs` is maintenance, only on user request.
+and use its printed absolute path literally (shell variables do not persist).
+Run `--prune-runs` only on user request; add `--delete` only when they ask to delete.
 
 Write `request.json`, `roles.json`, and `context.md` into that directory. Choose a
 stable task-specific `task_id` and role ids from the present contribution, not a

@@ -123,7 +123,8 @@ class DocumentationContractTests(unittest.TestCase):
         new_run = flat.index('codex_council.py" --new-run --skill-contract')
         self.assertLess(new_run, flat.index("--prepare 'ABS_RUNDIR'"))
         self.assertIn("use its printed absolute path literally", flat)
-        self.assertIn("`--prune-runs` is maintenance, only on user request", flat)
+        self.assertIn("Run `--prune-runs` only on user request; add `--delete` only when "
+                      "they ask to delete", flat)
 
     def test_reconciliation_quotes_or_checks_collaborator_observations(self):
         text = " ".join(SKILL.read_text().split())

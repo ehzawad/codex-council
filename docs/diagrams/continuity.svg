@@ -1,0 +1,137 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="408" height="934" viewBox="0 0 408 934" role="img">
+<title>Fresh or continued thread</title>
+<desc>UML activity diagram. Each worker starts a fresh Codex thread by default. Only when asked to continue, and when a thread is saved for the same project, task, session and role, does it continue that thread. If Codex no longer has the saved thread, the worker starts fresh with a warning that earlier turns are lost when repeating is safe; otherwise it stops and keeps the thread, so what it did can be checked before trying again.</desc>
+<style>
+text{font-family:"Helvetica Neue",Helvetica,Arial,"Liberation Sans","Nimbus Sans",sans-serif}
+rect,path,polygon,polyline,circle{stroke-width:1.5}
+.dash{stroke-dasharray:6 4}
+.title{font-size:18px;font-weight:700}
+.b{font-size:14px;font-weight:700}
+.t{font-size:14px;font-weight:400}
+.s{font-size:14px;font-weight:400}
+.c{font-size:14px;font-weight:400;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace}
+.n{font-size:14px;font-weight:700}
+text{fill:#1f2328}
+.s,.c,.n{fill:#59636e}
+.bg{fill:#f6f8fa;stroke:#d0d7de}
+.ln{fill:none;stroke:#59636e}
+.hd,.badge{fill:#59636e}
+.life{fill:none;stroke:#818b98;stroke-dasharray:5 5}
+.dot{fill:#1f2328}
+.ring{fill:none;stroke:#1f2328}
+.bt,.bd{fill:#f6f8fa}
+.k-plain{fill:#ffffff;stroke:#818b98}
+.k-you{fill:#ffffff;stroke:#59636e}
+.k-claude{fill:#ddf4ff;stroke:#0969da}
+.k-runner{fill:#fbefff;stroke:#8250df}
+.k-work{fill:#dafbe1;stroke:#1a7f37}
+.k-store{fill:#fff8c5;stroke:#9a6700}
+.k-warn{fill:#fff1e5;stroke:#bc4c00}
+.k-stop{fill:#ffebe9;stroke:#cf222e}
+.k-frame{fill:#f6f8fa;stroke:#818b98}
+@media (prefers-color-scheme: dark){
+text{fill:#f0f6fc}
+.s,.c,.n{fill:#9198a1}
+.bg{fill:#151b23;stroke:#3d444d}
+.ln{fill:none;stroke:#9198a1}
+.hd,.badge{fill:#9198a1}
+.life{fill:none;stroke:#656c76;stroke-dasharray:5 5}
+.dot{fill:#f0f6fc}
+.ring{fill:none;stroke:#f0f6fc}
+.bt,.bd{fill:#151b23}
+.k-plain{fill:#0d1117;stroke:#656c76}
+.k-you{fill:#0d1117;stroke:#9198a1}
+.k-claude{fill:#0c2d6b;stroke:#4493f8}
+.k-runner{fill:#271a3f;stroke:#ab7df8}
+.k-work{fill:#0f2d1a;stroke:#3fb950}
+.k-store{fill:#2e2410;stroke:#d29922}
+.k-warn{fill:#3d1d0b;stroke:#f0883e}
+.k-stop{fill:#3b1219;stroke:#f85149}
+.k-frame{fill:#151b23;stroke:#656c76}
+}
+</style>
+<rect class="bg" x="0.75" y="0.75" width="406.5" height="932.5" rx="14"/>
+<text x="24" y="40" class="title">Fresh or continued thread</text>
+<circle class="dot" cx="104" cy="72" r="8"/>
+<polygon class="k-plain" points="104,110 179,150 104,190 29,150"/>
+<text x="104" y="145.54" class="t" text-anchor="middle">Asked to</text>
+<text x="104" y="164.54" class="t" text-anchor="middle">continue?</text>
+<polyline class="ln" points="104,80 104,102"/>
+<polygon class="hd" points="99,100 104,110 109,100"/>
+<polygon class="k-plain" points="306,250 381,290 306,330 231,290"/>
+<text x="306" y="285.54" class="t" text-anchor="middle">Saved</text>
+<text x="306" y="304.54" class="t" text-anchor="middle">thread?</text>
+<polyline class="ln" points="179,150 306,150 306,242"/>
+<polygon class="hd" points="301,240 306,250 311,240"/>
+<text x="242.5" y="142" class="s" text-anchor="middle">yes</text>
+<polygon class="k-plain" points="104,277 117,290 104,303 91,290"/>
+<polyline class="ln" points="104,190 104,269"/>
+<polygon class="hd" points="99,267 104,277 109,267"/>
+<text x="114" y="238.5" class="b">no (the default)</text>
+<polyline class="ln" points="231,290 125,290"/>
+<polygon class="hd" points="127,285 117,290 127,295"/>
+<text x="221" y="282" class="s" text-anchor="end">no</text>
+<text x="296" y="348" class="s" text-anchor="end">(for the same project,</text>
+<text x="296" y="367" class="s" text-anchor="end">task, session and role)</text>
+<rect class="k-work" x="29" y="380" width="150" height="56" rx="14"/>
+<text x="104" y="403.54" class="b" text-anchor="middle">Start a fresh</text>
+<text x="104" y="422.54" class="b" text-anchor="middle">thread</text>
+<polyline class="ln" points="104,303 104,372"/>
+<polygon class="hd" points="99,370 104,380 109,370"/>
+<polyline class="ln" points="104,436 104,461"/>
+<polygon class="hd" points="99,459 104,469 109,459"/>
+<circle class="ring" cx="104" cy="480" r="11"/>
+<circle class="dot" cx="104" cy="480" r="6.5"/>
+<rect class="k-work" x="226" y="380" width="160" height="56" rx="14"/>
+<text x="306" y="403.54" class="b" text-anchor="middle">Continue the</text>
+<text x="306" y="422.54" class="b" text-anchor="middle">saved thread</text>
+<polyline class="ln" points="306,330 306,372"/>
+<polygon class="hd" points="301,370 306,380 311,370"/>
+<text x="316" y="348" class="s">yes</text>
+<polygon class="k-plain" points="306,495 381,535 306,575 231,535"/>
+<text x="306" y="530.54" class="t" text-anchor="middle">Codex still</text>
+<text x="306" y="549.54" class="t" text-anchor="middle">has it?</text>
+<polyline class="ln" points="306,436 306,487"/>
+<polygon class="hd" points="301,485 306,495 311,485"/>
+<rect class="k-work" x="29" y="507" width="150" height="56" rx="14"/>
+<text x="104" y="530.54" class="b" text-anchor="middle">Keep working</text>
+<text x="104" y="549.54" class="b" text-anchor="middle">in that thread</text>
+<polyline class="ln" points="231,535 187,535"/>
+<polygon class="hd" points="189,530 179,535 189,540"/>
+<text x="205" y="527" class="s" text-anchor="middle">yes</text>
+<polyline class="ln" points="104,563 104,588"/>
+<polygon class="hd" points="99,586 104,596 109,586"/>
+<circle class="ring" cx="104" cy="607" r="11"/>
+<circle class="dot" cx="104" cy="607" r="6.5"/>
+<polygon class="k-plain" points="306,641 381,681 306,721 231,681"/>
+<text x="306" y="676.54" class="t" text-anchor="middle">Safe to</text>
+<text x="306" y="695.54" class="t" text-anchor="middle">repeat?</text>
+<polyline class="ln" points="306,575 306,633"/>
+<polygon class="hd" points="301,631 306,641 311,631"/>
+<text x="316" y="604" class="s">no, it is</text>
+<text x="316" y="623" class="s">missing</text>
+<rect class="k-warn" x="29" y="634" width="150" height="94" rx="14"/>
+<text x="104" y="657.54" class="b" text-anchor="middle">Start fresh</text>
+<text x="104" y="676.54" class="s" text-anchor="middle">and warn that</text>
+<text x="104" y="695.54" class="s" text-anchor="middle">earlier turns</text>
+<text x="104" y="714.54" class="s" text-anchor="middle">are lost</text>
+<polyline class="ln" points="231,681 187,681"/>
+<polygon class="hd" points="189,676 179,681 189,686"/>
+<text x="205" y="673" class="s" text-anchor="middle">yes</text>
+<polyline class="ln" points="104,728 104,753"/>
+<polygon class="hd" points="99,751 104,761 109,751"/>
+<circle class="ring" cx="104" cy="772" r="11"/>
+<circle class="dot" cx="104" cy="772" r="6.5"/>
+<rect class="k-stop" x="226" y="761" width="160" height="94" rx="14"/>
+<text x="306" y="784.54" class="b" text-anchor="middle">Stop this worker</text>
+<text x="306" y="803.54" class="s" text-anchor="middle">keep the thread;</text>
+<text x="306" y="822.54" class="s" text-anchor="middle">check what it did</text>
+<text x="306" y="841.54" class="s" text-anchor="middle">before trying again</text>
+<polyline class="ln" points="306,721 306,753"/>
+<polygon class="hd" points="301,751 306,761 311,751"/>
+<text x="316" y="739" class="s">no</text>
+<polyline class="ln" points="306,855 306,880"/>
+<polygon class="hd" points="301,878 306,888 311,878"/>
+<circle class="ring" cx="306" cy="899" r="11"/>
+<circle class="dot" cx="306" cy="899" r="6.5"/>
+</svg>

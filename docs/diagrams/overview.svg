@@ -1,0 +1,122 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="408" height="739" viewBox="0 0 408 739" role="img">
+<title>How a council works</title>
+<desc>You ask Claude. Claude decides, within your instructions, and has the runner freeze a snapshot of your project. Each Codex worker works on its own copy of that snapshot and never changes your live files. Replies and evidence go to the run folder, which keeps them and the snapshot across restarts; Claude reads the results and answers you. Optional, experimental notes of Claude's position can be kept beside Claude; they are never required.</desc>
+<style>
+text{font-family:"Helvetica Neue",Helvetica,Arial,"Liberation Sans","Nimbus Sans",sans-serif}
+rect,path,polygon,polyline,circle{stroke-width:1.5}
+.dash{stroke-dasharray:6 4}
+.title{font-size:18px;font-weight:700}
+.b{font-size:14px;font-weight:700}
+.t{font-size:14px;font-weight:400}
+.s{font-size:14px;font-weight:400}
+.c{font-size:14px;font-weight:400;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace}
+.n{font-size:14px;font-weight:700}
+text{fill:#1f2328}
+.s,.c,.n{fill:#59636e}
+.bg{fill:#f6f8fa;stroke:#d0d7de}
+.ln{fill:none;stroke:#59636e}
+.hd,.badge{fill:#59636e}
+.life{fill:none;stroke:#818b98;stroke-dasharray:5 5}
+.dot{fill:#1f2328}
+.ring{fill:none;stroke:#1f2328}
+.bt,.bd{fill:#f6f8fa}
+.k-plain{fill:#ffffff;stroke:#818b98}
+.k-you{fill:#ffffff;stroke:#59636e}
+.k-claude{fill:#ddf4ff;stroke:#0969da}
+.k-runner{fill:#fbefff;stroke:#8250df}
+.k-work{fill:#dafbe1;stroke:#1a7f37}
+.k-store{fill:#fff8c5;stroke:#9a6700}
+.k-warn{fill:#fff1e5;stroke:#bc4c00}
+.k-stop{fill:#ffebe9;stroke:#cf222e}
+.k-frame{fill:#f6f8fa;stroke:#818b98}
+@media (prefers-color-scheme: dark){
+text{fill:#f0f6fc}
+.s,.c,.n{fill:#9198a1}
+.bg{fill:#151b23;stroke:#3d444d}
+.ln{fill:none;stroke:#9198a1}
+.hd,.badge{fill:#9198a1}
+.life{fill:none;stroke:#656c76;stroke-dasharray:5 5}
+.dot{fill:#f0f6fc}
+.ring{fill:none;stroke:#f0f6fc}
+.bt,.bd{fill:#151b23}
+.k-plain{fill:#0d1117;stroke:#656c76}
+.k-you{fill:#0d1117;stroke:#9198a1}
+.k-claude{fill:#0c2d6b;stroke:#4493f8}
+.k-runner{fill:#271a3f;stroke:#ab7df8}
+.k-work{fill:#0f2d1a;stroke:#3fb950}
+.k-store{fill:#2e2410;stroke:#d29922}
+.k-warn{fill:#3d1d0b;stroke:#f0883e}
+.k-stop{fill:#3b1219;stroke:#f85149}
+.k-frame{fill:#151b23;stroke:#656c76}
+}
+</style>
+<rect class="bg" x="0.75" y="0.75" width="406.5" height="737.5" rx="14"/>
+<text x="24" y="40" class="title">How a council works</text>
+<rect class="k-you" x="24" y="64" width="206" height="75" rx="6"/>
+<circle class="k-you" cx="48" cy="95.5" r="5"/>
+<path class="k-you" d="M39,112.5 Q39,102.5 48,102.5 Q57,102.5 57,112.5 Z"/>
+<text x="141" y="87.54" class="b" text-anchor="middle">You</text>
+<text x="141" y="106.54" class="s" text-anchor="middle">set the goal</text>
+<text x="141" y="125.54" class="s" text-anchor="middle">and the limits</text>
+<rect class="k-claude" x="24" y="189" width="206" height="75" rx="6"/>
+<text x="127" y="212.54" class="b" text-anchor="middle">Claude</text>
+<text x="127" y="231.54" class="t" text-anchor="middle">decides, within your</text>
+<text x="127" y="250.54" class="t" text-anchor="middle">instructions</text>
+<path class="k-store" d="M24,321 A90,7 0 0 1 204,321 V415 A90,7 0 0 1 24,415 Z"/>
+<path class="k-store" style="fill:none" d="M24,321 A90,7 0 0 0 204,321"/>
+<text x="114" y="351.54" class="b" text-anchor="middle">Frozen snapshot</text>
+<text x="114" y="370.54" class="b" text-anchor="middle">of your project</text>
+<text x="114" y="389.54" class="s" text-anchor="middle">workers never change</text>
+<text x="114" y="408.54" class="s" text-anchor="middle">your live files</text>
+<rect class="k-work" x="34" y="468" width="170" height="75" rx="6"/>
+<rect class="k-work" x="29" y="473" width="170" height="75" rx="6"/>
+<rect class="k-work" x="24" y="478" width="170" height="75" rx="6"/>
+<text x="109" y="501.54" class="b" text-anchor="middle">Codex workers</text>
+<text x="109" y="520.54" class="s" text-anchor="middle">each on its</text>
+<text x="109" y="539.54" class="s" text-anchor="middle">own copy</text>
+<path class="k-store" d="M24,710 V618 Q24,613 29,613 H86 L94,621 H225 Q230,621 230,626 V710 Q230,715 225,715 H29 Q24,715 24,710 Z"/>
+<text x="127" y="644.54" class="b" text-anchor="middle">Run folder</text>
+<text x="127" y="663.54" class="s" text-anchor="middle">holds the snapshot,</text>
+<text x="127" y="682.54" class="s" text-anchor="middle">replies and evidence,</text>
+<text x="127" y="701.54" class="s" text-anchor="middle">even across restarts</text>
+<polyline class="ln" points="48,139 48,181"/>
+<polygon class="hd" points="43,179 48,189 53,179"/>
+<circle class="badge" cx="68" cy="164" r="10"/>
+<text x="68" y="169" class="n bt" text-anchor="middle">1</text>
+<text x="84" y="169" class="t">ask</text>
+<polyline class="ln" points="48,264 48,306"/>
+<polygon class="hd" points="43,304 48,314 53,304"/>
+<circle class="badge" cx="68" cy="279.5" r="10"/>
+<text x="68" y="284.5" class="n bt" text-anchor="middle">2</text>
+<text x="84" y="284.5" class="t">runner freezes</text>
+<text x="84" y="303.5" class="t">a snapshot</text>
+<polyline class="ln" points="48,422 48,460"/>
+<polygon class="hd" points="43,458 48,468 53,458"/>
+<circle class="badge" cx="68" cy="445" r="10"/>
+<text x="68" y="450" class="n bt" text-anchor="middle">3</text>
+<text x="84" y="450" class="t">a copy per worker</text>
+<polyline class="ln" points="48,553 48,605"/>
+<polygon class="hd" points="43,603 48,613 53,603"/>
+<circle class="badge" cx="68" cy="573.5" r="10"/>
+<text x="68" y="578.5" class="n bt" text-anchor="middle">4</text>
+<text x="84" y="578.5" class="t">replies and</text>
+<text x="84" y="597.5" class="t">evidence</text>
+<polyline class="ln" points="222,621 222,272"/>
+<polygon class="hd" points="227,274 222,264 217,274"/>
+<circle class="badge" cx="242" cy="438.5" r="10"/>
+<text x="242" y="443.5" class="n bt" text-anchor="middle">5</text>
+<text x="258" y="443.5" class="t">results</text>
+<polyline class="ln" points="222,189 222,147"/>
+<polygon class="hd" points="227,149 222,139 217,149"/>
+<circle class="badge" cx="242" cy="164" r="10"/>
+<text x="242" y="169" class="n bt" text-anchor="middle">6</text>
+<text x="258" y="169" class="t">answer</text>
+<path class="k-frame dash" d="M248,189 H372 L384,201 V302 H248 Z"/>
+<path class="k-frame dash" style="fill:none" d="M372,189 V201 H384"/>
+<text x="260" y="212.54" class="b">Optional notes</text>
+<text x="260" y="231.54" class="b">of Claude's</text>
+<text x="260" y="250.54" class="b">position</text>
+<text x="260" y="269.54" class="s">experimental;</text>
+<text x="260" y="288.54" class="s">never required</text>
+<polyline class="ln dash" points="230,226.5 248,226.5"/>
+</svg>

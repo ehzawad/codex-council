@@ -8,7 +8,9 @@ Write context.md with the current objective, acceptance criteria and authorizati
 first. Then describe the contribution that could change the next decision, the
 claims to challenge, strongest contrary evidence, relevant artifacts and setup,
 in-flight work, and unknowns. Keep source facts, inference and proposals distinct.
-Previous council conclusions retain their original snapshot and limitations.
+Previous council conclusions retain their original snapshot and limitations. Their
+run directories persist until pruned, so reread an earlier result.json or reply
+rather than recalling it.
 
 A Codex thread does not inherit the host conversation. After host compaction,
 reread durable decisions and relevant live artifacts; acknowledge missing history.

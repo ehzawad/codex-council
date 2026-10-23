@@ -27,13 +27,90 @@ whatever the umask, under `$XDG_STATE_HOME` when that is an absolute path (a
 relative value is ignored, as the XDG base-directory specification requires) or
 else `~/.local/state`; an owned state directory with any other mode is reset to
 0700, while a symlinked or foreign-owned one is refused by the pre-flight and
-again at launch, and is never changed.
+again at launch, and is never changed. Run directories live beside that state in
+`runs/` (see [Run directories](#run-directories)).
 
 The staged request, context and role capability/lens contracts are frozen by
 preparation. Model/effort/selection/service_tier stay fillable after discovery.
 Context changes, new requirements or a different contribution require recapture
 rather than quietly reusing stale input identity. Hashes bind artifacts, not
 semantic correctness.
+
+## Run directories
+
+`--new-run` allocates `runs/<UTC YYYYMMDDTHHMMSSZ>-<16 hex>/` in the state
+directory, 0700 whatever the umask, and prints its physical path. A run persists
+across reboots and temporary-file cleaning, so its evidence and candidate bytes
+outlive the session, unlike `mktemp -d` under a `$TMPDIR` that a reboot or cleaner
+may clear. Every mode still accepts any private 0700 directory. The state
+directory, runs/ and the new run must each be an owned real directory with no
+group or other bits. --new-run refuses anything else without repairing it (the
+pre-flight and launch do reset an owned state directory's mode), and refuses a
+resolved path with a single quote or a control character, which the skill's
+single-quoted path cannot carry.
+
+By default runs live under `$HOME`, with two consequences. A source_root that
+contains the state home (say `$HOME`) would put the run inside its own capture, so
+--prepare refuses it and names the fix: a source_root that does not contain it, or
+XDG_STATE_HOME outside it. And a run can sit inside a Git work tree, so workers
+take their scratch cwd as the project root (see
+[Execution policy](#execution-policy)).
+
+Nothing is deleted automatically. --prune-runs is maintenance the skill runs only
+on user request; it lists by default and deletes only with --delete:
+
+```
+ runs/<entry>
+   |
+   +-- .pruning-<name> --> skip
+   |
+   +-- any other name --new-run does not
+   |   make --> ignored
+   |
+   +-- a link, foreign, not private, or on
+   |   another filesystem --> skip
+   |
+   +-- no launch record: never launched
+   |     |
+   |     +-- changed within max(DAYS, 1) days
+   |     |   --> skip
+   |     |
+   |     '-- otherwise eligible. --delete renames
+   |         it .pruning-<name>, checks it again,
+   |         then removes it or renames it back
+   |
+   '-- launched
+         |
+         v
+       control records private, lock the
+       recorded file and free? ------ no --> skip
+         |
+         | yes: take the lock, held through
+         | removal
+         v
+       terminal time, or last tick of a
+       "running" run, older than DAYS
+       days? ------------------------ no --> skip
+         |
+         | yes
+         v
+       recorded runner, its group and
+       every recorded codex group and
+       process gone? ----- no or unknown --> skip
+         |
+         | yes
+         v
+       eligible. --delete removes it in
+       place, control records last
+```
+
+Removal works through pinned descriptors whose device and inode are rechecked,
+unlinks links and special files unopened, and never crosses a filesystem; the
+first problem stops it and leaves the rest in place. Only recorded processes
+count, so a background process the runner never recorded does not block a prune.
+A prune never cancels, reaps or touches saved threads and role locks. Leftovers
+and exit codes are in
+[runtime-behavior.md](plugins/codex-council/skills/codex-council/references/runtime-behavior.md#pruning-runs).
 
 ## Capture backend
 
@@ -78,14 +155,17 @@ The adapter reads actual-cwd configuration, enumerates MCP names, then reads aga
 with requested restrictions. It removes extra writable roots and implicit temporary
 write grants, sets non-interactive approval, ignores user and project execpolicy
 rules (an allow rule would run its command outside the sandbox), turns memories
-off, and, with external tools denied, empties notify, disables the examined
-external-tool features and explicitly disables the discovered MCP servers by bare
-name. Wrong/unknown types, managed overrides or requirements, an unaddressable MCP
-name or an altered inventory block execution. Command network requires
-workspace-write or bypass and an authorization. Preflight reports the policy and
-the detached child reobserves it; --start repeats only the local contract, capture
-and selection-authoring checks before detaching. Launch setup publishes liveness
-between bounded metadata operations so long panels do not look like dead runners.
+off, sends `project_root_markers=[]` so the scratch cwd is Codex's project root
+(a run inside a Git work tree, such as a dotfiles home, loads no AGENTS.md or
+`.codex` layer from above it), and, with external tools denied, empties notify,
+disables the examined external-tool features and explicitly disables the
+discovered MCP servers by bare name. Wrong/unknown types, managed overrides or
+requirements, an unaddressable MCP name or an altered inventory block execution.
+Command network requires workspace-write or bypass and an authorization.
+Preflight reports the policy and the detached child reobserves it; --start repeats
+only the local contract, capture and selection-authoring checks before detaching.
+Launch setup publishes liveness between bounded metadata operations so long panels
+do not look like dead runners.
 
 There is a remaining check-to-exec window. Config observations are not a serving
 process attestation, and the command sandbox is not a sandbox of the entire Codex
@@ -96,7 +176,10 @@ Failure never silently grants bypass or edits user configuration.
 ## Model discovery and selection
 
 Discovery and execution use each role's actual scratch cwd, the same Codex
-binary/environment and no profile override. Relative CODEX_HOME is normalized
+binary/environment and no profile override. Discovery does not send the workers'
+`project_root_markers=[]`, so for a run inside another Git work tree it can report
+native defaults from a parent `.codex` layer the workers do not load; explicit pins
+avoid relying on them. Relative CODEX_HOME is normalized
 before relocation, without copying credentials. Source agent configuration and
 instruction files are not copied (see the
 [invocation contract](plugins/codex-council/skills/codex-council/references/invocation-contract.md)),
@@ -139,7 +222,8 @@ Bounded fan-out and nonblocking per-continuity-key locks serialize runs with the
 same logical source, task, host-session scope and role; a role waiting on its key
 gives up its fan-out slot. Every child has its own process group. Byte-inactivity watchdogs,
 bounded post-exit drain, descendant cleanup, signal latching, reply-first persistence,
-and orphan reaping complete the lifecycle. The supervisor is not a reboot-persistent job scheduler.
+and orphan reaping complete the lifecycle. The supervisor is not a reboot-persistent job scheduler:
+a reboot ends it, while its run directory persists.
 Same-user tampering, reparented descendants and a SIGKILL before child recording are
 not solved by the workspace copies.
 
@@ -301,6 +385,7 @@ checks changed intent and external conditions separately.
 | council_policy | Capability validation and fail-closed effective-config observation. |
 | council_evidence | Raw attempts, protocol summaries, candidate artifacts and result envelope. |
 | council_workflow | Versioned invocation contracts, bindings and per-role discovery orchestration. |
+| council_runs | Run allocation (--new-run) and descriptor-based pruning (--prune-runs). |
 
 ```
  codex_council (CLI and supervisor)
@@ -314,6 +399,9 @@ checks changed intent and external conditions separately.
    |     +-> council_workspace
    |     '-> council_discovery
    +-> council_liveness -> council_common
+   +-> council_runs
+   |     +-> council_liveness
+   |     '-> council_common
    +-> council_failures -> council_common
    +-> council_evidence -> council_workspace
    '-> council_common
@@ -327,15 +415,19 @@ imports.
 
 Imports form a DAG; production siblings do not import the entrypoint. The runner
 owns mutable run state. Runtime has no third-party Python dependency. Tests and
-project documentation are not installed as skill prompt content.
+project documentation are not installed as skill prompt content. Neither is
+`experiments/decision_receipts.py`, a checkout-only prototype that records
+Claude's revisable position over council evidence; the plugin never imports it,
+and it never dispatches, approves or gates (usage in its `--help`).
 
 ## Verification and release gate
 
-Unit tests exercise strict contracts, copies, links, freshness, policy observations
-and evidence gaps. CLI tests use real subprocesses and a fake Codex protocol for
-red/green experiments, task-scoped fresh/resume, transient retry safety, required
-coverage, actual-cwd routing and cancellation. The liveness scenarios run in the
-full suite. CI runs it on Ubuntu with Python 3.12 to 3.15 and on macOS with 3.13.
+Unit tests exercise strict contracts, copies, links, freshness, policy observations,
+run allocation and pruning, and evidence gaps. CLI tests use real subprocesses and
+a fake Codex protocol for red/green experiments, task-scoped fresh/resume,
+transient retry safety, required coverage, actual-cwd routing and cancellation.
+The liveness scenarios run in the full suite. CI runs it on Ubuntu with Python
+3.12 to 3.15 and on macOS with 3.13.
 
 The fake does not implement Codex sandbox security or evaluate model quality.
 Opt-in signed-in host tests check real inside/outside write and network denials.
@@ -356,4 +448,4 @@ loop replacing Codex exec, and a generic cluster scheduler.
 ## Supported versions
 
 See the [README requirements](README.md#requirements). The skill and runner share
-contract epoch 5.
+contract epoch 6.
