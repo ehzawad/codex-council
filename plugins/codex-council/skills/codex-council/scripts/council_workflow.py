@@ -85,7 +85,13 @@ def prepare(run_dir: str, roles: list[Any], body: str) -> dict[str, Any]:
     directory = private_dir(run_dir)
     request = _request(directory)
     source = Path(request["source_root"])
-    if directory.is_relative_to(source) or source.is_relative_to(directory):
+    if directory.is_relative_to(source):  # e.g. source_root $HOME holds the state home
+        raise WorkspaceError(
+            "source and run directory must be separate, non-overlapping trees, "
+            "but the run directory is inside source_root (a --new-run directory "
+            "lives under $XDG_STATE_HOME, by default ~/.local/state): choose a "
+            "source_root that does not contain it, or set XDG_STATE_HOME outside it")
+    if source.is_relative_to(directory):
         raise WorkspaceError("source and run directory must be separate, non-overlapping trees")
     if not body.strip():
         raise WorkspaceError("context must contain the current goal and contribution request")

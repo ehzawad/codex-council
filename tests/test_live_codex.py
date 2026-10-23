@@ -34,8 +34,6 @@ $CODEX_HOME/sessions like any other codex exec run. The codex --version
 line, the account type, the chosen models, and the report lines Codex's
 own messages produced are printed as `[live]` notes, never asserted; no
 email address or token is ever printed.
-
-Lives outside the plugin subtree so end-user installs don't bundle it.
 """
 
 import collections
@@ -107,6 +105,7 @@ ENDED_RE = re.compile(r"runner: (done|interrupted|aborted) \(exit (\d+)\)$")
 REQUIRED_POLICY_OVERRIDES = (
     'sandbox_mode="read-only"', 'approval_policy="never"',
     "features.memories=false", 'web_search="disabled"', "notify=[]",
+    "project_root_markers=[]",
 )
 # Option names that would select a model or a profile on the command line.
 MODEL_OPTIONS = ("-m", "--model", "-p", "--profile", "--oss")
@@ -557,7 +556,7 @@ class LiveCouncilCase(unittest.TestCase):
         return run
 
     def prepared(self, *roles):
-        """A fresh private run directory (as `mktemp -d` makes one) with
+        """A fresh private run directory (as --new-run makes one) with
         request.json, roles.json, and context.md written and captured by
         --prepare. The request captures no files (`include: []`): the
         smoke prompt needs none."""

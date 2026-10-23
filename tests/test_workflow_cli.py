@@ -298,6 +298,24 @@ class WorkflowCliTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 2, proc.stderr)
         self.assertFalse(self.execs())
 
+    def test_project_root_markers_must_be_observed_empty_before_inference(self):
+        """The fake starts from Codex's default markers; the -c override must
+        clear them, and a layer that keeps them or a Codex that does not
+        report them fails closed."""
+        self.assertEqual(self.cli("--check-staging-dir", self.stage()).returncode, 0)
+        for markers in ('[".git"]', "unreported"):
+            with self.subTest(markers=markers):
+                self.env.pop("FAKE_WORKFLOW_ROOT_MARKERS", None)
+                directory = self.stage()  # a launch uses its directory up
+                self.env["FAKE_WORKFLOW_ROOT_MARKERS"] = markers
+                proc = self.cli("--check-staging-dir", directory)
+                self.assertEqual(proc.returncode, 2, proc.stderr)
+                self.assertIn("requested execution policy: project_root_markers",
+                              proc.stderr)
+                proc = self.launch(directory)
+                self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertFalse(self.execs())
+
     def test_transient_failures_after_tool_work_are_not_replayed_fresh_or_resumed(self):
         for resume in (False, True):
             for status, tag in ((503, "5xx"), (429, "rate-limit")):

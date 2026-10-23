@@ -7,9 +7,10 @@ actual execution cwd, launches a detached supervisor, and records
 raw protocol evidence separately from collaborator interpretation. It neither
 judges substantive claims nor applies candidate changes to the live project.
 
-The only flow: --prepare, --discover, --check-staging-dir, --start; then
---follow/--status and --freshness before reconciliation. --cancel and --reap
-act only on verified process identities and the supervisor lock.
+The only flow: --new-run, --prepare, --discover, --check-staging-dir,
+--start; then --follow/--status and --freshness before reconciliation.
+--cancel and --reap act only on verified process identities and the
+supervisor lock; --prune-runs deletes only on request (see council_runs).
 Workers run only in --start's supervised child, only for a completed capture,
 and at most once per run directory.
 
@@ -74,6 +75,7 @@ from council_common import (  # noqa: E402
     _iter_json_objects,
     _log_inline,
     _plugin_version,
+    _print_stdout,
     _private_stat_problem,
     _project_root,
     _report_inline,
@@ -132,6 +134,7 @@ from council_workspace import WorkspaceError  # noqa: E402
 from council_policy import (  # noqa: E402
     ServiceTierOverridden, command_options, effects_possible, parse_policy, policy_dict)
 from council_evidence import AttemptEvidence, write_result  # noqa: E402
+from council_runs import DEFAULT_PRUNE_DAYS, RunsError, new_run, prune_runs  # noqa: E402
 from council_workflow import (  # noqa: E402
     prepare, load_plan, discover_prepared, resolve_selections, plan_lines,
     freshness_command,
@@ -216,10 +219,11 @@ DEFAULT_STALL_SECS = 1800
 # heartbeats with a rising quiet value before the watchdog fires.
 PROGRESS_HEARTBEAT_SECS = 300
 # Contract epoch for the optional --skill-contract handshake. Bump only when
-# SKILL.md's command contract changes incompatibly. Epoch 5 is the captured
-# workflow: request.json and --prepare before --discover, --check-staging-dir
-# and --start, per-role catalogs and workspaces, and result.json evidence.
-SKILL_CONTRACT_EPOCH = 5
+# SKILL.md's command contract changes incompatibly. Epoch 6 is the captured
+# workflow in a --new-run directory: request.json and --prepare before
+# --discover, --check-staging-dir and --start, per-role catalogs and
+# workspaces, and result.json evidence.
+SKILL_CONTRACT_EPOCH = 6
 # --start waits at most this long for its supervisor to write
 # supervisor.json (or exit early). It bounds the start command only, never
 # a running council.
@@ -256,9 +260,9 @@ COLLABORATION_BRIEF = (
     "Thoroughness beats speed."
 )
 STAGING_PATH_HINT = (
-    "Staging hint: use the exact directory printed by `mktemp -d` for "
+    "Staging hint: use the exact directory printed by `--new-run` for "
     "both roles.json and context.md in this invocation; keep roles, context, "
-    "out.md, and err.log under the same mktemp directory. Shell variables do "
+    "out.md, and err.log under the same run directory. Shell variables do "
     "not persist across Claude Code Bash calls."
 )
 # STAGING_PATH_HINT's launch form, for an input or path defect the supervised
@@ -498,15 +502,10 @@ def _ensure_state_dir():
     normalization, so the directory checked is the one _state_path and the
     role locks use (a "link/.." component resolves the same way for both).
     An existing state directory must be a real directory (not a symlink)
-    owned by the effective uid; when its mode is anything but 0700 (group-
-    or other-accessible, as one created under an earlier umask-dependent
-    release can be, or missing owner bits, as 0500, 000, or one a
-    concurrent council created under an owner-clearing umask), it is reset
-    to 0700 through a descriptor opened without following links and
-    re-checked to be the same owned directory (one without an owner read
-    bit cannot be opened, so it is reset by name without following a link
-    and re-checked afterwards). Anything else raises StateDirError and
-    nothing is chmodded.
+    owned by the effective uid; any mode but 0700 is reset to 0700 through
+    a no-follow descriptor and re-checked (without an owner read bit, by
+    name: _reset_unreadable_state_dir). Anything else raises StateDirError
+    and nothing is chmodded.
     """
     # Never normalized, and never resolved under the cwd (usually the
     # user's project): a relative one means no usable home directory.
@@ -846,26 +845,11 @@ def _fresh_cmd(root, model=None, effort=None, execution_options=None, service_ti
 class _EventFlagScanner:
     """Derive replay-safety flags from the stdout JSONL as chunks arrive.
 
-    Splits strictly on b"\\n" (JSONL's record separator) for the same reason
-    as _iter_json_objects: U+2028/U+2029/U+0085 are legal unescaped inside a
-    JSON string. Only items that do no work are replay-safe: the pure-text
-    agent_message and reasoning, and Codex's own `error` notices (message
-    only — for example the advisory that a resumed thread was recorded
-    with another model, routine once roles are routed). Every other type
-    (command executions, MCP tool calls, file changes, web searches, to-do
-    lists, collab tool calls, any unknown/future type, and a type that is
-    not a string) marks the attempt unsafe to replay — conservative by
-    default, since replaying such a turn could duplicate side effects. The
-    stream is not a complete record of tool calls (codex exec --json emits no
-    item for a sandbox-denied code-mode command), so _run_role_once also
-    treats every attempt of a role whose tools can leave effects as unsafe. A
-    non-blank line that is not a JSON object (Python's decoder rejects it,
-    for example for excessive nesting or the integer-digit limit, or it is
-    another JSON value) could hide such an item, so it marks the attempt
-    unsafe to replay too, and so does anything else scanning a line raises:
-    feed() and finish() never raise, so scanning never stops the stdout
-    pump. Only item.started and item.completed events are checked against
-    the safe-item allowlist; other top-level event types are accepted.
+    Splits strictly on b"\\n", as _iter_json_objects does. Only item events
+    are checked: an item type outside _SAFE_ITEM_TYPES, a non-object line,
+    or any scanning error marks the attempt unsafe to replay; feed() and
+    finish() never raise. The stream omits some tool calls, so
+    _run_role_once also treats every effect-capable role as unsafe.
     """
 
     _SAFE_ITEM_TYPES = frozenset({"agent_message", "reasoning", "error"})
@@ -1338,20 +1322,10 @@ async def _run_role_invocation(role, attempt, run_codex):
         failure_text = _failure_text(run.stdout, run.stderr)
 
         if run.returncode == 0:
-            # Resume-footgun mitigation. `codex exec resume <id>` parses <id>
-            # as a UUID first (UUIDs take precedence if it parses). On current
-            # codex-cli a valid-but-unknown UUID ERRORS ("no rollout found ...
-            # -32600", exit 1) and is handled by the stale-resume branch below;
-            # only a value that is NOT a valid UUID is treated as a thread NAME
-            # and silently starts a NEW thread (rc==0, fresh thread.started).
-            # The runner stores whatever non-empty id thread.started emitted
-            # and does not check that it is a UUID; Codex emits UUIDs, so
-            # silent-spawn needs an unexpected id or a hand-edited state
-            # file. Detect it by comparing a non-empty emitted
-            # thread.started.thread_id to what we asked to resume; if it
-            # differs, adopt the new id (no benefit re-running an
-            # already-completed turn) and warn — the role lost its prior
-            # accumulated framing.
+            # `codex exec resume <id>` treats a non-UUID <id> as a thread
+            # NAME and silently starts a new thread (rc 0); an unknown UUID
+            # errors into the stale branch below. A different emitted
+            # thread_id is adopted with a continuity-lost warning.
             # The reply is extracted BEFORE any state write so persistence
             # failures can never cost a completed reply.
             msg = extract_final_message(run.stdout)
@@ -1412,18 +1386,8 @@ async def _run_role_invocation(role, attempt, run_codex):
                 elapsed_seconds=elapsed, attempts=attempt, warning=warning,
             )
 
-        # rc != 0 on resume. Order (_failure_verdict): auth (never clear
-        # state) -> quota (terminal even with HTTP 429) -> ANCHORED-status
-        # retriable (a real API 429/5xx, by JSON status / `HTTP NNN` / reason
-        # phrase, beats a stale-looking message) -> model rejected (terminal;
-        # keeps state even when its text also looks stale) -> stale-resume
-        # (clear + restart fresh) -> SUBSTRING retriable fallback. The
-        # substring fallback sits after the stale check so a stale error that
-        # merely contains a bare digit run (e.g. "...thread id stale-429-sid")
-        # still restarts fresh. The verdict is computed once and formatted
-        # as-is, so the tag always matches the branch taken here; the verdict
-        # marks a transient class, and replay safety and the attempt budget
-        # decide the retry.
+        # rc != 0 on resume: one verdict (order in _failure_verdict),
+        # formatted as-is, so the tag matches the branch taken here.
         records = _failure_records(run.stdout)
         verdict = _failure_verdict(failure_text, records, model, resume=True)
         if verdict.kind != "stale":
@@ -1927,9 +1891,10 @@ def _parse_args(argv):
             "there is no built-in catalog."
         ),
         epilog=(
-            "Run --prepare RUNDIR first (RUNDIR/request.json, roles.json, "
-            "and context.md); every other launch step needs its completed "
-            "capture. --discover RUNDIR records each role's model snapshot "
+            "Allocate RUNDIR with --new-run (or use any private 0700 "
+            "directory), write its request.json, roles.json, and context.md, "
+            "then run --prepare RUNDIR; every other launch step needs its "
+            "completed capture. --discover RUNDIR records each role's model snapshot "
             "(metadata only; no thread or turn is started), and role "
             "objects accept a 'selection' object, required whenever the "
             "optional 'model' or 'effort' is present: mode 'user' for an "
@@ -1942,8 +1907,8 @@ def _parse_args(argv):
             "A model Codex rejects fails the role as [model-rejected] and a "
             "usage or credit limit as [quota]; neither is retried. SKILL "
             f"contract epoch {SKILL_CONTRACT_EPOCH}.\n\n"
-            "RUNDIR must be private (0700, user-owned, non-symlink), e.g. one "
-            "created by `mktemp -d`, and --discover and the preflight refuse "
+            "RUNDIR must be private (0700, user-owned, non-symlink), e.g. the "
+            "one --new-run prints, and --discover and the preflight refuse "
             "a directory that already launched. Each "
             "settled role's section is also "
             "written to <RUNDIR>/replies/<key>.md before its completion line "
@@ -2088,6 +2053,57 @@ def _parse_args(argv):
             "Cannot be combined with another command."
         ),
     )
+    # None, not False, when absent: the mode loop below treats any value
+    # but None as a selected mode.
+    parser.add_argument(
+        "--new-run", action="store_const", const=True, default=None,
+        help=(
+            "Allocate one fresh private run directory, "
+            "<state>/codex-council/runs/<UTC YYYYMMDDTHHMMSSZ>-<random>/ "
+            "(state: $XDG_STATE_HOME when absolute, else ~/.local/state), "
+            "0700 whatever the umask, and print its absolute path. It "
+            "persists across reboots. An existing state or runs directory "
+            "that is a symlink, foreign, or not private is refused (exit 2) "
+            "and never repaired, as is a run path with a single quote or a "
+            "control character. Cannot be combined with another command."
+        ),
+    )
+    parser.add_argument(
+        "--prune-runs", action="store_const", const=True, default=None,
+        help=(
+            "Maintenance, only on request: list the direct children of the "
+            "runs directory --new-run uses, and say for each whether it is "
+            "eligible for deletion or why it is skipped. Eligible only: a "
+            "launched run whose status.json terminal state (or, for a run "
+            "left \"running\" by a runner that died, as at a reboot, its "
+            "last tick) is older than --older-than days, whose supervisor "
+            "lock is the recorded file and free (held through removal), and "
+            "whose recorded runner and codex process groups are verifiably "
+            "gone; or a run never launched (no supervisor, claim, status, or "
+            "launch output files) in which nothing changed (by any entry's "
+            "modification or status-change time) for more than --older-than "
+            "days and at least one day; it is renamed out of reach of --start "
+            "and --prepare and checked again before removal. A process the "
+            "runner "
+            "never recorded (such as a tool command codex left running in "
+            "the background) is not detected. Never follows a "
+            "link, cancels, reaps, or touches saved threads. Exits 0 when "
+            "done, 1 when a deletion failed partway, 2 for invalid "
+            "arguments or an unsafe runs directory."
+        ),
+    )
+    parser.add_argument(
+        "--older-than", default=None, metavar="DAYS",
+        help=(f"With --prune-runs: a run's terminal status (or last tick) "
+              f"must be older than DAYS whole days, 0 to 999999999 (default "
+              f"{DEFAULT_PRUNE_DAYS}); a run never launched must also be "
+              f"unchanged for at least one day."),
+    )
+    parser.add_argument(
+        "--delete", action="store_const", const=True, default=None,
+        help=("With --prune-runs: delete the eligible runs. Without it, "
+              "nothing is deleted."),
+    )
     parser.add_argument(
         "--skill-contract", default=None, type=int, metavar="EPOCH",
         help=(
@@ -2130,6 +2146,8 @@ def _parse_args(argv):
         ("--status", args.status),
         ("--cancel", args.cancel),
         ("--reap", args.reap),
+        ("--new-run", args.new_run),
+        ("--prune-runs", args.prune_runs),
     )
     for name, value in commands:
         if value == "":
@@ -2141,6 +2159,15 @@ def _parse_args(argv):
                 parser.error(f"{name} cannot be combined with {flag}")
     if args.verbose and args.follow is None:
         parser.error("--verbose requires --follow")
+    for flag, value in (("--older-than", args.older_than),
+                        ("--delete", args.delete)):
+        if value is not None and args.prune_runs is None:
+            parser.error(f"{flag} requires --prune-runs")
+    if args.older_than is not None:
+        if not re.fullmatch(r"[0-9]{1,9}", args.older_than):
+            parser.error("--older-than must be a whole number of days from 0 "
+                         f"to 999999999; got {args.older_than!r}")
+        args.older_than = int(args.older_than)
     # The supervised child of --start only: never a public launch route.
     if args.supervisor_lock_fd is not None and (
             args.roles_file is None or args.context_file is None
@@ -2254,7 +2281,7 @@ def _usage_exit_if_staging_dirs_differ(roles_file, context_file,
     if roles_dir != context_dir:
         _usage_exit(
             "codex-council input staging error:\n"
-            f"- --roles-file and --context-file must be in the same mktemp "
+            f"- --roles-file and --context-file must be in the same run "
             f"directory; got roles dir {roles_dir!r} and context dir "
             f"{context_dir!r}.\n"
             f"{hint}"
@@ -2711,34 +2738,13 @@ def _fill_closed_standard_fds():
 
 
 def _start_command(run_dir):
-    """--start RUNDIR: launch the staged council detached; exit 0, 1, or 2.
+    """--start RUNDIR: launch the staged council detached (contract: --help).
 
-    1. Repeat the pre-flight's local contract, capture and selection-
-       authoring checks (execution-policy probes are left to the child,
-       which reobserves policy and revalidates automatic choices before
-       dispatch); a refusal exits 2 before anything is created, so the
-       directory stays untouched.
-    2. Claim the directory, in this order and each exclusively (O_EXCL,
-       O_NOFOLLOW, 0600): supervisor.lock, locked with flock(LOCK_EX), then
-       err.log and out.md. A concurrent --start that got there first makes
-       this one exit 2 having created and truncated nothing; an err.log or
-       out.md that appeared after step 1 makes it exit 2 truncating
-       nothing, though the lock file it created stays. The lock file is
-       never removed or replaced.
-    3. Start this script's supervised child (the only launch path), in its own
-       session, with stdout on out.md, stderr on err.log, stdin on
-       /dev/null, the same cwd and environment, and the locked descriptor
-       as its only extra one (--supervisor-lock-fd). The context stays in
-       its file; the command line carries only paths.
-    4. Close this process's copies (the lock stays held by the child) and
-       wait up to START_WAIT_SECS for the child to write supervisor.json.
-       A child that wrote it is a start (exit 0) even if it has already
-       ended; one that exits without writing it, or a spawn failure, is
-       exit 1 (read err.log; the directory is used up). When the wait
-       runs out with the child still running and no record, it is also
-       exit 0, with a note to run --status. A start whose own stdout is
-       closed or broken is exit 0 too, with one stderr line naming the pid
-       and directory instead.
+    Claims supervisor.lock (flock LOCK_EX), err.log, then out.md, each
+    O_EXCL|O_NOFOLLOW and 0600; a lost race truncates nothing, and the lock
+    file is never removed or replaced.
+    The supervised child gets the locked descriptor as its only extra one
+    (--supervisor-lock-fd) and only paths on its command line.
     """
     prefix = "--start: "
     _fill_closed_standard_fds()
@@ -2991,6 +2997,24 @@ def _force_utf8_streams():
 def main():
     _force_utf8_streams()
     args = _parse_args(sys.argv[1:])
+    # STATE_DIR is read at call time (tests patch it).
+    if args.new_run is not None:
+        try:
+            path = new_run(STATE_DIR)
+        except (RunsError, OSError) as exc:
+            _usage_exit("--new-run: " + _report_inline(exc)
+                        + "; nothing was used")
+        _print_stdout(path)
+        return
+    if args.prune_runs is not None:
+        days = (DEFAULT_PRUNE_DAYS if args.older_than is None
+                else args.older_than)
+        try:
+            code = prune_runs(STATE_DIR, days, delete=args.delete is not None)
+        except (RunsError, OSError) as exc:
+            _usage_exit("--prune-runs: " + _report_inline(exc)
+                        + "; nothing was deleted")
+        sys.exit(code)
     # Preserve relative CODEX_HOME semantics when execution moves to a scratch
     # cwd. No config file is edited and credentials are never copied.
     home = os.environ.get("CODEX_HOME")
@@ -3005,9 +3029,9 @@ def main():
             plan = prepare(directory, roles, body)
         except (OSError, ValueError) as exc:
             _usage_exit("--prepare: " + _report_inline(exc)
-                        + "; start over in a new private directory (if the "
-                        "inputs changed during capture, pause overlapping "
-                        "writers first).")
+                        + "; start over in a new directory from `--new-run` "
+                        "(if the inputs changed during capture, pause "
+                        "overlapping writers first).")
         print(f"[codex-council] captured snapshot={plan['snapshot']['snapshot_id']} "
               f"files={len(plan['snapshot']['files'])} roles={len(roles)} "
               f"omitted={len(plan['snapshot']['omitted'])} version={_plugin_version()}")

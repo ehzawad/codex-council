@@ -6,9 +6,6 @@ in liveness_scenarios.py; this module pins the command's contract: what
 it refuses before creating anything, what it creates and with which mode,
 what it prints, what the supervisor's command line carries, and how the
 hidden supervisor entry refuses anything but --start's own handoff.
-
-Run from repo root:
-    python3 -m unittest discover -s tests -p 'test_*.py'
 """
 
 import contextlib
@@ -64,6 +61,11 @@ class StartCase(unittest.TestCase):
             CODEX_HOME=os.path.join(self.base, "codex-home"),
             FAKE_CODEX_PID_DIR=self.pid_dir,
         )
+        # In-process --start: the env's state dir, never the inherited one.
+        state = patch.object(codex_council, "STATE_DIR", os.path.join(
+            self.base, "state", "codex-council"))
+        state.start()
+        self.addCleanup(state.stop)
         self.run_dir = self.stage("run")
         self.addCleanup(self.stop_everything)
 

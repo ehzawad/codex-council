@@ -1,0 +1,148 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="408" height="978" viewBox="0 0 408 978" role="img">
+<title>One council, step by step</title>
+<desc>UML sequence diagram with lifelines You, Claude, Runner and run folder, and Codex workers. You ask Claude. Claude asks the runner for a new run, and the runner creates the run folder. Claude writes the brief into it and asks the runner to snapshot the files; the runner stores the snapshot and a copy per worker. Claude checks, then starts; the runner starts each worker on its own copy; each worker replies with evidence, which the runner saves to the run folder. Claude reads the results, checks freshness with the runner, weighs the evidence, and answers you.</desc>
+<style>
+text{font-family:"Helvetica Neue",Helvetica,Arial,"Liberation Sans","Nimbus Sans",sans-serif}
+rect,path,polygon,polyline,circle{stroke-width:1.5}
+.dash{stroke-dasharray:6 4}
+.title{font-size:18px;font-weight:700}
+.b{font-size:14px;font-weight:700}
+.t{font-size:14px;font-weight:400}
+.s{font-size:14px;font-weight:400}
+.c{font-size:14px;font-weight:400;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace}
+.n{font-size:14px;font-weight:700}
+text{fill:#1f2328}
+.s,.c,.n{fill:#59636e}
+.bg{fill:#f6f8fa;stroke:#d0d7de}
+.ln{fill:none;stroke:#59636e}
+.hd,.badge{fill:#59636e}
+.life{fill:none;stroke:#818b98;stroke-dasharray:5 5}
+.dot{fill:#1f2328}
+.ring{fill:none;stroke:#1f2328}
+.bt,.bd{fill:#f6f8fa}
+.k-plain{fill:#ffffff;stroke:#818b98}
+.k-you{fill:#ffffff;stroke:#59636e}
+.k-claude{fill:#ddf4ff;stroke:#0969da}
+.k-runner{fill:#fbefff;stroke:#8250df}
+.k-work{fill:#dafbe1;stroke:#1a7f37}
+.k-store{fill:#fff8c5;stroke:#9a6700}
+.k-warn{fill:#fff1e5;stroke:#bc4c00}
+.k-stop{fill:#ffebe9;stroke:#cf222e}
+.k-frame{fill:#f6f8fa;stroke:#818b98}
+@media (prefers-color-scheme: dark){
+text{fill:#f0f6fc}
+.s,.c,.n{fill:#9198a1}
+.bg{fill:#151b23;stroke:#3d444d}
+.ln{fill:none;stroke:#9198a1}
+.hd,.badge{fill:#9198a1}
+.life{fill:none;stroke:#656c76;stroke-dasharray:5 5}
+.dot{fill:#f0f6fc}
+.ring{fill:none;stroke:#f0f6fc}
+.bt,.bd{fill:#151b23}
+.k-plain{fill:#0d1117;stroke:#656c76}
+.k-you{fill:#0d1117;stroke:#9198a1}
+.k-claude{fill:#0c2d6b;stroke:#4493f8}
+.k-runner{fill:#271a3f;stroke:#ab7df8}
+.k-work{fill:#0f2d1a;stroke:#3fb950}
+.k-store{fill:#2e2410;stroke:#d29922}
+.k-warn{fill:#3d1d0b;stroke:#f0883e}
+.k-stop{fill:#3b1219;stroke:#f85149}
+.k-frame{fill:#151b23;stroke:#656c76}
+}
+</style>
+<rect class="bg" x="0.75" y="0.75" width="406.5" height="976.5" rx="14"/>
+<text x="24" y="40" class="title">One council, step by step</text>
+<circle class="ring" cx="40" cy="71" r="7"/>
+<path class="ring" d="M40,78 V94 M29,84 H51 M31,106 L40,94 L49,106"/>
+<text x="40" y="122" class="b" text-anchor="middle">You</text>
+<rect class="k-claude" x="78" y="70" width="80" height="56" rx="6"/>
+<text x="118" y="103.04" class="b" text-anchor="middle">Claude</text>
+<rect class="k-runner" x="168" y="70" width="124" height="56" rx="6"/>
+<text x="230" y="93.54" class="b" text-anchor="middle">Runner</text>
+<text x="230" y="112.54" class="s" text-anchor="middle">and run folder</text>
+<rect class="k-work" x="307" y="64" width="86" height="56" rx="6"/>
+<rect class="k-work" x="304" y="67" width="86" height="56" rx="6"/>
+<rect class="k-work" x="301" y="70" width="86" height="56" rx="6"/>
+<text x="344" y="93.54" class="b" text-anchor="middle">Codex</text>
+<text x="344" y="112.54" class="b" text-anchor="middle">workers</text>
+<polyline class="life" points="40,130 40,920"/>
+<polyline class="life" points="118,128 118,920"/>
+<polyline class="life" points="230,128 230,920"/>
+<polyline class="life" points="344,128 344,920"/>
+<polyline class="ln" points="40,169 110,169"/>
+<polygon class="hd" points="108,174 118,169 108,164"/>
+<rect class="bd" x="63.8" y="143.8" width="30.4" height="20.7" rx="3"/>
+<text x="79" y="158" class="s" text-anchor="middle">ask</text>
+<polyline class="ln" points="118,208 222,208"/>
+<polygon class="hd" points="220,213 230,208 220,203"/>
+<rect class="bd" x="143.11" y="182.8" width="61.77" height="20.7" rx="3"/>
+<text x="174" y="197" class="s" text-anchor="middle">new run</text>
+<polyline class="ln" points="230,228 252,228 252,244 239,244"/>
+<polygon class="hd" points="241,239 231,244 241,249"/>
+<rect class="bd" x="257" y="218.8" width="75.73" height="39.7" rx="3"/>
+<text x="260" y="233" class="s">create the</text>
+<text x="260" y="252" class="s">run folder</text>
+<polyline class="ln" points="118,314 222,314"/>
+<polygon class="hd" points="220,319 230,314 220,309"/>
+<rect class="bd" x="123.5" y="269.8" width="101.01" height="39.7" rx="3"/>
+<text x="174" y="284" class="s" text-anchor="middle">write the brief</text>
+<text x="174" y="303" class="s" text-anchor="middle">into the folder</text>
+<polyline class="ln" points="118,372 222,372"/>
+<polygon class="hd" points="220,377 230,372 220,367"/>
+<rect class="bd" x="139.19" y="327.8" width="69.63" height="39.7" rx="3"/>
+<text x="174" y="342" class="s" text-anchor="middle">snapshot</text>
+<text x="174" y="361" class="s" text-anchor="middle">the files</text>
+<polyline class="ln" points="230,392 252,392 252,408 239,408"/>
+<polygon class="hd" points="241,403 231,408 241,413"/>
+<rect class="bd" x="257" y="382.8" width="82.71" height="77.7" rx="3"/>
+<text x="260" y="397" class="s">store the</text>
+<text x="260" y="416" class="s">snapshot</text>
+<text x="260" y="435" class="s">and a copy</text>
+<text x="260" y="454" class="s">per worker</text>
+<polyline class="ln" points="118,514 222,514"/>
+<polygon class="hd" points="220,519 230,514 220,509"/>
+<rect class="bd" x="138.32" y="469.8" width="71.37" height="39.7" rx="3"/>
+<text x="174" y="484" class="s" text-anchor="middle">check,</text>
+<text x="174" y="503" class="s" text-anchor="middle">then start</text>
+<polyline class="ln" points="230,591 336,591"/>
+<polygon class="hd" points="334,596 344,591 334,586"/>
+<rect class="bd" x="239.56" y="527.8" width="94.87" height="58.7" rx="3"/>
+<text x="287" y="542" class="s" text-anchor="middle">start each</text>
+<text x="287" y="561" class="s" text-anchor="middle">worker on its</text>
+<text x="287" y="580" class="s" text-anchor="middle">own copy</text>
+<polyline class="ln dash" points="344,649 230,649"/>
+<polyline class="ln" points="240,644 230,649 240,654"/>
+<rect class="bd" x="245.65" y="604.8" width="82.69" height="39.7" rx="3"/>
+<text x="287" y="619" class="s" text-anchor="middle">replies and</text>
+<text x="287" y="638" class="s" text-anchor="middle">evidence</text>
+<polyline class="ln" points="230,669 252,669 252,685 239,685"/>
+<polygon class="hd" points="241,680 231,685 241,690"/>
+<rect class="bd" x="257" y="659.8" width="82.71" height="39.7" rx="3"/>
+<text x="260" y="674" class="s">save to the</text>
+<text x="260" y="693" class="s">run folder</text>
+<polyline class="ln" points="118,755 222,755"/>
+<polygon class="hd" points="220,760 230,755 220,750"/>
+<rect class="bd" x="142.24" y="710.8" width="63.53" height="39.7" rx="3"/>
+<text x="174" y="725" class="s" text-anchor="middle">read the</text>
+<text x="174" y="744" class="s" text-anchor="middle">results</text>
+<polyline class="ln" points="118,813 222,813"/>
+<polygon class="hd" points="220,818 230,813 220,808"/>
+<rect class="bd" x="137.01" y="768.8" width="73.97" height="39.7" rx="3"/>
+<text x="174" y="783" class="s" text-anchor="middle">check</text>
+<text x="174" y="802" class="s" text-anchor="middle">freshness</text>
+<polyline class="ln" points="118,833 140,833 140,849 127,849"/>
+<polygon class="hd" points="129,844 119,849 129,854"/>
+<rect class="bd" x="145" y="823.8" width="73.11" height="39.7" rx="3"/>
+<text x="148" y="838" class="s">weigh the</text>
+<text x="148" y="857" class="s">evidence</text>
+<polyline class="ln dash" points="118,900 40,900"/>
+<polyline class="ln" points="50,895 40,900 50,905"/>
+<rect class="bd" x="50.73" y="874.8" width="56.54" height="20.7" rx="3"/>
+<text x="79" y="889" class="s" text-anchor="middle">answer</text>
+<polyline class="ln" points="24,946 56,946"/>
+<polygon class="hd" points="54,951 64,946 54,941"/>
+<text x="74" y="951" class="s">request</text>
+<polyline class="ln dash" points="160,946 200,946"/>
+<polyline class="ln" points="190,951 200,946 190,941"/>
+<text x="210" y="951" class="s">reply</text>
+</svg>

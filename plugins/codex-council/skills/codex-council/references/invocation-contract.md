@@ -25,7 +25,13 @@ question/objective gets a new id. `task_id` must fully match
 invocation. It is not a runner-scored confidence or a model ranking.
 
 `source_root` is an absolute directory; it and the run directory must be
-separate, non-overlapping trees. Include entries are normalized relative paths
+separate, non-overlapping trees. A `--new-run` directory lives under
+`$XDG_STATE_HOME` (by default `~/.local/state`), so `--prepare` refuses a
+`source_root` such as `$HOME` that contains it and names the fix: a `source_root`
+that does not contain it, or XDG_STATE_HOME set outside it (see
+[runtime-behavior.md](runtime-behavior.md#run-directories)).
+
+Include entries are normalized relative paths
 without `..`, absolute names, backslashes, or traversed symbolic links.
 With `include` omitted, Git supplies tracked and non-ignored untracked filenames;
 the runner reads their **current working bytes**, including staged/unstaged edits
@@ -102,15 +108,18 @@ Workspace-write permits experimental writes to that role's scratch cwd; addition
 writable roots and implicit /tmp/TMPDIR grants are removed. Execution is
 non-interactive with approval_policy=never. Every sandboxed run passes
 `--ignore-rules`, because a user or project execpolicy rule with `decision="allow"`
-runs its command outside the sandbox. Memories are off for every policy. When
-external_tools=deny, `notify` is emptied (it runs a host program after each turn)
-and MCP names are enumerated and disabled by bare name; a server name outside
-`[A-Za-z0-9_-]` cannot be addressed by a Codex `-c` key and blocks the run. The
-disabled features are the default-on surfaces of codex-cli 0.163, not a promise
-about tools a later Codex adds. Effective configuration is read again with
-the requested restrictions, and unknown/overridden settings, or managed
-requirements that forbid them, block execution. No automatic fallback to bypass
-exists.
+runs its command outside the sandbox. Memories are off for every policy, and
+`project_root_markers=[]` makes the role's scratch cwd Codex's project root, so no
+AGENTS.md or `.codex` layer from a Git repository above the run directory (a
+dotfiles home, say) reaches a worker. When external_tools=deny, `notify` is
+emptied (it runs a host program after each turn) and MCP names are enumerated and
+disabled by bare name; a server name outside `[A-Za-z0-9_-]` cannot be addressed
+by a Codex `-c` key and blocks the run. The disabled features are the default-on
+surfaces of codex-cli 0.163, not a promise about tools a later Codex adds.
+Effective configuration is read again with the requested restrictions, and
+unknown/overridden settings (a layer that keeps project root markers, say), or
+managed requirements that forbid them, block execution. No automatic fallback to
+bypass exists.
 
 **Limits:** config/read is evidence of configuration, not an OS attestation of a
 later worker. Configuration can change between checking and exec. The command
@@ -128,7 +137,8 @@ owner-read-only baseline, creates independent writable per-role copies and write
 `run.json`. It checks content and metadata before/after copying and refuses observed
 change. Pause overlapping writers for this interval. This is **observed stable**,
 not an atomic snapshot in the presence of arbitrary concurrent writers. A failed
-capture consumes its run directory; never repair/reuse it.
+capture consumes its run directory; never repair or reuse it, but allocate a new
+one with `--new-run`.
 
 The backend is copy-based for Git and non-Git projects. No shared Git metadata,
 hardlinks, automatic commits, or worktree/resume incompatibility. A clean-HEAD
@@ -144,8 +154,11 @@ at any depth, matched case-insensitively) are omitted even when an include selec
 them and recorded in `snapshot.omitted`; the brief carries any project rule a role
 needs. Native inheritance
 therefore means **the configuration Codex resolves in the execution cwd**, which
-may differ from the live project's configuration. Inspect the discovery summary;
-use a supported explicit pin when the user's intended model must be preserved.
+may differ from the live project's configuration. Discovery does not send
+`project_root_markers=[]`, so for a run inside another Git work tree its native
+values can come from a parent `.codex` layer the workers do not load. Inspect the
+discovery summary; use a supported explicit pin when the user's intended model
+must be preserved.
 The host Claude session's settings and user Codex configuration are never edited.
 
 Each role gets its own `model-snapshot.json` under the catalog path recorded in
@@ -171,10 +184,10 @@ gets a fresh discovery in the same cwd, retained as
 an attestation of a serving model or tier.
 
 Only model/effort/selection/service_tier may change after prepare. Changes to
-context, task, panel, instructions or execution policy require a fresh run
-directory. The logical source root and task id scope saved threads, not the scratch
-path. Session scope still follows CODEX_COUNCIL_SESSION_KEY, then host ids, then
-project scope.
+context, task, panel, instructions or execution policy require a fresh
+`--new-run` directory. The logical source root and task id scope saved threads,
+not the scratch path. Session scope still follows CODEX_COUNCIL_SESSION_KEY, then
+host ids, then project scope.
 
 ## Evidence and reconciliation
 

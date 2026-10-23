@@ -80,33 +80,25 @@ PS_TIMEOUT_SECS = 2
 # runner and a later reader always print the same start identity.
 _PS_ENV = {"LC_ALL": "C", "TZ": "UTC0"}
 
-# --follow timing: read err.log every FOLLOW_POLL_SECS, look at the runner
-# and the follower's own parent every FOLLOW_CHECK_SECS; neither a preparing
-# nor a dispatch line within FOLLOW_START_SECS means no council activity. No usable status.json
-# for STATUS_UNUSABLE_WARN_SECS after dispatch (or after its last usable
-# read) is reported once. A tick older than TICK_WARN_SECS while the runner
-# is present is reported once; at TICK_GIVE_UP_SECS the follower stops
-# (exit 4).
-FOLLOW_POLL_SECS = 0.5
-FOLLOW_CHECK_SECS = 2
-FOLLOW_START_SECS = 120
+# --follow timing.
+FOLLOW_POLL_SECS = 0.5  # err.log reads
+FOLLOW_CHECK_SECS = 2  # runner and own-parent checks
+FOLLOW_START_SECS = 120  # no preparing/dispatch line by then: no activity
+# No usable status.json this long after dispatch or its last usable read:
+# reported once.
 STATUS_UNUSABLE_WARN_SECS = 30
-TICK_WARN_SECS = 120
-TICK_GIVE_UP_SECS = 300
-# A wall-clock jump this much larger than the monotonic advance between two
-# follower polls is a system suspend: tick age then counts from the resume.
+TICK_WARN_SECS = 120  # stale tick while present: reported once
+TICK_GIVE_UP_SECS = 300  # then exit 4
+# A wall-clock jump this much past the monotonic advance between polls is a
+# suspend: tick age counts from the resume.
 FOLLOW_SUSPEND_SLACK_SECS = 60
-# Follower exit codes: 0 = a terminal line (or terminal status) was seen,
-# 1 = stdout is gone, 2 = usage error, 3 = no council activity, 4 = the
-# runner is gone or stopped ticking, 5 = the follower's own parent is gone.
+# Follower exits: 0 terminal seen, 2 usage error, and these.
 FOLLOW_EXIT_STDOUT_GONE = 1
 FOLLOW_EXIT_NO_ACTIVITY = 3
-FOLLOW_EXIT_RUNNER_GONE = 4
+FOLLOW_EXIT_RUNNER_GONE = 4  # gone or stopped ticking
 FOLLOW_EXIT_PARENT_GONE = 5
-# After dispatch, while the runner is alive and ticking, a follower that has
-# relayed nothing for FOLLOW_KEEPALIVE_SECS prints one `still running` line
-# naming at most KEEPALIVE_ROLES active roles. Each line is a Monitor event
-# that wakes Claude, so a long, quiet council still shows progress.
+# Quiet this long after dispatch (runner alive and ticking): one `still
+# running` line naming at most KEEPALIVE_ROLES roles, so Monitor wakes Claude.
 FOLLOW_KEEPALIVE_SECS = 600
 KEEPALIVE_ROLES = 5
 # The runner's role-id grammar (codex_council.ROLE_ID_PATTERN): only ids of
@@ -156,8 +148,9 @@ FOLLOW_ROUTINE_PATTERN = re.compile(
 # directory", never chmod or mkdir. --freshness (codex_council.main) uses
 # it too.
 RUN_DIR_RECOVERY = (
-    "Recovery: pass the exact absolute mktemp directory the council was "
-    "launched from (the directory holding roles.json, out.md, and err.log). "
+    "Recovery: pass the exact absolute run directory the council was "
+    "launched from (the one `--new-run` printed, holding roles.json, out.md, "
+    "and err.log). "
     "--follow, --status, --reap, and --cancel only read DIR/err.log, "
     "DIR/status.json, and the supervisor files, and --freshness only reads "
     "the capture records, DIR/request.json, and DIR/context.md; do not "
@@ -456,6 +449,8 @@ class RunView:
     tick_at: float | None
     roles: dict
     mode: str | None = None
+    # False when roles, a role record, or a recorded pid/pgid was unreadable.
+    roles_intact: bool = True
 
 
 def _int(value, minimum):
@@ -480,16 +475,17 @@ def _text(value):
     return value if isinstance(value, str) and value else None
 
 
-def read_status(path):
+def read_status(path, dir_fd=None):
     """status.json as a RunView, or None when there is no usable file.
 
     Unknown fields are ignored and a consumed field of the wrong type, or a
     number no float can hold, reads as unknown (None), so an unexpected
-    file degrades to fewer facts, never to a wrong claim.
+    file degrades to fewer facts, never to a wrong claim. `path` is
+    relative to `dir_fd` when one is given.
     """
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
-                     | os.O_CLOEXEC)
+                     | os.O_CLOEXEC, dir_fd=dir_fd)
         # Before fdopen, which raises on a directory and leaves the
         # descriptor open (this is polled).
         if not stat.S_ISREG(os.fstat(fd).st_mode):
@@ -506,10 +502,13 @@ def read_status(path):
     state = runner.get("state")
     roles = {}
     raw_roles = data.get("roles")
-    for role_id, raw in (raw_roles.items() if isinstance(raw_roles, dict)
-                         else ()):
+    intact = isinstance(raw_roles, dict)
+    for role_id, raw in (raw_roles.items() if intact else ()):
         if not isinstance(raw, dict):
+            intact = False
             continue
+        intact = intact and all(raw.get(key) is None or _int(raw[key], 2)
+                                for key in ("pid", "pgid"))
         roles[role_id] = {
             "state": raw.get("state") if raw.get("state") in ROLE_STATES
             else "unknown",
@@ -528,6 +527,7 @@ def read_status(path):
         roles=roles,
         mode=runner.get("mode") if runner.get("mode") in RUNNER_MODES
         else None,
+        roles_intact=intact,
     )
 
 
@@ -586,17 +586,17 @@ def supervisor_record(pid, lock_stat, version, epoch, started_at,
     }
 
 
-def read_supervisor(path):
+def read_supervisor(path, dir_fd=None):
     """supervisor.json as a SupervisorView, or None when unusable.
 
     Tolerant like read_status: a field of the wrong type reads as unknown
     (None). The file must also be a private regular file (not a symlink,
     this user's, mode 0600 or tighter), since --cancel signals the pid it
-    names.
+    names. `path` is relative to `dir_fd` when one is given.
     """
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
-                     | os.O_CLOEXEC)
+                     | os.O_CLOEXEC, dir_fd=dir_fd)
         # Before fdopen, as in read_status.
         if _private_stat_problem(os.fstat(fd), directory=False) is not None:
             os.close(fd)

@@ -1,0 +1,139 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="408" height="1062" viewBox="0 0 408 1062" role="img">
+<title>Life of a run</title>
+<desc>UML state machine of one run folder. Claude asks for a new run (Created). Claude writes the brief and the runner freezes your files (Snapshot taken). If the check fails, change model, effort or selection and check again, or leave the run for a new one. Once the check passes (Checked), start makes it Running. It ends Finished when the workers finish or the runner fails (--status reports done or aborted), Stopped when cancelled or shut down cleanly (interrupted), or Runner gone when the runner is killed or the power is lost (gone). A run is removed only when you prune old runs (30 days by default), whether it ended or was left unstarted.</desc>
+<style>
+text{font-family:"Helvetica Neue",Helvetica,Arial,"Liberation Sans","Nimbus Sans",sans-serif}
+rect,path,polygon,polyline,circle{stroke-width:1.5}
+.dash{stroke-dasharray:6 4}
+.title{font-size:18px;font-weight:700}
+.b{font-size:14px;font-weight:700}
+.t{font-size:14px;font-weight:400}
+.s{font-size:14px;font-weight:400}
+.c{font-size:14px;font-weight:400;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace}
+.n{font-size:14px;font-weight:700}
+text{fill:#1f2328}
+.s,.c,.n{fill:#59636e}
+.bg{fill:#f6f8fa;stroke:#d0d7de}
+.ln{fill:none;stroke:#59636e}
+.hd,.badge{fill:#59636e}
+.life{fill:none;stroke:#818b98;stroke-dasharray:5 5}
+.dot{fill:#1f2328}
+.ring{fill:none;stroke:#1f2328}
+.bt,.bd{fill:#f6f8fa}
+.k-plain{fill:#ffffff;stroke:#818b98}
+.k-you{fill:#ffffff;stroke:#59636e}
+.k-claude{fill:#ddf4ff;stroke:#0969da}
+.k-runner{fill:#fbefff;stroke:#8250df}
+.k-work{fill:#dafbe1;stroke:#1a7f37}
+.k-store{fill:#fff8c5;stroke:#9a6700}
+.k-warn{fill:#fff1e5;stroke:#bc4c00}
+.k-stop{fill:#ffebe9;stroke:#cf222e}
+.k-frame{fill:#f6f8fa;stroke:#818b98}
+@media (prefers-color-scheme: dark){
+text{fill:#f0f6fc}
+.s,.c,.n{fill:#9198a1}
+.bg{fill:#151b23;stroke:#3d444d}
+.ln{fill:none;stroke:#9198a1}
+.hd,.badge{fill:#9198a1}
+.life{fill:none;stroke:#656c76;stroke-dasharray:5 5}
+.dot{fill:#f0f6fc}
+.ring{fill:none;stroke:#f0f6fc}
+.bt,.bd{fill:#151b23}
+.k-plain{fill:#0d1117;stroke:#656c76}
+.k-you{fill:#0d1117;stroke:#9198a1}
+.k-claude{fill:#0c2d6b;stroke:#4493f8}
+.k-runner{fill:#271a3f;stroke:#ab7df8}
+.k-work{fill:#0f2d1a;stroke:#3fb950}
+.k-store{fill:#2e2410;stroke:#d29922}
+.k-warn{fill:#3d1d0b;stroke:#f0883e}
+.k-stop{fill:#3b1219;stroke:#f85149}
+.k-frame{fill:#151b23;stroke:#656c76}
+}
+</style>
+<rect class="bg" x="0.75" y="0.75" width="406.5" height="1060.5" rx="14"/>
+<rect class="k-frame" x="24" y="672" width="336" height="260" rx="16"/>
+<rect class="k-frame" x="24" y="64" width="360" height="403" rx="16"/>
+<text x="24" y="40" class="title">Life of a run</text>
+<circle class="dot" cx="106" cy="90" r="8"/>
+<rect class="k-plain" x="34" y="128" width="144" height="75" rx="14"/>
+<text x="106" y="151.54" class="b" text-anchor="middle">Created</text>
+<text x="106" y="170.54" class="s" text-anchor="middle">an empty</text>
+<text x="106" y="189.54" class="s" text-anchor="middle">private folder</text>
+<polyline class="ln" points="106,98 106,120"/>
+<polygon class="hd" points="101,118 106,128 111,118"/>
+<text x="116" y="118" class="s">Claude asks for a new run</text>
+<rect class="k-plain" x="34" y="275" width="144" height="56" rx="14"/>
+<text x="106" y="298.54" class="b" text-anchor="middle">Snapshot taken</text>
+<text x="106" y="317.54" class="s" text-anchor="middle">your files, frozen</text>
+<rect class="k-warn" x="234" y="275" width="150" height="113" rx="14"/>
+<text x="309" y="298.54" class="b" text-anchor="middle">Needs a fix</text>
+<text x="309" y="317.54" class="s" text-anchor="middle">change model,</text>
+<text x="309" y="336.54" class="s" text-anchor="middle">effort or selection,</text>
+<text x="309" y="355.54" class="s" text-anchor="middle">or leave it for</text>
+<text x="309" y="374.54" class="s" text-anchor="middle">a new run</text>
+<rect class="k-plain" x="34" y="393" width="144" height="56" rx="14"/>
+<text x="106" y="416.54" class="b" text-anchor="middle">Checked</text>
+<text x="106" y="435.54" class="s" text-anchor="middle">ready to start</text>
+<text x="368" y="86" class="n" text-anchor="end">Not started yet</text>
+<polyline class="ln" points="106,203 106,267"/>
+<polygon class="hd" points="101,265 106,275 111,265"/>
+<text x="116" y="225" class="s">Claude writes the brief;</text>
+<text x="116" y="244" class="s">the runner freezes your files</text>
+<polyline class="ln" points="178,295 226,295"/>
+<polygon class="hd" points="224,300 234,295 224,290"/>
+<text x="206" y="268.5" class="s" text-anchor="middle">check</text>
+<text x="206" y="287.5" class="s" text-anchor="middle">fails</text>
+<polyline class="ln" points="234,311 186,311"/>
+<polygon class="hd" points="188,306 178,311 188,316"/>
+<text x="206" y="326.2" class="s" text-anchor="middle">check</text>
+<text x="206" y="345.2" class="s" text-anchor="middle">again</text>
+<polyline class="ln" points="106,331 106,385"/>
+<polygon class="hd" points="101,383 106,393 111,383"/>
+<text x="116" y="381" class="s">check passes</text>
+<rect class="k-work" x="24" y="531" width="336" height="75" rx="14"/>
+<text x="192" y="554.54" class="b" text-anchor="middle">Running</text>
+<text x="192" y="573.54" class="s" text-anchor="middle">workers busy; replies</text>
+<text x="192" y="592.54" class="s" text-anchor="middle">arrive in the run folder</text>
+<polyline class="ln" points="106,449 106,523"/>
+<polygon class="hd" points="101,521 106,531 111,521"/>
+<text x="116" y="504" class="s">start</text>
+<text x="370" y="489" class="s" text-anchor="end">left unstarted:</text>
+<text x="370" y="508" class="s" text-anchor="end">you prune old runs too</text>
+<rect class="k-plain" x="36" y="710" width="138" height="75" rx="14"/>
+<text x="105" y="733.54" class="b" text-anchor="middle">Finished</text>
+<text x="105" y="752.54" class="s" text-anchor="middle">results kept</text>
+<text x="105" y="771.54" class="c" text-anchor="middle">done, aborted</text>
+<rect class="k-plain" x="210" y="710" width="138" height="75" rx="14"/>
+<text x="279" y="733.54" class="b" text-anchor="middle">Stopped</text>
+<text x="279" y="752.54" class="s" text-anchor="middle">work so far kept</text>
+<text x="279" y="771.54" class="c" text-anchor="middle">interrupted</text>
+<rect class="k-warn" x="123" y="841" width="138" height="75" rx="14"/>
+<text x="192" y="864.54" class="b" text-anchor="middle">Runner gone</text>
+<text x="192" y="883.54" class="s" text-anchor="middle">evidence kept</text>
+<text x="192" y="902.54" class="c" text-anchor="middle">gone</text>
+<text x="344" y="694" class="n" text-anchor="end">Ended</text>
+<polyline class="ln" points="105,606 105,702"/>
+<polygon class="hd" points="100,700 105,710 110,700"/>
+<rect class="bd" x="41" y="620.8" width="128.01" height="39.7" rx="3"/>
+<text x="105" y="635" class="s" text-anchor="middle">workers finish,</text>
+<text x="105" y="654" class="s" text-anchor="middle">or the runner fails</text>
+<polyline class="ln" points="279,606 279,702"/>
+<polygon class="hd" points="274,700 279,710 284,700"/>
+<rect class="bd" x="213.69" y="620.8" width="130.62" height="39.7" rx="3"/>
+<text x="279" y="635" class="s" text-anchor="middle">cancelled, or</text>
+<text x="279" y="654" class="s" text-anchor="middle">shut down cleanly</text>
+<polyline class="ln" points="192,606 192,833"/>
+<polygon class="hd" points="187,831 192,841 197,831"/>
+<rect class="bd" x="144.12" y="794.8" width="95.75" height="39.7" rx="3"/>
+<text x="192" y="809" class="s" text-anchor="middle">runner killed</text>
+<text x="192" y="828" class="s" text-anchor="middle">or power lost</text>
+<polyline class="ln" points="192,932 192,1002 361,1002"/>
+<polygon class="hd" points="359,1007 369,1002 359,997"/>
+<text x="202" y="952" class="s">you prune old runs</text>
+<text x="202" y="971" class="s">(30 days by default)</text>
+<polyline class="ln" points="380,467 380,983"/>
+<polygon class="hd" points="375,981 380,991 385,981"/>
+<circle class="ring" cx="380" cy="1002" r="11"/>
+<circle class="dot" cx="380" cy="1002" r="6.5"/>
+<text x="391" y="1034" class="b" text-anchor="end">Removed</text>
+</svg>

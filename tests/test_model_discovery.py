@@ -6,10 +6,6 @@ script's --discover mode as a subprocess. Both use the fake `codex` from
 tests/fake_codex.py on PATH (no network, no real Codex) and synthetic
 model ids only. Every fake-server test also asserts (as a cleanup) that
 discovery sent nothing but its five read-only methods.
-
-Lives outside the plugin subtree so end-user installs don't bundle it.
-Run from repo root:
-    python3 -m unittest discover -s tests -p 'test_*.py'
 """
 
 import contextlib
@@ -2207,7 +2203,7 @@ class DiscoverCommandTests(FakeCodexTestCase):
                 self.assertTrue(proc.stderr.startswith("--discover: "),
                                 proc.stderr)
                 self.assertIn(detail, proc.stderr)
-                self.assertIn("Run `mktemp -d` again", proc.stderr)
+                self.assertIn("Run `--new-run` again", proc.stderr)
                 self.assertEqual(proc.stdout, "")
         self.assertEqual(os.listdir(public), [])
         self.assertEqual(os.listdir(self.run_dir), [])

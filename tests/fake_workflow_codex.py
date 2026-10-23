@@ -38,7 +38,7 @@ def apply_codex_override(config, setting):
 
 def config(argv):
     value = {"model": "fixture-collaborator", "model_reasoning_effort": "brisk",
-             "model_provider": None,
+             "model_provider": None, "project_root_markers": [".git"],
              "mcp_servers": {os.environ.get("FAKE_WORKFLOW_MCP", "fixture-server"):
                              {"enabled": True}}}
     configured = set(value["mcp_servers"])
@@ -51,6 +51,12 @@ def config(argv):
         sys.exit(1)
     if os.environ.get("FAKE_WORKFLOW_POLICY_REFUSE"):
         value["sandbox_mode"] = "danger-full-access"
+    # A managed layer's project_root_markers (JSON), or "unreported".
+    markers = os.environ.get("FAKE_WORKFLOW_ROOT_MARKERS")
+    if markers == "unreported":
+        del value["project_root_markers"]
+    elif markers:
+        value["project_root_markers"] = json.loads(markers)
     return value
 
 

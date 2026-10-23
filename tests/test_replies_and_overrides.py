@@ -12,10 +12,6 @@ Unit tests import codex_council directly; end-to-end tests drive the REAL
 script as a subprocess with the fake `codex` from tests/fake_codex.py on
 PATH (no network, no real Codex) and an isolated XDG_STATE_HOME. Model ids
 are synthetic.
-
-Lives outside the plugin subtree so end-user installs don't bundle it.
-Run from repo root:
-    python3 -m unittest discover -s tests -p 'test_*.py'
 """
 
 import asyncio
