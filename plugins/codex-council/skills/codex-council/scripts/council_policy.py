@@ -149,6 +149,7 @@ def validate_observed(config: Any, policy: ExecutionPolicy,
         "sandbox_mode": "danger-full-access" if policy.sandbox == "bypass" else policy.sandbox,
         "approval_policy": "never",
         "features.memories": False,
+        "project_root_markers": [],
     }
     if policy.sandbox == "workspace-write":
         expected.update({

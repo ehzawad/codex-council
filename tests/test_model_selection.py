@@ -1147,6 +1147,8 @@ class PreflightPlanTests(unittest.TestCase):
                          side_effect=AssertionError("preflight discovered")),
             patch.object(council_workflow, "inspect_policy",
                          return_value={"overrides": []}),
+            patch.object(codex_council, "STATE_DIR",
+                         os.path.join(tmp.name, "state")),
         ):
             patcher.start()
             self.addCleanup(patcher.stop)

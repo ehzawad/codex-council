@@ -2864,6 +2864,11 @@ class CheckStagingDirTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         os.chmod(self.tmp.name, 0o700)
+        state = tempfile.TemporaryDirectory()  # never the inherited one
+        self.addCleanup(state.cleanup)
+        state_patcher = patch.object(codex_council, "STATE_DIR", state.name)
+        state_patcher.start()
+        self.addCleanup(state_patcher.stop)
         # Preflight requires codex on PATH; keep these tests hermetic
         # so they pass on codex-less machines.
         which_patcher = patch("shutil.which", return_value="/fake/bin/codex")

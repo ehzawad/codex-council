@@ -239,17 +239,21 @@ def _codex_override(config, setting):
 def run_policy_server(argv, scenario):
     """The council's execution-policy probe (launched with -c overrides):
     config/read answers the scenario's "policy_config" (default: no MCP
-    servers) with the overrides applied, as Codex does. Logged apart from
-    discovery to FAKE_CODEX_POLICY_LOG; FAKE_CODEX_PID_DIR gets
-    policy-<pid>.pid."""
+    servers and Codex's default project_root_markers) with the overrides
+    applied, as Codex does. "policy_unreported" lists top-level keys a Codex
+    leaves out of its answer. Logged apart from discovery to
+    FAKE_CODEX_POLICY_LOG; FAKE_CODEX_PID_DIR gets policy-<pid>.pid."""
     _record(f"policy-{os.getpid()}.pid", str(os.getpid()))
-    config = json.loads(json.dumps(scenario.get("policy_config", {"mcp_servers": {}})))
+    config = json.loads(json.dumps(scenario.get(
+        "policy_config", {"mcp_servers": {}, "project_root_markers": [".git"]})))
     for index, arg in enumerate(argv[:-1]):
         if arg == "-c":
             _codex_override(config, argv[index + 1])
     # Simulate managed layers that outrank CLI flags, independently of what
     # the fixture advertised during discovery.
     config.update(scenario.get("policy_forced_config", {}))
+    for key in scenario.get("policy_unreported", ()):
+        config.pop(key, None)
     methods = {"initialize": {"result": {"codexHome": "/fake-codex-home"}},
                "config/read": {"result": {"config": config, "origins": {}}},
                "configRequirements/read": {"result": {

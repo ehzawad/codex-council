@@ -2064,7 +2064,8 @@ def _parse_args(argv):
             "0700 whatever the umask, and print its absolute path. It "
             "persists across reboots. An existing state or runs directory "
             "that is a symlink, foreign, or not private is refused (exit 2) "
-            "and never repaired. Cannot be combined with another command."
+            "and never repaired, as is a run path with a single quote or a "
+            "control character. Cannot be combined with another command."
         ),
     )
     parser.add_argument(
@@ -2073,10 +2074,17 @@ def _parse_args(argv):
             "Maintenance, only on request: list the direct children of the "
             "runs directory --new-run uses, and say for each whether it is "
             "eligible for deletion or why it is skipped. Eligible only: a "
-            "launched run whose status.json terminal state is older than "
-            "--older-than days, whose supervisor lock is the recorded file "
-            "and free (held through removal), and whose recorded runner and "
-            "codex process groups are verifiably gone. A process the runner "
+            "launched run whose status.json terminal state (or, for a run "
+            "left \"running\" by a runner that died, as at a reboot, its "
+            "last tick) is older than --older-than days, whose supervisor "
+            "lock is the recorded file and free (held through removal), and "
+            "whose recorded runner and codex process groups are verifiably "
+            "gone; or a run never launched (no supervisor, claim, status, or "
+            "launch output files) in which nothing changed (by any entry's "
+            "modification or status-change time) for more than --older-than "
+            "days and at least one day; it is renamed out of reach of --start "
+            "and --prepare and checked again before removal. A process the "
+            "runner "
             "never recorded (such as a tool command codex left running in "
             "the background) is not detected. Never follows a "
             "link, cancels, reaps, or touches saved threads. Exits 0 when "
@@ -2086,9 +2094,10 @@ def _parse_args(argv):
     )
     parser.add_argument(
         "--older-than", default=None, metavar="DAYS",
-        help=(f"With --prune-runs: a run's terminal status must be older "
-              f"than DAYS whole days, 0 to 999999999 (default "
-              f"{DEFAULT_PRUNE_DAYS})."),
+        help=(f"With --prune-runs: a run's terminal status (or last tick) "
+              f"must be older than DAYS whole days, 0 to 999999999 (default "
+              f"{DEFAULT_PRUNE_DAYS}); a run never launched must also be "
+              f"unchanged for at least one day."),
     )
     parser.add_argument(
         "--delete", action="store_const", const=True, default=None,

@@ -2,12 +2,16 @@
 
 Each council gets <state dir>/runs/<UTC YYYYMMDDTHHMMSSZ>-<16 hex>/, so a
 reboot that clears $TMPDIR keeps its evidence. Nothing is deleted
-automatically: --prune-runs lists, and with --delete removes, only finished
-runs whose recorded runner and codex workers are verifiably gone (a process
-the runner never recorded, such as a tool command codex left running in the
-background, is not detected). Every step works
-through pinned directory descriptors and never follows a link. Saved-thread
-state and role locks beside runs/ are never read or touched here.
+automatically: --prune-runs lists, and with --delete removes, only launched
+runs that ended (a terminal status, or "running" left by a runner that died,
+as at a reboot) whose recorded runner and codex workers are verifiably gone
+(a process the runner never recorded, such as a tool command codex left
+running in the background, is not detected), and directories never
+launched in which nothing changed for at least a day; those are renamed
+out of reach of --start and --prepare and checked again before removal.
+Every step works through pinned directory descriptors and never follows a
+link. Saved-thread state and role locks beside runs/ are never read or
+touched here.
 """
 
 import fcntl
@@ -18,7 +22,9 @@ import stat
 import time
 
 from council_common import (
+    LAUNCH_OUTPUTS,
     SUPERVISOR_FILENAME,
+    SUPERVISOR_FILES,
     SUPERVISOR_LOCK_FILENAME,
     _print_stdout,
     _private_stat_problem,
@@ -42,12 +48,26 @@ PLAN_FILENAME = "run.json"  # council_workflow.PLAN_FILE
 # whose removal stopped partway is still recognised on the next prune.
 CONTROL_RECORDS = (PLAN_FILENAME, SUPERVISOR_LOCK_FILENAME,
                    SUPERVISOR_FILENAME, STATUS_FILENAME)
+EXECUTION_CLAIM_FILENAME = "execution.claim"  # codex_council's constant
+# Any of these means a launch began, so the directory is never "never launched".
+LAUNCH_RECORDS = (*SUPERVISOR_FILES, EXECUTION_CLAIM_FILENAME,
+                  STATUS_FILENAME, *LAUNCH_OUTPUTS)
+# A run never launched also waits this long whatever --older-than says, so a
+# prune never races a --prepare in progress.
+NEVER_LAUNCHED_FLOOR_DAYS = 1
+# A run never launched is renamed to this prefix + its name while removed.
+SET_ASIDE = ".pruning-"
+INTERRUPTED = "interrupted (runner gone)"
 _DIR_FLAGS = (os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
               | os.O_CLOEXEC)
 _FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
 # Recovery for an unusable state or runs directory: never repaired here.
 _MOVE_ASIDE = ("it is not changed. Move it aside or point XDG_STATE_HOME at "
                "an owned private directory")
+# The skill passes the run path inside single quotes, on one line.
+_UNQUOTABLE = ("contains a single quote or a control (or other unprintable) "
+               "character; the skill passes the run path in single quotes, so "
+               "point XDG_STATE_HOME at a path without them")
 # A state directory whose only problem is its mode (it holds saved threads).
 _STATE_MODE = ("it is not changed. It also holds saved threads and role "
                "locks, which moving it aside would discard: chmod 700 it (as "
@@ -65,7 +85,7 @@ class PruneError(Exception):
 
 # Descriptor-relative open/stat/mkdir/unlink/rmdir and listing by fd;
 # without them nothing is allocated or deleted (fail closed).
-_FD_OPS = ({os.open, os.stat, os.unlink, os.rmdir, os.mkdir}
+_FD_OPS = ({os.open, os.stat, os.unlink, os.rmdir, os.mkdir, os.rename}
            <= os.supports_dir_fd and os.listdir in os.supports_fd
            and os.stat in os.supports_follow_symlinks)
 
@@ -102,6 +122,10 @@ def _private_dir_fd(name, dir_fd, label, shown, *, absent_ok=False):
     return fd
 
 
+def _unquotable(path):
+    return "'" in path or not path.isprintable()  # controls are unprintable
+
+
 def _make_missing(path):
     """Create the missing components of `path` 0700 (the caller's umask is
     0o077); existing ancestors are never touched."""
@@ -124,7 +148,9 @@ def new_run(state_dir):
     the I/O does); missing components are created 0700 whatever the umask.
     The state directory, runs/ and the new run must each be a real
     directory owned by the effective uid with no group or other bits;
-    anything else raises RunsError and nothing is chmodded.
+    anything else raises RunsError and nothing is chmodded. A real path
+    with a single quote or a control character is refused before anything
+    is created.
     """
     if not os.path.isabs(state_dir):
         raise RunsError(
@@ -135,6 +161,10 @@ def new_run(state_dir):
     if not _FD_OPS:
         raise RunsError("descriptor-relative directory operations are "
                         "unavailable on this platform")
+    real = os.path.realpath(state_dir)  # what the printed path starts with
+    if _unquotable(real):
+        raise RunsError(f"every run path would start with {real!r}, which "
+                        f"{_UNQUOTABLE}")
     previous = os.umask(0o077)
     try:
         _make_missing(state_dir)
@@ -182,11 +212,14 @@ def _allocate(runs_fd, runs_path):
             named = None
         if (stat.S_IMODE(opened.st_mode) != 0o700 or named is None
                 or (named.st_dev, named.st_ino)
-                != (opened.st_dev, opened.st_ino)
-                or not path.isprintable()):
+                != (opened.st_dev, opened.st_ino)):
             os.rmdir(name, dir_fd=runs_fd)
             raise RunsError(f"the new run directory {path!r} cannot be "
                             "named reliably; it was removed")
+        if _unquotable(path):  # resolved differently since the check
+            os.rmdir(name, dir_fd=runs_fd)
+            raise RunsError(f"the new run directory {path!r} {_UNQUOTABLE}; "
+                            "it was removed")
         return path
     finally:
         os.close(run_fd)
@@ -201,26 +234,80 @@ def _lstat_at(dir_fd, name):
         return None
 
 
-def _structure_problem(run_fd):
-    """Why this directory is not a launched run's directory, or None."""
-    present = {name: _lstat_at(run_fd, name)
-               for name in ("prepare.lock", *CONTROL_RECORDS)}
-    if present[PLAN_FILENAME] is None:
+def _structure(run_fd):
+    """(why skipped, None); (None, what) for a directory never launched; or
+    (None, None) for a launched run with every control record present and
+    private."""
+    present = {name: _lstat_at(run_fd, name) for name in
+               ("prepare.lock", *CONTROL_RECORDS, *LAUNCH_RECORDS)}
+    if all(present[name] is None for name in LAUNCH_RECORDS):
+        if present[PLAN_FILENAME] is not None:
+            return None, "prepared, never started"
         if present["prepare.lock"] is not None:
-            return "partially prepared (the capture did not finish)"
-        if not os.listdir(run_fd):
-            return "allocated but never used (empty)"
-        return "not prepared (no run.json)"
-    if (present[SUPERVISOR_LOCK_FILENAME] is None
-            and present[SUPERVISOR_FILENAME] is None):
-        return "prepared but never started"
+            return None, "the capture did not finish"
+        return None, "not prepared" if os.listdir(run_fd) else "empty"
     for name in CONTROL_RECORDS:
         st = present[name]
         if st is None:
-            return f"never dispatched or incomplete (no {name})"
+            return f"never dispatched or incomplete (no {name})", None
         if _private_stat_problem(st, directory=False) is not None:
-            return f"{name} is not a private regular file"
-    return None
+            return f"{name} is not a private regular file", None
+    return None, None
+
+
+def _days(n):
+    return f"{n} day" if n == 1 else f"{n} days"
+
+
+def _newest_change(run_fd):
+    """The newest mtime or ctime of anything below the run, and the run's
+    own mtime (its ctime moves when it is renamed). Read-only through
+    descriptors: links are not followed, other filesystems not entered."""
+    top = os.fstat(run_fd)
+    newest = top.st_mtime
+    frames = [(run_fd, os.listdir(run_fd))]
+    try:
+        while frames:
+            fd, pending = frames[-1]
+            if not pending:
+                frames.pop()
+                if frames:
+                    os.close(fd)
+                continue
+            entry = pending.pop()
+            seen = _lstat_at(fd, entry)
+            if seen is None:
+                continue
+            newest = max(newest, seen.st_mtime, seen.st_ctime)
+            if stat.S_ISDIR(seen.st_mode) and seen.st_dev == top.st_dev:
+                child = os.open(entry, _DIR_FLAGS, dir_fd=fd)
+                opened = os.fstat(child)
+                if (opened.st_dev, opened.st_ino) != (seen.st_dev, seen.st_ino):
+                    os.close(child)
+                    raise PruneError(f"{entry!r} changed while being checked")
+                frames.append((child, _listing(child)))
+    finally:
+        for frame in frames[1:]:
+            os.close(frame[0])
+    return newest
+
+
+def _quiet_problem(run_fd, days, now):
+    """(why not, None) or (None, age): nothing in the run may have changed
+    within max(days, the floor) days."""
+    try:
+        age = now - _newest_change(run_fd)
+    except PruneError:
+        return "changed while being checked", None
+    limit = max(days, NEVER_LAUNCHED_FLOOR_DAYS)
+    if age < 0:
+        return "its newest change is in the future", None
+    if age <= limit * 86400:
+        floor = (" (the one-day floor for runs never launched)"
+                 if days < limit else "")
+        return (f"last changed {age / 86400:.1f} days ago, not older than "
+                f"{_days(limit)}{floor}"), None
+    return None, age
 
 
 def _take_lock(run_fd, supervisor):
@@ -260,26 +347,33 @@ def _take_lock(run_fd, supervisor):
     return None, why
 
 
-def _finished_problem(view, supervisor, days, now):
-    """(why not, None) or (None, age in seconds) from status.json."""
+def _status_problem(view, supervisor, days, now):
+    """(why not, None) or (None, detail) from status.json. A terminal state
+    ages from its terminal time; "running" left by a runner that died
+    without one (a reboot) ages from its last tick, and _process_problem
+    then confirms that runner is gone."""
     if view is None:
         return f"no usable {STATUS_FILENAME}", None
-    if view.state not in TERMINAL_STATES:
-        return (f"{STATUS_FILENAME} says {view.state}: no terminal state was "
-                "recorded (still running or interrupted)"), None
+    if view.state in TERMINAL_STATES:
+        label, done, when = view.state, view.state, "terminal time"
+    elif view.state == "running":
+        label = f"{STATUS_FILENAME} says running, last tick"
+        done, when = f"{INTERRUPTED}, last tick", "tick time"
+    else:
+        return f"{STATUS_FILENAME} records no known runner state", None
     if view.tick_at is None:
-        return f"{STATUS_FILENAME} records no terminal time", None
+        return f"{STATUS_FILENAME} records no {when}", None
     if view.pid is None or view.pid != supervisor.pid or (
             view.identity is not None and view.identity != supervisor.identity):
         return (f"{STATUS_FILENAME} and {SUPERVISOR_FILENAME} name different "
                 "runners"), None
     age = now - view.tick_at
     if age < 0:
-        return "its terminal time is in the future", None
+        return f"its {when} is in the future", None
+    ago = f"{age / 86400:.1f} days ago"
     if age <= days * 86400:
-        return (f"{view.state} {age / 86400:.1f} days ago, not older than "
-                f"{days} days"), None
-    return None, age
+        return f"{label} {ago}, not older than {_days(days)}", None
+    return None, f"{done} {ago}"
 
 
 def _live_members(table, pgid):
@@ -387,10 +481,60 @@ def _remove_run(runs_fd, name, run_fd, run_st):
             os.close(frame[0])
 
 
+def _put_back(runs_fd, aside, name):
+    """Rename `aside` back to `name`: '' or where the run stays."""
+    try:
+        if _lstat_at(runs_fd, name) is None:
+            os.rename(aside, name, src_dir_fd=runs_fd, dst_dir_fd=runs_fd)
+            return ""
+        why = f"{name} exists again"
+    except OSError as e:
+        why = e.strerror or str(e)
+    return f"; it was left at {aside} ({_report_inline(why)})"
+
+
+def _remove_never_launched(runs_fd, name, run_fd, opened, never, days):
+    """(kind, why or None). Renamed out of reach first, so a --start or
+    --prepare that begins now finds nothing, then checked again through
+    its descriptor for one that began before; renamed back unless removed."""
+    why, again = _structure(run_fd)  # a launch during the walk: not moved
+    if why is not None or again != never:
+        return "skip", "changed while being checked"
+    aside = SET_ASIDE + name
+    if _lstat_at(runs_fd, aside) is not None:
+        return "skip", f"{aside} already exists"
+    os.rename(name, aside, src_dir_fd=runs_fd, dst_dir_fd=runs_fd)
+    try:
+        moved = _lstat_at(runs_fd, aside)
+        why, again = _structure(run_fd)
+        if (moved is None or why is not None or again != never
+                or (moved.st_dev, moved.st_ino)
+                != (opened.st_dev, opened.st_ino)):
+            why = "changed while being checked"
+        else:
+            why, _ = _quiet_problem(run_fd, days, time.time())
+    except OSError as e:
+        why = f"cannot be checked ({e.strerror or e})"
+    if why is not None:
+        return "skip", why + _put_back(runs_fd, aside, name)
+    try:
+        _remove_run(runs_fd, aside, run_fd, opened)
+    except (OSError, PruneError) as e:
+        return "failed", (f"{_report_inline(e)}; removal stopped and what "
+                          "remains is left in place"
+                          + _put_back(runs_fd, aside, name))
+    return "removed", None
+
+
 def _consider(runs_fd, name, root_dev, days, delete, now):
     """(kind, detail) for one entry of the runs root: kind is ignored,
     skip, eligible, removed or failed."""
     if not RUN_NAME.fullmatch(name):
+        original = name.removeprefix(SET_ASIDE)
+        if original != name and RUN_NAME.fullmatch(original):
+            return "skip", (f"set aside by a prune that is removing it or "
+                            f"was stopped; rename it back to {original} to "
+                            "keep it (a later prune checks it again)")
         return "ignored", "not a --new-run directory name"
     seen = _lstat_at(runs_fd, name)
     if seen is None:
@@ -410,23 +554,33 @@ def _consider(runs_fd, name, root_dev, days, delete, now):
         opened = os.fstat(run_fd)
         if (opened.st_dev, opened.st_ino) != (seen.st_dev, seen.st_ino):
             return "skip", "changed while being checked"
-        why = _structure_problem(run_fd)
+        why, never = _structure(run_fd)
         if why is not None:
             return "skip", why
-        supervisor = read_supervisor(SUPERVISOR_FILENAME, dir_fd=run_fd)
-        if supervisor is None:
-            return "skip", f"no usable {SUPERVISOR_FILENAME}"
-        lock_fd, why = _take_lock(run_fd, supervisor)
-        if why is not None:
-            return "skip", why
-        # Validated with the lock held, and held through removal.
-        view = read_status(STATUS_FILENAME, dir_fd=run_fd)
-        why, age = _finished_problem(view, supervisor, days, now)
-        if why is None:
-            why = _process_problem(view, supervisor)
-        if why is not None:
-            return "skip", why
-        detail = f"{view.state} {age / 86400:.1f} days ago"
+        if never is not None:
+            label = f"never launched ({never})"
+            why, age = _quiet_problem(run_fd, days, now)
+            if why is not None:
+                return "skip", f"{label}, {why}"
+            detail = f"{label}, last changed {age / 86400:.1f} days ago"
+            if delete:
+                kind, why = _remove_never_launched(runs_fd, name, run_fd,
+                                                   opened, never, days)
+                return kind, detail if why is None else f"{label}, {why}"
+        else:
+            supervisor = read_supervisor(SUPERVISOR_FILENAME, dir_fd=run_fd)
+            if supervisor is None:
+                return "skip", f"no usable {SUPERVISOR_FILENAME}"
+            lock_fd, why = _take_lock(run_fd, supervisor)
+            if why is not None:
+                return "skip", why
+            # Validated with the lock held, and held through removal.
+            view = read_status(STATUS_FILENAME, dir_fd=run_fd)
+            why, detail = _status_problem(view, supervisor, days, now)
+            if why is None:
+                why = _process_problem(view, supervisor)
+            if why is not None:
+                return "skip", why
         if not delete:
             return "eligible", detail
         try:
@@ -444,10 +598,11 @@ def _consider(runs_fd, name, root_dev, days, delete, now):
 
 
 def prune_runs(state_dir, days, delete):
-    """--prune-runs: list (or with `delete` remove) finished runs older than
-    `days`; 0 when done, 1 when a removal failed partway. An unusable state
-    or runs directory raises RunsError (exit 2); an absent one has nothing
-    to prune. Never creates anything, cancels, reaps or follows a link."""
+    """--prune-runs: list (or with `delete` remove) ended runs older than
+    `days` and runs never launched older than max(`days`, 1); 0 when done,
+    1 when a removal failed partway. An unusable state or runs directory
+    raises RunsError (exit 2); an absent one has nothing to prune. Never
+    creates anything, cancels, reaps or follows a link."""
     if not os.path.isabs(state_dir):
         raise RunsError(f"no absolute state directory ({state_dir!r})")
     if not _FD_OPS:
@@ -490,6 +645,6 @@ def prune_runs(state_dir, days, delete):
     if counts.get("ignored"):
         summary += f", {counts['ignored']} ignored"
     tail = "" if delete else "; dry run: pass --delete to remove the eligible runs"
-    _print_stdout(f"[codex-council] prune: older than {days} days: "
+    _print_stdout(f"[codex-council] prune: older than {_days(days)}: "
                   f"{summary}{tail}")
     return 1 if counts.get("failed") else 0

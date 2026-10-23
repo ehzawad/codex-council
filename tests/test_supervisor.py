@@ -61,6 +61,11 @@ class StartCase(unittest.TestCase):
             CODEX_HOME=os.path.join(self.base, "codex-home"),
             FAKE_CODEX_PID_DIR=self.pid_dir,
         )
+        # In-process --start: the env's state dir, never the inherited one.
+        state = patch.object(codex_council, "STATE_DIR", os.path.join(
+            self.base, "state", "codex-council"))
+        state.start()
+        self.addCleanup(state.stop)
         self.run_dir = self.stage("run")
         self.addCleanup(self.stop_everything)
 
