@@ -13,7 +13,7 @@ This module also owns the Role object the resolver works on, the
 `selection` object grammar of roles.json, the per-role orchestration shared
 by the preflight and the launch (_resolve_run_selections: authoring
 validation, then, at launch only, a fresh discovery in the role's own
-scratch cwd for an automatically selected role), and the
+execution cwd for an automatically selected role), and the
 text that reports each decision in err.log, out.md, reply files, and the
 preflight plan. An independently requested service tier is opt-in and checked
 against the resolved model; it is never selected or discarded by routing.
@@ -144,6 +144,7 @@ class Role:
     execution_overrides: tuple = ()
     task_id: str | None = None
     input_snapshot: str | None = None
+    worktree: dict | None = None  # a worktree role's bound repo, branch, base and root
     # Independent of model/effort provenance: only an explicit user request
     # may populate this field, including alongside a routed selection.
     service_tier: str | None = None
@@ -708,7 +709,8 @@ def _model_selection_lines(roles, routing_mode, state, reason):
     return [_log_inline(line) for line in lines]
 
 
-def _resolve_run_selections(roles, run_dir, routing_mode, at_launch, project_root=None):
+def _resolve_run_selections(roles, run_dir, routing_mode, at_launch, project_root=None,
+                            *, config_overrides=()):
     """Validate authoring, then attach every role's decision, for the
     preflight plan and the launch; returns (roles, launch snapshot or None).
     Callers pass one role, with its catalog directory as `run_dir`.
@@ -734,8 +736,10 @@ def _resolve_run_selections(roles, run_dir, routing_mode, at_launch, project_roo
     tier_requested = any(r.service_tier is not None for r in roles)
     automatic = routing_mode == "auto" and any(_is_automatic(r) for r in roles)
     if at_launch and (tier_requested or automatic):
-        launch = (_discover(routing_mode) if project_root is None else
-                  _discover(routing_mode, project_root=project_root))
+        options = {"project_root": project_root} if project_root is not None else {}
+        if config_overrides:
+            options["config_overrides"] = config_overrides
+        launch = _discover(routing_mode, **options)
     now = _utc_iso(time.time()) if at_launch else authoring_now
     resolved = []
     evidence = launch if at_launch else planning

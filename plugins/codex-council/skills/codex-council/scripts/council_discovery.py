@@ -127,7 +127,7 @@ def _model_routing_mode():
 def _execution_context(deadline=None, project_root=None):
     """The process context discovery shares with every worker.
 
-    In a prepared run `project_root` is the role's scratch workspace:
+    In a prepared run `project_root` is the role's execution cwd:
     discovery and the worker use that cwd, the same PATH-resolved `codex`
     and environment, and no profile override, and the root is passed as
     config/read's cwd, the parameter that selects project config layers.
@@ -528,7 +528,7 @@ def _app_server_session(executable, deadline, cwd=None, config_overrides=()):
     """Spawn `codex app-server --listen stdio://` and yield its transport.
 
     Launched like a worker — the same PATH-resolved binary and environment,
-    the role's scratch cwd when `cwd` is given (a prepared run always gives
+    the role's cwd when `cwd` is given (a prepared run always gives
     it), no --profile — in its own process group, and
     always torn down (_stop_process_group) however the session ends.
     """
@@ -956,7 +956,7 @@ def _request_source(session, method, params, normalize, problems):
     return value
 
 
-def _observe_codex(deadline, project_root=None):
+def _observe_codex(deadline, project_root=None, *, config_overrides=()):
     """Run the discovery I/O; return raw observations for _build_snapshot.
 
     Sends only initialize/initialized, account/read, config/read,
@@ -986,8 +986,10 @@ def _observe_codex(deadline, project_root=None):
         problems.append("codex_version_unavailable")
     session = None
     try:
-        with _app_server_session(executable, deadline,
-                                 **({"cwd": project_root} if project_root is not None else {})) as session:
+        options = {"cwd": project_root} if project_root is not None else {}
+        if config_overrides:
+            options["config_overrides"] = config_overrides
+        with _app_server_session(executable, deadline, **options) as session:
             codex_home, problem = _normalize_initialize(session.request(
                 "initialize", {
                     "clientInfo": {
@@ -1205,7 +1207,7 @@ def _build_snapshot(*, snapshot_id, created_at, plugin_version, routing_mode,
     }
 
 
-def _discover(routing_mode, project_root=None):
+def _discover(routing_mode, project_root=None, *, config_overrides=()):
     """Run bounded, metadata-only model discovery; return the snapshot dict.
 
     Never raises (KeyboardInterrupt, and the termination signal the entry
@@ -1222,8 +1224,10 @@ def _discover(routing_mode, project_root=None):
     """
     deadline = time.monotonic() + DISCOVERY_TIMEOUT_SECS
     try:
-        observed = (_observe_codex(deadline) if project_root is None else
-                    _observe_codex(deadline, project_root=project_root))
+        options = {"project_root": project_root} if project_root is not None else {}
+        if config_overrides:
+            options["config_overrides"] = config_overrides
+        observed = _observe_codex(deadline, **options)
     except Exception as e:  # a discovery bug must never cost a council
         observed = {
             "context": dict(_EMPTY_DISCOVERY_CONTEXT),
@@ -1595,7 +1599,7 @@ def _discovery_summary(snapshot):
     return [_report_inline(line) for line in lines]
 
 
-def _discover_command(run_dir, project_root=None):
+def _discover_command(run_dir, project_root=None, *, config_overrides=()):
     """Discover for one role: write the snapshot into `run_dir` (the role's
     catalog directory) and print the summary. The public --discover RUNDIR
     validates the prepared run and calls this once per role.
@@ -1617,8 +1621,10 @@ def _discover_command(run_dir, project_root=None):
     )
     # A launched directory's planning snapshot is that council's evidence.
     _usage_exit_if_launched(run_dir, "--discover: ")
-    snapshot = (_discover(_model_routing_mode()) if project_root is None else
-                _discover(_model_routing_mode(), project_root=project_root))
+    options = {"project_root": project_root} if project_root is not None else {}
+    if config_overrides:
+        options["config_overrides"] = config_overrides
+    snapshot = _discover(_model_routing_mode(), **options)
     try:
         path = _write_snapshot(os.path.abspath(run_dir), snapshot)
     except Exception as e:

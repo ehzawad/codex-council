@@ -459,8 +459,9 @@ def overview() -> Diagram:
     d = Diagram(
         "overview", WIDTH, "How a council works",
         "You ask Claude. Claude decides, within your instructions, and has the runner "
-        "freeze a snapshot of your project. Each Codex worker works on its own copy of that "
-        "snapshot and never changes your live files. Replies and evidence go to the run "
+        "freeze a snapshot of your project. By default each Codex worker works on its own copy "
+        "of that snapshot; a worker may instead get its own Git worktree or, when you ask, "
+        "edit your live files. Replies and evidence go to the run "
         "folder, which keeps them and the snapshot across restarts; Claude reads the "
         "results and answers you. Optional, experimental notes of Claude's position can "
         "be kept beside Claude; they are never required.")
@@ -471,10 +472,10 @@ def overview() -> Diagram:
     claude = d.node(x, you.bottom + GAP, w,
                     ["*Claude", "decides, within your", "instructions"], "claude")
     snap = d.node(x, claude.bottom + GAP, narrow,
-                  ["*Frozen snapshot", "*of your project", "_workers never change",
-                   "_your live files"], "store", "store")
+                  ["*Frozen snapshot", "*of your project", "_workers edit your",
+                   "_live files only", "_when you ask"], "store", "store")
     workers = d.node(x, snap.bottom + GAP + 6, narrow - 10,
-                     ["*Codex workers", "_each on its", "_own copy"], "work", "stack")
+                     ["*Codex workers", "_each on its own", "_copy or worktree"], "work", "stack")
     folder = d.node(x, workers.bottom + GAP + 10, w,
                     ["*Run folder", "_holds the snapshot,", "_replies and evidence,",
                      "_even across restarts"], "store", "folder")
@@ -487,7 +488,8 @@ def overview() -> Diagram:
     d.line((down, claude.bottom), (down, snap.top))
     d.step(down + 10, between(claude, snap), 2, ["runner freezes", "a snapshot"])
     d.line((down, snap.bottom), (down, workers.top - 10))  # the back copy's edge
-    d.step(down + 10, between(snap, workers, workers.top - 10), 3, ["a copy per worker"])
+    d.step(down + 10, between(snap, workers, workers.top - 10), 3,
+           ["a copy per worker", "by default"])
     d.line((down, workers.bottom), (down, folder.top))
     d.step(down + 10, between(workers, folder), 4, ["replies and", "evidence"])
     d.line((up, folder.top + 8), (up, claude.bottom))  # the body, right of the tab
@@ -587,8 +589,9 @@ def council_sequence() -> Diagram:
         "UML sequence diagram with lifelines You, Claude, Runner and run folder, and Codex "
         "workers. You ask Claude. Claude asks the runner for a new run, and the runner "
         "creates the run folder. Claude writes the brief into it and asks the runner to "
-        "snapshot the files; the runner stores the snapshot and a copy per worker. Claude "
-        "checks, then starts; the runner starts each worker on its own copy; each worker "
+        "snapshot the files; the runner stores the snapshot and, by default, a copy per "
+        "worker. Claude checks, then starts; the runner starts each worker on its own copy, "
+        "or on a Git worktree, or, if you ask, on your live files; each worker "
         "replies with evidence, which the runner saves to the run folder. Claude reads the "
         "results, checks freshness with the runner, weighs the evidence, and answers you.")
     xs = [40, 118, 230, 344]
@@ -607,9 +610,10 @@ def council_sequence() -> Diagram:
         (runner, runner, ["create the", "run folder"]),
         (claude, runner, ["write the brief", "into the folder"]),
         (claude, runner, ["snapshot", "the files"]),
-        (runner, runner, ["store the", "snapshot", "and a copy", "per worker"]),
+        (runner, runner, ["store the", "snapshot", "and a copy", "per worker", "by default"]),
         (claude, runner, ["check,", "then start"]),
-        (runner, workers, ["start each", "worker on its", "own copy"]),
+        (runner, workers, ["start each", "worker on its", "own copy, or", "a Git worktree,",
+                           "or, if you ask,", "your live files"]),
         (workers, runner, ["replies and", "evidence"], reply),
         (runner, runner, ["save to the", "run folder"]),
         (claude, runner, ["read the", "results"]),

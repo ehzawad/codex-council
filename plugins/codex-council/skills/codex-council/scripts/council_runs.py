@@ -11,14 +11,18 @@ launched in which nothing changed for at least a day; those are renamed
 out of reach of --start and --prepare and checked again before removal.
 Every step works through pinned directory descriptors and never follows a
 link. Saved-thread state and role locks beside runs/ are never read or
-touched here.
+touched here. A removed run's Git worktrees are then deregistered from their
+repositories (only once their directories are gone, so Git deletes no files);
+their branches are always kept and listed.
 """
 
 import fcntl
+import json
 import os
 import re
 import secrets
 import stat
+import subprocess
 import time
 
 from council_common import (
@@ -226,6 +230,96 @@ def _allocate(runs_fd, runs_path):
 
 
 # ---------- --prune-runs ----------
+
+_WORKTREE_ROOT = re.compile(r"workspaces/[A-Za-z0-9_-]+\Z")  # council_workflow's layout
+_COMMIT = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")  # SHA-1 or SHA-256
+
+
+def _worktrees(run_fd):
+    """(repository, worktree root, branch, base) of each worktree role
+    run.json records; none for a copy-only, 1.4.0 or unreadable record."""
+    try:
+        fd = os.open(PLAN_FILENAME, _FILE_FLAGS, dir_fd=run_fd)
+    except OSError:
+        return []
+    try:
+        if _private_stat_problem(os.fstat(fd), directory=False) is not None:
+            return []
+        chunks = []
+        while chunk := os.read(fd, 1 << 20):
+            chunks.append(chunk)
+        plan = json.loads(b"".join(chunks))
+    except (OSError, ValueError, RecursionError):
+        return []
+    finally:
+        os.close(fd)
+    roles = plan.get("roles") if isinstance(plan, dict) else None
+    found = []
+    for binding in roles.values() if isinstance(roles, dict) else ():
+        worktree = binding.get("worktree") if isinstance(binding, dict) else None
+        if (isinstance(worktree, dict)
+                and all(isinstance(worktree.get(key), str)
+                        for key in ("repo", "root", "branch", "base"))
+                and _WORKTREE_ROOT.fullmatch(worktree["root"])
+                and _COMMIT.fullmatch(worktree["base"])):
+            found.append((worktree["repo"], worktree["root"], worktree["branch"],
+                          worktree["base"]))
+    return found
+
+
+def _git(repo, *args):
+    """Git without user/system config, fsmonitor or hooks; stdout, or None
+    on failure."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+    try:
+        proc = subprocess.run(
+            ["git", "-c", "core.fsmonitor=false", "-c", f"core.hooksPath={os.devnull}",
+             "-C", repo, *args], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, env=env, check=False)
+    except OSError:
+        return None
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def _commits(repo, branch, base):
+    """How much of a role's work its branch keeps: only commits survive."""
+    count = (_git(repo, "rev-list", "--count", f"{base}..refs/heads/{branch}")
+             if os.path.isdir(repo) else None)
+    if count is None or not count.strip().isdigit():
+        return "only its commits"
+    return f"{int(count)} commit{'s' * (int(count) != 1)} beyond its base"
+
+
+def _kept(worktrees):
+    """The dry-run note for a run with worktrees."""
+    return "".join(f"; keeps branch {_report_inline(branch)} in {_report_inline(repo)} "
+                   f"({_commits(repo, branch, base)}; uncommitted changes in its worktree "
+                   "are deleted with the run, and the worktree deregistered, on --delete)"
+                   for repo, _, branch, base in worktrees)
+
+
+def _deregister(worktrees, run_path):
+    """Deregister a removed run's worktrees; notes naming every kept branch."""
+    notes = []
+    for repo, root, branch, base in worktrees:
+        path = os.path.join(run_path, root)
+        kept = (f"kept branch {_report_inline(branch)} in {_report_inline(repo)} "
+                f"({_commits(repo, branch, base)}; uncommitted worktree changes were "
+                "deleted with the run)")
+        if not os.path.isdir(repo):
+            notes.append(f"; repository {_report_inline(repo)} is gone, so nothing was "
+                         f"deregistered; {kept}")
+        elif os.path.lexists(path):  # Git would delete what is there
+            notes.append(f"; {_report_inline(path)} still exists, so it was not "
+                         f"deregistered; {kept}")
+        elif _git(repo, "worktree", "remove", "--force", path) is not None:
+            notes.append(f"; deregistered worktree {_report_inline(path)}; {kept}")
+        else:
+            notes.append(f"; could not deregister worktree {_report_inline(path)} (`git "
+                         f"worktree prune` in {_report_inline(repo)} clears it); {kept}")
+    return "".join(notes)
+
 
 def _lstat_at(dir_fd, name):
     try:
@@ -526,9 +620,9 @@ def _remove_never_launched(runs_fd, name, run_fd, opened, never, days):
     return "removed", None
 
 
-def _consider(runs_fd, name, root_dev, days, delete, now):
-    """(kind, detail) for one entry of the runs root: kind is ignored,
-    skip, eligible, removed or failed."""
+def _consider(runs_fd, name, root_dev, days, delete, now, shown):
+    """(kind, detail) for one entry of the runs root `shown`: kind is
+    ignored, skip, eligible, removed or failed."""
     if not RUN_NAME.fullmatch(name):
         original = name.removeprefix(SET_ASIDE)
         if original != name and RUN_NAME.fullmatch(original):
@@ -557,6 +651,7 @@ def _consider(runs_fd, name, root_dev, days, delete, now):
         why, never = _structure(run_fd)
         if why is not None:
             return "skip", why
+        worktrees = _worktrees(run_fd)
         if never is not None:
             label = f"never launched ({never})"
             why, age = _quiet_problem(run_fd, days, now)
@@ -566,6 +661,8 @@ def _consider(runs_fd, name, root_dev, days, delete, now):
             if delete:
                 kind, why = _remove_never_launched(runs_fd, name, run_fd,
                                                    opened, never, days)
+                if kind == "removed":
+                    detail += _deregister(worktrees, os.path.join(shown, name))
                 return kind, detail if why is None else f"{label}, {why}"
         else:
             supervisor = read_supervisor(SUPERVISOR_FILENAME, dir_fd=run_fd)
@@ -582,13 +679,13 @@ def _consider(runs_fd, name, root_dev, days, delete, now):
             if why is not None:
                 return "skip", why
         if not delete:
-            return "eligible", detail
+            return "eligible", detail + _kept(worktrees)
         try:
             _remove_run(runs_fd, name, run_fd, opened)
         except (OSError, PruneError) as e:
             return "failed", (f"{_report_inline(e)}; removal stopped and "
                               "what remains is left in place")
-        return "removed", detail
+        return "removed", detail + _deregister(worktrees, os.path.join(shown, name))
     except OSError as e:
         return "skip", f"cannot be checked ({e.strerror or e})"
     finally:
@@ -630,7 +727,7 @@ def prune_runs(state_dir, days, delete):
         for name in sorted(os.listdir(runs_fd)):
             try:
                 kind, detail = _consider(runs_fd, name, root_dev, days,
-                                         delete, now)
+                                         delete, now, shown)
             except OSError as e:  # never "removed" after an error
                 kind = "failed" if delete else "skip"
                 detail = f"cannot be checked or removed ({_report_inline(e)})"

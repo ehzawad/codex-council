@@ -19,6 +19,9 @@ workspace-write in its own captured copy. Read-only is appropriate for inspectio
 network, native integrations and bypass require explicit authorization. A label
 such as “reviewer” never grants or revokes permissions. Separate scratch copies
 avoid overlapping file mutations but do not supply a complete OS security boundary.
+Where a writer runs is a separate choice: a copy by default, a worktree for writers
+that should not touch the user's tree, the live tree only on the user's request for
+direct edits; there is no writer limit, and live writers share one tree.
 
 Choose models from each role's actual-cwd discovery snapshot. A syntactically
 valid explicit user pin wins and is forwarded unchanged, even when it is absent
@@ -52,9 +55,9 @@ must not name a model whose advertised retirement has passed, and native_effort 
 refused when the proven native model's advertised retirement has passed. These
 examples illustrate shapes; copy the actual role-specific snapshot_id and advertised
 values at runtime. Inheritance is omission, never literal inherit/default
-placeholders. Source `.codex` configuration is not copied into scratch, so inspect
-the actual native configuration rather than assuming source-layer defaults survived
-relocation.
+placeholders. Source `.codex` configuration is not copied into a copy role's
+workspace, so inspect the actual native configuration rather than assuming
+source-layer defaults survived relocation.
 
 Fast mode is a separate, explicit user request: add `"service_tier": "fast"` to a
 role only when the user asks. It may join any selection mode, or stand alone (no

@@ -26,10 +26,17 @@ coverage gap; do not fabricate a passing or failing empirical result.
 
 Pause overlapping managed writers only during preparation. Capture refuses observed
 changes, but cannot make arbitrary external writers atomic. After preparation,
-Claude can continue independent live work while roles experiment in their copies.
-The baseline and role contracts are frozen; changing the context or authorization
-requires another invocation. Model, effort, selection and service_tier fields
-alone can be filled after actual-cwd discovery.
+Claude can continue independent live work while copy roles experiment in their
+copies. Every run captures, whatever its workspaces: the capture fixes the inputs
+and the reference for diffs and freshness, not where a role runs. A worktree role
+starts from the capture on its own branch; a live role works in the working tree
+itself, which other writers, Claude included, may keep changing. A copy role sees no
+instruction files (AGENTS.md and the like) or project `.codex`; a worktree role sees
+them as committed at HEAD, without their uncommitted edits; a live role sees them as
+they are. State any project rule a role needs in the brief. The baseline and role
+contracts are frozen; changing the context or authorization requires another
+invocation. Model, effort, selection and service_tier fields alone can be filled
+after actual-cwd discovery.
 
 At reconciliation, --freshness checks the captured filesystem scope, the recorded
 omission list and the staged context, not the user's current intention or external

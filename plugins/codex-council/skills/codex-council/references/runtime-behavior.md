@@ -18,12 +18,12 @@ never passes the lock to Codex children. The detached launch is for explicit pro
 ownership and recovery, not a claim that all Claude Code hosts impose one universal
 background timeout. Local interactive and unattended hosts have different limits.
 
-A launch publishes a `preparing` activity line and status ticks between
-bounded metadata checks. This is not a claim that workers have started. Permissions
-are reobserved before inference; a failed or overridden restriction blocks dispatch.
-One role's cwd is its private captured copy. The fan-out, per-continuity-key locks
-(logical source, task, host-session scope and role), stall watchdog, and
-process-group cleanup are owned by the runner.
+A launch publishes a `preparing` activity line and status ticks between bounded
+metadata checks. This is not a claim that workers have started. Permissions are
+reobserved before inference; a failed or overridden restriction blocks dispatch. A
+role's cwd is its private copy, its Git worktree, or the live source_root. The
+fan-out, per-continuity-key locks (logical source, task, host-session scope and
+role), stall watchdog, and process-group cleanup are owned by the runner.
 
 ## Run directories
 
@@ -58,11 +58,12 @@ By default runs live under `$HOME`, with two consequences. `--prepare` refuses a
 `~/.local/state`) and says why: choose a `source_root` that does not contain it,
 or set XDG_STATE_HOME outside it in the environment Claude Code starts with (this
 also moves saved threads and role locks), then allocate a new run. And a run can
-sit inside a Git work tree (a dotfiles home), so every worker invocation and
-policy probe sends `-c project_root_markers=[]`: Codex takes the role's scratch
-cwd as the project root and loads no AGENTS.md or `.codex` layer from a parent
-repository. The probe must observe that empty list; a layer that keeps markers,
-or a Codex that does not report them, blocks execution.
+sit inside a Git work tree (a dotfiles home), so a copy role's discovery, policy
+probe and worker send `-c project_root_markers=[]`: Codex takes the copy as the
+project root and loads no AGENTS.md or `.codex` layer from a parent repository.
+The probe must observe that empty list; a layer that keeps markers, or a Codex that
+does not report them, blocks execution. Live and worktree roles resolve the project
+root natively.
 
 Writing the three input files is a host Write, which the skill does not
 pre-approve. A `dontAsk` or other unattended session needs a Write rule covering
@@ -118,7 +119,8 @@ directory; there is no direct launch.
 3. If gone and live recorded Codex groups remain, --reap signals only verified
    identities/groups. A held/replaced lock, conflicting identity or unreadable
    process table means unknown: do not signal by guessed PID.
-4. Preserve settled replies and raw attempt logs. Inspect partial effects before
+4. Preserve settled replies and raw attempt logs. Inspect partial effects (a live
+   role's in the working tree, a worktree role's in its worktree and branch) before
    deciding which unfinished contributions can be deliberately recovered. Use a
    new `--new-run` directory, recapture current context and inputs, and rerun only
    what is still useful. Never relaunch into the consumed directory.
@@ -132,6 +134,25 @@ hierarchy remain a documented process-cleanup limit. This is not a cluster OS or
 container runtime. A reboot ends the runner and its workers; the run directory
 persists, and --status then reports interrupted, or gone if the runner was killed
 outright.
+
+## Live and worktree writers
+
+A live role edits the user's working tree directly. result.json's top-level `live`
+section holds one shared `evidence/live.diff` for the run (changes observed in the
+tree since capture, by any writer), its files, `writers` and
+`changed_before_launch`; attribution is not per role. Inspect the tree itself
+(`git status`, `git diff`) alongside it. `--freshness` reports stale by design after
+live edits.
+
+A worktree role leaves its work in `workspaces/<key>` on its branch: its artifacts
+give `candidate.diff` and the worktree's head, checked-out branch, commit count and
+commits. Nothing is applied to the user's tree; merge or apply what you accept.
+
+`--cancel`, a signal or a reboot stops a live writer but does not undo edits already
+on disk: inspect the tree before deciding anything. Once a live or worktree writer
+has started, the result.json written after `--cancel` or a handled signal still
+records the live diff and worktree artifacts; a copy role's artifacts are inspected
+only when the council finished.
 
 ## Failures and safe replay
 
@@ -158,8 +179,10 @@ replayed automatically. Completed-turn shutdown stalls can keep a completed repl
 ## Files and privacy
 
 Inputs: request.json, roles.json, context.md. Capture: run.json, baseline/,
-`workspaces/<key>/`, `catalogs/<key>/`. Lifecycle: supervisor.lock, supervisor.json,
-status.json, err.log, out.md, replies/. Evidence: `evidence/<key>/` and result.json.
+`workspaces/<key>/` (a copy or a Git worktree; none for a live role),
+`catalogs/<key>/`. Lifecycle: supervisor.lock, supervisor.json, status.json,
+err.log, out.md, replies/. Evidence: `evidence/<key>/`, `evidence/live.diff` when a
+role is live, and result.json.
 Each `<key>` is the role key `run.json` records (a hashed key for ids over 32
 characters). Run directories, control/evidence files, and every scratch directory
 the capture creates are private whatever the umask, as are workspaces/, evidence/,
@@ -235,6 +258,14 @@ to `.pruning-<name>`, out of reach of `--start` and `--prepare`, and checked aga
 through its descriptor (same directory, still never launched, still quiet); any
 change, or a failed removal, renames it back. The first problem stops a removal:
 what remains is left in place and the line says `failed`, never `removed`.
+
+A run with worktree roles is removed the same way; then each worktree is
+deregistered from its repository with `git worktree remove --force` on the
+already-removed path, so Git deletes no files. A prune never deletes a branch:
+commits survive on the kept branch, while uncommitted worktree changes are deleted
+with the run. The dry run and the removal line say so and give each branch's commit
+count beyond its base; a worktree that could not be deregistered is named, and
+`git worktree prune` in its repository clears it.
 
 A `.pruning-<name>` entry remains only when renaming it back failed (the line says
 why, for example `<name>` exists again) or the prune was stopped midway; it may be

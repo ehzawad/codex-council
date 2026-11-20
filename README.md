@@ -9,12 +9,20 @@ A contribution can investigate, reproduce, test, research, compare alternatives,
 build an authorized candidate. One is often enough. There is no role catalog,
 model ranking, fixed panel size, peer-debate loop, or automatic per-turn hook.
 
+Each role runs in one of three [workspaces](#workspaces): a private **copy** of the
+captured inputs (the default), its own **Git worktree** on a new branch, or, when you
+ask, your **live** working tree. There is no writer limit. Live and worktree roles
+run on Codex's native harness, with the project's own AGENTS.md and `.codex`.
+**Full access** (no sandbox, network, Codex's own tools) is used only when you ask
+for it. Every role is asked to end its reply with a status line (ready, blocked on
+one question for you, or failed) that Claude uses to triage.
+
 ## Requirements
 
 | Component | Supported |
 |---|---|
 | Claude Code | 2.1.x, with plugin skills |
-| Codex CLI | codex-cli 0.163 or later, signed in |
+| Codex CLI | codex-cli 0.170 or later, signed in |
 | Python | 3.12 or later, on macOS or Linux |
 
 The skill speaks contract epoch 6. The runner uses only the standard library and
@@ -57,12 +65,13 @@ outside the installed plugin source (`plugins/codex-council`).
 
 ## How a council works
 
-![How a council works: you ask Claude; Claude, deciding within your instructions, has the runner freeze a snapshot of your project; each Codex worker works on its own copy; replies and evidence go to the run folder, which keeps them and the snapshot across restarts; Claude reads the results and answers you. A dashed note beside Claude marks optional, experimental notes of Claude's position, never required.](docs/diagrams/overview.svg)
+![How a council works: you ask Claude; Claude, deciding within your instructions, has the runner freeze a snapshot of your project; each Codex worker works on its own copy by default, or on its own Git worktree, and edits your live files only when you ask; replies and evidence go to the run folder, which keeps them and the snapshot across restarts; Claude reads the results and answers you. A dashed note beside Claude marks optional, experimental notes of Claude's position, never required.](docs/diagrams/overview.svg)
 
 Claude stays the orchestrator and decides, within your instructions. The runner is a
 standard-library Python CLI that captures inputs, launches one detached supervisor
 per run directory and records evidence; every contribution is a `codex exec` worker
-in its own scratch copy. The dashed note is an optional
+in its own copy by default, in its own Git worktree, or, when you ask, in your
+working tree. The dashed note is an optional
 [experiment](#optional-decision-receipts-experiment), not part of the plugin.
 
 | Part | What it is |
@@ -70,12 +79,12 @@ in its own scratch copy. The dashed note is an optional
 | Claude | Runs the `codex-council` skill: briefs each contribution, selects models, reconciles evidence. |
 | Runner | `codex_council.py`; each step is its own foreground command. |
 | Supervisor | One detached process per run: holds `supervisor.lock`, runs workers with bounded parallelism, records evidence. |
-| Codex workers | One `codex exec` per role, each in its own scratch copy of the snapshot. |
-| Run folder | The private run directory: inputs, snapshot, copies, catalogs, evidence, replies, `result.json`, `out.md`. |
+| Codex workers | One `codex exec` per role, each in its own copy of the snapshot by default. |
+| Run folder | The private run directory: inputs, snapshot, copies and worktrees, catalogs, evidence, replies, `result.json`, `out.md`. |
 
 ## One invocation
 
-![One council, step by step: a sequence diagram across You, Claude, the runner with its run folder, and the Codex workers. You ask; Claude has the runner create a new run folder, writes the brief into it and has the runner snapshot the files and store a copy per worker; Claude checks, then starts; the runner starts each worker on its own copy, and each replies with evidence, which the runner saves to the run folder; Claude reads the results, checks freshness with the runner, weighs the evidence, and answers you.](docs/diagrams/council-sequence.svg)
+![One council, step by step: a sequence diagram across You, Claude, the runner with its run folder, and the Codex workers. You ask; Claude has the runner create a new run folder, writes the brief into it and has the runner snapshot the files and store a copy per worker by default; Claude checks, then starts; the runner starts each worker on its own copy, or on a Git worktree, or, if you ask, on your live files, and each replies with evidence, which the runner saves to the run folder; Claude reads the results, checks freshness with the runner, weighs the evidence, and answers you.](docs/diagrams/council-sequence.svg)
 
 Each step is its own foreground command with `--skill-contract 6`:
 
@@ -83,8 +92,8 @@ Each step is its own foreground command with `--skill-contract 6`:
 |---|---|---|
 | New run | `--new-run` | Allocates a fresh private run directory and prints its absolute path. |
 | Brief | none | Claude writes `request.json`, `roles.json` and `context.md` there. |
-| Snapshot | `--prepare RUNDIR` | Observed-stable capture, read-only baseline, per-role copies, `run.json`. |
-| Models | `--discover RUNDIR` | Per-role metadata probe in that role's scratch cwd. Claude may then fill model, effort and selection from the snapshots; `service_tier` only on an explicit user request. |
+| Snapshot | `--prepare RUNDIR` | Observed-stable capture, read-only baseline, each role's workspace (a copy, a Git worktree or the live tree), `run.json`. |
+| Models | `--discover RUNDIR` | Per-role metadata probe in that role's execution cwd, with the overrides its worker sends. Claude may then fill model, effort and selection from the snapshots; `service_tier` only on an explicit user request. |
 | Check | `--check-staging-dir RUNDIR` | Contract, capture, selection authoring and execution policy. Exit 2 names the fix: model, effort, selection or `service_tier` fields are fixed in place; anything else needs a new run. |
 | Start | `--start RUNDIR` | Claims `supervisor.lock`, `err.log` and `out.md` and spawns the detached supervisor. |
 | Follow | `--follow RUNDIR` | Relays progress under Monitor; Claude reads settled replies as they arrive. |
@@ -102,7 +111,8 @@ evidence.
 Preparation captures **working bytes**, not just Git HEAD: dirty tracked files,
 staged/unstaged edits, deletions, and non-ignored untracked files. A partially staged
 file is captured as its working version. Non-Git capture uses explicit include paths
-and keeps empty directories; a context-only question may select no files. Pause
+and keeps empty directories; a context-only question with only copy roles may select
+no files. Pause
 overlapping writers during capture: the runner refuses observed changes but does
 not claim an atomic snapshot of arbitrary external writers. Paths that collide
 under Unicode canonical caseless matching, whether files, empty directories or
@@ -113,10 +123,10 @@ why. Choose a narrower `source_root`, or set `XDG_STATE_HOME` outside it in the
 environment Claude Code starts with (this also moves saved threads and role locks),
 then allocate a new run.
 
-Every contribution receives an independent copy of the same baseline, so Claude may
-continue live work afterward. Copies share no Git control metadata or hardlinks and
-avoid Codex's worktree/resume incompatibility. Git-dependent build commands can need
-additional setup; a missing prerequisite is a coverage gap, not a source bug.
+By default every contribution receives an independent copy of the same baseline, so
+Claude may continue live work afterward. Copies share no Git control metadata or
+hardlinks; Git-dependent build commands can need additional setup, and a missing
+prerequisite is a coverage gap, not a source bug.
 
 ## Input and execution contracts
 
@@ -126,32 +136,32 @@ from role labels:
 
 | Capability | Default | Scope |
 |---|---|---|
-| Command sandbox | read-only | workspace-write for scratch experiments; bypass requires an authorization and `network: true`. |
+| Command sandbox | read-only | workspace-write for experiments in the role's workspace; bypass requires an authorization and `network: true`. |
 | Command network | false | `true` requires workspace-write or bypass and an authorization; read-only always has it off. |
-| External tools | deny | Apps/plugins/browser/computer/hooks/subagents/web, notify, installer/remote-plugin features and configured MCP servers disabled; native integrations require an authorization. |
+| External tools | deny | Apps/plugins/browser/computer/hooks/subagents/web, memories, notify, installer/remote-plugin features and configured MCP servers disabled; native integrations require an authorization. |
 | Thread continuity | fresh | Explicit resume within logical source, task, host session and role. |
 | Required contribution | true | Missing execution/evidence leaves required coverage incomplete. |
+| Workspace | copy | `worktree` or `live` needs workspace-write or bypass and an authorization; see [Workspaces](#workspaces). |
 
-Preflight shows role count, model/effort plan, context bytes, watchdog, scratch
-scope, capabilities and continuity, and the launch reobserves execution policy
-before inference. Configuration evidence is not an attestation of a later process:
-managed settings, unsupported fields or an unknown tool inventory fail closed. No
-silent bypass or model hopping is used as recovery.
+Preflight shows role count, model/effort plan, context bytes, watchdog, write scope,
+each role's workspace, capabilities and continuity, and the launch reobserves
+execution policy before inference. Configuration evidence is not an attestation of a
+later process: managed settings, unsupported fields or an unknown tool inventory
+fail closed. No silent bypass or model hopping is used as recovery.
 
 Known credential, configuration, agent-instruction and cache paths met during
 selection are excluded and recorded in `run.json`; that list is neither a complete
 inventory of ignored paths nor a secret scan, so put any project rule a role needs
-in the brief. Native model inheritance means what Codex resolves in the **scratch
-execution cwd**, not the source project's `.codex/config.toml`. Every role has its
-own catalog snapshot; pin supported values explicitly when that distinction
-matters. Every worker invocation and policy probe also sends
-`-c project_root_markers=[]`: Codex takes the role's scratch copy as the project
-root and loads no AGENTS.md or `.codex` layer from a Git repository above it, which
+in the brief. Native model inheritance means what Codex resolves in the role's
+**execution cwd**; for a copy role that is not the source project's
+`.codex/config.toml`. Every role has its own catalog snapshot; pin supported values
+explicitly when that distinction matters. A copy role's discovery, policy probe and
+worker send `-c project_root_markers=[]`: Codex takes the copy as the project root
+and loads no AGENTS.md or `.codex` layer from a Git repository above it, which
 matters because runs live under `$HOME` (possibly a dotfiles repository). The probe
-must observe that empty list; otherwise execution is blocked. `--discover` reads
-configuration without that override, so for a run inside another Git work tree it
-can report native defaults from a layer the workers do not load; pin explicitly
-when that matters.
+must observe that empty list; otherwise execution is blocked. Per role,
+`--discover`, launch discovery, the policy probe and the worker send the same
+overrides, so `--discover` can exit 2 when a policy cannot be established.
 
 Fast mode is opt-in per role and only on an explicit user request: Claude sets that
 role's `service_tier` to `fast`, which costs more usage. Not every model has a Fast
@@ -159,6 +169,45 @@ tier, so preflight and launch check the tier against that role's own discovery a
 refuse with exit 2 when it is not advertised or cannot be proven. It is a
 per-invocation override; `~/.codex/config.toml` is never edited. Reports state what
 was sent, not which model or tier served a turn.
+
+### Workspaces
+
+| Workspace | Where the role works | What you get |
+|---|---|---|
+| `copy` (default) | A private copy of the snapshot in the run folder. | A candidate diff and the exact bytes; your files are untouched. |
+| `worktree` | A Git worktree in the run folder on its own new branch, `codex-council/<run>/<role>`, starting from what you see: uncommitted edits, untracked selected files and deletions. | A candidate diff, the branch and its commits; Claude merges or applies what it accepts. |
+| `live` | Your working tree. | Edits land directly; one shared live diff for the run, not attributed per role. |
+
+`worktree` and `live` need workspace-write or bypass and an authorization. Claude
+picks `worktree` for writers that should not touch your tree (several writers, or
+branch-based work) and `live` only when you ask for direct edits. A worktree needs a
+Git repository with a commit at HEAD; omitted paths such as AGENTS.md and `.codex`
+stay as committed. Branches are created only once every role is prepared, and an
+existing branch is refused. A worktree role with bypass may commit on its branch;
+one with workspace-write cannot. There is no writer limit: any number of live and
+worktree roles can share a run, you accept the collisions, and no lock spans runs.
+After a live run, review your tree (`git status`, `git diff`) alongside
+`result.json`; `--freshness` then reports stale by design.
+
+Live and worktree roles run on Codex's native harness: no `project_root_markers`
+override, so Codex resolves the project root, AGENTS.md and project `.codex` as if
+you ran codex there (a worktree's as committed at HEAD; Codex trusts a linked
+worktree like its main repository). With external tools denied, memories, the
+examined features, subagents (`agents.enabled=false`), web search, notify and MCP
+servers are off. Codex 0.170 removes its subagent tools only with
+`agents.enabled=false`, so on an older CLI restricted roles fail closed. With native
+external tools, Codex's own harness stays as you configured it.
+
+**Full access** is `sandbox: bypass`, `network: true`, `external_tools: native` and
+an authorization, used only when you ask for it. Codex then runs any command, uses
+the network, live web search and its own tools and subagents, and is told to work
+autonomously: implement, verify its own result, reconcile with other writers in its
+tree, and stop to report blocked on an unsettled design decision.
+
+Every role is asked to end with `Status: ready`, `Status: blocked: <question>` or
+`Status: failed: <reason>`. The runner records it as `reported_status` in
+`result.json` and `reported=` in the reply header; it is the role's own claim, not
+verification.
 
 ## Lifecycle and evidence
 
@@ -195,9 +244,9 @@ and a vanished recorded identity. `--cancel` stops a verified detached runner;
 
 | Output | Meaning |
 |---|---|
-| run.json / baseline / workspaces | Invocation identity, exact captured inputs and independent experimental copies. |
+| run.json / baseline / workspaces | Invocation identity, exact captured inputs, and each copy or Git worktree. |
 | catalogs/ | Model/configuration discovery in each actual execution cwd. |
-| evidence/ | Private raw stdout/stderr, attempt metadata, policy observations, launch snapshots and candidate artifacts. |
+| evidence/ | Private raw stdout/stderr, attempt metadata, policy observations, launch snapshots, candidate artifacts and, with live roles, the shared `live.diff`. |
 | result.json | Versioned observations, completeness and applicability, separate from collaborator interpretation. |
 | replies/ / out.md | Early role replies and the readable final report. |
 
@@ -207,18 +256,22 @@ Directory and file names under these folders use the role keys recorded in
 Command fields in JSONL are Codex-reported observations, not an independent OS audit.
 The runner never infers substantive correctness from a clean exit or agreement.
 Artifact manifests cover added, removed and changed regular files, executable-flag
-changes included; small text changes also get a candidate diff, while binary or
-large changes stay in scratch. Other permission changes and empty-directory changes
-are not recorded. A symlink or special file a role leaves is listed by path and
-kind, never followed or diffed. **Nothing automatically applies, commits, or
-publishes a candidate change to the live source.** Claude checks current intent,
-freshness, evidence and integration results before accepting it.
+changes included; small text changes also get a diff, while binary or large changes
+stay in the workspace. Other permission changes and empty-directory changes are not
+recorded. A symlink, special file, nested Git repository, submodule or unreadable
+entry a role leaves is listed by path and kind, never followed or diffed. **The
+runner never applies a patch or publishes a change:** a copy role's candidate stays
+in its copy and a worktree role's in its worktree and branch; only a live role, at
+your request, edits your working tree, and `result.json`'s `live` section records
+one shared diff for the run, its writers and what had already changed at launch.
+Claude checks current intent, freshness, evidence and integration results before
+accepting a change.
 
 Exit 0 requires a delivered report, at least one successful role and complete
 required contributions. Exit 1 covers no successful role, undelivered output, or
 incomplete required coverage/evidence; exit 2 is invalid input or refused policy.
 `--freshness` exits 0 unchanged, 1 stale/unknown (a moved or deleted source is
-unknown), 2 invalid contract. Workers start only from `--start` on a completed
+unknown; live edits make it stale by design), 2 invalid contract. Workers start only from `--start` on a completed
 capture, once per run directory.
 
 ## Cleaning up old runs
@@ -258,6 +311,11 @@ filesystems. A never-launched run is first renamed `.pruning-<name>` and checked
 again; a leftover `.pruning-<name>` is skipped by every later prune. Saved threads
 and role locks are never touched. Exit 0 means done, 1 a removal failed partway
 (what remains is left in place), 2 invalid arguments or an unsafe runs directory.
+
+A run with worktree roles is deleted the same way, and each worktree is then
+deregistered from its repository. A prune never deletes a branch: commits survive
+on the kept branch, while uncommitted changes in the worktree are deleted with the
+run. The dry run and the removal output say so and give each branch's commit count.
 Details:
 [Pruning runs](plugins/codex-council/skills/codex-council/references/runtime-behavior.md#pruning-runs).
 
@@ -304,7 +362,7 @@ See [runtime recovery](plugins/codex-council/skills/codex-council/references/run
 
 ## Security and known limits
 
-Scratch separation is not a whole-process security boundary. Codex command sandbox
+Workspace separation is not a whole-process security boundary. Codex command sandbox
 modes do not promise to hide HOME or constrain every external integration. An
 orchestrator-written authorization string is a declaration, not independently
 authenticated user consent. Same-user/bypass processes can tamper with files;
@@ -312,7 +370,7 @@ checksums and read-only modes detect mistakes, not all malicious activity. Use
 trusted inputs and verify actual sandbox denials on the target host.
 
 Excluded data, dependency state, Git metadata, ACLs/xattrs and remote services are
-not recreated. `--freshness` compares selected file bytes and executable flags,
+not recreated in a copy. `--freshness` compares selected file bytes and executable flags,
 empty directories, Git HEAD and selected index entries, the recorded omission list
 and the staged context; it does not check omitted file contents, user intent or
 external dependencies. Raw logs may hold sensitive tool output; keep them private.
@@ -359,8 +417,9 @@ CODEX_COUNCIL_LIVE_TESTS=1 python3 -m unittest tests.test_live_codex -v
 CODEX_COUNCIL_LIVE_WORKFLOW=1 python3 -m unittest discover -s tests -p 'test_live_workflow.py' -v
 ```
 
-`test_live_codex` checks model/effort routing, the `-c` overrides sent and thread
-continuity on trivial prompts. `test_live_workflow` checks that workspace-write
+`test_live_codex` checks model/effort routing, the `-c` overrides sent (each a
+configuration field the installed Codex accepts) and thread continuity on trivial
+prompts. `test_live_workflow` checks that workspace-write
 allows a scratch write but denies an external write and a command-network
 connection, and that read-only denies both writes, using temporary canaries and a
 host-local listener. A model that declines the probe is not a pass, and a refused

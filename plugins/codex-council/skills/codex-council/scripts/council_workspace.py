@@ -1,11 +1,13 @@
-"""Content-addressed, copy-backed experiment inputs; no agent or Git writes.
+"""Content-addressed, copy-backed experiment inputs; no agent writes.
 
 A capture is observed-stable, not an atomic snapshot of arbitrary external
 writers. Pause overlapping writers during capture. Symlinks, special files, and
 case/Unicode collisions among selected files, empty directories, and directory
 components are refused. Every directory a capture or copy creates is 0700
 whatever the process umask. Copies never share writable inodes with the
-source, and Git metadata/configuration is never borrowed by an experiment.
+source, and Git metadata/configuration is never borrowed by a copy. The only
+Git writes add (or roll back) a worktree role's own worktree and then put it on
+a new branch; no hook runs and no branch is reused, overwritten or deleted.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -68,6 +71,18 @@ def private_dir(path: str | Path) -> Path:
             or st.st_mode & 0o077):
         raise WorkspaceError(f"not an owned private directory: {path}")
     return path.resolve(strict=True)
+
+
+def contains_path(directory: Path, path: Path) -> bool:
+    """Check ancestry even when a filesystem accepts alternate case spellings."""
+    if path.is_relative_to(directory):
+        return True
+    identity = directory.stat()
+    for ancestor in (path, *path.parents):
+        with contextlib.suppress(FileNotFoundError):
+            if os.path.samestat(identity, ancestor.stat()):
+                return True
+    return False
 
 
 def private_mkdirs(path: Path) -> None:
@@ -274,18 +289,32 @@ def _hash_file(root: Path, name: str, destination: Path | None = None
              "executable": bool(before.st_mode & 0o111)}, _stamp(before))
 
 
-def _git(root: Path, *args: str) -> bytes | None:
+def _git_call(root: Path, *args: str) -> dict[str, Any]:
+    """Git without user/system config, fsmonitor or hooks."""
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+    return {"args": ["git", "--no-optional-locks", "-c", "core.fsmonitor=false",
+                     "-c", f"core.hooksPath={os.devnull}", "-C", str(root), *args],
+            "stdin": subprocess.DEVNULL, "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE, "env": env, "check": False}
+
+
+def _git(root: Path, *args: str) -> bytes | None:
+    """Bounded metadata read; None on failure."""
     try:
-        proc = subprocess.run(
-            ["git", "--no-optional-locks", "-c", "core.fsmonitor=false",
-             "-c", f"core.hooksPath={os.devnull}", "-C", str(root), *args],
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, env=env, timeout=15, check=False)
+        proc = subprocess.run(**_git_call(root, *args), timeout=15)
     except (OSError, subprocess.TimeoutExpired):
         return None
     return proc.stdout if proc.returncode == 0 else None
+
+
+def _git_write(root: Path, *args: str) -> subprocess.CompletedProcess[bytes] | None:
+    """A worktree add or removal: bounded by the checkout, like a capture's
+    copy, not by a deadline. None if Git could not run."""
+    try:
+        return subprocess.run(**_git_call(root, *args))
+    except OSError:
+        return None
 
 
 def _in_scope(name: str, include: list[str] | None, exclude: list[str]) -> bool:
@@ -328,22 +357,45 @@ def _walk(root: Path, start: str, exclude: list[str],
     Directories holding no selected entry are added to `empty`. A symlink or
     special file is refused (naming the exclude fix when `hints`) unless `special`
     is a dict; then it is recorded there by kind and never opened, followed
-    or descended."""
+    or descended, an entry that vanishes while listed is absent, and one that
+    cannot be read or is replaced is recorded instead of ending the walk."""
     selected: set[str] = set()
     empty = set() if empty is None else empty
+    if special is not None and start != "." and (reason := _omission(start, exclude)):
+        omitted[start] = reason
+        return selected
+
+    def unlisted(name: str, exc: OSError) -> bool:
+        """Inspection only: record an entry that vanished, cannot be read or
+        was replaced; False when it is now absent."""
+        tolerated = (isinstance(exc, (FileNotFoundError, PermissionError))
+                     or exc.errno in LINK_ERRNOS)
+        if special is None or not tolerated:
+            raise exc
+        if isinstance(exc, FileNotFoundError):
+            return False
+        special[name] = ("unreadable" if isinstance(exc, PermissionError)
+                         else "changed-during-inspection")
+        return True
 
     def visit(parent: int, leaf: str, name: str) -> bool:
         reason = _omission(name, exclude)
         if reason:
             omitted[name] = reason
             return False
-        st = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
+        try:
+            st = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
+        except OSError as exc:
+            return unlisted(name, exc)
         if stat.S_ISREG(st.st_mode):
             selected.add(name)
             return True
         if stat.S_ISDIR(st.st_mode):
-            child = os.open(leaf, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                            dir_fd=parent)
+            try:
+                child = os.open(leaf, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                dir_fd=parent)
+            except OSError as exc:
+                return unlisted(name, exc)
             try:
                 found = False
                 for entry in os.listdir(child):
@@ -366,21 +418,37 @@ def _walk(root: Path, start: str, exclude: list[str],
                 visit(directory, entry, entry)
         else:
             parts = PurePosixPath(relative_path(start)).parts
-            try:
-                for part in parts[:-1]:
+            for depth, part in enumerate(parts[:-1], 1):
+                try:
                     child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                                     dir_fd=directory)
-                    os.close(directory)
-                    directory = child
-            except OSError as exc:
-                if exc.errno not in LINK_ERRNOS:
-                    raise
-                # Exclusions are matched below this descent, so the fix is
-                # the include path itself.
-                fix = "; name it in include by a path through real directories"
-                raise WorkspaceError("selected input or a directory in its path is a "
-                                     f"symlink or not a directory: {start}"
-                                     f"{fix if hints else ''}") from None
+                except OSError as exc:
+                    if special is not None:
+                        ancestor = "/".join(parts[:depth])
+                        if exc.errno not in LINK_ERRNOS:
+                            unlisted(ancestor, exc)
+                            return selected
+                        try:
+                            mode = os.stat(part, dir_fd=directory,
+                                           follow_symlinks=False).st_mode
+                        except OSError as again:
+                            unlisted(ancestor, again)
+                            return selected
+                        if not stat.S_ISREG(mode):  # a directory again: replaced meanwhile
+                            special[ancestor] = (
+                                "changed-during-inspection" if stat.S_ISDIR(mode)
+                                else "symlink" if stat.S_ISLNK(mode) else "special-file")
+                        return selected
+                    if exc.errno not in LINK_ERRNOS:
+                        raise
+                    # Exclusions are matched below this descent, so the fix
+                    # is the include path itself.
+                    fix = "; name it in include by a path through real directories"
+                    raise WorkspaceError("selected input or a directory in its path is a "
+                                         f"symlink or not a directory: {start}"
+                                         f"{fix if hints else ''}") from None
+                os.close(directory)
+                directory = child
             visit(directory, parts[-1], start)
     finally:
         os.close(directory)
@@ -396,11 +464,16 @@ def inventory(root: Path, include: list[str] | None, exclude: list[str], *,
     Git's ignore rules and, like Git, lists files only. It refuses, by name,
     a submodule (populated, empty or missing), an untracked nested
     repository, and a symlink or special file it is not told to exclude.
-    `special` is passed to _walk; `portable=False` skips the collision check
+    With `special`, selected links, special files, nested repositories,
+    submodules, unreadable entries and files that change while inspected are
+    recorded by kind, and missing entries represent deletions. The selected
+    root must still be a directory. `portable=False` skips the collision check
     for output that is not a capture; `hints=False` leaves the request.json
     fix out of refusals, for a run already prepared from that request."""
     omitted: dict[str, str] = {}
     empty: set[str] = set()
+    if special is not None and not stat.S_ISDIR(root.lstat().st_mode):
+        raise WorkspaceError(f"artifact root is not a directory: {root}")
 
     def fix(name: str) -> str:
         return _exclude_fix(name) if hints else ""
@@ -447,6 +520,7 @@ def inventory(root: Path, include: list[str] | None, exclude: list[str], *,
             parts = PurePosixPath(name).parts
             reason = _omission(name, exclude) or (
                 _omission(f"{name}/", exclude) if nested else None)
+            blocked = False
             for depth in range(1, len(parts)):
                 if reason:
                     break
@@ -454,31 +528,64 @@ def inventory(root: Path, include: list[str] | None, exclude: list[str], *,
                 reason = omitted.get(parent)
                 if reason or parent in real_dirs:
                     continue
-                if not os.path.islink(root / parent):
+                try:
+                    mode = (root / parent).lstat().st_mode
+                except (FileNotFoundError, NotADirectoryError):
+                    blocked = True
+                    break
+                except PermissionError:
+                    if special is None:
+                        raise
+                    special[parent] = "unreadable"
+                    blocked = True
+                    break
+                if stat.S_ISDIR(mode):
                     real_dirs.add(parent)
                     continue
-                # A link Git does not list (an ignored one) above a tracked
-                # path: refused and excluded by its own name, like a listed one.
-                reason = _omission(parent, exclude)
-                if not reason:
-                    raise WorkspaceError(f"selected symlink is not copied: {parent}"
-                                         f"{fix(parent)}")
-                omitted[parent] = reason
+                if stat.S_ISLNK(mode):
+                    # Git may not list an ignored link above a tracked path.
+                    reason = _omission(parent, exclude)
+                    if reason:
+                        omitted[parent] = reason
+                        break
+                    if special is None:
+                        raise WorkspaceError(f"selected symlink is not copied: {parent}"
+                                             f"{fix(parent)}")
+                if special is not None and not stat.S_ISREG(mode):
+                    special[parent] = "symlink" if stat.S_ISLNK(mode) else "special-file"
+                blocked = True
+                break
             if reason:
                 omitted[name] = reason
+                continue
+            if special is not None and (nested or name in gitlinks):
+                if not blocked:  # else an ancestor is missing or recorded
+                    special[name] = "nested-git-repo" if nested else "git-submodule"
                 continue
             if nested:
                 raise WorkspaceError(f"nested Git repository is not copied: {name}/"
                                      f"{select(name)}")
             if name in gitlinks:  # populated, empty or missing
                 raise WorkspaceError(f"Git submodule is not copied: {name}{select(name)}")
+            if blocked:
+                continue
             try:
                 st = os.lstat(root / name)
             except (FileNotFoundError, NotADirectoryError):
                 continue  # tracked deletion: absence is part of this capture
-            if stat.S_ISLNK(st.st_mode):
-                raise WorkspaceError(f"selected symlink is not copied: {name}{fix(name)}")
+            except PermissionError:
+                if special is None:
+                    raise
+                special[name] = "unreadable"
+                continue
             if not stat.S_ISREG(st.st_mode):
+                link = stat.S_ISLNK(st.st_mode)
+                if special is not None:
+                    if not stat.S_ISDIR(st.st_mode):
+                        special[name] = "symlink" if link else "special-file"
+                    continue  # Git scope lists files only
+                if link:
+                    raise WorkspaceError(f"selected symlink is not copied: {name}{fix(name)}")
                 raise WorkspaceError("selected special file or directory is not copied: "
                                      f"{name}{fix(name)}")
             names.add(name)
@@ -493,7 +600,13 @@ def inventory(root: Path, include: list[str] | None, exclude: list[str], *,
                              f"{collision[0]} and {collision[1]}")
     files, stamps = {}, {}
     for name in sorted(names):
-        files[name], stamps[name] = _hash_file(root, name)
+        try:
+            files[name], stamps[name] = _hash_file(root, name)
+        except (FileNotFoundError, NotADirectoryError, PermissionError, WorkspaceError) as exc:
+            if special is None:
+                raise
+            special[name] = ("unreadable" if isinstance(exc, PermissionError)
+                             else "changed-during-inspection")  # gone or replaced
     return files, stamps, omitted, sorted(empty)
 
 
@@ -505,7 +618,7 @@ def capture(source: Path, baseline: Path, *, include: list[str] | None = None,
     if not source.is_dir():
         raise WorkspaceError("source_root must be a directory")
     baseline = baseline.parent.resolve(strict=False) / baseline.name
-    if baseline.is_relative_to(source):
+    if contains_path(source, baseline):
         raise WorkspaceError("run directory must be outside the source tree")
     private_dir(baseline.parent)
     exclude = [] if exclude is None else exclude
@@ -594,7 +707,7 @@ def copy_workspace(baseline: Path, target: Path, snapshot: dict[str, Any]) -> No
     verify_tree(target, snapshot["files"], snapshot["dirs"])
 
 
-def freshness(snapshot: dict[str, Any]) -> dict[str, Any]:
+def freshness(snapshot: dict[str, Any], *, live: bool = False) -> dict[str, Any]:
     """Compare selected file bytes and executable flags, empty directories,
     Git HEAD and selected index entries, and the recorded omission
     inventory with the capture. Omitted file contents and remote
@@ -605,18 +718,199 @@ def freshness(snapshot: dict[str, Any]) -> dict[str, Any]:
             # Said plainly: a Git scope would otherwise report "non-Git
             # inputs require explicit include paths".
             raise WorkspaceError(f"source_root is missing or not a directory: {root}")
+        special: dict[str, str] = {}
         files, _, omitted, dirs = inventory(root, snapshot["include"], snapshot["exclude"],
-                                            hints=False)
-        changed = sorted(name for name in set(files) | set(snapshot["files"])
-                         if files.get(name) != snapshot["files"].get(name))
+                                            special=special if live else None,
+                                            portable=not live, hints=False)
+        changed = sorted(set(special) | {name for name in set(files) | set(snapshot["files"])
+                                        if files.get(name) != snapshot["files"].get(name)})
         changed += sorted(f"{name}/" for name in set(dirs) ^ set(snapshot["dirs"]))
         metadata_changed = git_state(root, snapshot["include"], snapshot["exclude"],
                                      omitted, files) != snapshot["git"]
         omissions_changed = omitted != snapshot["omitted"]
-        return {"state": "stale" if changed or metadata_changed or omissions_changed
-                else "unchanged", "changed_paths": changed,
-                "git_metadata_changed": metadata_changed,
-                "omissions_changed": omissions_changed,
-                "scope": "captured inputs only; external dependencies unverified"}
+        result = {"state": "stale" if changed or metadata_changed or omissions_changed
+                  else "unchanged", "changed_paths": changed,
+                  "git_metadata_changed": metadata_changed,
+                  "omissions_changed": omissions_changed,
+                  "scope": "captured inputs only; external dependencies unverified"}
+        if special:
+            result["special_paths"] = special
+        return result
     except (OSError, ValueError, KeyError, TypeError) as exc:
         return {"state": "unknown", "error": f"{type(exc).__name__}: {exc}"}
+
+
+# ---------- worktree roles ----------
+
+_COPY_OR_LIVE = "; use execution.workspace copy or live"
+
+
+def _first_line(data: bytes) -> str:
+    lines = data.decode("utf-8", "replace").strip().splitlines()
+    return lines[0][:300] if lines else "no message"
+
+
+def _absolute(root: Path, *args: str) -> str | None:
+    out = _git(root, "rev-parse", *args)
+    return None if out is None else os.path.realpath(os.fsdecode(out.rstrip(b"\n")))
+
+
+def worktree_origin(source: Path) -> dict[str, str]:
+    """Repository top, HEAD commit and source_root's subdirectory for a
+    worktree role; refused, naming the alternatives, outside a Git work tree
+    with a commit at HEAD."""
+    if shutil.which("git") is None:
+        raise WorkspaceError("execution.workspace=worktree needs Git, which was not found"
+                             + _COPY_OR_LIVE)
+    top = _absolute(source, "--show-toplevel")
+    if top is None:
+        raise WorkspaceError("execution.workspace=worktree needs source_root inside a Git "
+                             "work tree" + _COPY_OR_LIVE)
+    base = _git(source, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
+    if base is None:
+        raise WorkspaceError("execution.workspace=worktree needs a commit at HEAD, but HEAD "
+                             "is unborn; commit first" + _COPY_OR_LIVE)
+    # Git's own spelling: a case-insensitive filesystem accepts others.
+    prefix = _git(source, "rev-parse", "--show-prefix")
+    subdir = None if prefix is None else os.fsdecode(prefix.rstrip(b"\n")).rstrip("/") or "."
+    try:
+        relative_path(subdir, allow_dot=True)
+    except WorkspaceError:
+        raise WorkspaceError(f"source_root's path below its Git top level {top} cannot be "
+                             f"recorded: {subdir!r}" + _COPY_OR_LIVE) from None
+    return {"repo": top, "base": base.decode("ascii").strip(), "subdir": subdir}
+
+
+def check_branch(repo: Path, branch: str) -> None:
+    """A valid branch name Git can create: never reused or overwritten, and
+    no existing branch above or below it in the ref namespace."""
+    ref = f"refs/heads/{branch}"
+    if _git(repo, "check-ref-format", ref) is None:
+        raise WorkspaceError(f"worktree branch name is not valid in Git: {branch}; "
+                             "prepare in a run directory from --new-run")
+    listed = _git(repo, "for-each-ref", "--format=%(refname)",
+                  f"refs/heads/{branch.split('/')[0]}")
+    if listed is None:
+        raise WorkspaceError("Git branches could not be listed" + _COPY_OR_LIVE)
+    for existing in os.fsdecode(listed).splitlines():
+        if existing == ref:
+            raise WorkspaceError(f"worktree branch already exists: {branch}; it is never "
+                                 "reused or overwritten, so prepare in a new run directory")
+        if ref.startswith(existing + "/") or existing.startswith(ref + "/"):
+            raise WorkspaceError(f"worktree branch {branch} cannot coexist with existing "
+                                 f"branch {existing.removeprefix('refs/heads/')}; rename that "
+                                 "branch" + _COPY_OR_LIVE)
+
+
+def add_worktree(repo: Path, path: Path, base: str) -> None:
+    """Check `base` out, detached, in the new private directory `path`; its
+    branch comes once the whole preparation succeeded (create_branch)."""
+    path.mkdir(mode=0o700)
+    os.chmod(path, 0o700)
+    proc = _git_write(repo, "worktree", "add", "--quiet", "--detach", str(path), base)
+    if proc is None or proc.returncode != 0:
+        detail = "Git could not run" if proc is None else _first_line(proc.stderr)
+        raise WorkspaceError(f"git worktree add failed for {path}: {detail}")
+
+
+def create_branch(root: Path, branch: str) -> None:
+    """Put a prepared worktree on new `branch` at its HEAD; files stay as they are."""
+    proc = _git_write(root, "checkout", "--quiet", "-b", branch)
+    if proc is None or proc.returncode != 0:
+        detail = "Git could not run" if proc is None else _first_line(proc.stderr)
+        raise WorkspaceError(f"worktree branch {branch} could not be created: {detail}")
+
+
+def remove_worktree(repo: Path, path: Path) -> bool:
+    """Deregister (and delete) a worktree this run added; its branch stays."""
+    proc = _git_write(repo, "worktree", "remove", "--force", str(path))
+    return proc is not None and proc.returncode == 0
+
+
+def verify_scope(root: Path, snapshot: dict[str, Any]) -> None:
+    """The capture's selection at `root` holds exactly the captured inputs."""
+    try:
+        files, _, _, dirs = inventory(root, snapshot["include"], snapshot["exclude"],
+                                      hints=False)
+    except WorkspaceError as exc:
+        raise WorkspaceError(f"worktree selected inputs cannot be compared: {exc}") from None
+    changed = sorted(name for name in set(files) | set(snapshot["files"])
+                     if files.get(name) != snapshot["files"].get(name))
+    changed += sorted(f"{name}/" for name in set(dirs) ^ set(snapshot["dirs"]))
+    if changed:
+        raise WorkspaceError(f"worktree selected inputs differ from the capture: {changed[0]}"
+                             + (f" and {len(changed) - 1} more" if len(changed) > 1 else ""))
+
+
+def overlay_worktree(baseline: Path, cwd: Path, snapshot: dict[str, Any]) -> None:
+    """Make a fresh checkout's selected scope equal the capture: write files
+    whose bytes or executable flag differ and delete selected entries the
+    capture lacks (user deletions). Omitted paths stay as checked out."""
+    private_mkdirs(cwd)  # source_root may be absent at HEAD
+    special: dict[str, str] = {}
+    files, _, _, _ = inventory(cwd, snapshot["include"], snapshot["exclude"],
+                               special=special, portable=False, hints=False)
+    expected = snapshot["files"]
+    extra = {*files, *(name for name, kind in special.items()
+                       if kind in ("symlink", "special-file"))} - set(expected)
+    for name in sorted(extra, reverse=True):
+        os.unlink(cwd / name)
+        parent = PurePosixPath(name).parent
+        while parent.parts and parent.as_posix() not in snapshot["dirs"]:
+            try:
+                os.rmdir(cwd / parent)  # emptied by this deletion
+            except OSError:
+                break
+            parent = parent.parent
+    for name, value in expected.items():
+        if files.get(name) == value:
+            continue
+        target = cwd / name
+        if os.path.isdir(target) and not os.path.islink(target):
+            raise WorkspaceError(f"worktree cannot reproduce the capture: {name} is a file in "
+                                 "it but a directory holding omitted paths at HEAD"
+                                 + _COPY_OR_LIVE)
+        if os.path.lexists(target):
+            os.unlink(target)
+        if _hash_file(baseline, name, target)[0] != value:
+            raise WorkspaceError(f"baseline changed while copying: {name}")
+    for name in snapshot["dirs"]:
+        private_mkdirs(cwd / name)
+    try:
+        verify_scope(cwd, snapshot)
+    except WorkspaceError as exc:
+        raise WorkspaceError(f"{exc} (Git's ignore rules, index or omitted paths at HEAD "
+                             "differ from your working tree)" + _COPY_OR_LIVE) from None
+
+
+def check_worktree(root: Path, repo: str, branch: str, base: str | None = None) -> None:
+    """`root` is a worktree of `repo`; with `base`, still on `branch` at it."""
+    top = _absolute(root, "--show-toplevel")
+    common = _absolute(root, "--path-format=absolute", "--git-common-dir")
+    # samefile: Git spells the top level as on disk, whatever spelling reached root.
+    if (top is None or not os.path.samefile(top, root) or common is None
+            or common != _absolute(Path(repo), "--path-format=absolute", "--git-common-dir")):
+        raise WorkspaceError(f"not a Git worktree of the recorded repository: {root}")
+    if base is None:
+        return
+    ref = _git(root, "symbolic-ref", "--quiet", "HEAD")
+    head = _git(root, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
+    if ref != f"refs/heads/{branch}\n".encode() or head is None or head.strip() != base.encode():
+        raise WorkspaceError(f"worktree changed after preparation: {root} must have "
+                             f"branch {branch} checked out at {base}")
+
+
+def worktree_state(root: Path, base: str, limit: int = 500) -> dict[str, Any]:
+    """Observed HEAD, checked-out branch, and commits base..HEAD (oldest
+    first, at most `limit` of the newest)."""
+    head = _git(root, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
+    ref = _git(root, "symbolic-ref", "--quiet", "--short", "HEAD")
+    count = _git(root, "rev-list", "--count", f"{base}..HEAD") if head else None
+    log = _git(root, "log", "--no-show-signature", "--reverse", f"--max-count={limit}",
+               "--format=%H%x09%s", f"{base}..HEAD") if head else None
+    commits = None if log is None else [
+        dict(zip(("sha", "subject"), line.split("\t", 1)))
+        for line in log.decode("utf-8", "replace").splitlines()]
+    return {"head": head.decode("ascii").strip() if head else None,
+            "checked_out": ref.decode("utf-8", "replace").strip() if ref else None,
+            "commit_count": int(count) if count else None, "commits": commits}

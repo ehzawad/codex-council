@@ -17,10 +17,13 @@ from typing import Any, Callable
 from council_workspace import WorkspaceError
 
 POLICY_KEYS = frozenset({"sandbox", "network", "external_tools", "continuity",
-                         "required", "authorization"})
-# The default-on external surfaces of codex-cli 0.163 that reach
-# outside the command sandbox or install things. This is not a promise about
-# tool classes a later Codex adds; a new surface needs its own review.
+                         "required", "authorization", "workspace"})
+WORKSPACES = ("copy", "worktree", "live")
+# The default-on external surfaces of codex-cli 0.170 that reach outside the
+# command sandbox or install things. This is not a promise about tool classes a
+# later Codex adds; a new surface needs its own review. multi_agent is
+# deprecated (documented for the v1 tools): the v2 tools, whose spawn_agent can
+# pick its own model and effort, obey only agents.enabled (config_overrides).
 DISABLED_FEATURES = ("apps", "plugins", "browser_use", "browser_use_external",
                      "computer_use", "hooks", "multi_agent", "image_generation",
                      "tool_suggest", "skill_mcp_dependency_install", "remote_plugin",
@@ -43,6 +46,7 @@ class ExecutionPolicy:
     continuity: str = "fresh"
     required: bool = True
     authorization: str | None = None
+    workspace: str = "copy"
 
 
 def parse_policy(value: Any = None) -> ExecutionPolicy:
@@ -54,6 +58,8 @@ def parse_policy(value: Any = None) -> ExecutionPolicy:
     policy = ExecutionPolicy(**value)
     if policy.sandbox not in ("read-only", "workspace-write", "bypass"):
         raise WorkspaceError("execution.sandbox must be read-only, workspace-write, or bypass")
+    if policy.workspace not in WORKSPACES:
+        raise WorkspaceError("execution.workspace must be copy, worktree, or live")
     if type(policy.network) is not bool or type(policy.required) is not bool:
         raise WorkspaceError("execution.network and execution.required must be booleans")
     if policy.external_tools not in ("deny", "native"):
@@ -63,6 +69,16 @@ def parse_policy(value: Any = None) -> ExecutionPolicy:
     if policy.authorization is not None and (
             not isinstance(policy.authorization, str) or not policy.authorization.strip()):
         raise WorkspaceError("execution.authorization must be a nonempty string")
+    if policy.workspace != "copy":
+        if policy.sandbox == "read-only":
+            raise WorkspaceError(f"execution.workspace={policy.workspace} requires "
+                                 "workspace-write or bypass")
+        if not policy.authorization:
+            target = ("edit the working tree" if policy.workspace == "live"
+                      else "add a Git worktree and branch to the repository")
+            raise WorkspaceError(f"execution.workspace={policy.workspace} requires "
+                                 "execution.authorization explaining the user's "
+                                 f"permission to {target}")
     if (policy.sandbox == "bypass" or policy.network or policy.external_tools == "native"
             ) and not policy.authorization:
         raise WorkspaceError("bypass, network, and native external tools require an "
@@ -88,7 +104,11 @@ def effects_possible(policy: ExecutionPolicy | None) -> bool:
 
 
 def policy_dict(value: Any = None) -> dict[str, Any]:
-    return asdict(parse_policy(value))
+    policy = asdict(parse_policy(value))
+    # Preserve the normalized contract hash of previously prepared copy runs.
+    if policy["workspace"] == "copy":
+        del policy["workspace"]
+    return policy
 
 
 def config_overrides(policy: ExecutionPolicy, mcp_names: tuple[str, ...] = ()
@@ -98,14 +118,17 @@ def config_overrides(policy: ExecutionPolicy, mcp_names: tuple[str, ...] = ()
                  "sandbox_workspace_write.writable_roots=[]",
                  "sandbox_workspace_write.exclude_slash_tmp=true",
                  "sandbox_workspace_write.exclude_tmpdir_env_var=true",
-                 f"sandbox_workspace_write.network_access={str(policy.network).lower()}",
-                 # Memories carry earlier sessions into a fresh contribution.
-                 "features.memories=false",
-                 # The workspace is the project root: no AGENTS.md or .codex
-                 # layer from a Git repo above the run directory.
-                 "project_root_markers=[]"]
+                 f"sandbox_workspace_write.network_access={str(policy.network).lower()}"]
+    if policy.external_tools == "deny":
+        # Memories carry earlier sessions into a fresh contribution.
+        overrides.append("features.memories=false")
+    if policy.workspace == "copy":
+        # The copy lives in the run directory: markers would climb into
+        # unrelated parents. Live and worktree roles resolve natively.
+        overrides.append("project_root_markers=[]")
     if policy.external_tools == "deny":
         overrides.extend(f"features.{name}=false" for name in DISABLED_FEATURES)
+        overrides.append("agents.enabled=false")
         overrides.append('web_search="disabled"')
         # notify runs a host program after every turn, outside the sandbox.
         overrides.append("notify=[]")
@@ -148,9 +171,9 @@ def validate_observed(config: Any, policy: ExecutionPolicy,
     expected: dict[str, Any] = {
         "sandbox_mode": "danger-full-access" if policy.sandbox == "bypass" else policy.sandbox,
         "approval_policy": "never",
-        "features.memories": False,
-        "project_root_markers": [],
     }
+    if policy.workspace == "copy":
+        expected["project_root_markers"] = []
     if policy.sandbox == "workspace-write":
         expected.update({
             "sandbox_workspace_write.writable_roots": [],
@@ -159,7 +182,9 @@ def validate_observed(config: Any, policy: ExecutionPolicy,
             "sandbox_workspace_write.network_access": policy.network,
         })
     if policy.external_tools == "deny":
+        expected["features.memories"] = False
         expected.update({f"features.{name}": False for name in DISABLED_FEATURES})
+        expected["agents.enabled"] = False
         expected["web_search"] = "disabled"
         expected["notify"] = []
     for key, wanted in expected.items():
@@ -194,7 +219,8 @@ def validate_requirements(requirements: Any, policy: ExecutionPolicy) -> None:
         return
     if not isinstance(features, dict):
         raise WorkspaceError("managed requirements: unusable featureRequirements")
-    disabled = ("memories", *(DISABLED_FEATURES if policy.external_tools == "deny" else ()))
+    # Native external tools leave the user's own harness as configured.
+    disabled = ("memories", *DISABLED_FEATURES) if policy.external_tools == "deny" else ()
     for name in disabled:
         if features.get(name) is True:
             raise WorkspaceError(f"managed requirements force a disabled feature on: {name}")

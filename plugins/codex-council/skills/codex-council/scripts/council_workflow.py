@@ -13,20 +13,28 @@ import json
 import os
 import re
 import secrets
+import shutil
+import time
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from council_policy import inspect_policy, inspect_service_tier, parse_policy, policy_dict
-from council_workspace import (WorkspaceError, atomic_json, capture, copy_workspace,
-                               digest, freshness, private_dir, private_mkdirs,
-                               read_json,
-                               relative_path, snapshot_digest, verify_tree)
+from council_policy import (config_overrides, inspect_policy, inspect_service_tier,
+                            parse_policy, policy_dict)
+from council_workspace import (WorkspaceError, add_worktree, atomic_json, capture,
+                               check_branch, check_worktree, contains_path, copy_workspace,
+                               create_branch, digest, freshness, overlay_worktree, private_dir,
+                               private_mkdirs, read_json, relative_path, remove_worktree,
+                               snapshot_digest, verify_scope, verify_tree, worktree_origin)
 
 REQUEST_SCHEMA = "codex-council/request@1"
 PLAN_SCHEMA = "codex-council/run@1"
 PLAN_FILE = "run.json"
 REQUEST_KEYS = frozenset({"schema", "task_id", "reason", "source_root", "include", "exclude"})
 TASK_ID = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]*\Z")
+WORKTREE_KEYS = frozenset({"root", "repo", "branch", "base", "subdir"})
+# Recorded at launch: in-scope paths that already differed from the capture.
+LIVE_BEFORE_LAUNCH = "evidence/live-before-launch.json"
 
 
 def role_key(role_id: str) -> str:
@@ -81,27 +89,49 @@ def _context_hash(body: str) -> str:
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
+def workspace_mode(binding: dict[str, Any]) -> str:
+    """copy, worktree or live; a 1.4.0 record has no workspace key (copy)."""
+    return binding["execution"].get("workspace", "copy")
+
+
+def _has_mode(bindings: Iterable[dict[str, Any]], mode: str) -> bool:
+    return any(workspace_mode(binding) == mode for binding in bindings)
+
+
+def worktree_branch(run_dir: Path, key: str) -> str:
+    return f"codex-council/{run_dir.name}/{key}"
+
+
 def prepare(run_dir: str, roles: list[Any], body: str) -> dict[str, Any]:
     directory = private_dir(run_dir)
     request = _request(directory)
     source = Path(request["source_root"])
-    if directory.is_relative_to(source):  # e.g. source_root $HOME holds the state home
+    if contains_path(source, directory):  # e.g. source_root $HOME holds the state home
         raise WorkspaceError(
             "source and run directory must be separate, non-overlapping trees, "
             "but the run directory is inside source_root (a --new-run directory "
             "lives under $XDG_STATE_HOME, by default ~/.local/state): choose a "
             "source_root that does not contain it, or set XDG_STATE_HOME outside it")
-    if source.is_relative_to(directory):
+    if contains_path(directory, source):
         raise WorkspaceError("source and run directory must be separate, non-overlapping trees")
     if not body.strip():
         raise WorkspaceError("context must contain the current goal and contribution request")
     if not roles or len({role.id for role in roles}) != len(roles):
         raise WorkspaceError("prepare needs a nonempty panel with unique ids")
     contracts = {role.id: role_contract(role) for role in roles}
+    modes = {role.id: workspace_mode(contracts[role.id]) for role in roles}
+    if request["include"] == [] and set(modes.values()) != {"copy"}:
+        raise WorkspaceError("include [] captures no files, so live or worktree edits could "
+                             "not be reported; name the inputs in include")
     for name in ("baseline", "workspaces", "evidence", "catalogs", PLAN_FILE,
                  "out.md", "err.log", "replies", "supervisor.lock", "supervisor.json"):
         if os.path.lexists(directory / name):
             raise WorkspaceError(f"run directory is already prepared or launched ({name})")
+    origin = worktree_origin(source) if "worktree" in modes.values() else None
+    branches = {role_id: worktree_branch(directory, role_key(role_id))
+                for role_id, mode in modes.items() if mode == "worktree"}
+    for branch in branches.values():
+        check_branch(Path(origin["repo"]), branch)
     # A failed capture consumes this directory, even if it never wrote run.json.
     claim = os.open(directory / "prepare.lock", os.O_WRONLY | os.O_CREAT
                     | os.O_EXCL | os.O_NOFOLLOW, 0o600)
@@ -113,30 +143,60 @@ def prepare(run_dir: str, roles: list[Any], body: str) -> dict[str, Any]:
                        exclude=request["exclude"])
     for name in ("workspaces", "evidence", "catalogs"):
         private_mkdirs(directory / name)
-    bindings = {}
-    for role in roles:
-        key = role_key(role.id)
-        relative = f"workspaces/{key}"
-        copy_workspace(directory / "baseline", directory / relative, snapshot)
-        private_mkdirs(directory / "evidence" / key)
-        private_mkdirs(directory / "catalogs" / key)
-        bindings[role.id] = {
-            "workspace": relative, "evidence": f"evidence/{key}",
-            "catalog": f"catalogs/{key}", "contract_sha256": digest(contracts[role.id]),
-            "execution": contracts[role.id]["execution"],
-        }
-    plan = {"schema": PLAN_SCHEMA, "run_id": secrets.token_hex(16),
-            "task_id": request["task_id"], "reason": request["reason"],
-            "request_sha256": digest(request), "context_sha256": _context_hash(body),
-            "context_bytes": len(body.encode("utf-8")), "snapshot": snapshot,
-            "roles": bindings, "backend": "private-copy",
-            "limitations": ["observed-stable capture is not an atomic filesystem snapshot",
-                            "agent config directories, agent instruction files "
-                            "(AGENTS.md, CLAUDE.md and their override/local variants), "
-                            "credentials and caches are not copied",
-                            "sandbox restricts command writes, not all host reads",
-                            "remote data and dependencies are outside the capture"]}
-    atomic_json(directory / PLAN_FILE, plan)
+    bindings: dict[str, dict[str, Any]] = {}
+    added: dict[Path, str] = {}  # worktree path -> its branch, created last
+    created: list[str] = []
+    try:
+        for role in roles:
+            key = role_key(role.id)
+            binding: dict[str, Any] = {}
+            if modes[role.id] == "live":
+                workspace = str(source)
+            elif modes[role.id] == "worktree":
+                root, subdir = f"workspaces/{key}", origin["subdir"]
+                add_worktree(Path(origin["repo"]), directory / root, origin["base"])
+                added[directory / root] = branches[role.id]
+                workspace = root if subdir == "." else f"{root}/{subdir}"
+                overlay_worktree(directory / "baseline", directory / workspace, snapshot)
+                binding["worktree"] = {"root": root, "repo": origin["repo"],
+                                       "branch": branches[role.id], "base": origin["base"],
+                                       "subdir": subdir}
+            else:
+                workspace = f"workspaces/{key}"
+                copy_workspace(directory / "baseline", directory / workspace, snapshot)
+            private_mkdirs(directory / "evidence" / key)
+            private_mkdirs(directory / "catalogs" / key)
+            bindings[role.id] = {
+                "workspace": workspace, "evidence": f"evidence/{key}",
+                "catalog": f"catalogs/{key}", "contract_sha256": digest(contracts[role.id]),
+                "execution": contracts[role.id]["execution"], **binding,
+            }
+        # Only a fully bound run creates branches, so a refusal leaves none.
+        for path, branch in added.items():
+            create_branch(path, branch)
+            created.append(branch)
+        plan = {"schema": PLAN_SCHEMA, "run_id": secrets.token_hex(16),
+                "task_id": request["task_id"], "reason": request["reason"],
+                "request_sha256": digest(request), "context_sha256": _context_hash(body),
+                "context_bytes": len(body.encode("utf-8")), "snapshot": snapshot,
+                "roles": bindings,
+                "backend": "private-copy" if set(modes.values()) == {"copy"} else "per-role",
+                "limitations": ["observed-stable capture is not an atomic filesystem snapshot",
+                                "agent config directories, agent instruction files "
+                                "(AGENTS.md, CLAUDE.md and their override/local variants), "
+                                "credentials and caches are not copied",
+                                "sandbox restricts command writes, not all host reads",
+                                "remote data and dependencies are outside the capture"]}
+        atomic_json(directory / PLAN_FILE, plan)
+    except BaseException as exc:
+        # Deregister this run's worktrees; a created branch is never deleted.
+        removed = [path for path in added if remove_worktree(Path(origin["repo"]), path)]
+        if added and isinstance(exc, (OSError, ValueError)):
+            kept = (f" and kept the branches it created ({', '.join(created)})" if created
+                    else "; no branch was created")
+            raise WorkspaceError(f"{exc}; removed {len(removed)} of {len(added)} worktrees "
+                                 f"this run added{kept}") from None
+        raise
     return plan
 
 
@@ -176,14 +236,47 @@ def load_plan(run_dir: str | Path, roles: list[Any] | None = None,
     for role_id, binding in bindings.items():
         if not isinstance(role_id, str) or not isinstance(binding, dict):
             raise WorkspaceError("invalid role binding")
+        execution = binding.get("execution")
+        if not isinstance(execution, dict):
+            raise WorkspaceError("invalid recorded execution policy")
+        policy = parse_policy(execution)
         key = role_key(role_id)
-        for field, expected in (("workspace", f"workspaces/{key}"),
-                                ("evidence", f"evidence/{key}"),
-                                ("catalog", f"catalogs/{key}")):
-            if binding.get(field) != expected:
+        expected = {"evidence": f"evidence/{key}", "catalog": f"catalogs/{key}"}
+        private = list(expected.values())
+        worktree = binding.get("worktree")
+        if (worktree is not None) != (policy.workspace == "worktree"):
+            raise WorkspaceError("worktree record does not match the recorded workspace")
+        if policy.workspace == "live":
+            if binding.get("workspace") != snapshot["source_root"]:
+                raise WorkspaceError("live workspace must match the captured source_root")
+        elif policy.workspace == "worktree":
+            if (not isinstance(worktree, dict) or set(worktree) != WORKTREE_KEYS
+                    or not all(isinstance(value, str) for value in worktree.values())):
+                raise WorkspaceError("invalid worktree record")
+            subdir = relative_path(worktree["subdir"], allow_dot=True)
+            root = f"workspaces/{key}"
+            expected["workspace"] = root if subdir == "." else f"{root}/{subdir}"
+            if (worktree["root"] != root
+                    or worktree["branch"] != worktree_branch(directory, key)):
+                raise WorkspaceError("worktree is not this run's deterministic path and branch")
+            if strict_source or os.path.lexists(directory / root):
+                private.append(root)  # --freshness: the user may have removed it
+        else:
+            expected["workspace"] = f"workspaces/{key}"
+            private.append(expected["workspace"])
+        for field, value in expected.items():
+            if binding.get(field) != value:
                 raise WorkspaceError("role path is not this run's deterministic private path")
-            private_dir(directory / expected)
-        parse_policy(binding.get("execution"))
+        for relative in private:
+            private_dir(directory / relative)
+        if worktree is not None and strict_source:
+            check_worktree(directory / worktree["root"], worktree["repo"], worktree["branch"])
+    if _has_mode(bindings.values(), "live") and strict_source:
+        source = Path(snapshot["source_root"])
+        if not source.is_dir():
+            raise WorkspaceError("live workspace source_root must be a directory")
+        if contains_path(source, directory) or contains_path(directory, source):
+            raise WorkspaceError("source and run directory must be separate, non-overlapping trees")
     if roles is not None:
         if set(bindings) != {role.id for role in roles}:
             raise WorkspaceError("panel changed after capture; prepare a new invocation")
@@ -198,7 +291,14 @@ def load_plan(run_dir: str | Path, roles: list[Any] | None = None,
     if verify_inputs:
         verify_tree(directory / "baseline", snapshot["files"], snapshot["dirs"])
         for binding in bindings.values():
-            verify_tree(directory / binding["workspace"], snapshot["files"], snapshot["dirs"])
+            mode = workspace_mode(binding)
+            if mode == "copy":
+                verify_tree(directory / binding["workspace"], snapshot["files"], snapshot["dirs"])
+            elif mode == "worktree":
+                worktree = binding["worktree"]
+                check_worktree(directory / worktree["root"], worktree["repo"],
+                               worktree["branch"], worktree["base"])
+                verify_scope(directory / binding["workspace"], snapshot)
     return plan
 
 
@@ -229,13 +329,20 @@ def bind_roles(run_dir: str, roles: list[Any], body: str, *, at_launch: bool,
         # across a config or installation change.
         if at_launch:
             atomic_json(directory / binding["evidence"] / "execution-policy.json", checked)
+        worktree = binding.get("worktree")
         bound.append(dataclasses.replace(
             role, execution=binding["execution"], workdir=workspace,
             evidence_dir=str(directory / binding["evidence"]),
             execution_overrides=tuple(checked["overrides"]),
             task_id=plan["task_id"], input_snapshot=plan["snapshot"]["snapshot_id"],
+            worktree=worktree and {**worktree, "root": str(directory / worktree["root"])},
         ))
     return bound, plan
+
+
+def role_overrides(role: Any) -> tuple[str, ...]:
+    """What the worker sends: the probe's overrides, else the policy's own."""
+    return tuple(role.execution_overrides) or config_overrides(parse_policy(role.execution))
 
 
 def discover_prepared(run_dir: str, roles: list[Any], body: str) -> None:
@@ -249,8 +356,13 @@ def discover_prepared(run_dir: str, roles: list[Any], body: str) -> None:
 
     for role in roles:
         binding = plan["roles"][role.id]
-        _discover_command(str(directory / binding["catalog"]),
-                          project_root=str(directory / binding["workspace"]))
+        workspace = str(directory / binding["workspace"])
+        # The policy probe's overrides, MCP disables included, as at launch;
+        # without codex no session starts and discovery records codex_missing.
+        overrides = (inspect_policy(workspace, parse_policy(binding["execution"]))["overrides"]
+                     if shutil.which("codex") else ())
+        _discover_command(str(directory / binding["catalog"]), project_root=workspace,
+                          config_overrides=tuple(overrides))
 
 
 def resolve_selections(roles: list[Any], run_dir: str, routing_mode: str,
@@ -267,7 +379,7 @@ def resolve_selections(roles: list[Any], run_dir: str, routing_mode: str,
             on_progress()
         selected, snapshot = _resolve_run_selections(
             [role], str(Path(run_dir) / binding["catalog"]), routing_mode,
-            at_launch, project_root=role.workdir)
+            at_launch, project_root=role.workdir, config_overrides=role_overrides(role))
         if role.service_tier is not None and probe_policy:
             decision = selected[0].decision
             checked = inspect_service_tier(
@@ -282,6 +394,13 @@ def resolve_selections(roles: list[Any], run_dir: str, routing_mode: str,
         if snapshot is not None:
             snapshots.append(snapshot)
             atomic_json(Path(role.evidence_dir) / "launch-model-snapshot.json", snapshot)
+    if at_launch and _has_mode(plan["roles"].values(), "live"):
+        # Not refused: recorded so live attribution names what others changed first.
+        observed = freshness(plan["snapshot"], live=True)
+        atomic_json(private_dir(run_dir) / LIVE_BEFORE_LAUNCH,
+                    {"observed_at": time.time(), "state": observed["state"],
+                     "changed_paths": observed.get("changed_paths"),
+                     "error": observed.get("error")})
     # The report renderer takes one discovery summary. Never imply a single
     # catalog governed all workers: per-role evidence stays in each directory.
     launch = None
@@ -300,21 +419,45 @@ def resolve_selections(roles: list[Any], run_dir: str, routing_mode: str,
 
 def plan_lines(plan: dict[str, Any], roles: list[Any], stall_secs: int) -> list[str]:
     watchdog = f"{stall_secs}s" if stall_secs else "off"
-    unrestricted = any(parse_policy(role.execution).sandbox == "bypass" for role in roles)
-    write_scope = "UNRESTRICTED" if unrestricted else "scratch-command-writes-only"
+    policies = [(role, parse_policy(role.execution)) for role in roles]
+    modes = {policy.workspace for _, policy in policies}
+    unrestricted = any(policy.sandbox == "bypass" for _, policy in policies)
+    write_scope = ("UNRESTRICTED" if unrestricted else
+                   "working-tree-command-writes" if "live" in modes else
+                   "scratch-command-writes-only")
+    workspace = "private-copy-per-role" if modes == {"copy"} else "per-role (see below)"
     lines = [f"[codex-council] execution plan: roles={len(roles)} "
              f"context_bytes={plan['context_bytes']} watchdog={watchdog} "
-             f"workspace=private-copy-per-role; write_scope={write_scope}; "
-             "permissions=observed-before-launch-not-runtime-attested",
-             "[codex-council] configuration context: scratch cwd; source .codex/.claude/"
-             ".agents directories and AGENTS.md/CLAUDE.md instruction files are not "
-             "copied; inspect the actual native-model discovery"]
-    for role in roles:
-        policy = parse_policy(role.execution)
+             f"workspace={workspace}; write_scope={write_scope}; "
+             "permissions=observed-before-launch-not-runtime-attested"]
+    if "copy" in modes:
+        lines.append("[codex-council] configuration context: copy roles: scratch cwd; source "
+                     ".codex/.claude/.agents directories and AGENTS.md/CLAUDE.md instruction "
+                     "files are not copied; inspect the actual native-model discovery")
+    if "live" in modes:
+        lines.append("[codex-council] configuration context: live roles: Codex loads the "
+                     "project's own AGENTS.md and .codex natively from your working tree")
+    if "worktree" in modes:
+        lines.append("[codex-council] configuration context: worktree roles: Codex loads the "
+                     "project's own AGENTS.md and .codex natively as committed at HEAD; "
+                     "uncommitted changes to them are not overlaid")
+    for role, policy in policies:
+        binding = plan["roles"][role.id]
+        if policy.workspace == "live":
+            destination = (f"workspace=LIVE {plan['snapshot']['source_root']}; "
+                           "edits land in your working tree")
+        elif policy.workspace == "worktree":
+            destination = (f"workspace=worktree {role.workdir or binding['workspace']} "
+                           f"branch={binding['worktree']['branch']}")
+        else:
+            destination = "workspace=copy"
         lines.append(f"[codex-council] execution plan: {role.id}: "
                      f"sandbox={policy.sandbox} network={policy.network} "
                      f"external_tools={policy.external_tools} continuity={policy.continuity} "
-                     f"required={policy.required}")
+                     f"required={policy.required} {destination}")
+        if policy.workspace == "worktree" and policy.sandbox == "workspace-write":
+            lines.append(f"[codex-council] note: {role.id}: commits need bypass (the "
+                         "worktree's .git is outside its writable root)")
     return lines
 
 
@@ -332,7 +475,7 @@ def freshness_command(run_dir: str) -> int:
         # may outlive a link it was reached through: unknown, named as
         # spelled.
         snapshot = {**snapshot, "source_root": source}
-    result = freshness(snapshot)
+    result = freshness(snapshot, live=_has_mode(plan["roles"].values(), "live"))
     try:
         context = (directory / "context.md").read_bytes()
         if hashlib.sha256(context).hexdigest() != plan["context_sha256"]:
