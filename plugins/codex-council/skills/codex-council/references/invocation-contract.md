@@ -37,7 +37,8 @@ With `include` omitted, Git supplies tracked and non-ignored untracked filenames
 the runner reads their **current working bytes**, including staged/unstaged edits
 and deletions; a partially staged file is captured as its working version. Explicit
 includes also keep empty directories. A non-Git project requires `include`.
-`include: []` supports a pure question without filesystem inputs. Exclusions are
+`include: []` supports a pure question without filesystem inputs; it is refused when
+any role is live or worktree, whose edits it could not report. Exclusions are
 case-sensitive shell-style patterns matched against relative names, not validated as
 paths. An omitted or `null` `exclude` means no exclusions. Implicit Git scope lists
 files, so exclude a directory there as `dir/*`. Explicit includes may select ignored
@@ -99,30 +100,55 @@ fabricated token bill.
 |---|---|---|
 | sandbox | read-only | Command sandbox: read-only, workspace-write, or explicitly authorized bypass. |
 | network | false | Command-network request. `true` requires workspace-write or bypass and an authorization; read-only requires false. Bypass cannot enforce false and requires true explicitly. |
-| external_tools | deny | Disable apps/plugins/browser/computer/hooks/subagents/web, the notify program, installer and remote-plugin features, and configured MCP servers, or explicitly authorize native integrations. |
+| external_tools | deny | Disable apps/plugins/browser/computer/hooks/subagents/web, memories, the notify program, installer and remote-plugin features, and configured MCP servers, or explicitly authorize native integrations. |
 | continuity | fresh | Resume only when this task's earlier thread is useful. |
 | required | true | Missing/failed contribution or missing evidence makes required coverage incomplete. |
-| authorization | absent | Required explanation of user permission for bypass/network/native external tools. |
+| authorization | absent | Required explanation of user permission for bypass/network/native external tools or a live or worktree workspace. |
+| workspace | copy | `copy`: a private copy of the capture in the run directory. `worktree`: a Git worktree on its own new branch. `live`: the captured source_root itself. worktree and live need workspace-write or bypass and an authorization; a read-only role is copy only. |
 
-Workspace-write permits experimental writes to that role's scratch cwd; additional
-writable roots and implicit /tmp/TMPDIR grants are removed. Execution is
-non-interactive with approval_policy=never. Every sandboxed run passes
+Workspace-write permits writes to that role's cwd (its copy, its worktree, or the
+live tree); additional writable roots and implicit /tmp/TMPDIR grants are removed.
+Execution is non-interactive with approval_policy=never. Every sandboxed run passes
 `--ignore-rules`, because a user or project execpolicy rule with `decision="allow"`
-runs its command outside the sandbox. Memories are off for every policy, and
-`project_root_markers=[]` makes the role's scratch cwd Codex's project root, so no
-AGENTS.md or `.codex` layer from a Git repository above the run directory (a
-dotfiles home, say) reaches a worker. When external_tools=deny, `notify` is
-emptied (it runs a host program after each turn) and MCP names are enumerated and
-disabled by bare name; a server name outside `[A-Za-z0-9_-]` cannot be addressed
-by a Codex `-c` key and blocks the run. The disabled features are the default-on
-surfaces of codex-cli 0.163, not a promise about tools a later Codex adds.
-Effective configuration is read again with the requested restrictions, and
-unknown/overridden settings (a layer that keeps project root markers, say), or
-managed requirements that forbid them, block execution. No automatic fallback to
-bypass exists.
+runs its command outside the sandbox. A copy role also gets
+`project_root_markers=[]`: its copy lives in the run directory, so the copy is
+Codex's project root and no AGENTS.md or `.codex` layer from a Git repository above
+the run directory (a dotfiles home, say) reaches it. Live and worktree roles get no
+markers override: Codex resolves the project root, AGENTS.md and project `.codex`
+natively, as if the user ran codex there. Codex trusts a linked worktree like its
+main repository, because project trust is keyed by the main repository root.
+
+When external_tools=deny, memories are off, the examined features are disabled,
+`agents.enabled=false` removes the subagent tools, web search is disabled, `notify`
+is emptied (it runs a host program after each turn), and MCP names are enumerated
+and disabled by bare name; a server name outside `[A-Za-z0-9_-]` cannot be
+addressed by a Codex `-c` key and blocks the run. The disabled surfaces are the
+default-on surfaces of codex-cli 0.170, not a promise about tools a later Codex
+adds. In 0.170, `features.multi_agent=false` leaves the v2 subagent tools
+(spawn_agent, send_message, wait_agent, followup_task, list_agents,
+interrupt_agent) exposed; only `agents.enabled=false` removes them, and the policy
+probe requires it, so an older CLI fails closed for restricted roles.
+external_tools=native leaves Codex's own harness (memories, features, MCP, hooks,
+plugins, notify, web search) as the user configured it. Effective configuration is
+read again with the requested restrictions, and unknown/overridden settings (a
+layer that keeps a copy role's project root markers, say), or managed requirements
+that forbid them, block execution. Per role, `--discover`, launch discovery, the
+policy probe, the service-tier check and the worker send the same overrides. No
+automatic fallback to bypass exists.
+
+**Full access** is `sandbox: bypass`, `network: true`, `external_tools: native` and
+an `authorization`; it needs no other key. Codex then runs any command, uses the
+network, uses live web search (Codex's default under full access), and uses its own
+tools and subagents; a bypass role with external_tools deny is told instead that web
+search, MCP tools and subagents stay disabled. The prompt tells every bypass role to
+work autonomously (implement, verify its own result, and reconcile with other
+writers sharing its tree before reporting), to take a local change as far as a
+verified, reviewable result, and to stop and report blocked when a design decision
+is unsettled. Use full access only when the user explicitly asks for it.
 
 **Limits:** config/read is evidence of configuration, not an OS attestation of a
-later worker. Configuration can change between checking and exec. The command
+later worker. Configuration can change between checking and exec; an MCP inventory
+change in that window fails the worker with a message saying so. The command
 sandbox is not a sandbox around the entire Codex process, does not promise to
 hide the rest of HOME, and cannot authenticate the user's permission from an
 orchestrator-written `authorization` string. Native external tools have their own
@@ -133,32 +159,53 @@ behavior with the opt-in live tests before relying on a particular host setup.
 ## Prepare, discover, then resolve
 
 `--prepare RUNDIR` exclusively claims preparation, copies current inputs into an
-owner-read-only baseline, creates independent writable per-role copies and writes
-`run.json`. It checks content and metadata before/after copying and refuses observed
-change. Pause overlapping writers for this interval. This is **observed stable**,
-not an atomic snapshot in the presence of arbitrary concurrent writers. A failed
-capture consumes its run directory; never repair or reuse it, but allocate a new
-one with `--new-run`.
+owner-read-only baseline, binds each role's workspace and writes `run.json`. It
+checks content and metadata before/after copying and refuses observed change. Pause
+overlapping writers for this interval. This is **observed stable**, not an atomic
+snapshot in the presence of arbitrary concurrent writers. A failed capture consumes
+its run directory; never repair or reuse it, but allocate a new one with
+`--new-run`. The capture is always taken; the workspace decides where a role runs.
 
-The backend is copy-based for Git and non-Git projects. No shared Git metadata,
-hardlinks, automatic commits, or worktree/resume incompatibility. A clean-HEAD
-worktree alone would omit precisely the dirty edits under investigation. Git-dependent
-build/version commands can fail without .git; record this as an environment gap,
-not proof of a source-code bug. Dependencies and external state need explicit,
-authorized setup and must be identified in the evidence.
+**copy** (default): an independent writable copy for Git and non-Git projects, with
+no shared Git metadata or hardlinks. Git-dependent build/version commands can fail
+without .git; record this as an environment gap, not proof of a source-code bug.
+Dependencies and external state need explicit, authorized setup and must be
+identified in the evidence.
 
-Each role's discovery runs in its actual scratch cwd. Source `.codex`, `.claude` and
-`.agents` directories are intentionally not copied or flattened into global settings,
-and agent instruction files (AGENTS.md, AGENTS.override.md, CLAUDE.md, CLAUDE.local.md,
-at any depth, matched case-insensitively) are omitted even when an include selects
-them and recorded in `snapshot.omitted`; the brief carries any project rule a role
-needs. Native inheritance
-therefore means **the configuration Codex resolves in the execution cwd**, which
-may differ from the live project's configuration. Discovery does not send
-`project_root_markers=[]`, so for a run inside another Git work tree its native
-values can come from a parent `.codex` layer the workers do not load. Inspect the
-discovery summary; use a supported explicit pin when the user's intended model
-must be preserved.
+**worktree**: source_root must be inside a Git work tree whose HEAD is a commit;
+otherwise `--prepare` refuses and suggests copy or live. The runner adds a Git
+worktree at `workspaces/<key>`, detached at HEAD (the role's cwd is source_root's
+subdirectory in it), running Git with user and system config, hooks and fsmonitor
+disabled. It overlays the capture, so the role starts from what the user sees:
+uncommitted edits, untracked selected files and deletions. Omitted paths (AGENTS.md
+and other instruction files, `.codex`) stay as committed at HEAD; uncommitted
+changes to them are not overlaid. Only after every role is prepared does it create
+branch `codex-council/<run dir name>/<role key>`. An existing branch, or one that
+conflicts in the ref namespace, is refused before capture; a prepare that fails
+while binding roles removes the worktrees it added and creates no branch.
+`--prepare` prints each worktree's path, branch and base. A bypass worktree role may
+commit on its branch. A workspace-write one cannot (its worktree's `.git` is outside
+the writable root), and its prompt says so.
+
+**live**: the role's cwd is the captured source_root, so its edits land in the
+user's working tree. There is no writer limit: any number of live and worktree roles
+may share a run, the owner accepts collisions, and no lock spans runs. The prompt
+tells a live role to preserve others' edits, re-read files before editing them, and
+leave commits and pushes to the user unless they asked.
+
+Each role's discovery runs in its actual execution cwd, with the policy probe's
+overrides for that cwd, so `--discover` can exit 2 when a policy cannot be
+established, like the preflight. For copy roles, source `.codex`, `.claude` and
+`.agents` directories are intentionally not copied or flattened into global
+settings, and agent instruction files (AGENTS.md, AGENTS.override.md, CLAUDE.md,
+CLAUDE.local.md, at any depth, matched case-insensitively) are omitted even when an
+include selects them and recorded in `snapshot.omitted`; the brief carries any
+project rule a role needs. Native inheritance therefore means **the configuration
+Codex resolves in the execution cwd**, which for a copy role may differ from the
+live project's configuration. Live roles load the project's own AGENTS.md and
+`.codex`; worktree roles load them as committed at HEAD. Inspect the discovery
+summary; use a supported explicit pin when the user's intended model must be
+preserved.
 The host Claude session's settings and user Codex configuration are never edited.
 
 Each role gets its own `model-snapshot.json` under the catalog path recorded in
@@ -185,8 +232,9 @@ an attestation of a serving model or tier.
 
 Only model/effort/selection/service_tier may change after prepare. Changes to
 context, task, panel, instructions or execution policy require a fresh
-`--new-run` directory. The logical source root and task id scope saved threads,
-not the scratch path. Session scope still follows CODEX_COUNCIL_SESSION_KEY, then
+`--new-run` directory. The logical source root, task id and workspace mode (live
+and worktree roles keep their own saved threads) scope saved threads, not the
+workspace path. Session scope still follows CODEX_COUNCIL_SESSION_KEY, then
 host ids, then project scope.
 
 ## Evidence and reconciliation
@@ -207,16 +255,40 @@ Collaborator prose is stored separately as interpretation. No parser declares
 substantive claims true. Required coverage and execution success are distinct from
 applicability to current work and from verified task success.
 
+The brief asks every role to end with one last line: `Status: ready`,
+`Status: blocked: <the one question for the user>` or `Status: failed: <reason>`.
+The runner parses it, tolerating markdown emphasis, into
+`roles.<id>.interpretation.reported_status` = `{state, detail}`, or null when the
+last line is not one. It is the collaborator's own claim, not verification. The
+reply-file header gains `reported=<state>`.
+
 Artifact manifests cover added, removed and changed non-omitted regular files,
 executable-flag changes included; other permission changes and empty-directory
-changes are not recorded. A non-omitted symlink or special file a role leaves is
-listed by path with kind `symlink` or `special-file` (and the captured `before`
-entry when it replaced a captured file); it is never followed, read or diffed, and
-is not a coverage gap. Small text changes also produce a human-inspectable
-`candidate.diff`; binary, large and executable-flag-only changes retain metadata
-and exact bytes in scratch. Nothing applies patches to the live source. Treat all
-artifacts as untrusted. Frozen-directory modes and digests detect mistakes, not
-malicious same-user/bypass tampering.
+changes are not recorded. Live and worktree manifests use the capture's selection.
+A non-omitted symlink, special file, nested Git repository, Git submodule or
+unreadable entry a role leaves is listed by path with its kind (`symlink`,
+`special-file`, `nested-git-repo`, `git-submodule`, `unreadable`) and the captured
+`before` entry it replaced; it is never followed, read or diffed, and is not a
+coverage gap. A file that changes or vanishes while it is inspected is flagged
+`changed_during_inspection`, without a patch. Small text changes also produce a
+human-inspectable diff; binary, large and executable-flag-only changes retain
+metadata and exact bytes in the workspace. Treat all artifacts as untrusted.
+Frozen-directory modes and digests detect mistakes, not malicious same-user/bypass
+tampering. Per workspace:
+
+- **copy**: `evidence/<key>/candidate.diff`; the exact bytes stay in the role's
+  copy. Nothing applies patches to the live source.
+- **worktree**: `evidence/<key>/candidate.diff` plus `worktree` = `{path, branch,
+  base, repo, head, checked_out, commit_count, commits}` and
+  `applied_to_live_tree: false`. Nothing is applied to the user's tree; Claude
+  merges or applies what it accepts.
+- **live**: result.json gains a top-level `live` section: one shared
+  `evidence/live.diff` for the run, its `files`, `writers` (every live role id),
+  `changed_before_launch` (in-scope paths that already differed from the capture
+  at launch), `applied_to_live_tree: true`, and an `attribution` note that changes
+  are not attributed per role. Each live role's `artifacts` only point at that
+  shared diff. When the tree cannot be inspected, `live` is null and each live
+  role records `artifact-inspection-incomplete`.
 
 `--freshness RUNDIR` returns 0 for unchanged captured scope, 1 for stale/unknown,
 and 2 for an invalid contract. It checks selected file bytes and executable flags,
@@ -226,7 +298,8 @@ file does not make a capture stale (adding an excluded path to the index, or
 removing one, changes the omission list, which does). A changed staged context adds
 its reason and keeps the file-level detail (changed paths, Git and omission flags),
 as `result.json` applicability does; a moved or deleted source root reports unknown
-(exit 1), not an invalid contract. It does not check omitted file contents, changed
+(exit 1), not an invalid contract. After live edits it reports stale by design. It
+does not check omitted file contents, changed
 user intent, or unrecorded external dependencies. Claude must compare the current
 goal as well. A failed baseline due to unavailable dependencies is a blocked check,
 not a discovered bug.

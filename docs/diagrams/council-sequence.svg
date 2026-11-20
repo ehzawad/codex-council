@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="408" height="978" viewBox="0 0 408 978" role="img">
+<svg xmlns="http://www.w3.org/2000/svg" width="408" height="1054" viewBox="0 0 408 1054" role="img">
 <title>One council, step by step</title>
-<desc>UML sequence diagram with lifelines You, Claude, Runner and run folder, and Codex workers. You ask Claude. Claude asks the runner for a new run, and the runner creates the run folder. Claude writes the brief into it and asks the runner to snapshot the files; the runner stores the snapshot and a copy per worker. Claude checks, then starts; the runner starts each worker on its own copy; each worker replies with evidence, which the runner saves to the run folder. Claude reads the results, checks freshness with the runner, weighs the evidence, and answers you.</desc>
+<desc>UML sequence diagram with lifelines You, Claude, Runner and run folder, and Codex workers. You ask Claude. Claude asks the runner for a new run, and the runner creates the run folder. Claude writes the brief into it and asks the runner to snapshot the files; the runner stores the snapshot and, by default, a copy per worker. Claude checks, then starts; the runner starts each worker on its own copy, or on a Git worktree, or, if you ask, on your live files; each worker replies with evidence, which the runner saves to the run folder. Claude reads the results, checks freshness with the runner, weighs the evidence, and answers you.</desc>
 <style>
 text{font-family:"Helvetica Neue",Helvetica,Arial,"Liberation Sans","Nimbus Sans",sans-serif}
 rect,path,polygon,polyline,circle{stroke-width:1.5}
@@ -50,7 +50,7 @@ text{fill:#f0f6fc}
 .k-frame{fill:#151b23;stroke:#656c76}
 }
 </style>
-<rect class="bg" x="0.75" y="0.75" width="406.5" height="976.5" rx="14"/>
+<rect class="bg" x="0.75" y="0.75" width="406.5" height="1052.5" rx="14"/>
 <text x="24" y="40" class="title">One council, step by step</text>
 <circle class="ring" cx="40" cy="71" r="7"/>
 <path class="ring" d="M40,78 V94 M29,84 H51 M31,106 L40,94 L49,106"/>
@@ -65,10 +65,10 @@ text{fill:#f0f6fc}
 <rect class="k-work" x="301" y="70" width="86" height="56" rx="6"/>
 <text x="344" y="93.54" class="b" text-anchor="middle">Codex</text>
 <text x="344" y="112.54" class="b" text-anchor="middle">workers</text>
-<polyline class="life" points="40,130 40,920"/>
-<polyline class="life" points="118,128 118,920"/>
-<polyline class="life" points="230,128 230,920"/>
-<polyline class="life" points="344,128 344,920"/>
+<polyline class="life" points="40,130 40,996"/>
+<polyline class="life" points="118,128 118,996"/>
+<polyline class="life" points="230,128 230,996"/>
+<polyline class="life" points="344,128 344,996"/>
 <polyline class="ln" points="40,169 110,169"/>
 <polygon class="hd" points="108,174 118,169 108,164"/>
 <rect class="bd" x="63.8" y="143.8" width="30.4" height="20.7" rx="3"/>
@@ -94,55 +94,59 @@ text{fill:#f0f6fc}
 <text x="174" y="361" class="s" text-anchor="middle">the files</text>
 <polyline class="ln" points="230,392 252,392 252,408 239,408"/>
 <polygon class="hd" points="241,403 231,408 241,413"/>
-<rect class="bd" x="257" y="382.8" width="82.71" height="77.7" rx="3"/>
+<rect class="bd" x="257" y="382.8" width="82.71" height="96.7" rx="3"/>
 <text x="260" y="397" class="s">store the</text>
 <text x="260" y="416" class="s">snapshot</text>
 <text x="260" y="435" class="s">and a copy</text>
 <text x="260" y="454" class="s">per worker</text>
-<polyline class="ln" points="118,514 222,514"/>
-<polygon class="hd" points="220,519 230,514 220,509"/>
-<rect class="bd" x="138.32" y="469.8" width="71.37" height="39.7" rx="3"/>
-<text x="174" y="484" class="s" text-anchor="middle">check,</text>
-<text x="174" y="503" class="s" text-anchor="middle">then start</text>
-<polyline class="ln" points="230,591 336,591"/>
-<polygon class="hd" points="334,596 344,591 334,586"/>
-<rect class="bd" x="239.56" y="527.8" width="94.87" height="58.7" rx="3"/>
-<text x="287" y="542" class="s" text-anchor="middle">start each</text>
-<text x="287" y="561" class="s" text-anchor="middle">worker on its</text>
-<text x="287" y="580" class="s" text-anchor="middle">own copy</text>
-<polyline class="ln dash" points="344,649 230,649"/>
-<polyline class="ln" points="240,644 230,649 240,654"/>
-<rect class="bd" x="245.65" y="604.8" width="82.69" height="39.7" rx="3"/>
-<text x="287" y="619" class="s" text-anchor="middle">replies and</text>
-<text x="287" y="638" class="s" text-anchor="middle">evidence</text>
-<polyline class="ln" points="230,669 252,669 252,685 239,685"/>
-<polygon class="hd" points="241,680 231,685 241,690"/>
-<rect class="bd" x="257" y="659.8" width="82.71" height="39.7" rx="3"/>
-<text x="260" y="674" class="s">save to the</text>
-<text x="260" y="693" class="s">run folder</text>
-<polyline class="ln" points="118,755 222,755"/>
-<polygon class="hd" points="220,760 230,755 220,750"/>
-<rect class="bd" x="142.24" y="710.8" width="63.53" height="39.7" rx="3"/>
-<text x="174" y="725" class="s" text-anchor="middle">read the</text>
-<text x="174" y="744" class="s" text-anchor="middle">results</text>
-<polyline class="ln" points="118,813 222,813"/>
-<polygon class="hd" points="220,818 230,813 220,808"/>
-<rect class="bd" x="137.01" y="768.8" width="73.97" height="39.7" rx="3"/>
-<text x="174" y="783" class="s" text-anchor="middle">check</text>
-<text x="174" y="802" class="s" text-anchor="middle">freshness</text>
-<polyline class="ln" points="118,833 140,833 140,849 127,849"/>
-<polygon class="hd" points="129,844 119,849 129,854"/>
-<rect class="bd" x="145" y="823.8" width="73.11" height="39.7" rx="3"/>
-<text x="148" y="838" class="s">weigh the</text>
-<text x="148" y="857" class="s">evidence</text>
-<polyline class="ln dash" points="118,900 40,900"/>
-<polyline class="ln" points="50,895 40,900 50,905"/>
-<rect class="bd" x="50.73" y="874.8" width="56.54" height="20.7" rx="3"/>
-<text x="79" y="889" class="s" text-anchor="middle">answer</text>
-<polyline class="ln" points="24,946 56,946"/>
-<polygon class="hd" points="54,951 64,946 54,941"/>
-<text x="74" y="951" class="s">request</text>
-<polyline class="ln dash" points="160,946 200,946"/>
-<polyline class="ln" points="190,951 200,946 190,941"/>
-<text x="210" y="951" class="s">reply</text>
+<text x="260" y="473" class="s">by default</text>
+<polyline class="ln" points="118,533 222,533"/>
+<polygon class="hd" points="220,538 230,533 220,528"/>
+<rect class="bd" x="138.32" y="488.8" width="71.37" height="39.7" rx="3"/>
+<text x="174" y="503" class="s" text-anchor="middle">check,</text>
+<text x="174" y="522" class="s" text-anchor="middle">then start</text>
+<polyline class="ln" points="230,667 336,667"/>
+<polygon class="hd" points="334,672 344,667 334,662"/>
+<rect class="bd" x="233.02" y="546.8" width="107.95" height="115.7" rx="3"/>
+<text x="287" y="561" class="s" text-anchor="middle">start each</text>
+<text x="287" y="580" class="s" text-anchor="middle">worker on its</text>
+<text x="287" y="599" class="s" text-anchor="middle">own copy, or</text>
+<text x="287" y="618" class="s" text-anchor="middle">a Git worktree,</text>
+<text x="287" y="637" class="s" text-anchor="middle">or, if you ask,</text>
+<text x="287" y="656" class="s" text-anchor="middle">your live files</text>
+<polyline class="ln dash" points="344,725 230,725"/>
+<polyline class="ln" points="240,720 230,725 240,730"/>
+<rect class="bd" x="245.65" y="680.8" width="82.69" height="39.7" rx="3"/>
+<text x="287" y="695" class="s" text-anchor="middle">replies and</text>
+<text x="287" y="714" class="s" text-anchor="middle">evidence</text>
+<polyline class="ln" points="230,745 252,745 252,761 239,761"/>
+<polygon class="hd" points="241,756 231,761 241,766"/>
+<rect class="bd" x="257" y="735.8" width="82.71" height="39.7" rx="3"/>
+<text x="260" y="750" class="s">save to the</text>
+<text x="260" y="769" class="s">run folder</text>
+<polyline class="ln" points="118,831 222,831"/>
+<polygon class="hd" points="220,836 230,831 220,826"/>
+<rect class="bd" x="142.24" y="786.8" width="63.53" height="39.7" rx="3"/>
+<text x="174" y="801" class="s" text-anchor="middle">read the</text>
+<text x="174" y="820" class="s" text-anchor="middle">results</text>
+<polyline class="ln" points="118,889 222,889"/>
+<polygon class="hd" points="220,894 230,889 220,884"/>
+<rect class="bd" x="137.01" y="844.8" width="73.97" height="39.7" rx="3"/>
+<text x="174" y="859" class="s" text-anchor="middle">check</text>
+<text x="174" y="878" class="s" text-anchor="middle">freshness</text>
+<polyline class="ln" points="118,909 140,909 140,925 127,925"/>
+<polygon class="hd" points="129,920 119,925 129,930"/>
+<rect class="bd" x="145" y="899.8" width="73.11" height="39.7" rx="3"/>
+<text x="148" y="914" class="s">weigh the</text>
+<text x="148" y="933" class="s">evidence</text>
+<polyline class="ln dash" points="118,976 40,976"/>
+<polyline class="ln" points="50,971 40,976 50,981"/>
+<rect class="bd" x="50.73" y="950.8" width="56.54" height="20.7" rx="3"/>
+<text x="79" y="965" class="s" text-anchor="middle">answer</text>
+<polyline class="ln" points="24,1022 56,1022"/>
+<polygon class="hd" points="54,1027 64,1022 54,1017"/>
+<text x="74" y="1027" class="s">request</text>
+<polyline class="ln dash" points="160,1022 200,1022"/>
+<polyline class="ln" points="190,1027 200,1022 190,1017"/>
+<text x="210" y="1027" class="s">reply</text>
 </svg>

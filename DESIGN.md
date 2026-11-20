@@ -52,9 +52,8 @@ single-quoted path cannot carry.
 By default runs live under `$HOME`, with two consequences. A source_root that
 contains the state home (say `$HOME`) would put the run inside its own capture, so
 --prepare refuses it and names the fix: a source_root that does not contain it, or
-XDG_STATE_HOME outside it. And a run can sit inside a Git work tree, so workers
-take their scratch cwd as the project root (see
-[Execution policy](#execution-policy)).
+XDG_STATE_HOME outside it. And a run can sit inside a Git work tree, so copy roles
+take their copy as the project root (see [Execution policy](#execution-policy)).
 
 Nothing is deleted automatically. --prune-runs is maintenance the skill runs only
 on user request; it lists by default and deletes only with --delete:
@@ -137,30 +136,70 @@ scanner. ACLs, xattrs, submodules, sparse layout, remote data and dependency
 environments are not reproduced.
 
 The frozen baseline is read-only to catch mistakes, not a same-uid trust boundary.
-Each role gets a separate writable copy and runs tests/experiments only according
+A copy role gets a separate writable copy and runs tests/experiments only according
 to its explicit capabilities. Missing Git metadata or dependencies can block a
-baseline; blocked setup is not evidence of an implementation defect. Worktrees are
-not required for isolation here, and Codex's worktree/resume incompatibility is
-avoided rather than hidden.
+baseline; blocked setup is not evidence of an implementation defect. Every run
+captures, whatever its workspaces: the capture is the reference for diffs and
+freshness.
+
+## Workspaces
+
+Three workspace modes answer three different requests. A copy is the default for
+investigation and experiments: the role works away from the user's tree. A
+worktree serves writers that need Git (several writers, or branch-based work)
+without touching the user's tree: each starts from what the user sees, overlaid
+from the capture, and leaves reviewable branches and diffs. Live serves the explicit
+request to edit the working tree directly. Only Claude's per-role choice differs;
+capture, evidence and reconciliation stay the same.
+
+Copies live in the run directory, so `project_root_markers=[]` stops Codex from
+climbing into an unrelated parent repository. A worktree or the live tree is a real
+checkout, so Codex resolves its project root, AGENTS.md and `.codex` natively, as
+if the user ran codex there; overriding it would make roles behave unlike the
+user's own Codex. For the same reason native external tools leave Codex's own
+harness, memories included, as the user configured it; only a role with external
+tools denied turns those surfaces off.
+
+There is no writer limit and no cross-run lock: serializing writers would refuse
+work the owner asked for, and collisions are theirs to accept. Live writers share
+one tree, so the runner records one shared live diff, the paths that had already
+changed at launch, and an attribution note instead of per-role claims it cannot
+make. Worktree roles each get their own branch and diff.
+
+Branches are created only after every role is prepared, so a prepare that fails
+while binding roles leaves no branch behind; an existing branch is refused rather
+than reused or overwritten. Branches are never deleted, by a failed prepare or a
+prune, because they may hold the only copy of a role's commits. A prune deletes the
+run directory first and only then deregisters each worktree, so Git never removes
+files itself.
+
+The brief asks every role to end with a one-line status (ready, blocked with one
+question for the user, or failed). It costs a role one line and gives Claude cheap
+triage: blocked questions lead the report to the user. It is recorded as the role's
+own claim, never as verification.
 
 ## Execution policy
 
 Role names do not grant capabilities. Read-only is default; workspace-write enables
-experimental files in that role's scratch cwd. Network, native integrations and
-bypass require an authorization declaration. Bypass must acknowledge that network
-denial cannot be enforced by that sandbox mode. Native tools retain their own
-privileges, independent of command-network policy.
+writes in that role's cwd. Network, native integrations, bypass and a live or
+worktree workspace require an authorization declaration. Full access is bypass,
+network and native external tools with an authorization; it needs no extra key.
+Bypass must acknowledge that network denial cannot be enforced by that sandbox
+mode. Native tools retain their own privileges, independent of command-network
+policy.
 
 The adapter reads actual-cwd configuration, enumerates MCP names, then reads again
 with requested restrictions. It removes extra writable roots and implicit temporary
 write grants, sets non-interactive approval, ignores user and project execpolicy
-rules (an allow rule would run its command outside the sandbox), turns memories
-off, sends `project_root_markers=[]` so the scratch cwd is Codex's project root
-(a run inside a Git work tree, such as a dotfiles home, loads no AGENTS.md or
-`.codex` layer from above it), and, with external tools denied, empties notify,
-disables the examined external-tool features and explicitly disables the
-discovered MCP servers by bare name. Wrong/unknown types, managed overrides or
-requirements, an unaddressable MCP name or an altered inventory block execution.
+rules (an allow rule would run its command outside the sandbox), and, for a copy
+role, sends `project_root_markers=[]` so the copy is Codex's project root (a run
+inside a Git work tree, such as a dotfiles home, loads no AGENTS.md or `.codex`
+layer from above it). With external tools denied it turns memories off, empties
+notify, disables the examined external-tool features and subagents
+(`agents.enabled=false`, which codex-cli 0.170 needs to remove its subagent tools),
+and explicitly disables the discovered MCP servers by bare name. Wrong/unknown
+types, managed overrides or requirements, an unaddressable MCP name or an altered
+inventory block execution.
 Command network requires workspace-write or bypass and an authorization.
 Preflight reports the policy and the detached child reobserves it; --start repeats
 only the local contract, capture and selection-authoring checks before detaching.
@@ -175,16 +214,14 @@ Failure never silently grants bypass or edits user configuration.
 
 ## Model discovery and selection
 
-Discovery and execution use each role's actual scratch cwd, the same Codex
-binary/environment and no profile override. Discovery does not send the workers'
-`project_root_markers=[]`, so for a run inside another Git work tree it can report
-native defaults from a parent `.codex` layer the workers do not load; explicit pins
-avoid relying on them. Relative CODEX_HOME is normalized
-before relocation, without copying credentials. Source agent configuration and
-instruction files are not copied (see the
+Discovery and execution use each role's actual execution cwd, the same Codex
+binary/environment, the same overrides (the policy probe's) and no profile
+override. Relative CODEX_HOME is normalized before relocation, without copying
+credentials. Source agent configuration and instruction files are not copied into
+a copy role's workspace (see the
 [invocation contract](plugins/codex-council/skills/codex-council/references/invocation-contract.md)),
-so source-layer defaults may differ from scratch-native defaults; preflight says
-so, and no claim of source configuration parity is made.
+so its defaults may differ from the source's; preflight says so, and no claim of
+source configuration parity is made.
 
 Discovery reads account, configuration, managed requirements and the model catalog
 through one adapter, with strict value grammar, authoring validation, launch-time
@@ -315,7 +352,7 @@ deliberate recovery.
    |                                                  |
    v                                                  |
  codex exec, fresh or resume,                         |
- in the role's scratch cwd                            |
+ in the role's cwd                                    |
    |                                                  |
    v                                                  |
  Outcome <------------------------------------+       |
@@ -356,10 +393,12 @@ raw spooling alone does not make total runner memory bounded.
 The result envelope separates runner observations, Codex-reported protocol data,
 and collaborator interpretation. It includes exact input/context identity, baseline
 integrity, required contribution coverage and current applicability. Text patches
-are convenience artifacts; exact bytes remain in scratch. A symlink or special file
-a role leaves is listed by path and kind, never followed or diffed. No artifact is
-applied, committed or published automatically. Reconciliation checks evidence and
-current requirements, not vote counts or a clean transport exit.
+are convenience artifacts; exact bytes remain in the workspace. A symlink, special
+file, nested repository, submodule or unreadable entry a role leaves is listed by
+path and kind, never followed or diffed. The runner applies, commits and publishes
+nothing; only an authorized role changes the user's tree (live) or its own branch
+(worktree). Reconciliation checks evidence and current requirements, not vote
+counts or a clean transport exit.
 
 Exit 0 requires a delivered report, at least one successful role, and complete
 required contributions, each with an observed completed turn.
@@ -368,8 +407,9 @@ Stale captured inputs are a separate applicability verdict, not a retroactive cl
 that the old experiment never happened. --freshness covers only the capture:
 selected file bytes and executable flags, empty directories, Git HEAD, the index
 entries of selected paths, the recorded omission list and the staged context.
-Staging an unrelated file leaves a capture fresh; a new commit does not. Claude
-checks changed intent and external conditions separately.
+Staging an unrelated file leaves a capture fresh; a new commit does not, and live
+edits make it stale by design. Claude checks changed intent and external conditions
+separately.
 
 ## Module boundaries
 
@@ -381,11 +421,11 @@ checks changed intent and external conditions separately.
 | council_selection | Role/selection data, pure model resolver and authoring validation. |
 | council_failures | Structured failure classification and recovery wording. |
 | council_liveness | Status/identity/lock handling, follow/status/cancel/reap. |
-| council_workspace | Read-only source capture, independent copies, integrity and freshness. |
+| council_workspace | Read-only source capture, independent copies, Git worktrees, integrity and freshness. |
 | council_policy | Capability validation and fail-closed effective-config observation. |
-| council_evidence | Raw attempts, protocol summaries, candidate artifacts and result envelope. |
+| council_evidence | Raw attempts, protocol summaries, candidate and live artifacts, reported status and result envelope. |
 | council_workflow | Versioned invocation contracts, bindings and per-role discovery orchestration. |
-| council_runs | Run allocation (--new-run) and descriptor-based pruning (--prune-runs). |
+| council_runs | Run allocation (--new-run), descriptor-based pruning (--prune-runs) and worktree deregistration. |
 
 ```
  codex_council (CLI and supervisor)

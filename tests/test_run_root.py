@@ -747,6 +747,100 @@ class PruneTests(RunRootCase):
         with open(target_file, encoding="utf-8") as f:
             self.assertEqual(f.read(), "keep\n")
 
+    def git(self, cwd, *args):
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+                   GIT_AUTHOR_NAME="Fixture", GIT_AUTHOR_EMAIL="fixture@example.invalid",
+                   GIT_COMMITTER_NAME="Fixture", GIT_COMMITTER_EMAIL="fixture@example.invalid")
+        return subprocess.run(["git", "-C", cwd, *args], env=env, capture_output=True,
+                              text=True, check=True).stdout.strip()
+
+    def worktree_run(self, run):
+        """Give `run` a real worktree role as --prepare records it: (repo,
+        worktree path, branch)."""
+        repo = os.path.join(self.base, "repo")
+        os.makedirs(repo, exist_ok=True)
+        self.git(repo, "init", "-q")
+        with open(os.path.join(repo, "a.txt"), "w", encoding="utf-8") as f:
+            f.write("a\n")
+        self.git(repo, "add", ".")
+        self.git(repo, "commit", "-qm", "base")
+        base = self.git(repo, "rev-parse", "HEAD")
+        branch = f"codex-council/{os.path.basename(run)}/builder"
+        path = os.path.join(run, "workspaces", "builder")
+        council_workspace.add_worktree(Path(repo), Path(path), base)
+        council_workspace.create_branch(Path(path), branch)
+        self.git(path, "commit", "-q", "--allow-empty", "-m", "kept work")
+        with open(os.path.join(path, "a.txt"), "w", encoding="utf-8") as f:
+            f.write("uncommitted\n")
+        self.edit_record(run, "run.json", lambda plan: plan.update(roles={"builder": {
+            "workspace": "workspaces/builder", "execution": {"workspace": "worktree"},
+            "worktree": {"root": "workspaces/builder", "repo": repo, "branch": branch,
+                         "base": base, "subdir": "."}}}))
+        self.assertIn(path, self.git(repo, "worktree", "list", "--porcelain"))
+        return repo, path, branch
+
+    def test_deleting_a_run_deregisters_its_worktree_and_keeps_the_branch(self):
+        run = self.finished_run()
+        repo, path, branch = self.worktree_run(run)
+        head = self.git(path, "rev-parse", "HEAD")
+        code, lines = self.prune()
+        self.assertEqual(code, 0, lines)
+        self.assertIn(f"keeps branch {branch} in {repo} (1 commit beyond its base; "
+                      "uncommitted changes in its worktree are deleted with the run, and the "
+                      "worktree deregistered, on --delete)", self.line_for(lines, run))
+        self.assertIn(path, self.git(repo, "worktree", "list", "--porcelain"))
+        code, lines = self.prune(delete=True)
+        self.assertEqual(code, 0, lines)
+        self.assertFalse(os.path.lexists(run))
+        self.assertEqual(self.line_for(lines, run),
+                         f"removed {run}: done 40.0 days ago; deregistered worktree {path}; "
+                         f"kept branch {branch} in {repo} (1 commit beyond its base; "
+                         "uncommitted worktree changes were deleted with the run)")
+        self.assertNotIn(path, self.git(repo, "worktree", "list", "--porcelain"))
+        self.assertEqual(self.git(repo, "rev-parse", branch), head)
+
+    def test_a_never_launched_worktree_run_is_deregistered_by_its_original_path(self):
+        run = self.prepared_run()
+        repo, path, branch = self.worktree_run(run)
+        code, lines = self.prune_at(2, days=1, delete=True)
+        self.assertEqual(code, 0, lines)
+        self.assertFalse(os.path.lexists(run))
+        self.assertIn(f"deregistered worktree {path}; kept branch {branch}",
+                      self.line_for(lines, run))
+        self.assertNotIn(path, self.git(repo, "worktree", "list", "--porcelain"))
+        self.git(repo, "rev-parse", "--verify", branch)
+
+    def test_a_branch_without_commits_is_reported_as_keeping_none_of_the_work(self):
+        run = self.finished_run()
+        repo, path, branch = self.worktree_run(run)
+        self.git(path, "reset", "-q", "--soft", "HEAD~1")
+        code, lines = self.prune()
+        self.assertEqual(code, 0, lines)
+        self.assertIn(f"keeps branch {branch} in {repo} (0 commits beyond its base; "
+                      "uncommitted changes in its worktree are deleted",
+                      self.line_for(lines, run))
+
+    def test_a_gone_repository_is_noted_and_the_run_still_removed(self):
+        run = self.finished_run()
+        repo, path, branch = self.worktree_run(run)
+        _rmtree_any(repo)
+        code, lines = self.prune(delete=True)
+        self.assertEqual(code, 0, lines)
+        self.assertFalse(os.path.lexists(run))
+        self.assertIn(f"repository {repo} is gone, so nothing was deregistered; "
+                      f"kept branch {branch}", self.line_for(lines, run))
+
+    def test_only_a_worktree_root_in_the_run_layout_is_ever_deregistered(self):
+        run = self.finished_run()
+        repo, path, branch = self.worktree_run(run)
+        self.edit_record(run, "run.json", lambda plan: plan["roles"]["builder"][
+            "worktree"].update(root="../../elsewhere"))
+        code, lines = self.prune(delete=True)
+        self.assertEqual(code, 0, lines)
+        self.assertEqual(self.line_for(lines, run), f"removed {run}: done 40.0 days ago")
+        self.assertIn(path, self.git(repo, "worktree", "list", "--porcelain"))  # prunable
+
     def test_saved_thread_state_and_role_locks_are_preserved(self):
         run = self.finished_run()
         saved = os.path.join(self.state, "proj-abc__architect.json")

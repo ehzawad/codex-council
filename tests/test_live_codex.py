@@ -57,6 +57,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # imported before the runner modules.
 import council_testlib  # noqa: E402
 import council_discovery  # noqa: E402
+import council_policy  # noqa: E402
 import council_selection  # noqa: E402
 import council_workflow  # noqa: E402
 
@@ -1055,6 +1056,35 @@ class LiveRejectionTests(LiveCouncilCase):
         self.assert_no_overrides(follow_up, argv)
         self.assertEqual(self.saved_threads(role_id), [thread])
         self.assert_native_recorded(snapshot, thread, since=before)
+
+
+class LiveOverrideAcceptanceTests(LiveCouncilCase):
+    """Every -c override each policy sends is a configuration field the
+    installed Codex accepts. `codex exec --strict-config ... --help` never
+    loads configuration, so it accepts anything; the app-server's
+    --print-startup-config validates without starting a server or turn."""
+
+    def strict(self, overrides):
+        argv = [self.real_codex, "app-server", "--strict-config", "--print-startup-config"]
+        for setting in overrides:
+            argv += ["-c", setting]
+        return subprocess.run(argv, cwd=self.repo, env=self.env, capture_output=True,
+                              text=True, stdin=subprocess.DEVNULL, timeout=60)
+
+    def test_every_policy_override_is_a_known_configuration_field(self):
+        bogus = self.strict(["council_probe_unknown_field=1"])
+        self.assertNotEqual(bogus.returncode, 0, "strict config accepted an unknown field")
+        auth = {"authorization": "live acceptance probe"}
+        for spec in ({}, {"sandbox": "workspace-write"},
+                     {"sandbox": "workspace-write", "network": True, **auth},
+                     {"sandbox": "workspace-write", "workspace": "worktree", **auth},
+                     {"sandbox": "bypass", "network": True, "external_tools": "native",
+                      "workspace": "live", **auth}):
+            with self.subTest(spec=spec):
+                overrides = council_policy.config_overrides(council_policy.parse_policy(spec))
+                proc = self.strict(overrides)
+                self.assertEqual(proc.returncode, 0, (overrides, proc.stdout[-400:],
+                                                      proc.stderr[-400:]))
 
 
 if __name__ == "__main__":

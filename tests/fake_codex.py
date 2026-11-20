@@ -236,8 +236,16 @@ def _codex_override(config, setting):
     config[segments[-1]] = value
 
 
-def run_policy_server(argv, scenario):
-    """The council's execution-policy probe (launched with -c overrides):
+def _client_name(raw):
+    try:
+        return json.loads(raw)["params"]["clientInfo"]["name"]
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def run_policy_server(argv, scenario, first=b""):
+    """The council's execution-policy probe (its initialize names client
+    codex-council-policy; discovery sends the same -c overrides):
     config/read answers the scenario's "policy_config" (default: no MCP
     servers and Codex's default project_root_markers) with the overrides
     applied, as Codex does. "policy_unreported" lists top-level keys a Codex
@@ -259,8 +267,9 @@ def run_policy_server(argv, scenario):
                "configRequirements/read": {"result": {
                    "requirements": scenario.get("policy_requirements")}}}
     methods.update(scenario.get("policy_methods", {}))
+    pending = [first] if first else []
     while True:
-        raw = sys.stdin.buffer.readline()
+        raw = pending.pop() if pending else sys.stdin.buffer.readline()
         if not raw:
             return 0
         if not raw.strip():
@@ -275,7 +284,7 @@ def run_policy_server(argv, scenario):
             return code
 
 
-def run_app_server(scenario):
+def run_app_server(scenario, first=b""):
     server = scenario.get("server", {})
     methods = scenario.get("methods", {})
     _record("server.pid", str(os.getpid()))
@@ -297,8 +306,9 @@ def run_app_server(scenario):
         sys.stderr.flush()
     if server.get("startup_exit") is not None:
         return server["startup_exit"]
+    pending = [first] if first else []
     while True:
-        raw = sys.stdin.buffer.readline()
+        raw = pending.pop() if pending else sys.stdin.buffer.readline()
         if not raw:
             _record("stdin.eof", "")
             break
@@ -526,10 +536,13 @@ def main():
     scenario = _scenario()
     if argv[:1] == ["--version"]:
         return run_version(scenario)
-    if argv[:1] == ["app-server"] and "-c" in argv:
-        return run_policy_server(argv, scenario)
     if argv[:1] == ["app-server"]:
-        return run_app_server(scenario)
+        # Discovery and the policy probe send the same -c overrides; only
+        # the probe's initialize names client codex-council-policy.
+        first = sys.stdin.buffer.readline() if "-c" in argv else b""
+        if _client_name(first) == "codex-council-policy":
+            return run_policy_server(argv, scenario, first)
+        return run_app_server(scenario, first)
     if argv[:1] == ["exec"]:
         return run_exec(argv, scenario)
     sys.stderr.write("fake codex: unsupported arguments %r\n" % (argv,))

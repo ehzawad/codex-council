@@ -5,7 +5,8 @@ Claude decides when a task-shaped contribution is useful. This runner captures
 current inputs into independent copies, resolves per-role model choices in the
 actual execution cwd, launches a detached supervisor, and records
 raw protocol evidence separately from collaborator interpretation. It neither
-judges substantive claims nor applies candidate changes to the live project.
+judges substantive claims nor applies patches. An authorized live worker
+edits the working tree directly; a worktree worker commits on its own branch.
 
 The only flow: --new-run, --prepare, --discover, --check-staging-dir,
 --start; then --follow/--status and --freshness before reconciliation.
@@ -133,7 +134,7 @@ from council_selection import (  # noqa: E402
 from council_workspace import WorkspaceError  # noqa: E402
 from council_policy import (  # noqa: E402
     ServiceTierOverridden, command_options, effects_possible, parse_policy, policy_dict)
-from council_evidence import AttemptEvidence, write_result  # noqa: E402
+from council_evidence import AttemptEvidence, reported_status, write_result  # noqa: E402
 from council_runs import DEFAULT_PRUNE_DAYS, RunsError, new_run, prune_runs  # noqa: E402
 from council_workflow import (  # noqa: E402
     prepare, load_plan, discover_prepared, resolve_selections, plan_lines,
@@ -257,7 +258,10 @@ COLLABORATION_BRIEF = (
     "Finish with plain paragraphs Claude can reconcile: the result first, "
     "then the evidence, dependencies on other work, risks, and open "
     "questions. If nothing material falls in your lens, say so clearly. "
-    "Thoroughness beats speed."
+    "Thoroughness beats speed. End with one last line: `Status: ready` when "
+    "your deliverable is complete, `Status: blocked: <the one question for "
+    "the user>` when an unsettled decision stops you, or `Status: failed: "
+    "<reason>` when you could not do it."
 )
 STAGING_PATH_HINT = (
     "Staging hint: use the exact directory printed by `--new-run` for "
@@ -465,10 +469,14 @@ def _max_parallel_roles():
 
 
 def _project_key(role_id):
-    """State key for (logical source, task id, optional session key, role)."""
+    """State key for source, task, workspace mode, optional session key and role."""
     base = hashlib.sha256(_logical_project_root().encode()).hexdigest()[:16]
     if _WORKFLOW["plan"] is not None:
-        base += "-" + hashlib.sha256(_WORKFLOW["plan"]["task_id"].encode()).hexdigest()[:16]
+        plan = _WORKFLOW["plan"]
+        base += "-" + hashlib.sha256(plan["task_id"].encode()).hexdigest()[:16]
+        mode = plan.get("roles", {}).get(role_id, {}).get("execution", {}).get("workspace")
+        if mode in ("live", "worktree"):
+            base += "-" + mode
     role_component = _state_role_component(role_id)
     session_key = _session_key()
     if session_key:
@@ -780,14 +788,66 @@ def _compose_prompt(role, body):
     """
     workspace = ""
     if role.workdir:
+        execution = role.execution or {}
+        mode = execution.get("workspace", "copy")
+        bypass = execution.get("sandbox") == "bypass"
+        others = "Do not edit another role's workspace or council control files. "
+        if mode == "live":
+            scope = (
+                f"Your execution workspace is the live working tree at {role.workdir}. "
+                "Use relative paths in this tree and make only the edits authorized "
+                "by the current task. The input snapshot records earlier state. "
+                "Preserve other people's edits. Leave commits and pushes to the user "
+                "unless they explicitly requested them. Other writers (people or "
+                "roles) may edit this tree at the same time, so re-read files before "
+                "editing them and preserve their edits. Outside this tree, do not "
+                "edit other roles' workspaces or council control files. "
+            )
+        elif mode == "worktree":
+            worktree = role.worktree or {}
+            # workspace-write cannot reach the worktree's .git (outside its root).
+            edits = ("Edit and commit freely on that branch; " if bypass else
+                     "Edit freely there but do not commit: this sandbox cannot write "
+                     "the repository's Git metadata, and the council records your "
+                     "uncommitted changes. ")
+            scope = (
+                f"Your execution workspace is a Git worktree of the user's repository "
+                f"at {role.workdir} on branch {worktree.get('branch')}, based on "
+                f"{worktree.get('base')} plus the user's captured uncommitted changes. "
+                f"Use relative paths in this tree. {edits}"
+                f"{'never' if bypass else 'Never'} push, touch other branches, or edit "
+                "the user's working tree. " + others
+            )
+        else:  # the 1.4.0 copy text, unchanged
+            scope = (
+                f"Your execution workspace is {role.workdir}. Use its relative paths. "
+                "Historical absolute paths may identify the live project: do not use "
+                "them as substitutes for captured inputs. Changes belong only in "
+                "this experimental workspace. " + others + "Never apply or publish "
+                "changes to the live project. "
+            )
+        if bypass:
+            # Bypass always has the network; external tools only when native.
+            scope += (
+                "You have full access, so run any commands and use the network, web "
+                "search and your own tools and subagents as the task needs; this "
+                "replaces the subagent limit above. "
+                if execution.get("external_tools") == "native" else
+                "Your commands run without a sandbox, so run any commands and use "
+                "the network as the task needs; web search, MCP tools and subagents "
+                "stay disabled for this role. "
+            ) + (
+                "Work autonomously: implement, verify your own result (run the "
+                "relevant tests or checks), and where other writers share your tree, "
+                "reconcile with their changes before you report what you verified and "
+                "what you could not. Take a local change as far as a verified, "
+                "reviewable result; when it needs a design decision the context does "
+                "not settle, stop and report it as blocked instead of guessing. "
+            )
         workspace = (
             f"\nCaptured task: {role.task_id}; input snapshot: {role.input_snapshot}.\n"
-            f"Your execution workspace is {role.workdir}. Use its relative paths. "
-            "Historical absolute paths may identify the live project: do not use "
-            "them as substitutes for captured inputs. Changes belong only in "
-            "this experimental workspace. Do not edit another role's workspace "
-            "or council control files. Never apply or publish changes to the live "
-            "project. When empirical work would decide the question, establish "
+            + scope
+            + "When empirical work would decide the question, establish "
             "a baseline, run a discriminating check, inspect its actual output, "
             "and report commands, results, changed artifacts and limitations. "
             "Never claim execution when a check was only proposed.\n"
@@ -1799,6 +1859,8 @@ def _format_reply_file(r):
             fields.append(f"requested_effort={decision.requested_effort}")
     if r.warning:
         fields.append("warning=yes")
+    if reported := reported_status(r.text):
+        fields.append(f"reported={reported['state']}")
     header = f"<!-- codex-council reply {' '.join(fields)} -->"
     body = "\n".join(_format_role_section(r)).rstrip()
     return f"{header}\n\n{body}\n"
@@ -2040,7 +2102,7 @@ def _parse_args(argv):
         "--discover", default=None, metavar="RUNDIR",
         help=(
             "Metadata-only model discovery for each role of a prepared "
-            "RUNDIR, in that role's scratch workspace: query `codex "
+            "RUNDIR, in that role's execution cwd with its overrides: query `codex "
             "app-server` for account type, native configuration, managed "
             "defaults, and the model catalog (no thread or turn is started; "
             f"bounded by {DISCOVERY_TIMEOUT_SECS}s per role), write "
@@ -2115,7 +2177,7 @@ def _parse_args(argv):
         ),
     )
     parser.add_argument("--prepare", metavar="RUNDIR",
-                        help="Capture request.json inputs and create independent experiment workspaces.")
+                        help="Capture request.json inputs and bind each role's workspace.")
     parser.add_argument("--freshness", metavar="RUNDIR",
                         help=("Compare captured inputs with current source state (0 unchanged, "
                               "1 stale/unknown, 2 invalid run directory)."))
@@ -3015,7 +3077,7 @@ def main():
             _usage_exit("--prune-runs: " + _report_inline(exc)
                         + "; nothing was deleted")
         sys.exit(code)
-    # Preserve relative CODEX_HOME semantics when execution moves to a scratch
+    # Preserve relative CODEX_HOME semantics when execution moves to a role
     # cwd. No config file is edited and credentials are never copied.
     home = os.environ.get("CODEX_HOME")
     if home and not os.path.isabs(home):
@@ -3035,6 +3097,12 @@ def main():
         print(f"[codex-council] captured snapshot={plan['snapshot']['snapshot_id']} "
               f"files={len(plan['snapshot']['files'])} roles={len(roles)} "
               f"omitted={len(plan['snapshot']['omitted'])} version={_plugin_version()}")
+        for role_id, binding in plan["roles"].items():
+            if "worktree" in binding:
+                print(_report_inline(
+                    f"[codex-council] worktree {role_id}: "
+                    f"{os.path.join(directory, binding['workspace'])} "
+                    f"branch={binding['worktree']['branch']} base={binding['worktree']['base']}"))
         return
     if args.freshness is not None:
         directory = _check_private_dir(args.freshness, prefix="--freshness: ",
@@ -3166,7 +3234,7 @@ def main():
           "no worker dispatched yet")
     # Authoring defects exit 2 here, before any worker; each automatic
     # selection is then revalidated by a fresh discovery in its role's own
-    # scratch cwd, and every
+    # execution cwd, and every
     # role gets the decision its commands are built from. A termination
     # signal during that discovery unwinds through its teardown.
     try:
@@ -3237,6 +3305,14 @@ def main():
         print("\n## Captured evidence\n\nRead `result.json` and per-attempt logs before "
               "reconciliation. Run `--freshness` before applying any candidate change. "
               "Execution success is not a substantive verification verdict.")
+        modes = {(role.execution or {}).get("workspace", "copy") for role in roles}
+        if "live" in modes:
+            print("Review live edits in the working tree. The live diff records observed "
+                  "changes since capture, including edits from other writers.")
+        if "worktree" in modes:
+            print("Worktree roles left their changes on their own branches; merge or "
+                  "apply what you accept. `--prune-runs --delete` removes the worktrees "
+                  "and keeps the branches.")
         sys.stdout.flush()
     except (OSError, ValueError):
         # stdout is dead: the report was not delivered, so no sentinel may

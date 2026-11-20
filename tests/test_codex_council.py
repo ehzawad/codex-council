@@ -39,6 +39,7 @@ import codex_council  # noqa: E402
 import council_common  # noqa: E402
 import council_failures  # noqa: E402
 import council_liveness  # noqa: E402
+import council_policy  # noqa: E402
 import council_selection  # noqa: E402
 from council_testlib import (  # noqa: E402
     FIXED_PROJECT_ROOT,
@@ -1189,6 +1190,16 @@ class ObservedCodexStringClassifierTests(unittest.TestCase):
     in both directions (tagged when genuine, suppressed when echoed in a
     non-retriable body)."""
 
+    def test_a_disabled_mcp_server_no_longer_configured_names_the_inventory(self):
+        # codex-cli 0.170, for -c mcp_servers.<name>.enabled=false naming a
+        # server the loaded config lacks (a partial table).
+        text = "Error loading config.toml: invalid transport in `mcp_servers.node_repl`"
+        self.assertEqual(_classify(text),
+                         f"{text} (MCP inventory changed or is unknown since the launch "
+                         "policy check; prepare a new run)")
+        self.assertEqual(_classify("Error loading config.toml: bad"),
+                         "Error loading config.toml: bad")
+
     def test_model_at_capacity_rewrite_is_5xx(self):
         # codex rewrites an HTTP 503 server_is_overloaded/slow_down to this
         # exact code-less sentence.
@@ -1330,6 +1341,21 @@ class CommandShapeTests(unittest.TestCase):
         self.assertIn("-C", cmd)
         self.assertIn("resume", cmd)
         self.assertLess(cmd.index("-C"), cmd.index("resume"))
+
+    def test_resume_keeps_every_policy_option_before_the_subcommand(self):
+        """Verified on codex-cli 0.170: parent-placed -C, --sandbox and -c
+        govern a resumed thread, and `exec resume` takes no --sandbox or -C."""
+        for spec in ({"sandbox": "workspace-write"},
+                     {"sandbox": "bypass", "network": True, "external_tools": "native",
+                      "workspace": "live", "authorization": "User granted full access"}):
+            with self.subTest(spec=spec):
+                options = council_policy.command_options(council_policy.parse_policy(spec))
+                cmd = codex_council._resume_cmd("/root", "sid-1", execution_options=options)
+                at = cmd.index("resume")
+                self.assertEqual(cmd[at - len(options):at], options)
+                self.assertEqual(cmd[:4], ["codex", "exec", "-C", "/root"])
+                self.assertEqual(cmd[at:], ["resume", "sid-1", "--skip-git-repo-check",
+                                            "--json", "-"])
 
     def test_fresh_cmd_has_no_resume_keyword(self):
         cmd = codex_council._fresh_cmd("/root")

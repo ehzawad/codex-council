@@ -2,6 +2,7 @@
 """Scripted protocol fixture. It checks argv, NOT actual sandbox enforcement."""
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -114,6 +115,9 @@ def execute(argv):
          "argv": argv, "thread": sid})
     emit({"type": "thread.started", "thread_id": sid})
     emit({"type": "turn.started"})
+    if "LIVE_WRITE_AND_WAIT" in body:
+        (cwd / "subject.py").write_text("value = 3\n")
+        time.sleep(120)
     if "HANG_FIXTURE" in body:
         emit({"type": "item.started", "item": {"type": "command_execution", "command": "sleep"}})
         time.sleep(120)
@@ -154,6 +158,33 @@ def execute(argv):
         (cwd / "bin").mkdir()
         os.symlink("/usr/bin/git", cwd / "bin/git")
         os.mkfifo(cwd / "test.fifo")
+    for name in re.findall(r"LIVE_WRITE_FILE:([a-z.]+)", body.split("## Shared working context")[0]):
+        if "re-read files before editing them" not in body:
+            return 2
+        (cwd / name).write_text(f"written by {name}\n")
+    if "WORKTREE_COMMIT_FIXTURE" in body:
+        if ("Edit and commit freely on that branch" not in body
+                or "You have full access" not in body):
+            return 2
+        (cwd / "subject.py").write_text("value = 3\n")
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+                   GIT_AUTHOR_NAME="Fixture", GIT_AUTHOR_EMAIL="fixture@example.invalid",
+                   GIT_COMMITTER_NAME="Fixture", GIT_COMMITTER_EMAIL="fixture@example.invalid")
+        for args in (("add", "subject.py"), ("commit", "-qm", "Worker change")):
+            subprocess.run(["git", *args], cwd=cwd, env=env, check=True, capture_output=True)
+        (cwd / "notes.txt").write_text("uncommitted\n")
+    if "LIVE_SCOPE_FIXTURE" in body:
+        if "Your execution workspace is the live working tree" not in body:
+            return 2
+        (cwd / "subject.py").write_text("value = 2\n")
+        (cwd / "delete.txt").unlink()
+        selected = cwd / "selected"
+        (selected / "new.txt").write_text("added\n")
+        (selected / "excluded.txt").write_text("out-of-scope fixture\n")
+        (cwd / "unselected.txt").write_text("out-of-scope fixture\n")
+        (selected / "link").symlink_to("../unselected.txt")
+        os.mkfifo(selected / "test.fifo")
     if "EXPERIMENT_FIXTURE" in body:
         if config(argv).get("sandbox_mode") != "workspace-write":
             return 2
@@ -166,6 +197,8 @@ def execute(argv):
         message = f"Baseline exit {before}; candidate exit {after}. Inspect the evidence."
     else:
         message = "Fixture contribution completed; no substantive verdict is inferred."
+    if "REPORTED_STATUS_FIXTURE" in body:
+        message += "\n\n**Status:** blocked: Which schema version wins?"
     if "UNFINISHED_TURN" in body:
         emit({"type": "item.completed", "item": {"type": "agent_message",
               "text": "I am about to run the required check."}})

@@ -44,6 +44,7 @@ class RoleFixture:
     execution_overrides: tuple = ()
     task_id: str | None = None
     input_snapshot: str | None = None
+    worktree: dict | None = None
 
 
 def write_json(path, value):
@@ -857,6 +858,71 @@ class PolicyTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(workspace.WorkspaceError):
                 policy.parse_policy(value)
 
+    def test_live_and_worktree_require_explicit_write_policy_and_authorization(self):
+        self.assertRaisesRegex(workspace.WorkspaceError, "copy, worktree, or live",
+                               policy.parse_policy, {"workspace": "auto"})
+        for mode in ("live", "worktree"):
+            permits = {"workspace": mode, "authorization": "User authorized edits"}
+            for value, reason in (
+                    (permits, f"workspace={mode} requires workspace-write or bypass"),
+                    ({"workspace": mode, "sandbox": "workspace-write"}, "authorization"),
+                    ({**permits, "sandbox": "bypass"}, "network=false")):
+                with self.subTest(value=value), self.assertRaisesRegex(
+                        workspace.WorkspaceError, reason):
+                    policy.parse_policy(value)
+            self.assertEqual(policy.parse_policy(
+                {**permits, "sandbox": "workspace-write"}).workspace, mode)
+            self.assertEqual(policy.policy_dict({**permits, "sandbox": "workspace-write"})
+                             ["workspace"], mode)
+        # Copy runs keep the 1.4.0 normalized contract (no workspace key).
+        self.assertEqual(policy.policy_dict({"workspace": "copy"}), policy.policy_dict())
+        self.assertNotIn("workspace", policy.policy_dict())
+
+    def test_native_harness_rules_are_per_mode(self):
+        """Markers are cleared only for a copy (it lives in the run
+        directory); memories are off only when external tools are denied."""
+        auth = {"authorization": "User authorized"}
+        for mode in ("copy", "worktree", "live"):
+            for tools in ("deny", "native"):
+                with self.subTest(mode=mode, tools=tools):
+                    spec = {"external_tools": tools, **auth}
+                    if mode != "copy":
+                        spec.update(workspace=mode, sandbox="workspace-write")
+                    p = policy.parse_policy(spec)
+                    settings = policy.config_overrides(p)
+                    self.assertEqual("project_root_markers=[]" in settings, mode == "copy")
+                    self.assertEqual("features.memories=false" in settings, tools == "deny")
+                    self.assertEqual("features.hooks=false" in settings, tools == "deny")
+                    host = {"mcp_servers": {}, "project_root_markers": [".git"],
+                            "features": {"memories": True}}
+                    config = apply_overrides(host, settings)
+                    policy.validate_observed(config, p, ())
+                    self.assertEqual(config["project_root_markers"],
+                                     [] if mode == "copy" else [".git"])
+                    self.assertEqual(config["features"]["memories"], tools != "deny")
+                    forced = {"featureRequirements": {"memories": True}}
+                    if tools == "deny":
+                        with self.assertRaisesRegex(workspace.WorkspaceError, "memories"):
+                            policy.validate_requirements(forced, p)
+                    else:
+                        policy.validate_requirements(forced, p)
+
+    def test_full_access_leaves_codexs_own_harness_as_configured(self):
+        """Full access is bypass + network + native external tools: no new
+        key, and in a live or worktree cwd nothing but the sandbox settings."""
+        for mode in ("live", "worktree"):
+            with self.subTest(mode=mode):
+                full = policy.parse_policy({"sandbox": "bypass", "network": True,
+                                            "external_tools": "native", "workspace": mode,
+                                            "authorization": "User granted full access"})
+                self.assertEqual(policy.command_options(full), [
+                    "--dangerously-bypass-approvals-and-sandbox",
+                    "-c", 'sandbox_mode="danger-full-access"', "-c", 'approval_policy="never"',
+                    "-c", "sandbox_workspace_write.writable_roots=[]",
+                    "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
+                    "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+                    "-c", "sandbox_workspace_write.network_access=true"])
+
     def test_mcp_keys_are_bare_codex_dotted_paths(self):
         p = policy.parse_policy()
         settings = policy.config_overrides(p, ("node_repl", "fixture-2"))
@@ -960,7 +1026,30 @@ class PolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(workspace.WorkspaceError, "notify"):
             policy.validate_observed(config, p, ())
         native = policy.parse_policy({"external_tools": "native", "authorization": "user asked"})
-        self.assertIn("features.memories=false", policy.config_overrides(native))
+        self.assertNotIn("features.memories=false", policy.config_overrides(native))
+        policy.validate_observed(apply_overrides(host, policy.config_overrides(native)), native, ())
+
+    def test_multi_agent_tools_are_disabled_by_agents_enabled_and_observed(self):
+        """codex-cli 0.170: features.multi_agent no longer removes the v2
+        collaboration tools (spawn_agent picks its own model); only
+        agents.enabled=false does, and config/read reports it."""
+        deny = policy.parse_policy()
+        settings = policy.config_overrides(deny)
+        self.assertIn("agents.enabled=false", settings)
+        self.assertIn("features.multi_agent=false", settings)
+        host = {"mcp_servers": {}, "agents": {"enabled": True, "max_threads": 6}}
+        config = apply_overrides(host, settings)
+        self.assertEqual(config["agents"], {"enabled": False, "max_threads": 6})
+        policy.validate_observed(config, deny, ())
+        for value in (True, None):
+            with self.subTest(value=value):
+                config["agents"]["enabled"] = value
+                with self.assertRaisesRegex(workspace.WorkspaceError, "agents.enabled"):
+                    policy.validate_observed(config, deny, ())
+        native = policy.parse_policy({"external_tools": "native", "authorization": "user asked"})
+        self.assertFalse(any(s.startswith("agents.") for s in policy.config_overrides(native)))
+        policy.validate_observed(apply_overrides(host, policy.config_overrides(native)),
+                                 native, ())
 
     def test_unknown_future_mcp_server_between_reads_is_refused(self):
         calls = 0
@@ -1007,6 +1096,58 @@ class WorkflowTests(WorkspaceCase):
         a.write_text("modified a")
         self.assertEqual(b.read_text(), "value = 1\n")
         self.assertEqual(self.file.read_text(), "value = 1\n")
+
+    def test_several_live_roles_share_the_tree_and_an_alternate_root_is_refused(self):
+        execution = {"workspace": "live", "sandbox": "workspace-write",
+                     "authorization": "User authorized live edits"}
+        roles, body = self.stage(roles=[RoleFixture(id="a", execution=execution),
+                                        RoleFixture(id="b", execution=execution),
+                                        RoleFixture(id="c")])
+        plan = workflow.prepare(str(self.run), roles, body)
+        self.assertEqual(plan["roles"]["a"]["workspace"], str(self.source))
+        self.assertEqual(plan["roles"]["b"]["workspace"], str(self.source))
+        self.assertEqual(plan["roles"]["c"]["workspace"], "workspaces/c")
+        self.assertEqual(plan["backend"], "per-role")
+        self.assertFalse((self.run / "workspaces/a").exists())
+        workflow.load_plan(self.run, roles, body, verify_inputs=True)
+        plan["roles"]["a"]["workspace"] = str(self.base)
+        write_json(self.run / "run.json", plan)
+        with self.assertRaisesRegex(workspace.WorkspaceError, "match the captured source_root"):
+            workflow.load_plan(self.run, roles, body)
+
+    def test_include_nothing_is_refused_for_live_and_worktree_roles(self):
+        for mode in ("live", "worktree"):
+            with self.subTest(mode=mode):
+                execution = {"workspace": mode, "sandbox": "workspace-write",
+                             "authorization": "User authorized edits"}
+                roles, body = self.stage(roles=[RoleFixture(id="a", execution=execution)])
+                request = workspace.read_json(self.run / "request.json", private=False)
+                write_json(self.run / "request.json", {**request, "include": []})
+                with self.assertRaisesRegex(workspace.WorkspaceError,
+                                            r"include \[\] captures no files"):
+                    workflow.prepare(str(self.run), roles, body)
+                self.assertFalse((self.run / "prepare.lock").exists())
+        roles, body = self.stage()
+        request = workspace.read_json(self.run / "request.json", private=False)
+        write_json(self.run / "request.json", {**request, "include": []})
+        self.assertEqual(workflow.prepare(str(self.run), roles, body)["snapshot"]["files"], {})
+
+    def test_live_working_tree_cannot_contain_run_under_an_alternate_spelling(self):
+        alias = self.source.with_name(self.source.name.swapcase())
+        if not alias.exists():
+            self.skipTest("case-sensitive filesystem")
+        self.assertTrue(alias.samefile(self.source))
+        self.run.rename(self.source / "run")
+        self.run = self.source / "run"
+        execution = {"workspace": "live", "sandbox": "workspace-write",
+                     "authorization": "User authorized live edits"}
+        roles, body = self.stage(roles=[RoleFixture(execution=execution)])
+        request = workspace.read_json(self.run / "request.json")
+        request.update(source_root=str(alias), include=["subject.py"])
+        write_json(self.run / "request.json", request)
+        with self.assertRaisesRegex(workspace.WorkspaceError, "inside source_root"):
+            workflow.prepare(str(self.run), roles, body)
+        self.assertFalse((self.run / "prepare.lock").exists())
 
     def test_run_control_directories_are_private_whatever_the_umask(self):
         """workspaces/, evidence/, catalogs/ and each role's subdirectories
@@ -1279,7 +1420,554 @@ class WorkflowTests(WorkspaceCase):
         self.assertEqual(workflow.load_plan(self.run, roles, body)["run_id"], plan["run_id"])
 
 
+GIT_IDENTITY = {"GIT_AUTHOR_NAME": "Fixture", "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
+                "GIT_COMMITTER_NAME": "Fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid"}
+
+
+def git_at(path, *args):
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1", **GIT_IDENTITY)
+    return subprocess.run(["git", "-C", str(path), *args], env=env, capture_output=True,
+                          check=True).stdout.decode().rstrip("\n")
+
+
+WORKTREE = {"workspace": "worktree", "sandbox": "workspace-write",
+            "authorization": "User authorized a worktree and branch"}
+LIVE = {"workspace": "live", "sandbox": "workspace-write",
+        "authorization": "User authorized working-tree edits"}
+
+
+class WorktreeTests(WorkspaceCase):
+    """A worktree role starts from what the user sees: HEAD plus the
+    captured uncommitted changes, on a new branch of the repository."""
+
+    def repo(self):
+        """Committed files, then dirty, exec-bit, deleted, staged-deleted,
+        untracked, ignored and instruction-file changes in the working tree."""
+        for name, text in (("tool.sh", "echo tool\n"), ("deleted.txt", "tracked\n"),
+                           ("staged.txt", "tracked\n"), ("AGENTS.md", "HEAD instructions\n"),
+                           ("pkg/inner.py", "inner = 1\n"), (".gitignore", "*.log\n")):
+            (self.source / name).parent.mkdir(exist_ok=True)
+            (self.source / name).write_text(text)
+        self.git("init", "-q")
+        self.git("add", ".")
+        self.git("commit", "-qm", "baseline")
+        self.base_commit = git_at(self.source, "rev-parse", "HEAD")
+        self.file.write_text("value = 2\n")
+        (self.source / "tool.sh").chmod(0o755)
+        (self.source / "deleted.txt").unlink()
+        self.git("rm", "-q", "staged.txt")
+        (self.source / "untracked.txt").write_text("untracked\n")
+        (self.source / "debug.log").write_text("ignored\n")
+        (self.source / "AGENTS.md").write_text("local instructions\n")
+
+    def git(self, *args):
+        return git_at(self.source, *args)
+
+    def stage(self, roles, include=None, source=None):
+        request = {"schema": workflow.REQUEST_SCHEMA, "task_id": "worktree-task",
+                   "reason": "Implement in an isolated branch",
+                   "source_root": str(source or self.source)}
+        if include is not None:
+            request["include"] = include
+        write_json(self.run / "request.json", request)
+        body = "Current objective.\n"
+        (self.run / "context.md").write_text(body)
+        return roles, body
+
+    def branch(self, key="builder"):
+        return f"codex-council/{self.run.name}/{key}"
+
+    def test_worktree_starts_from_head_plus_the_captured_changes(self):
+        self.repo()
+        roles, body = self.stage([RoleFixture(id="builder", execution=WORKTREE)])
+        plan = workflow.prepare(str(self.run), roles, body)
+        binding = plan["roles"]["builder"]
+        self.assertEqual(binding["workspace"], "workspaces/builder")
+        self.assertEqual(binding["worktree"], {
+            "root": "workspaces/builder", "repo": str(self.source), "subdir": ".",
+            "branch": self.branch(), "base": self.base_commit})
+        work = self.run / "workspaces/builder"
+        self.assertEqual(stat.S_IMODE(work.lstat().st_mode), 0o700)
+        self.assertTrue((work / ".git").is_file())
+        self.assertEqual((work / "subject.py").read_text(), "value = 2\n")
+        self.assertTrue(os.access(work / "tool.sh", os.X_OK))
+        self.assertFalse((work / "deleted.txt").exists())
+        self.assertFalse((work / "staged.txt").exists())
+        self.assertEqual((work / "untracked.txt").read_text(), "untracked\n")
+        self.assertFalse((work / "debug.log").exists())  # ignored: not captured
+        # Omitted paths stay as checked out from HEAD.
+        self.assertEqual((work / "AGENTS.md").read_text(), "HEAD instructions\n")
+        self.assertEqual(git_at(work, "rev-parse", "--abbrev-ref", "HEAD"), self.branch())
+        self.assertEqual(self.git("rev-parse", self.branch()), self.base_commit)
+        status = git_at(work, "status", "--porcelain")
+        for line in (" M subject.py", " M tool.sh", " D deleted.txt", " D staged.txt",
+                     "?? untracked.txt"):
+            self.assertIn(line, status.splitlines())
+        # The user's tree and branch are untouched.
+        self.assertEqual(self.file.read_text(), "value = 2\n")
+        self.assertEqual(self.git("rev-parse", "--abbrev-ref", "HEAD"),
+                         git_at(self.source, "symbolic-ref", "--short", "HEAD"))
+        self.assertIn("D  staged.txt", self.git("status", "--porcelain").splitlines())
+        workflow.load_plan(self.run, roles, body, verify_inputs=True)
+        (work / "subject.py").write_text("value = 9\n")
+        with self.assertRaisesRegex(workspace.WorkspaceError,
+                                    "worktree selected inputs differ from the capture: subject.py"):
+            workflow.load_plan(self.run, roles, body, verify_inputs=True)
+
+    def test_a_source_root_below_the_top_level_runs_in_that_subdirectory(self):
+        self.repo()
+        (self.source / "pkg/inner.py").write_text("inner = 2\n")
+        roles, body = self.stage([RoleFixture(id="builder", execution=WORKTREE)],
+                                 source=self.source / "pkg")
+        plan = workflow.prepare(str(self.run), roles, body)
+        binding = plan["roles"]["builder"]
+        self.assertEqual(binding["worktree"]["subdir"], "pkg")
+        self.assertEqual(binding["workspace"], "workspaces/builder/pkg")
+        self.assertEqual((self.run / "workspaces/builder/pkg/inner.py").read_text(),
+                         "inner = 2\n")
+        self.assertEqual((self.run / "workspaces/builder/subject.py").read_text(),
+                         "value = 1\n")  # outside source_root: as committed
+        with patch.object(workflow, "inspect_policy",
+                          side_effect=lambda root, p: {"overrides": []}):
+            bound, _ = workflow.bind_roles(str(self.run), roles, body, at_launch=False)
+        self.assertEqual(bound[0].workdir, str(self.run / "workspaces/builder/pkg"))
+        self.assertEqual(bound[0].worktree["root"], str(self.run / "workspaces/builder"))
+        self.assertEqual(bound[0].worktree["branch"], self.branch())
+
+    def test_explicit_scope_overlay_creates_and_removes_entries(self):
+        self.repo()
+        (self.source / "pkg/inner.py").unlink()
+        (self.source / "pkg/empty").mkdir()
+        roles, body = self.stage([RoleFixture(id="builder", execution=WORKTREE)],
+                                 include=["subject.py", "pkg"])
+        plan = workflow.prepare(str(self.run), roles, body)
+        work = self.run / "workspaces/builder"
+        self.assertFalse((work / "pkg/inner.py").exists())
+        self.assertTrue((work / "pkg/empty").is_dir())
+        self.assertEqual(plan["snapshot"]["dirs"], ["pkg/empty"])
+        self.assertTrue((work / "deleted.txt").exists())  # outside the selection
+        workflow.load_plan(self.run, roles, body, verify_inputs=True)
+
+    def test_refusals_outside_a_git_work_tree_with_a_commit(self):
+        roles, body = self.stage([RoleFixture(id="builder", execution=WORKTREE)],
+                                 include=["."])
+        with self.assertRaisesRegex(workspace.WorkspaceError,
+                                    "inside a Git work tree; use execution.workspace copy or live"):
+            workflow.prepare(str(self.run), roles, body)
+        with patch.object(workspace.shutil, "which", return_value=None), \
+                self.assertRaisesRegex(workspace.WorkspaceError, "needs Git, which was not found"):
+            workflow.prepare(str(self.run), roles, body)
+        self.git("init", "-q")
+        with self.assertRaisesRegex(workspace.WorkspaceError,
+                                    "HEAD is unborn; commit first; use execution.workspace"):
+            workflow.prepare(str(self.run), roles, body)
+        self.assertFalse((self.run / "prepare.lock").exists())
+        self.assertFalse((self.run / "baseline").exists())
+
+    def test_an_existing_branch_is_refused_and_never_touched(self):
+        self.repo()
+        self.git("branch", self.branch(), self.base_commit)
+        roles, body = self.stage([RoleFixture(id="builder", execution=WORKTREE)])
+        with self.assertRaisesRegex(workspace.WorkspaceError,
+                                    "worktree branch already exists: " + re.escape(self.branch())):
+            workflow.prepare(str(self.run), roles, body)
+        self.assertEqual(self.git("rev-parse", self.branch()), self.base_commit)
+        self.assertFalse((self.run / "prepare.lock").exists())
+        renamed = self.base / "run with space"
+        self.run.rename(renamed)
+        self.run = renamed
+        roles, body = self.stage([RoleFixture(id="builder", execution=WORKTREE)])
+        with self.assertRaisesRegex(workspace.WorkspaceError, "branch name is not valid"):
+            workflow.prepare(str(self.run), roles, body)
+
+    def test_a_branch_above_or_below_in_the_ref_namespace_is_refused_before_capture(self):
+        """Git cannot create codex-council/<run>/<key> beside a branch named
+        codex-council or codex-council/<run>/<key>/x: refused before the
+        run directory is used up."""
+        self.repo()
+        roles, body = self.stage([RoleFixture(id="builder", execution=WORKTREE)])
+        for existing in ("codex-council", f"codex-council/{self.run.name}",
+                         f"{self.branch()}/nested"):
+            with self.subTest(existing=existing):
+                self.git("branch", existing, self.base_commit)
+                with self.assertRaisesRegex(
+                        workspace.WorkspaceError,
+                        f"worktree branch {re.escape(self.branch())} cannot coexist with "
+                        f"existing branch {re.escape(existing)}; rename that branch; use "
+                        "execution.workspace copy or live"):
+                    workflow.prepare(str(self.run), roles, body)
+                self.assertFalse((self.run / "prepare.lock").exists())
+                self.git("branch", "-D", existing)
+        self.git("branch", "codex-councilx", self.base_commit)  # not in the namespace
+        workflow.prepare(str(self.run), roles, body)
+        self.assertEqual(self.git("rev-parse", self.branch()), self.base_commit)
+
+    def test_source_root_is_recorded_in_gits_own_spelling(self):
+        """A case-insensitive filesystem accepts another spelling of
+        source_root; a subdirectory Git spells unsafely is refused before
+        capture."""
+        self.repo()
+        alternate = Path(str(self.source / "pkg").swapcase())
+        if not alternate.exists():
+            self.skipTest("case-sensitive filesystem")
+        roles, body = self.stage([RoleFixture(id="builder", execution=WORKTREE)],
+                                 source=alternate)
+        plan = workflow.prepare(str(self.run), roles, body)
+        self.assertEqual(plan["roles"]["builder"]["worktree"]["subdir"], "pkg")
+        self.assertEqual(plan["roles"]["builder"]["workspace"], "workspaces/builder/pkg")
+        workflow.load_plan(self.run, roles, body, verify_inputs=True)
+
+    def test_a_subdirectory_git_spells_unsafely_is_refused_before_capture(self):
+        self.repo()
+        odd = self.source / "we\\ird"
+        odd.mkdir()
+        (odd / "f.txt").write_text("f\n")
+        roles, body = self.stage([RoleFixture(id="builder", execution=WORKTREE)], source=odd)
+        with self.assertRaisesRegex(workspace.WorkspaceError,
+                                    "below its Git top level .* cannot be recorded: "
+                                    + re.escape(repr(odd.name))
+                                    + "; use execution.workspace copy or live"):
+            workflow.prepare(str(self.run), roles, body)
+        self.assertFalse((self.run / "prepare.lock").exists())
+        self.assertEqual(self.git("branch", "--list", "codex-council/*"), "")
+
+    def test_a_failed_preparation_deregisters_its_worktrees_and_creates_no_branch(self):
+        self.repo()
+        roles, body = self.stage([RoleFixture(id="one", execution=WORKTREE),
+                                  RoleFixture(id="two", execution=WORKTREE)])
+        original = workspace.overlay_worktree
+        calls = []
+
+        def fail_second(*args):
+            calls.append(args)
+            if len(calls) == 2:
+                raise workspace.WorkspaceError("overlay fixture failure")
+            return original(*args)
+
+        with patch.object(workflow, "overlay_worktree", side_effect=fail_second), \
+                self.assertRaisesRegex(workspace.WorkspaceError,
+                                       "overlay fixture failure; removed 2 of 2 worktrees "
+                                       "this run added; no branch was created"):
+            workflow.prepare(str(self.run), roles, body)
+        listed = self.git("worktree", "list", "--porcelain")
+        self.assertNotIn(str(self.run), listed)
+        self.assertEqual(self.git("branch", "--list", "codex-council/*"), "")
+        self.assertTrue((self.run / "prepare.lock").exists())  # this directory is used up
+
+    def test_a_late_failure_names_the_branches_it_created_and_keeps_them(self):
+        self.repo()
+        roles, body = self.stage([RoleFixture(id="one", execution=WORKTREE)])
+        with patch.object(workflow, "atomic_json", side_effect=OSError("disk full")), \
+                self.assertRaisesRegex(workspace.WorkspaceError,
+                                       "disk full; removed 1 of 1 worktrees this run added "
+                                       "and kept the branches it created "
+                                       + re.escape(f"({self.branch('one')})")):
+            workflow.prepare(str(self.run), roles, body)
+        self.assertEqual(self.git("rev-parse", self.branch("one")), self.base_commit)
+        self.assertNotIn(str(self.run), self.git("worktree", "list", "--porcelain"))
+
+    def test_a_worktree_that_cannot_reproduce_the_capture_is_refused_without_a_branch(self):
+        """HEAD's ignore rules, index or omitted paths can differ from the
+        user's tree: refused clearly, suggesting copy or live, and no branch
+        is left behind."""
+        def unignore():  # outside source_root (pkg), so never overlaid
+            (self.source / ".gitignore").write_text("*.log\n!keep.log\n")
+            (self.source / "pkg/keep.log").write_text("kept\n")
+
+        def force():
+            (self.source / "forced.log").write_text("forced\n")
+            self.git("add", "-f", "forced.log")
+
+        def file_for_dir():
+            shutil.rmtree(self.source / "pkg")
+            (self.source / "pkg").write_text("now a file\n")
+
+        for case, change, below, reason in (
+                ("unignored", unignore, "pkg",
+                 "worktree selected inputs differ from the capture: keep.log"),
+                ("forced", force, ".", "worktree selected inputs differ from the capture: "
+                 "forced.log"),
+                ("file-for-dir", file_for_dir, ".",
+                 "pkg is a file in it but a directory holding omitted paths at HEAD")):
+            with self.subTest(case=case):
+                self.source = self.base / f"source-{case}"
+                self.run = self.base / f"run-{case}"
+                self.source.mkdir(mode=0o700)
+                self.run.mkdir(mode=0o700)
+                self.file = self.source / "subject.py"
+                self.file.write_text("value = 1\n")
+                (self.source / "pkg").mkdir()
+                (self.source / "pkg/AGENTS.md").write_text("pkg instructions\n")
+                self.repo()
+                change()
+                roles, body = self.stage([RoleFixture(id="builder", execution=WORKTREE)],
+                                         source=self.source / below)
+                with self.assertRaisesRegex(workspace.WorkspaceError, reason) as caught:
+                    workflow.prepare(str(self.run), roles, body)
+                self.assertIn("use execution.workspace copy or live; removed 1 of 1 worktrees "
+                              "this run added; no branch was created", str(caught.exception))
+                self.assertEqual(self.git("branch", "--list", "codex-council/*"), "")
+                self.assertNotIn(str(self.run), self.git("worktree", "list"))
+
+    def test_the_recorded_worktree_is_validated(self):
+        self.repo()
+        roles, body = self.stage([RoleFixture(id="builder", execution=WORKTREE)])
+        original = workflow.prepare(str(self.run), roles, body)
+        for change, reason in (
+                (lambda b: b["worktree"].update(root="workspaces/other"),
+                 "deterministic path and branch"),
+                (lambda b: b["worktree"].update(branch="main"), "deterministic path and branch"),
+                (lambda b: b.pop("worktree"), "worktree record does not match"),
+                (lambda b: b["worktree"].update(extra="x"), "invalid worktree record"),
+                (lambda b: b.update(workspace="workspaces/builder/x"), "deterministic private path")):
+            with self.subTest(reason=reason):
+                plan = copy.deepcopy(original)
+                change(plan["roles"]["builder"])
+                write_json(self.run / "run.json", plan)
+                with self.assertRaisesRegex(workspace.WorkspaceError, reason):
+                    workflow.load_plan(self.run, roles, body)
+        plan = copy.deepcopy(original)
+        plan["roles"]["builder"]["worktree"] = {"root": "workspaces/builder", "repo": "/x",
+                                                "branch": "b", "base": "c", "subdir": "."}
+        plan["roles"]["builder"]["execution"] = policy.policy_dict()
+        write_json(self.run / "run.json", plan)
+        with self.assertRaisesRegex(workspace.WorkspaceError, "worktree record does not match"):
+            workflow.load_plan(self.run)
+        write_json(self.run / "run.json", original)
+        (self.run / "workspaces/builder").chmod(0o755)
+        with self.assertRaisesRegex(workspace.WorkspaceError, "not an owned private directory"):
+            workflow.load_plan(self.run, roles, body)
+        (self.run / "workspaces/builder").chmod(0o700)
+        (self.run / "workspaces/builder/.git").unlink()
+        with self.assertRaisesRegex(workspace.WorkspaceError, "not a Git worktree"):
+            workflow.load_plan(self.run, roles, body)
+        # --freshness does not need the worktree.
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            workflow.freshness_command(str(self.run))
+        self.assertIn('"state"', output.getvalue())
+
+    def test_freshness_answers_after_the_user_removes_the_worktree(self):
+        """Merging the branch and running `git worktree remove` is natural
+        cleanup; --freshness still answers about the source."""
+        self.repo()
+        roles, body = self.stage([RoleFixture(id="builder", execution=WORKTREE)])
+        workflow.prepare(str(self.run), roles, body)
+        self.git("worktree", "remove", "--force", str(self.run / "workspaces/builder"))
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(workflow.freshness_command(str(self.run)), 0)
+        self.assertEqual(json.loads(output.getvalue())["state"], "unchanged")
+        with self.assertRaises(FileNotFoundError):  # launching still needs it
+            workflow.load_plan(self.run, roles, body)
+
+    def test_commits_on_the_branch_are_reported_with_the_candidate_diff(self):
+        self.repo()
+        roles, body = self.stage([RoleFixture(id="builder", execution=WORKTREE)])
+        plan = workflow.prepare(str(self.run), roles, body)
+        work = self.run / "workspaces/builder"
+        (work / "subject.py").write_text("value = 3\n")
+        git_at(work, "commit", "-qam", "Role change")
+        (work / "new.py").write_text("new = 1\n")
+        result = evidence.write_result(self.run, plan, [])
+        artifacts = result["roles"]["builder"]["artifacts"]
+        self.assertFalse(artifacts["applied_to_live_tree"])
+        self.assertIn(f"on branch {self.branch()} in worktree {work}", artifacts["application"])
+        self.assertIn("merge or apply what you accept", artifacts["application"])
+        info = artifacts["worktree"]
+        head = git_at(work, "rev-parse", "HEAD")
+        self.assertEqual((info["path"], info["branch"], info["base"], info["head"],
+                          info["checked_out"], info["commit_count"]),
+                         (str(work), self.branch(), self.base_commit, head, self.branch(), 1))
+        self.assertEqual(info["commits"], [{"sha": head, "subject": "Role change"}])
+        diff = (self.run / "evidence/builder" / artifacts["candidate_diff"]).read_text()
+        self.assertIn("-value = 2\n+value = 3", diff)
+        self.assertIn("+new = 1", diff)
+        self.assertEqual({row["path"]: row["kind"] for row in artifacts["files"]},
+                         {"subject.py": "modified", "new.py": "added"})
+        self.assertNotIn("live", result)
+        self.assertEqual(self.file.read_text(), "value = 2\n")  # nothing applied
+
+    def test_a_nested_repository_or_submodule_a_role_creates_is_a_special_kind(self):
+        self.init_git()
+        snap = workspace.capture(self.source, self.baseline)
+        nested = self.source / "nested"
+        nested.mkdir()
+        git_at(nested, "init", "-q")
+        (nested / "file.txt").write_text("nested\n")
+        self.git("update-index", "--add", "--cacheinfo",
+                 f"160000,{git_at(self.source, 'rev-parse', 'HEAD')},sub")
+        special = {}
+        workspace.inventory(self.source, None, [], special=special, portable=False)
+        self.assertEqual(special, {"nested": "nested-git-repo", "sub": "git-submodule"})
+        with self.assertRaisesRegex(workspace.WorkspaceError, "not copied"):
+            workspace.inventory(self.source, None, [])  # capture is unchanged
+        directory = self.run / "evidence"
+        directory.mkdir(mode=0o700)
+        artifacts = evidence.collect_artifacts(self.baseline, self.source, snap, directory,
+                                               mode="live")
+        self.assertEqual({row["path"]: row["kind"] for row in artifacts["files"]},
+                         {"nested": "nested-git-repo", "sub": "git-submodule"})
+
+    def test_two_live_writers_share_one_diff_and_attribution_is_not_per_role(self):
+        from council_selection import Role
+        (self.source / "other.py").write_text("other = 1\n")
+        roles, body = self.stage([Role("a", "A", "Edit.", execution=policy.policy_dict(LIVE)),
+                                  Role("b", "B", "Edit.", execution=policy.policy_dict(LIVE)),
+                                  Role("c", "C", "Review.", execution=policy.policy_dict())],
+                                 include=["."])
+        plan = workflow.prepare(str(self.run), roles, body)
+        (self.source / "other.py").write_text("other = 2\n")  # before launch
+        workflow.resolve_selections(roles, str(self.run), "off", True, body,
+                                    probe_policy=False)
+        before = workspace.read_json(self.run / "evidence/live-before-launch.json")
+        self.assertEqual(before["changed_paths"], ["other.py"])
+        self.file.write_text("value = 2\n")
+        (self.source / "added.py").write_text("added = 1\n")
+        result = evidence.write_result(self.run, plan, [])
+        live = result["live"]
+        self.assertEqual(live["writers"], ["a", "b"])
+        self.assertEqual(live["live_diff"], "evidence/live.diff")
+        self.assertIn("not per role", live["attribution"])
+        self.assertEqual(live["changed_before_launch"], ["other.py"])
+        self.assertTrue(live["applied_to_live_tree"])
+        self.assertEqual({row["path"] for row in live["files"]},
+                         {"subject.py", "added.py", "other.py"})
+        for role_id in ("a", "b"):
+            self.assertEqual(result["roles"][role_id]["artifacts"],
+                             {"live_diff": "evidence/live.diff", "applied_to_live_tree": True,
+                              "writers": ["a", "b"]})
+        diff = (self.run / "evidence/live.diff").read_text()
+        self.assertIn("+value = 2", diff)
+        self.assertIn("+added = 1", diff)
+        self.assertEqual(sorted(path.name for path in (self.run / "evidence").rglob("*.diff")),
+                         ["candidate.diff", "live.diff"])
+        self.assertIn("candidate_diff", result["roles"]["c"]["artifacts"])
+
+    def test_a_cancelled_live_run_inspects_the_tree_only_after_a_spawn(self):
+        roles, body = self.stage([RoleFixture(id="a", execution=LIVE)], include=["."])
+        plan = workflow.prepare(str(self.run), roles, body)
+        self.file.write_text("value = 2\n")
+        result = evidence.write_result(self.run, plan, [], execution_state="refused")
+        self.assertIsNone(result["live"])
+        self.assertIsNone(result["roles"]["a"]["artifacts"])
+        recorder = evidence.AttemptEvidence(self.run / "evidence/a", ["codex"], "goal")
+        recorder.spawned(123, 123)
+        recorder.finish(returncode=None, state="interrupted")
+        result = evidence.write_result(self.run, plan, [], execution_state="interrupted")
+        self.assertEqual(result["live"]["writers"], ["a"])
+
+    def test_discovery_and_selection_send_each_role_its_worker_overrides(self):
+        import council_discovery
+        import council_selection
+        self.repo()
+        roles, body = self.stage([council_selection.Role(
+            role_id, role_id.title(), "Contribute.", execution=policy.policy_dict(execution))
+            for role_id, execution in (("copy", None), ("builder", WORKTREE),
+                                       ("live", {**LIVE, "external_tools": "native"}))])
+        workflow.prepare(str(self.run), roles, body)
+        probed = {}
+
+        def inspect(root, p):
+            probed[root] = policy.config_overrides(p, ("fixture",))
+            return {"overrides": list(probed[root])}
+
+        with patch.object(council_discovery, "_discover_command") as discover, \
+                patch.object(workflow, "inspect_policy", side_effect=inspect), \
+                patch.object(workflow.shutil, "which", return_value="/fixture/codex"):
+            workflow.discover_prepared(str(self.run), roles, body)
+        sent = {Path(call.args[0]).name: call.kwargs["config_overrides"]
+                for call in discover.call_args_list}
+        for call in discover.call_args_list:  # the probe's, MCP disables included
+            self.assertEqual(call.kwargs["config_overrides"],
+                             tuple(probed[call.kwargs["project_root"]]))
+        self.assertIn("mcp_servers.fixture.enabled=false", sent["copy"])
+        self.assertIn("project_root_markers=[]", sent["copy"])
+        self.assertNotIn("project_root_markers=[]", sent["builder"])
+        self.assertNotIn("project_root_markers=[]", sent["live"])
+        self.assertNotIn("features.memories=false", sent["live"])
+        self.assertEqual(Path(discover.call_args_list[1].kwargs["project_root"]),
+                         self.run / "workspaces/builder")
+        discovered = dict(probed)
+        probed.clear()
+
+        def resolve(selected, *args, config_overrides, **kwargs):
+            seen[selected[0].id] = config_overrides
+            return selected, None
+
+        seen = {}
+        with patch.object(workflow, "inspect_policy", side_effect=inspect), \
+                patch.object(council_selection, "_resolve_run_selections", side_effect=resolve):
+            bound, _, _ = workflow.resolve_selections(roles, str(self.run), "auto", True, body)
+        for role in bound:
+            self.assertEqual(seen[role.id], tuple(probed[role.workdir]))
+            self.assertEqual(role.execution_overrides, seen[role.id])
+        self.assertEqual(discovered, probed)  # --discover and launch send the same
+
+    def test_plan_lines_name_each_workspace_and_its_configuration(self):
+        self.repo()
+        roles, body = self.stage([RoleFixture(id="copy"),
+                                  RoleFixture(id="builder", execution=WORKTREE),
+                                  RoleFixture(id="live", execution=LIVE)])
+        plan = workflow.prepare(str(self.run), roles, body)
+        text = "\n".join(workflow.plan_lines(plan, roles, 0))
+        self.assertIn("workspace=per-role (see below); write_scope=working-tree-command-writes",
+                      text)
+        self.assertIn("copy: sandbox=read-only network=False external_tools=deny "
+                      "continuity=fresh required=True workspace=copy", text)
+        self.assertIn(f"workspace=worktree workspaces/builder branch={self.branch()}", text)
+        self.assertIn(f"workspace=LIVE {self.source}; edits land in your working tree", text)
+        self.assertIn("builder: commits need bypass", text)
+        self.assertIn("copy roles: scratch cwd", text)
+        self.assertIn("AGENTS.md/CLAUDE.md instruction files are not copied", text)
+        self.assertIn("live roles: Codex loads the project's own AGENTS.md and .codex "
+                      "natively from your working tree", text)
+        self.assertIn("worktree roles: Codex loads the project's own AGENTS.md and .codex "
+                      "natively as committed at HEAD", text)
+        bypass = {**WORKTREE, "sandbox": "bypass", "network": True}
+        lines = workflow.plan_lines(plan, [RoleFixture(id="builder", execution=bypass)], 0)
+        self.assertFalse(any("commits need bypass" in line for line in lines))
+        self.assertIn("write_scope=UNRESTRICTED", lines[0])
+
+    def test_a_copy_run_keeps_the_1_4_0_run_json_shape_and_contract(self):
+        roles, body = self.stage([RoleFixture(id="a")], include=["."])
+        plan = workflow.prepare(str(self.run), roles, body)
+        binding = plan["roles"]["a"]
+        self.assertEqual(set(binding), {"workspace", "evidence", "catalog",
+                                        "contract_sha256", "execution"})
+        legacy = {"sandbox": "read-only", "network": False, "external_tools": "deny",
+                  "continuity": "fresh", "required": True, "authorization": None}
+        self.assertEqual(binding["execution"], legacy)
+        role = roles[0]
+        self.assertEqual(binding["contract_sha256"], workspace.digest(
+            {"id": role.id, "label": role.label, "instruction": role.instruction,
+             "execution": legacy}))
+        self.assertEqual(plan["backend"], "private-copy")
+        workflow.load_plan(self.run, roles, body, verify_inputs=True)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(workflow.freshness_command(str(self.run)), 0)
+
+
 class EvidenceTests(WorkspaceCase):
+    def test_reported_status_is_the_replys_last_line_only(self):
+        cases = {
+            "done\n\nStatus: ready": {"state": "ready", "detail": None},
+            "**Status:** blocked: Which API wins?": {"state": "blocked",
+                                                    "detail": "Which API wins?"},
+            "`Status: failed \u2014 tests need a GPU.`": {"state": "failed",
+                                                         "detail": "tests need a GPU"},
+            "_Status: READY_": {"state": "ready", "detail": None},
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(evidence.reported_status(text), expected)
+        for text in (None, "", "Status: ready\nthen more", "Status: done",
+                     "Status: readying", "The status: ready line is quoted here"):
+            with self.subTest(text=text):
+                self.assertIsNone(evidence.reported_status(text))
+
     def test_records_raw_bytes_and_separates_tool_evidence_from_claims(self):
         directory = self.run / "evidence"
         directory.mkdir(mode=0o700)
@@ -1359,6 +2047,140 @@ class EvidenceTests(WorkspaceCase):
         self.assertEqual({row["path"] for row in result["files"]}, {"subject.py", "result.bin"})
         self.assertIn("+value = 2", (directory / "candidate.diff").read_text())
         self.assertEqual(self.file.read_text(), "value = 1\n")
+
+    def test_live_git_scope_inspects_links_and_tracked_special_files(self):
+        self.git("init", "-q")
+        (self.source / ".gitignore").write_text("ignored\n")
+        self.git("add", "subject.py")
+        snap = workspace.capture(self.source, self.baseline)
+        self.file.unlink()
+        os.mkfifo(self.file)
+        (self.source / "ignored").write_text("not selected\n")
+        (self.source / "link").symlink_to("ignored")
+        directory = self.run / "evidence"
+        directory.mkdir(mode=0o700)
+        artifacts = evidence.collect_artifacts(self.baseline, self.source, snap, directory,
+                                               mode="live")
+        for row in artifacts["files"]:
+            self.assertFalse(row["text_patch"])
+        expected = {"link": "symlink", "subject.py": "special-file"}
+        self.assertEqual({row["path"]: row["kind"] for row in artifacts["files"]}, expected)
+        fresh = workspace.freshness(snap, live=True)
+        self.assertEqual(fresh["state"], "stale")
+        self.assertEqual(fresh["special_paths"], expected)
+
+    def test_live_narrow_scope_does_not_read_through_a_replaced_ancestor(self):
+        folder = self.source / "folder"
+        folder.mkdir()
+        (folder / "selected").write_text("captured\n")
+        snap = workspace.capture(self.source, self.baseline, include=["folder/selected"])
+        folder.rename(self.base / "moved")
+        folder.symlink_to(self.base / "moved", target_is_directory=True)
+        (self.base / "moved/selected").write_text("outside the source\n")
+        directory = self.run / "evidence"
+        directory.mkdir(mode=0o700)
+        artifacts = evidence.collect_artifacts(self.baseline, self.source, snap, directory,
+                                               mode="live")
+        self.assertEqual({row["path"]: row["kind"] for row in artifacts["files"]},
+                         {"folder": "symlink", "folder/selected": "deleted"})
+        self.assertNotIn("outside the source", (directory / artifacts["live_diff"]).read_text())
+        self.assertEqual(workspace.freshness(snap, live=True)["special_paths"], {"folder": "symlink"})
+
+    def test_a_file_changed_during_inspection_is_flagged_not_the_whole_manifest(self):
+        """Per-file tolerance: bytes that no longer match the inventory, or a
+        file that vanishes while hashed, flag that entry without a patch."""
+        (self.source / "other.py").write_text("other = 1\n")
+        (self.source / "gone.py").write_text("gone = 1\n")
+        snap = self.capture()
+        self.file.write_text("value = 2\n")
+        (self.source / "other.py").write_text("other = 2\n")
+        (self.source / "gone.py").write_text("gone = 2\n")
+        directory = self.run / "evidence"
+        directory.mkdir(mode=0o700)
+        original_bytes, original_hash = evidence._bytes, workspace._hash_file
+
+        def change_before_diff(root, name, expected):
+            if root == self.source and name == "subject.py":
+                self.file.write_text("value = 3\n")
+            return original_bytes(root, name, expected)
+
+        def vanish_while_hashed(root, name, destination=None):
+            if root == self.source and name == "gone.py":
+                (self.source / "gone.py").unlink()
+            return original_hash(root, name, destination)
+
+        with patch.object(evidence, "_bytes", side_effect=change_before_diff), \
+                patch.object(workspace, "_hash_file", side_effect=vanish_while_hashed):
+            artifacts = evidence.collect_artifacts(self.baseline, self.source, snap, directory,
+                                                   mode="live")
+        rows = {row["path"]: row for row in artifacts["files"]}
+        self.assertEqual(set(rows), {"subject.py", "other.py", "gone.py"})
+        for name in ("subject.py", "gone.py"):
+            self.assertTrue(rows[name]["changed_during_inspection"], rows[name])
+            self.assertFalse(rows[name]["text_patch"])
+            self.assertEqual(rows[name]["kind"], "modified")
+        self.assertNotIn("changed_during_inspection", rows["other.py"])
+        self.assertTrue(rows["other.py"]["text_patch"])
+        diff = (directory / "live.diff").read_text()
+        self.assertIn("+other = 2", diff)
+        self.assertNotIn("value", diff)
+
+    def test_an_entry_that_vanishes_while_its_directory_is_walked_is_absent(self):
+        """Concurrent writers are accepted: an entry listed and then gone
+        before it is examined, or a directory gone before it is opened, is
+        a deletion, not a lost manifest."""
+        (self.source / "pkg").mkdir()
+        (self.source / "pkg/inner.py").write_text("inner = 1\n")
+        (self.source / "other.py").write_text("other = 1\n")
+        snap = self.capture()
+        self.file.write_text("value = 2\n")
+        directory = self.run / "evidence"
+        directory.mkdir(mode=0o700)
+        listdir = os.listdir
+
+        def racing(path):
+            names = listdir(path)
+            if "other.py" in names:  # the source root: two entries vanish next
+                (self.source / "other.py").unlink()
+                shutil.rmtree(self.source / "pkg")
+                names.append("listed-then-gone.txt")
+            return names
+
+        with patch.object(workspace.os, "listdir", side_effect=racing):
+            artifacts = evidence.collect_artifacts(self.baseline, self.source, snap, directory,
+                                                   mode="live")
+        self.assertEqual({row["path"]: row["kind"] for row in artifacts["files"]},
+                         {"subject.py": "modified", "other.py": "deleted",
+                          "pkg/inner.py": "deleted"})
+        with patch.object(workspace.os, "listdir", side_effect=lambda path: [
+                *listdir(path), "listed-then-gone.txt"]), \
+                self.assertRaises(FileNotFoundError):  # a capture still refuses
+            workspace.capture(self.source, self.run / "baseline-2", include=["."])
+
+    def test_an_unreadable_entry_is_listed_by_kind_not_the_whole_manifest(self):
+        if os.geteuid() == 0:
+            self.skipTest("root reads mode-000 files")
+        (self.source / "pkg").mkdir()
+        (self.source / "pkg/inner.py").write_text("inner = 1\n")
+        (self.source / "secret.bin").write_text("secret\n")
+        snap = self.capture()
+        self.file.write_text("value = 2\n")
+        (self.source / "secret.bin").chmod(0)
+        (self.source / "pkg").chmod(0)
+        directory = self.run / "evidence"
+        directory.mkdir(mode=0o700)
+        artifacts = evidence.collect_artifacts(self.baseline, self.source, snap, directory,
+                                               mode="live")
+        rows = {row["path"]: row for row in artifacts["files"]}
+        self.assertEqual({name: row["kind"] for name, row in rows.items()},
+                         {"subject.py": "modified", "secret.bin": "unreadable",
+                          "pkg": "unreadable"})  # pkg/inner.py: unknown, not deleted
+        self.assertEqual(rows["secret.bin"]["before"], snap["files"]["secret.bin"])
+        self.assertIn("+value = 2", (directory / "live.diff").read_text())
+        self.assertEqual(workspace.freshness(snap, live=True)["special_paths"],
+                         {"pkg": "unreadable", "secret.bin": "unreadable"})
+        with self.assertRaises(PermissionError):  # a capture still refuses
+            workspace.capture(self.source, self.run / "baseline-2", include=["."])
 
     def test_candidate_diff_preserves_embedded_unicode_line_separators(self):
         old = 'value = "first\u2028second\x85third"\n'

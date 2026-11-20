@@ -15,19 +15,34 @@ import io
 import json
 import os
 import platform
+import re
 import secrets
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
-from council_workspace import (atomic_json, digest, freshness,
+from council_workspace import (WorkspaceError, atomic_json, digest, freshness,
                                inventory, private_dir, read_json, regular,
-                               verify_tree)
+                               verify_tree, worktree_state)
 
 MAX_SUMMARY_LINE = 8 * 1024 * 1024
 MAX_COMMAND_SUMMARIES = 10000
 PATCH_FILE_LIMIT = 1024 * 1024
+LIVE_BEFORE_LAUNCH = "evidence/live-before-launch.json"  # council_workflow's constant
+
+# The brief's closing line, markdown emphasis tolerated: the role's own claim.
+_STATUS_LINE = re.compile(r"[*_`\s]*status[*_`\s]*:[*_`\s]*(ready|blocked|failed)(?![a-z])"
+                          r"[*_`]*\s*(?:[:\-\u2013\u2014]\s*(.*?))?[*_`.!\s]*", re.IGNORECASE)
+
+
+def reported_status(text: str | None) -> dict[str, Any] | None:
+    """{state, detail} from a reply's last nonblank line, else None."""
+    lines = [line for line in (text or "").splitlines() if line.strip()]
+    match = _STATUS_LINE.fullmatch(lines[-1]) if lines else None
+    if match is None:
+        return None
+    return {"state": match[1].lower(), "detail": match[2] or None}
 
 
 class AttemptEvidence:
@@ -194,45 +209,72 @@ class AttemptEvidence:
         return self.meta
 
 
-def _bytes(root: Path, name: str) -> bytes:
-    with regular(root, name) as stream:
-        return stream.read(PATCH_FILE_LIMIT + 1)
+def _bytes(root: Path, name: str, expected: dict[str, Any]) -> bytes | None:
+    """The file's bytes, or None when it no longer matches its inventory entry."""
+    try:
+        with regular(root, name) as stream:
+            data = stream.read(PATCH_FILE_LIMIT + 1)
+            executable = bool(os.fstat(stream.fileno()).st_mode & 0o111)
+    except (OSError, WorkspaceError):  # gone, replaced or made unreadable
+        return None
+    if (len(data) != expected["bytes"] or executable != expected["executable"]
+            or hashlib.sha256(data).hexdigest() != expected["sha256"]):
+        return None
+    return data
 
 
 def collect_artifacts(baseline: Path, workspace: Path, snapshot: dict[str, Any],
-                      evidence_dir: Path) -> dict[str, Any]:
+                      evidence_dir: Path, *, mode: str = "copy") -> dict[str, Any]:
     """Inspect changed files without following links or executing artifacts.
 
     The manifest covers added, removed and changed non-omitted regular files,
     executable-flag changes included; other permission changes and
     empty-directory changes are not recorded. Large, binary and
     executable-flag-only changes stay in the manifest, not a lossy text patch.
-    A symlink or special file the role left is listed by path and kind, with
-    the captured entry it replaced; it is never opened, followed or diffed.
-    Scratch output is not a capture, so names that collide are not refused.
+    A symlink, special file, nested repository, submodule or unreadable entry
+    the role left is listed by path and kind, with the captured entry it
+    replaced; it is never opened, followed or diffed. A file that changes or
+    vanishes while it is hashed or read is flagged changed_during_inspection,
+    without a patch; one gone before it is examined is a deletion. Live and
+    worktree output uses the capture's selection. Output inspection permits
+    names that would collide in a fresh portable capture.
     """
     special: dict[str, str] = {}
-    files, _, omitted, _ = inventory(workspace, ["."], [], special=special,
-                                     portable=False)
+    include, exclude = ((["."], []) if mode == "copy"
+                        else (snapshot["include"], snapshot["exclude"]))
+    files, _, omitted, _ = inventory(workspace, include, exclude, special=special,
+                                     portable=False, hints=False)
+    # What lies below an unreadable directory is unknown, not deleted.
+    unknown = tuple(f"{name}/" for name, kind in special.items() if kind == "unreadable")
     changed = sorted({*special, *(name for name in set(files) | set(snapshot["files"])
-                                  if files.get(name) != snapshot["files"].get(name))})
+                                  if files.get(name) != snapshot["files"].get(name)
+                                  and not name.startswith(unknown))})
     artifacts, patches = [], []
     for name in changed:
         before, after = snapshot["files"].get(name), files.get(name)
-        if name in special:
+        unstable = special.get(name) == "changed-during-inspection"
+        if name in special and not unstable:
             artifacts.append({"path": name, "kind": special[name], "before": before,
                               "after": None, "text_patch": False})
             continue
         entry = {"path": name, "before": before, "after": after,
                  "kind": "added" if before is None else "deleted" if after is None
-                 else "modified", "text_patch": False}
+                 and not unstable else "modified", "text_patch": False}
+        if unstable:
+            entry["changed_during_inspection"] = True
+            artifacts.append(entry)
+            continue
         if (any(ord(ch) < 32 for ch in name)
                 or max((before or {}).get("bytes", 0), (after or {}).get("bytes", 0))
                 > PATCH_FILE_LIMIT):
             artifacts.append(entry)
             continue
-        old = _bytes(baseline, name) if before else b""
-        new = _bytes(workspace, name) if after else b""
+        old = _bytes(baseline, name, before) if before else b""
+        new = _bytes(workspace, name, after) if after else b""
+        if old is None or new is None:
+            entry["changed_during_inspection"] = True
+            artifacts.append(entry)
+            continue
         try:
             if b"\0" in old or b"\0" in new:
                 raise UnicodeError("binary artifact")
@@ -250,15 +292,20 @@ def collect_artifacts(baseline: Path, workspace: Path, snapshot: dict[str, Any],
                     patches.append("\n\\ No newline at end of file\n")
             entry["text_patch"] = True
         artifacts.append(entry)
-    # Human-inspectable candidate only. Exact bytes remain in the workspace;
-    # application and integration checks belong to the orchestrator.
-    path = evidence_dir / "candidate.diff"
+    path = evidence_dir / ("live.diff" if mode == "live" else "candidate.diff")
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8", newline="") as stream:
         os.fchmod(fd, 0o600)  # 0600 whatever the umask
         stream.writelines(patches)
-    return {"files": artifacts, "omitted": omitted, "candidate_diff": path.name,
-            "application": "never automatic; inspect exact workspace bytes"}
+    result = {"files": artifacts, "omitted": omitted}
+    if mode == "live":
+        result.update(live_diff=path.name, applied_to_live_tree=True,
+                      application="observed in the working tree since capture; "
+                                  "includes changes by other writers")
+    else:
+        result.update(candidate_diff=path.name,
+                      application="never automatic; inspect exact workspace bytes")
+    return result
 
 
 def write_result(run_dir: Path, plan: dict[str, Any], results: list[Any],
@@ -274,7 +321,10 @@ def write_result(run_dir: Path, plan: dict[str, Any], results: list[Any],
         gaps.append("baseline-integrity-not-established")
     # The context check refines the input comparison; it never discards its
     # file-level detail.
-    application = freshness(manifest)
+    modes = {role_id: binding["execution"].get("workspace", "copy")
+             for role_id, binding in plan["roles"].items()}
+    writers = sorted(role_id for role_id, mode in modes.items() if mode == "live")
+    application = freshness(manifest, live=bool(writers))
     try:
         if hashlib.sha256((run_dir / "context.md").read_bytes()).hexdigest() != plan["context_sha256"]:
             application.update(state="stale", reason="context changed since capture")
@@ -283,12 +333,10 @@ def write_result(run_dir: Path, plan: dict[str, Any], results: list[Any],
         if application["state"] != "stale":
             application["state"] = "unknown"
         gaps.append("context-unavailable-at-reconciliation")
-    roles = {}
+    observed = {}
     for role_id, binding in plan["roles"].items():
-        result = by_id.get(role_id)
-        directory = run_dir / binding["evidence"]
         attempts, role_gaps = [], []
-        for path in sorted(directory.glob("attempt-*.json")):
+        for path in sorted((run_dir / binding["evidence"]).glob("attempt-*.json")):
             try:
                 attempt = read_json(path)
                 if not isinstance(attempt, dict) or attempt.get("schema") != "codex-council/attempt@1":
@@ -297,6 +345,38 @@ def write_result(run_dir: Path, plan: dict[str, Any], results: list[Any],
             except (OSError, ValueError):
                 gaps.append(f"{role_id}:attempt-metadata-unreadable")
                 role_gaps.append("attempt-metadata-unreadable")
+        observed[role_id] = attempts, role_gaps
+
+    def inspect(role_ids: list[str]) -> bool:
+        # After graceful teardown a stopped writer may already have changed
+        # its tree; a refusal or cancellation before any spawn left nothing.
+        return baseline_intact and (execution_state == "done" or any(
+            attempt.get("pid") for role_id in role_ids for attempt in observed[role_id][0]))
+
+    live = None
+    if writers and inspect(writers):
+        # Live writers share one tree, so its changes are inspected once.
+        try:
+            live = collect_artifacts(run_dir / "baseline", Path(manifest["source_root"]),
+                                     manifest, run_dir / "evidence", mode="live")
+        except (OSError, ValueError):
+            pass
+        else:
+            try:
+                before = read_json(run_dir / LIVE_BEFORE_LAUNCH)
+                changed_before = before.get("changed_paths") if isinstance(before, dict) else None
+            except (OSError, ValueError):
+                changed_before = None
+            live.update(live_diff=f"evidence/{live['live_diff']}", writers=writers,
+                        attribution="not per role: live writers share one tree, and "
+                                    "others may have edited it too",
+                        changed_before_launch=changed_before)
+    roles = {}
+    for role_id, binding in plan["roles"].items():
+        result = by_id.get(role_id)
+        mode = modes[role_id]
+        directory = run_dir / binding["evidence"]
+        attempts, role_gaps = observed[role_id]
         if not attempts:
             role_gaps.append("no-attempt-evidence")
         if any(not attempt.get("evidence_complete") for attempt in attempts):
@@ -307,13 +387,34 @@ def write_result(run_dir: Path, plan: dict[str, Any], results: list[Any],
         if role_ok and attempts and attempts[-1].get("turn_completed_observed") is not True:
             role_gaps.append("turn-completion-not-observed")
         artifacts = None
-        if execution_state == "done" and baseline_intact:
+        # A copy is inspected once its council is done; a worktree keeps a
+        # stopped writer's commits, so like the live tree once it spawned.
+        collect = (inspect([role_id]) if mode == "worktree"
+                   else baseline_intact and execution_state == "done")
+        if mode == "live":
+            if live is not None:  # the shared observation lives in result["live"]
+                artifacts = {"live_diff": live["live_diff"], "applied_to_live_tree": True,
+                             "writers": writers}
+            elif inspect(writers):
+                role_gaps.append("artifact-inspection-incomplete")
+        elif collect:
             try:
                 artifacts = collect_artifacts(run_dir / "baseline",
                                               run_dir / binding["workspace"], manifest,
-                                              directory)
+                                              directory, mode=mode)
             except (OSError, ValueError):
                 role_gaps.append("artifact-inspection-incomplete")
+            if artifacts is not None and mode == "worktree":
+                worktree = binding["worktree"]
+                root = run_dir / worktree["root"]
+                artifacts.update(
+                    applied_to_live_tree=False,
+                    application=f"on branch {worktree['branch']} in worktree {root}; "
+                                "nothing was applied to your working tree; merge or apply "
+                                "what you accept",
+                    worktree={"path": str(root), "branch": worktree["branch"],
+                              "base": worktree["base"], "repo": worktree["repo"],
+                              **worktree_state(root, worktree["base"])})
         required = binding["execution"]["required"]
         if required and (not role_ok or role_gaps):
             gaps.append(f"{role_id}:required-contribution-incomplete")
@@ -333,6 +434,7 @@ def write_result(run_dir: Path, plan: dict[str, Any], results: list[Any],
             "coverage_gaps": role_gaps,
             "interpretation": {
                 "source": "collaborator", "text": result.text if result else None,
+                "reported_status": reported_status(result.text) if result else None,
                 "error": result.error if result else "no settled reply",
                 "verification": "requires-orchestrator-reconciliation",
             },
@@ -348,6 +450,8 @@ def write_result(run_dir: Path, plan: dict[str, Any], results: list[Any],
         "environment": {"system": platform.system(), "release": platform.release(),
                         "python": sys.version.split()[0]},
     }
+    if writers:
+        result["live"] = live
     result["result_digest"] = digest(result)
     atomic_json(run_dir / "result.json", result)
     return result

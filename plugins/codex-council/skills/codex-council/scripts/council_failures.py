@@ -620,6 +620,11 @@ def _model_rejected_error(decision, provider_message, phase):
     )
 
 
+# Codex's config error for `-c mcp_servers.<name>.enabled=false` naming a
+# server that is not configured: the override creates a partial table.
+_MCP_GONE = "invalid transport in `mcp_servers."
+
+
 def _classify_failure(failure_text, rc, phase, decision, verdict):
     """Return a tagged error string for a non-zero codex exit.
 
@@ -640,4 +645,8 @@ def _classify_failure(failure_text, rc, phase, decision, verdict):
         return f"[retriable:{verdict.kind}] {detail}"
     if verdict.kind == "model-rejected":
         return _model_rejected_error(decision, verdict.rejection, phase)
+    if _MCP_GONE in detail:
+        # An MCP server disabled by name is no longer configured.
+        return (f"{detail} (MCP inventory changed or is unknown since the launch "
+                "policy check; prepare a new run)")
     return detail
